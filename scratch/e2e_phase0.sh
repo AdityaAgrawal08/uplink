@@ -6,7 +6,9 @@ cd "$(dirname "$0")/.." || exit 1
 
 SERVER="${SERVER:-http://localhost:3000}"
 BIN="$(pwd)/cli/build/uplink"
-WORK="$(mktemp -d /tmp/opencode/e2e.XXXXXX)"
+TMP_ROOT="${TMPDIR:-/tmp}/opencode"
+mkdir -p "$TMP_ROOT"
+WORK="$(mktemp -d "$TMP_ROOT/e2e.XXXXXX")"
 PASS=0; FAIL=0
 
 say()  { printf '\n=== %s ===\n' "$1"; }
