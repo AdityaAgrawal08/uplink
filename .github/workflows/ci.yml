@@ -1,26 +1,188 @@
 name: CI
-on: [push, pull_request]
+
+# Validity gate for every push: lint, typecheck, build, unit tests,
+# cross-platform CLI builds, and a full end-to-end integration matrix
+# (real MongoDB service container + mock R2 storage) covering every
+# feature surface: share send/receive, folders, E2EE, multipart,
+# idempotency, negative contracts, and collaborative sessions
+# (auto-skipped on branches without session routes).
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  typecheck:
+  cli-lint-test-build:
+    name: CLI · vet · test · cross-build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - run: npm ci
-      - run: npm run lint
-      # Run TypeScript compiler type checking directly without emitting outputs
-      - run: npx tsc --noEmit
 
-  go-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.21"
+          go-version-file: cli/go.mod
           cache-dependency-path: cli/go.sum
-      - run: cd cli && go build -v
-      - run: cd cli && go test -v ./pkg/...
+
+      - name: Vet
+        run: go vet ./...
+        working-directory: cli
+
+      - name: Unit tests (all packages)
+        run: go test -race ./...
+        working-directory: cli
+
+      - name: Cross-compile release targets
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}; ext=""
+            [ "$os" = "windows" ] && ext=".exe"
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" -o "dist/uplink-${os}-${arch}${ext}" .
+            echo "built uplink-${os}-${arch}"
+          done
+        working-directory: cli
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-binaries
+          path: cli/dist/
+          retention-days: 7
+
+  web-lint-test-build:
+    name: Web · lint · typecheck · unit · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Unit tests (crypto, crc64, redis mock)
+        run: npx tsx scratch/run_tests.ts
+
+      - name: Production build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: 1
+
+  e2e-integration:
+    name: E2E · full feature matrix vs live server
+    needs: [cli-lint-test-build, web-lint-test-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MONGODB_URI: mongodb://localhost:27017/uplink_ci
+      # Placeholder values trip the isPlaceholder() guard in src/lib/r2.ts,
+      # forcing deterministic local mock storage — no cloud credentials.
+      R2_ACCESS_KEY_ID: ci_placeholder_key
+      R2_SECRET_ACCESS_KEY: ci_placeholder_secret
+      R2_ENDPOINT_URL: https://placeholder.r2.cloudflarestorage.com
+      R2_BUCKET_NAME: uplink-ci-bucket
+      UPSTASH_REDIS_REST_URL: https://placeholder.upstash.io
+      UPSTASH_REDIS_REST_TOKEN: placeholder_token
+      IP_ANONYMIZATION_SECRET: ci_ip_anonymization_secret
+      APP_URL: http://localhost:3000
+      FORCE_MOCK_STORAGE: "true"
+      NEXT_TELEMETRY_DISABLED: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+          cache-dependency-path: cli/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build server
+        run: npm run build
+
+      - name: Build CLI
+        run: go build -o build/uplink .
+        working-directory: cli
+
+      - name: Boot production server
+        run: |
+          npm start > "$GITHUB_WORKSPACE/server.log" 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3000/api/v1/speedtest > /dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:3000/api/v1/speedtest > /dev/null || {
+            echo "::error::server failed to become healthy"; tail -50 server.log; exit 1;
+          }
+          echo "server healthy"
+
+      - name: Core transfer matrix (send/receive/folder/E2EE/multipart/idempotency/negative)
+        run: SERVER=http://localhost:3000 ./scratch/e2e_phase0.sh
+
+      - name: Collaborative session lifecycle (skips if routes absent)
+        run: SERVER=http://localhost:3000 ./scratch/session_flow_test.sh
+
+      - name: API contract probes
+        # NOTE: deliberately NO /share/init calls here — the init rate limiter
+        # (10 per 5 min per instance on mock Redis) is already budgeted by the
+        # transfer matrix (~7) and the session test (1). Zero-size and bad-hash
+        # rejections are covered inside the matrix (S4/S5).
+        run: |
+          set -e
+
+          ST=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/api/v1/share/nonexistent0000)
+          [ "$ST" = "404" ] || { echo "::error::unknown share metadata expected 404, got $ST"; exit 1; }
+
+          ST=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/api/v1/share/nonexistent0000/authorize-download \
+            -H 'Content-Type: application/json' -d '{}')
+          [ "$ST" = "404" ] || { echo "::error::unknown share authorize expected 404, got $ST"; exit 1; }
+
+          BYTES=$(curl -s http://localhost:3000/api/v1/speedtest | wc -c)
+          [ "$BYTES" = "262144" ] || { echo "::error::speedtest payload $BYTES != 262144"; exit 1; }
+
+          echo "all API contract probes passed"
+
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-server-log
+          path: server.log
+          retention-days: 7
