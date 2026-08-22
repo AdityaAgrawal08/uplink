@@ -186,3 +186,26 @@ jobs:
           name: e2e-server-log
           path: server.log
           retention-days: 7
+
+  # Single rolling gate for branch protection: require exactly this one
+  # check ("pipeline") on main and every feature PR stays one setting.
+  pipeline:
+    name: pipeline · all gates green
+    needs: [cli-lint-test-build, web-lint-test-build, e2e-integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    steps:
+      - name: Verify no gate failed or was skipped
+        run: |
+          result="${{ contains(needs.cli-lint-test-build.result, 'failure')
+                    || contains(needs.cli-lint-test-build.result, 'cancelled')
+                    || contains(needs.web-lint-test-build.result, 'failure')
+                    || contains(needs.web-lint-test-build.result, 'cancelled')
+                    || contains(needs.e2e-integration.result, 'failure')
+                    || contains(needs.e2e-integration.result, 'cancelled') }}"
+          if [ "$result" = "true" ]; then
+            echo "::error::one or more CI gates failed"
+            exit 1
+          fi
+          echo "all gates green — branch is mergeable"
