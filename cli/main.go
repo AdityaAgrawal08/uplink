@@ -137,6 +137,34 @@ func printUsage() {
 	fmt.Println("              uplink --help")
 }
 
+// normalizeFlagOrder moves all flags before the first positional argument.
+//
+// Go's flag package stops parsing at the first non-flag token, which silently
+// drops any flags placed after a positional argument
+// (e.g. "uplink send file.txt --server X" would ignore --server entirely).
+func normalizeFlagOrder(args []string, valueFlags map[string]bool) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if len(arg) > 1 && arg[0] == '-' && arg != "-" {
+			flags = append(flags, arg)
+			name := strings.TrimLeft(arg, "-")
+			// A "--flag value" pair consumes the next token; "--flag=value" does not.
+			if !strings.Contains(name, "=") && valueFlags[name] && i+1 < len(args) {
+				i++
+				flags = append(flags, args[i])
+			}
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+	return append(flags, positional...)
+}
+
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -243,7 +271,13 @@ func handleSend(args []string) {
 	noQrFlag := sendCmd.Bool("no-qr", false, "Suppress QR code display")
 	encryptFlag := sendCmd.Bool("encrypt", false, "Enable Client-Side End-to-End Encryption")
 
-	err := sendCmd.Parse(args)
+	sendValueFlags := map[string]bool{
+		"password": true,
+		"expire":   true,
+		"server":   true,
+	}
+
+	err := sendCmd.Parse(normalizeFlagOrder(args, sendValueFlags))
 	if err != nil {
 		fmt.Println("Error parsing flags:", err)
 		os.Exit(1)
@@ -828,7 +862,12 @@ func handleReceive(args []string) {
 	mkdirShortFlag := recvCmd.Bool("p", false, "Create destination directory (shortcut)")
 	lanFlag := recvCmd.Bool("lan", false, "Enable direct LAN P2P transfer")
 
-	err := recvCmd.Parse(args)
+	receiveValueFlags := map[string]bool{
+		"password": true,
+		"server":   true,
+	}
+
+	err := recvCmd.Parse(normalizeFlagOrder(args, receiveValueFlags))
 	if err != nil {
 		fmt.Println("Error parsing flags:", err)
 		os.Exit(1)

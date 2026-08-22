@@ -52,6 +52,7 @@ export async function POST(
       return NextResponse.json({
         message: "Upload already confirmed",
         shareId: share.shareId,
+        downloadCode: share.downloadCode || null,
         status: share.status,
       });
     }

@@ -86,3 +86,58 @@ func TestFormatBytes(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeFlagOrder(t *testing.T) {
+	valueFlags := map[string]bool{"server": true, "password": true, "expire": true}
+
+	tests := []struct {
+		name     string
+		input    []string
+		expected []string
+	}{
+		{
+			name:     "flags already first are preserved",
+			input:    []string{"--server", "http://x", "file.txt"},
+			expected: []string{"--server", "http://x", "file.txt"},
+		},
+		{
+			name:     "flags after positional move to front",
+			input:    []string{"file.txt", "--no-qr", "--server", "http://x"},
+			expected: []string{"--no-qr", "--server", "http://x", "file.txt"},
+		},
+		{
+			name:     "equals-form value flag stays intact",
+			input:    []string{"file.txt", "--server=http://y", "-f"},
+			expected: []string{"--server=http://y", "-f", "file.txt"},
+		},
+		{
+			name:     "double dash terminator keeps remainder positional",
+			input:    []string{"--no-qr", "--", "-weird.txt", "--server"},
+			expected: []string{"--no-qr", "-weird.txt", "--server"},
+		},
+		{
+			name:     "value flag at end without value",
+			input:    []string{"file.txt", "--password"},
+			expected: []string{"--password", "file.txt"},
+		},
+		{
+			name:     "mixed shortcuts and long flags",
+			input:    []string{"4827165038", "-r", "--server", "http://z", "destDir"},
+			expected: []string{"-r", "--server", "http://z", "4827165038", "destDir"},
+		},
+	}
+
+	for _, tt := range tests {
+		got := normalizeFlagOrder(tt.input, valueFlags)
+		if len(got) != len(tt.expected) {
+			t.Errorf("%s: normalizeFlagOrder(%v) = %v; expected %v", tt.name, tt.input, got, tt.expected)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.expected[i] {
+				t.Errorf("%s: normalizeFlagOrder(%v) = %v; expected %v", tt.name, tt.input, got, tt.expected)
+				break
+			}
+		}
+	}
+}
