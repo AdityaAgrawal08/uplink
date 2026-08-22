@@ -5,8 +5,11 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 
 SERVER="${SERVER:-http://localhost:3000}"
-BIN="$(pwd)/cli/build/uplink"
-WORK="$(mktemp -d /tmp/opencode/e2e.XXXXXX)"
+BIN="${BIN:-$(pwd)/cli/build/uplink}"
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/uplink-e2e.XXXXXX")"
+BODY="$SCRATCH/body.json"
+WORK="$SCRATCH/work"
+mkdir -p "$WORK"
 PASS=0; FAIL=0
 
 say()  { printf '\n=== %s ===\n' "$1"; }
