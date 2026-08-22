@@ -108,9 +108,27 @@ export async function POST(req: NextRequest) {
         if (status === "PROCESSING") {
           return apiError("A request with this Idempotency-Key is currently processing", 409);
         }
-        if (status) {
-          success = true;
-          return NextResponse.json(status);
+        if (status && typeof status === "object") {
+          // Only replay the cached init if the referenced share is still
+          // alive. The cache outlives share expiry (2h TTL vs 1h default),
+          // so a blind replay could resurrect a DELETED/EXPIRED share and
+          // hand the user a dead link on re-send.
+          const cachedShareId = (status as { shareId?: string }).shareId;
+          const live = cachedShareId
+            ? await (await getDb()).collection("shares").findOne(
+                { shareId: cachedShareId },
+                { projection: { status: 1, expiresAt: 1 } }
+              )
+            : null;
+          const terminal = ["EXPIRED", "DELETED", "PENDING_DELETE", "DELETE_FAILED"];
+          const notExpired = !!live?.expiresAt && new Date(live.expiresAt as unknown as string) > new Date();
+          if (live && !terminal.includes(live.status) && notExpired) {
+            success = true;
+            return NextResponse.json(status);
+          }
+          // Stale cache for a dead share — drop it and fall through to a
+          // fresh initialization below.
+          await redis.del(redisIdempotencyKey);
         }
       }
     }
