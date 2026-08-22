@@ -13,9 +13,16 @@ say()  { printf '\n=== %s ===\n' "$1"; }
 ok()   { printf '  [PASS] %s\n' "$1"; PASS=$((PASS+1)); }
 bad()  { printf '  [FAIL] %s\n' "$1"; FAIL=$((FAIL+1)); }
 
-send_code() { # $1=path -> echoes download code or empty
-    "$BIN" send "$1" --server "$SERVER" --no-qr 2>&1 |
-    awk '/^Code:$/{getline; print; exit}'
+send_code() { # $1=path -> echoes download code or empty; failure reason goes to stderr
+    local out rc
+    out=$("$BIN" send "$1" --server "$SERVER" --no-qr 2>&1); rc=$?
+    local code
+    code=$(printf '%s\n' "$out" | awk '/^Code:$/{getline; print; exit}')
+    if [ -z "$code" ]; then
+        printf '[diag] %s send rc=%d: %s\n' "$(basename "$1")" "$rc" \
+            "$(printf '%s\n' "$out" | grep -v '█\|░' | tail -2 | tr '\n' ' ')" >&2
+    fi
+    printf '%s' "$code"
 }
 
 say "S1: small text file round-trip"
@@ -28,7 +35,7 @@ if diff -q "$WORK/s1.txt" "$WORK/rx1/s1.txt" >/dev/null 2>&1; then ok "content i
 
 say "S2: directory (tarball) round-trip"
 mkdir -p "$WORK/pkg/sub"
-echo alpha > "$WORK/pkg/a.txt"
+echo "alpha $(date +%s)" > "$WORK/pkg/a.txt"
 echo beta  > "$WORK/pkg/sub/b.txt"
 CODE=$(send_code "$WORK/pkg")
 if [ -n "$CODE" ]; then ok "folder send code $CODE"; else bad "folder send failed"; fi
@@ -70,6 +77,22 @@ if [ -n "$CODE" ]; then ok "multipart send code $CODE"; else bad "multipart send
 mkdir -p "$WORK/rx3"
 ( cd "$WORK/rx3" && "$BIN" receive "$CODE" --server "$SERVER" >/dev/null 2>&1 )
 if cmp -s "$WORK/s7.bin" "$WORK/rx3/s7.bin"; then ok "25MB byte-identical"; else bad "multipart mismatch"; fi
+
+say "S8: stale idempotency cache cannot resurrect a dead share (RUN_SLOW=1, ~80s)"
+if [ "${RUN_SLOW:-0}" = "1" ]; then
+    printf 'stale-cache %s\n' "$(date +%s)" > "$WORK/s8.txt"
+    OUT=$("$BIN" send "$WORK/s8.txt" --server "$SERVER" --no-qr --expire 1m 2>&1)
+    CODE_A=$(printf '%s\n' "$OUT" | awk '/^Code:$/{getline; print; exit}')
+    if [ -n "$CODE_A" ]; then ok "initial send code $CODE_A (expires in 1m)"; else bad "initial send failed"; fi
+    sleep 70
+    OUT=$("$BIN" send "$WORK/s8.txt" --server "$SERVER" --no-qr --expire 1m 2>&1)
+    CODE_B=$(printf '%s\n' "$OUT" | awk '/^Code:$/{getline; print; exit}')
+    if [ -n "$CODE_B" ] && [ "$CODE_B" != "$CODE_A" ]; then ok "re-send after expiry got fresh share $CODE_B"
+    elif [ -n "$CODE_B" ]; then bad "re-send reused dead share code $CODE_B"
+    else bad "re-send after expiry failed: $(printf '%s\n' "$OUT" | grep -v '█\|░' | tail -2 | tr '\n' ' ')"; fi
+else
+    echo "  [skip] set RUN_SLOW=1 to enable (~80s)"
+fi
 
 say "RESULT: PASS=$PASS FAIL=$FAIL  (workdir $WORK)"
 [ $FAIL -eq 0 ]
