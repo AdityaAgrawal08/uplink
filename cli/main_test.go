@@ -6,7 +6,6 @@ import (
 )
 
 func TestGenerateShareCode(t *testing.T) {
-	// Generate 100 codes and verify structure and uniqueness
 	codes := make(map[string]bool)
 	alphanumeric := regexp.MustCompile("^[a-zA-Z0-9]{6}$")
 
@@ -25,26 +24,120 @@ func TestGenerateShareCode(t *testing.T) {
 	}
 }
 
-func TestShouldSkip(t *testing.T) {
+func TestSanitizeFilename(t *testing.T) {
 	tests := []struct {
-		name     string
 		input    string
-		expected bool
+		expected string
 	}{
-		{"hidden file", ".gitignore", true},
-		{"temp file", "file.tmp", true},
-		{"swap file", "file.swp", true},
-		{"regular file", "document.pdf", false},
-		{"nested regular file", "path/to/image.png", false},
-		{"nested hidden file", "path/to/.config", true},
+		{"../../etc/passwd", "passwd"},
+		{"folder/file.txt", "file.txt"},
+		{"", "file"},
+		{".", "file"},
+		{"..", "file"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := shouldSkip(tt.input)
-			if got != tt.expected {
-				t.Errorf("shouldSkip(%q) = %v; expected %v", tt.input, got, tt.expected)
+		got := sanitizeFilename(tt.input)
+		if got != tt.expected {
+			t.Errorf("sanitizeFilename(%q) = %q; expected %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestParseDurationToSeconds(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int
+		hasError bool
+	}{
+		{"5m", 300, false},
+		{"2h", 7200, false},
+		{"1d", 86400, false},
+		{"invalid", 0, true},
+		{"0h", 0, true},
+	}
+
+	for _, tt := range tests {
+		got, err := parseDurationToSeconds(tt.input)
+		if (err != nil) != tt.hasError {
+			t.Errorf("parseDurationToSeconds(%q) error = %v; expected error = %v", tt.input, err, tt.hasError)
+		}
+		if !tt.hasError && got != tt.expected {
+			t.Errorf("parseDurationToSeconds(%q) = %d; expected %d", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestFormatBytes(t *testing.T) {
+	tests := []struct {
+		input    int64
+		expected string
+	}{
+		{500, "500 B"},
+		{1024, "1.0 KB"},
+		{1048576, "1.0 MB"},
+		{1073741824, "1.0 GB"},
+	}
+
+	for _, tt := range tests {
+		got := formatBytes(tt.input)
+		if got != tt.expected {
+			t.Errorf("formatBytes(%d) = %q; expected %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestNormalizeFlagOrder(t *testing.T) {
+	valueFlags := map[string]bool{"server": true, "password": true, "expire": true}
+
+	tests := []struct {
+		name     string
+		input    []string
+		expected []string
+	}{
+		{
+			name:     "flags already first are preserved",
+			input:    []string{"--server", "http://x", "file.txt"},
+			expected: []string{"--server", "http://x", "file.txt"},
+		},
+		{
+			name:     "flags after positional move to front",
+			input:    []string{"file.txt", "--no-qr", "--server", "http://x"},
+			expected: []string{"--no-qr", "--server", "http://x", "file.txt"},
+		},
+		{
+			name:     "equals-form value flag stays intact",
+			input:    []string{"file.txt", "--server=http://y", "-f"},
+			expected: []string{"--server=http://y", "-f", "file.txt"},
+		},
+		{
+			name:     "double dash terminator keeps remainder positional",
+			input:    []string{"--no-qr", "--", "-weird.txt", "--server"},
+			expected: []string{"--no-qr", "-weird.txt", "--server"},
+		},
+		{
+			name:     "value flag at end without value",
+			input:    []string{"file.txt", "--password"},
+			expected: []string{"--password", "file.txt"},
+		},
+		{
+			name:     "mixed shortcuts and long flags",
+			input:    []string{"4827165038", "-r", "--server", "http://z", "destDir"},
+			expected: []string{"-r", "--server", "http://z", "4827165038", "destDir"},
+		},
+	}
+
+	for _, tt := range tests {
+		got := normalizeFlagOrder(tt.input, valueFlags)
+		if len(got) != len(tt.expected) {
+			t.Errorf("%s: normalizeFlagOrder(%v) = %v; expected %v", tt.name, tt.input, got, tt.expected)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.expected[i] {
+				t.Errorf("%s: normalizeFlagOrder(%v) = %v; expected %v", tt.name, tt.input, got, tt.expected)
+				break
 			}
-		})
+		}
 	}
 }
