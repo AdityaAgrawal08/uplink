@@ -330,7 +330,7 @@ func handleSend(args []string) {
 	serverUrl := sanitizeServerUrl(*serverFlag)
 
 	// Perform actual upload
-	code, shareLink, filename, size, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
+	code, _, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
 	if err != nil {
 		fmt.Printf("\n✗ Upload failed: %v\n", err)
 		os.Exit(1)
@@ -339,27 +339,9 @@ func handleSend(args []string) {
 	fmt.Printf("\n✓ Upload completed\n\n")
 	fmt.Printf("File:\n%s\n\n", filename)
 	if code != "" {
-		fmt.Printf("Code:\n%s\n\n", code)
+		fmt.Printf("Code:\n%s\n", code)
 	}
-	fmt.Printf("Link:\n%s\n\n", cleanPrintName(shareLink))
-	fmt.Printf("Expires:\n%s\n\n", *expireFlag)
-	fmt.Printf("Size:\n%s\n", formatBytes(size))
-
-	if *encryptFlag {
-		fmt.Println("\n⚠️  Security Notice: The decryption key is embedded inside the share link and code.")
-		fmt.Println("   Ensure you share them securely, as they will appear in command history and server logs.")
-	}
-
-	// Display QR code on completion
-	showQR := false
-	if *qrFlag {
-		showQR = true
-	} else if !*noQrFlag {
-		showQR = ShouldShowQR(cfg.ShowQR)
-	}
-	if showQR {
-		PrintQRCode(shareLink)
-	}
+	fmt.Printf("Expires:\n%s\n", *expireFlag)
 
 	notifyTransferComplete(filename)
 }
