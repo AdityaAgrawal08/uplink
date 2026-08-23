@@ -87,6 +87,25 @@ func TestFormatBytes(t *testing.T) {
 	}
 }
 
+func TestChunkSizeFloor(t *testing.T) {
+	ac := &AdaptiveChunker{}
+	// Simulate a very slow link (2 KB/s) — the measured chunk would be ~10 KB.
+	ac.RecordSpeed(2048)
+	cs := ac.ChunkSize()
+	if cs != minChunk {
+		t.Errorf("slow-link chunk size = %d; want floor %d (5 MiB, S3 minimum part size)", cs, minChunk)
+	}
+	if cs < 5<<20 {
+		t.Errorf("chunk size %d below S3 5 MiB part minimum", cs)
+	}
+
+	fast := &AdaptiveChunker{}
+	fast.RecordSpeed(100 << 20) // 100 MB/s → clamps to max
+	if got := fast.ChunkSize(); got != maxChunk {
+		t.Errorf("fast-link chunk size = %d; want ceiling %d", got, maxChunk)
+	}
+}
+
 func TestNormalizeFlagOrder(t *testing.T) {
 	valueFlags := map[string]bool{"server": true, "password": true, "expire": true}
 

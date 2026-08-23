@@ -8,7 +8,9 @@ import (
 )
 
 const (
-	minChunk     = 1 << 20  // 1 MB
+	// minChunk must stay >= 5 MiB: S3/R2 reject CompleteMultipartUpload when
+	// any non-final part is smaller than 5 MiB ("minimum allowed object size").
+	minChunk     = 5 << 20  // 5 MiB
 	maxChunk     = 10 << 20 // 10 MB
 	smoothFactor = 0.3      // EMA smoothing factor
 	targetSec    = 5.0      // target 5 seconds per chunk
