@@ -23,6 +23,8 @@ jobs:
             arch: amd64
           - os: darwin
             arch: arm64
+          - os: windows
+            arch: amd64
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -30,17 +32,22 @@ jobs:
       - name: Set Up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: cli/go.mod
 
       - name: Build Binary
         run: |
           cd cli
-          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} CGO_ENABLED=0 go build -o uplink -ldflags="-s -w"
+          ext=""
+          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
+            go build -o "uplink${ext}" -trimpath -ldflags="-s -w"
 
       - name: Archive Binary
         run: |
           cd cli
-          tar -czf ../uplink-${{ matrix.os }}-${{ matrix.arch }}.tar.gz uplink
+          ext=""
+          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+          tar -czf ../uplink-${{ matrix.os }}-${{ matrix.arch }}.tar.gz "uplink${ext}"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

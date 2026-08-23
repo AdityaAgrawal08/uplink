@@ -121,7 +121,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Uplink CLI Client (v3.1.0)")
+	fmt.Println("Uplink CLI Client (v0.0.1)")
 	fmt.Println("Usage: uplink <command> [arguments] [flags]")
 	fmt.Println()
 	fmt.Println("Commands:")
