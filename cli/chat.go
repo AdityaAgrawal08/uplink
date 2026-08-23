@@ -64,17 +64,17 @@ func (c *chatClient) endpoint(path string) string {
 }
 
 // fetchBacklog seeds history (latest 50) and positions the cursor.
-func (c *chatClient) fetchBacklog() error {
+func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 	code, body, err := getJSON(c.endpoint("/messages"), c.authHeaders())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if code == 403 || code == 410 {
-		return fmt.Errorf("session unavailable (%d)", code)
+		return nil, fmt.Errorf("session unavailable (%d)", code)
 	}
 	var poll chatPollResponse
 	if err := json.Unmarshal(body, &poll); err != nil {
-		return err
+		return nil, err
 	}
 	for _, m := range poll.Messages {
 		if int64(m.Seq) > c.lastSeq {
@@ -84,48 +84,59 @@ func (c *chatClient) fetchBacklog() error {
 			c.onMessage(m)
 		}
 	}
-	return nil
+	return poll.Messages, nil
 }
 
-// pollOnce fetches messages newer than the cursor. Returns ended=true when
-// the room has terminated.
-func (c *chatClient) pollOnce() (ended bool, err error) {
+// pollOnce fetches messages newer than the cursor and RETURNS them (the TUI
+// routes them through Update; plain mode prints via its onMessage hook).
+func (c *chatClient) pollOnce() (newMsgs []chatMessage, ended bool, err error) {
 	code, body, err := getJSON(c.endpoint(fmt.Sprintf("/messages?after=%d&wait=2500", c.lastSeq)), c.authHeaders())
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if code == 410 {
-		return true, nil
+		return nil, true, nil
 	}
 	if code == 403 {
-		return true, fmt.Errorf("kicked from session")
+		return nil, true, fmt.Errorf("kicked from session")
 	}
 	var poll chatPollResponse
 	if err := json.Unmarshal(body, &poll); err != nil {
-		return false, err
+		return nil, false, err
 	}
 	for _, m := range poll.Messages {
 		if int64(m.Seq) <= c.lastSeq {
 			continue
 		}
 		c.lastSeq = int64(m.Seq)
+		newMsgs = append(newMsgs, m)
 		if c.onMessage != nil {
 			c.onMessage(m)
 		}
 	}
-	return poll.Ended, nil
+	return newMsgs, poll.Ended, nil
 }
 
-func (c *chatClient) sendMessage(text string) (int, error) {
+func (c *chatClient) sendMessage(text string) (code int, msg chatMessage, err error) {
 	code, body, err := postJSON(c.endpoint("/messages"), map[string]any{"text": text}, c.authHeaders())
 	if err != nil {
-		return 0, err
+		return code, msg, err
 	}
-	var e struct {
+	var r struct {
+		Seq   int    `json:"seq"`
 		Error string `json:"error"`
 	}
-	_ = json.Unmarshal(body, &e)
-	return code, fmt.Errorf("%s", e.Error)
+	_ = json.Unmarshal(body, &r)
+	if r.Seq > 0 {
+		msg = chatMessage{Seq: r.Seq, Username: c.me, Kind: "chat", Text: text}
+		if int64(r.Seq) > c.lastSeq {
+			c.lastSeq = int64(r.Seq) // own message already counted toward cursor
+		}
+	}
+	if r.Error != "" {
+		return code, msg, fmt.Errorf("%s", r.Error)
+	}
+	return code, msg, nil
 }
 
 func (c *chatClient) beatOnce() (hb heartbeatResponse, err error) {
@@ -184,9 +195,13 @@ func runChatPlain(serverURL, key, me string) {
 	}
 	client.onTransientErr = func(err error) {}
 
-	if err := client.fetchBacklog(); err != nil {
+	backlog, err := client.fetchBacklog()
+	if err != nil {
 		fmt.Printf("✗ Failed to load session: %v\n", err)
 		os.Exit(1)
+	}
+	for _, m := range backlog {
+		printMsg(m)
 	}
 	// Register presence immediately (also seeds the roster before the first
 	// 15s tick would fire).
@@ -204,7 +219,7 @@ func runChatPlain(serverURL, key, me string) {
 		for {
 			select {
 			default:
-				ended, err := client.pollOnce()
+				newMsgs, ended, err := client.pollOnce()
 				if ended {
 					reason := "Session has ended"
 					if err != nil {
@@ -214,6 +229,7 @@ func runChatPlain(serverURL, key, me string) {
 					client.onEnded(reason)
 					return
 				}
+				_ = newMsgs // already printed via onMessage hook
 				if err != nil {
 					pollFailures++
 					time.Sleep(time.Duration(400*pollFailures) * time.Millisecond) // backoff
@@ -249,13 +265,15 @@ func runChatPlain(serverURL, key, me string) {
 		case "/help":
 			fmt.Println("* Commands: /users · /exit · anything else sends a message")
 		default:
-			code, err := client.sendMessage(line)
+			code, msg, err := client.sendMessage(line)
 			if code == 429 {
 				fmt.Println("* Slow down — too many messages.")
 			} else if code == 410 {
 				client.onEnded("Session has ended")
 			} else if err != nil && code != 201 {
 				fmt.Printf("* Send failed: %v\n", err)
+			} else if code == 201 && client.onMessage != nil {
+				client.onMessage(msg) // instant local echo (plain mode)
 			}
 		}
 	}
