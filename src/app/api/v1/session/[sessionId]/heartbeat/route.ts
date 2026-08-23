@@ -66,7 +66,16 @@ export async function POST(
       );
     }
 
-    return NextResponse.json({ ok: true });
+    // 4. Live roster so clients can surface joins/leaves without extra calls
+    const activeUsers = (
+      await db
+        .collection("session_participants")
+        .find({ sessionId, status: "ACTIVE" })
+        .project({ username: 1, _id: 0 })
+        .toArray()
+    ).map((u) => u.username);
+
+    return NextResponse.json({ ok: true, activeUsers });
   } catch (error) {
     console.error("Error in POST /api/v1/session/heartbeat:", error);
     const errMsg = error instanceof Error ? error.message : "Internal Server Error";

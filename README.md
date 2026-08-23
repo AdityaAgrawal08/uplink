@@ -88,6 +88,20 @@ uplink queue cancel <id>
 uplink queue clear
 ```
 
+### Terminal Chat (session-based)
+```bash
+# Start a chat room — you get a 6-digit key
+uplink create session
+
+# Others join with the key (unique nickname per room)
+uplink join 482716
+```
+Full-screen TUI chat: instant delivery, live roster (`/users`), graceful `/exit`.
+Room ends automatically when the last member leaves. In non-interactive shells,
+set `UPLINK_CHAT_PLAIN=1` for line-based rendering.
+
+---
+
 ### Automation & Watch Mode
 ```bash
 # Watch a directory and auto-upload any additions/changes

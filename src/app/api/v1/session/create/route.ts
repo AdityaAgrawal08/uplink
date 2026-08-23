@@ -5,13 +5,9 @@ import { hashPassword } from "@/lib/crypto";
 import { apiError } from "@/lib/api-utils";
 import { BloomFilter } from "@/lib/bloom";
 
+// 6-digit numeric key (e.g. "042917") — the shareable chat room code.
 function generateSessionId(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let result = "";
-  for (let i = 0; i < 8; i++) {
-    result += chars.charAt(crypto.randomInt(0, chars.length));
-  }
-  return result;
+  return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
 }
 
 export async function POST(req: NextRequest) {

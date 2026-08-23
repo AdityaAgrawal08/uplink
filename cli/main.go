@@ -100,6 +100,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	cfg := LoadConfig()
 	subcommand := os.Args[1]
 
 	switch subcommand {
@@ -107,6 +108,14 @@ func main() {
 		handleSend(os.Args[2:])
 	case "receive":
 		handleReceive(os.Args[2:])
+	case "join":
+		cmdJoinChat(os.Args[2:], cfg)
+	case "create":
+		if len(os.Args) < 3 || os.Args[2] != "session" {
+			fmt.Println("✗ Unknown command. Did you mean: uplink create session ?")
+			os.Exit(1)
+		}
+		cmdCreateSession(os.Args[3:], cfg)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -132,6 +141,12 @@ func printUsage() {
 	fmt.Println("  receive     Download a file or directory")
 	fmt.Println("              uplink receive 4827165038")
 	fmt.Println("              uplink receive https://uplink-delta-xi.vercel.app/share/...")
+	fmt.Println()
+	fmt.Println("  create session   Start a chat room and get a 6-digit key")
+	fmt.Println("                   uplink create session")
+	fmt.Println()
+	fmt.Println("  join <key>       Join a chat room with the 6-digit key")
+	fmt.Println("                   uplink join 482716")
 	fmt.Println()
 	fmt.Println("  help        Show available commands")
 	fmt.Println("              uplink --help")

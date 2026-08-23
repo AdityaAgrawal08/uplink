@@ -159,6 +159,9 @@ jobs:
       - name: Collaborative session lifecycle (skips if routes absent)
         run: SERVER=http://localhost:3000 ./scratch/session_flow_test.sh
 
+      - name: Two-client chat E2E (cross-delivery, roster, end-propagation)
+        run: SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh
+
       - name: API contract probes
         # NOTE: deliberately NO /share/init calls here — the init rate limiter
         # (10 per 5 min per instance on mock Redis) is already budgeted by the
