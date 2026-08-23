@@ -1,147 +1,138 @@
 # Uplink-Delta 🚀
 
-Uplink-Delta is a resilient, offline-first, client-side encrypted file-sharing platform designed for both direct P2P transfers (LAN & WAN) and secure cloud-mediated sharing.
+A fast, secure file-sharing platform with a built-in **terminal chat** — one Go binary, four commands:
 
-Built with a **Go stdlib-first** philosophy, the CLI client performs zero-buffering streaming uploads, NAT hole-punching, and client-side encryption, matching a glassmorphic **Next.js** web interface with CDN-powered inline file previews.
+```
+uplink send <file>            # share any file or folder
+uplink receive <code>         # download a share
+uplink create session         # start a terminal chat room
+uplink join <6-digit-key>     # join one
+```
 
-> [!NOTE]
-> **Latest Release: v0.0.1**
-> * **Security & Timing Attack Protection**: Implemented constant-time checks for P2P authentication.
-> * **Download Limit Counter Enforcement**: Refactored the web preview component to dynamically authorize downloads, preventing download limit bypasses.
-> * **Critical E2EE Overflow Fix**: Resolved a 2-byte chunk size limit overflow issue by adjusting the chunk limit to 65,519 bytes, permitting decryption of files larger than 64KB.
-> * **E2EE warnings**: Added security notifications inside CLI stdout highlighting key exposure risks in command history.
-> * **R2 Hash Verification Fallback**: Computes actual SHA-256 from object storage when hash headers are absent.
-> * **Accurate Directory Size Checks**: Replaced the directory metadata size check with a recursive size calculation of all files inside the directory before uploading or queueing.
-> * **Atomic LAN Share Limits**: Enforced atomic compare-and-swap checks for LAN download limits to resolve race conditions under concurrent client downloads.
-> * **Lifecycle Context Propagation**: Propagated cancellation context down to all HTTP and multipart upload calls.
-> * **Idempotency Cache Correction**: Aligned Next.js API idempotency key expiration with the 2-hour presigned URL duration to prevent expired presigned URLs from being cached and reused.
-> * **Secure PRNG for Share Codes**: Replaced weak pseudo-random generation with cryptographically secure generation for share codes.
+Files are streamed straight to Cloudflare R2 via presigned URLs; share metadata lives in MongoDB. Optional client-side encryption keeps the server zero-knowledge.
 
 ---
 
-## Key Features
+## Install
 
-### 1. Peer-to-Peer Transfers (LAN & WAN)
-* **Direct LAN Mode**: Share files directly over local networks. Uses mDNS service discovery with hashed share codes (`sha256(code)[:8]`) to prevent sniffing, serving files over ephemeral TLS using on-the-fly self-signed certificates.
-* **WAN Mode via DHT**: Connects NAT-isolated peers using `go-libp2p` and Kademlia DHT content routing. Performs direct UDP hole-punching over QUIC connections.
-* **Secure Transfers**: Enforces transfer integrity checks using streaming SHA-256 verification and implements strict access passwords and download limits.
-
-### 2. Resiliency & Offline Queue
-* **Resumable Transfers**: Preserves exact chunk ETags and CRC64NVMe checksums from S3/R2 multipart uploads, allowing interrupted uploads or downloads to resume exactly where they left off.
-* **Offline Queue**: When the network is unavailable, uploads are automatically queued under `~/.uplink/queue/`. A background polling worker monitors reachability and retries uploads.
-
-### 3. Zero-Knowledge Security
-* **End-to-End Encryption (E2EE)**: Files can be encrypted client-side using 256-bit AES-GCM in ~64 KB chunks (65,519 bytes) before upload.
-* **Key Preservation**: The decryption key is appended to the download code (`<code>:<keyHex>`) and is never sent to the server.
-* **Web Notice**: The browser preview page detects E2EE files and displays a warning, directing the recipient to decrypt using the CLI client.
-
-### 4. Interactive Previews & Automation
-* **Rich Web Previews**: Glassmorphic web previews for image, video, audio, text, PDF, and source code files with CDN-loaded `highlight.js` syntax highlighting.
-* **Watch Directory Mode**: Monitor local directories using `fsnotify`. Automatically uploads new or modified files with a 500ms write-debouncing filter.
-* **Shell Completions**: Generates autocomplete helpers for Bash, Zsh, and Fish environments.
-
----
-
-## CLI Usage
-
-### Uploading Files & Directories
 ```bash
-# Standard upload
+curl -sSfL https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/install.sh | sh
+```
+
+Installs to `/usr/local/bin` (falls back to `~/.local/bin`, honors `PREFIX`).
+Build from source instead: `cd cli && go build -o uplink .`
+
+---
+
+## Sharing Files
+
+```bash
+# Share a file — returns a 10-digit code + link
 uplink send report.pdf
 
-# Upload folder (automatically packages to tarball)
-uplink send ./documents
+# Folders are packed into a tarball automatically
+uplink send ./my-project/
 
-# Upload with client-side encryption
+# End-to-end encrypt before upload (key appended to the code)
 uplink send invoice.xlsx --encrypt
 
-# Start direct LAN P2P transfer
-uplink send video.mp4 --lan
-
-# Queue upload locally (useful when offline)
-uplink send backup.tar.gz --queue
+# Custom expiry (5m / 30m / 2h / 1d) and password protection
+uplink send report.pdf --expire 30m --password hunter2
 ```
 
-### Downloading Assets
 ```bash
-# Standard download
+# Download by code into the current directory
 uplink receive 4827165038
 
-# Download E2EE encrypted assets (auto-decrypts using local key)
+# Into a specific destination
+uplink receive 4827165038 ~/Downloads
+
+# Handle existing targets
+uplink receive 4827165038 --force    # overwrite (-f)
+uplink receive 4827165038 --rename   # save as "report (1).pdf" (-r)
+
+# Encrypted shares decrypt automatically when the key is in the code
 uplink receive 4827165038:7c4a8d8e9...
-
-# Download directly over LAN
-uplink receive 4827165038 --lan
 ```
 
-### Managing the Offline Queue
+Integrity is verified end-to-end with SHA-256 on every download; large files
+upload in resumable multipart chunks (S3-safe 5 MiB minimum part size).
+
+## Direct LAN Transfers
+
+Skip the cloud entirely between machines on the same network:
+
 ```bash
-# List all queued items
-uplink queue
-
-# Pause / Resume / Cancel a queued item
-uplink queue pause <id>
-uplink queue resume <id>
-uplink queue cancel <id>
-
-# Clear completed or failed queue tasks
-uplink queue clear
+uplink send video.mp4 --lan           # mDNS discovery + ephemeral TLS
+uplink receive <share-code> --lan     # falls back to cloud if peer not found
 ```
 
-### Terminal Chat (session-based)
+## Terminal Chat
+
 ```bash
-# Start a chat room — you get a 6-digit key
-uplink create session
-
-# Others join with the key (unique nickname per room)
-uplink join 482716
+uplink create session      # pick a nickname → get a 6-digit room key
+uplink join 482716         # friends join anywhere on the internet
 ```
-Full-screen TUI chat: instant delivery, live roster (`/users`), graceful `/exit`.
-Room ends automatically when the last member leaves. In non-interactive shells,
-set `UPLINK_CHAT_PLAIN=1` for line-based rendering.
+
+Full-screen chat UI (OpenCode-style chrome): messages deliver in ~0.5 s,
+live online roster (`/users`), graceful `/exit` or Ctrl+C.
+The room ends automatically the moment its last member leaves, and the
+transcript is purged. In scripts/CI, set `UPLINK_CHAT_PLAIN=1` for plain-line
+rendering.
+
+## Web Previews
+
+Every share gets a browser page with inline previews for text/code, images,
+video, audio, and PDFs — plus a QR code for phone downloads.
 
 ---
 
-### Automation & Watch Mode
-```bash
-# Watch a directory and auto-upload any additions/changes
-uplink watch /path/to/sync/folder
+## Configuration (optional)
 
-# Generate shell auto-completions
-uplink completion zsh > ~/.zsh/completion/_uplink
-```
+| Env var | Default | Purpose |
+|---|---|---|
+| `UPLINK_SERVER` | `https://uplink-delta-xi.vercel.app` | Backend to talk to |
+| `UPLINK_EXPIRY` | `1h` | Default share expiry |
+| `UPLINK_LAN_PORT` | `9090` | Base port for LAN transfers |
+| `UPLINK_SHOW_QR` | `auto` | QR display after uploads |
+| `UPLINK_CHAT_PLAIN` | unset | Force plain-text chat rendering |
+
+A JSON config file at `~/.uplink/config.json` mirrors these settings.
 
 ---
 
 ## Development Setup
 
-### Next.js Web Application
+### Next.js backend
 ```bash
-# Install package dependencies
 npm install
-
-# Start local Next.js dev server
-npm run dev
-
-# Run ESLint validation checks
+npm run dev        # dev server on :3000 (mock storage without R2 creds)
 npm run lint
-
-# Compile production bundle
 npm run build
+npx tsc --noEmit
 ```
 
-### Go CLI Client
+### Go CLI
 ```bash
-# Compile CLI binary
 cd cli
-go build -o build/uplink
-
-# Run CLI unit test suites
+go vet ./...
 go test ./...
+go build -o build/uplink .
 ```
 
-### Database Testing
+### End-to-end tests (need a local server on :3000)
 ```bash
-# Execute local mock database tests
-npx tsx scratch/run_tests.ts
+npm start &                                # terminal 1 (uses mock storage)
+SERVER=http://localhost:3000 ./scratch/e2e_phase0.sh            # file matrix
+SERVER=http://localhost:3000 ./scratch/session_flow_test.sh     # sessions API
+SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh      # two-client chat
 ```
+
+CI runs all of this on every push (Go cross-build matrix, lint/typecheck/
+unit/build, and the full E2E suite against a MongoDB service container).
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).
