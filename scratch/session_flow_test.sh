@@ -77,7 +77,26 @@ ST=$(code -X POST "$SERVER/api/v1/session/$SID/download/$FILEID" \
 DLURL=$(jget downloadUrl < "$BODY")
 if [ "$ST" = "200" ] && [ -n "$DLURL" ]; then ok "download authorized"; else bad "status=$ST body=$(head -c 160 "$BODY")"; fi
 
-echo "=== S-C9: cleanup run ==="
+echo "=== S-C9: chat messages (send/poll/guards) ==="
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/messages" \
+     -H 'Content-Type: application/json' -H 'X-Uplink-Username: ci_alice' \
+     -d '{"text":"first chat message"}')
+grep -q '"seq":' "$BODY" && ok "message sent" || bad "send status=$ST body=$(cat "$BODY")"
+
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0" -H 'X-Uplink-Username: ci_bob')
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));ms=d["messages"];assert any(m["text"]=="first chat message" for m in ms);assert any("joined" in m["text"] and m["kind"]=="system" for m in ms)' "$BODY" 2>/dev/null \
+    && ok "bob sees backlog incl. system join" || bad "poll/backlog wrong"
+
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/messages" \
+     -H 'Content-Type: application/json' -H 'X-Uplink-Username: eve_outsider' \
+     -d '{"text":"intrude"}')
+[ "$ST" = "403" ] && ok "non-member rejected (403)" || bad "expected 403, got $ST"
+
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/join" \
+     -H 'Content-Type: application/json' -d '{"username":"ci_alice"}')
+[ "$ST" = "409" ] && ok "duplicate username 409" || bad "dup expected 409, got $ST"
+
+echo "=== S-C10: cleanup run ==="
 ST=$(code -X POST "$SERVER/api/v1/session/cleanup")
 [ "$ST" = "200" ] && ok "cleanup executed" || bad "status=$ST"
 
