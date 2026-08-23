@@ -259,6 +259,7 @@ func runChatPlain(serverURL, key, me string) {
 	}
 	// stdin closed (EOF) — treat as exit
 	client.leave()
+	fmt.Println("* Disconnected.")
 }
 
 // runChatTUI renders the full-screen bubbletea interface. Defined in

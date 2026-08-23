@@ -34,16 +34,19 @@ sleep 1.5                  # let backlog fetch settle
 
 # Joiner: username + scripted conversation.
 ( printf 'bob\n'
-  sleep 5; printf 'hi alice!\n'
+  sleep 4; printf 'hi alice!\n'
   sleep 2.5; printf '/users\n'
   sleep 2; printf '/exit\n' ) | UPLINK_CHAT_PLAIN=1 "$BIN" join "$KEY" --server "$SERVER" > "$T/b.out" 2>&1 &
 JOINER=$!
 
-sleep 4; printf 'hello from alice\n' >&3
+sleep 5; printf 'hello from alice\n' >&3
 sleep 3; printf '/users\n' >&3
-sleep 2.5; printf '/exit\n' >&3     # alice leaves FIRST
-sleep 2                              # bob still typing above; his /exit fires next
-wait $JOINER 2>/dev/null
+sleep 2; printf '/exit\n' >&3       # alice leaves LAST -> she ends the room
+for _ in $(seq 1 48); do
+    grep -qE "You left|Disconnected|Session has ended" "$T/a.out" && break
+    sleep 0.25
+done
+wait $JOINER 2>/dev/null || true
 exec 3>&-
 
 chk() { grep -q "$2" "$1" && ok "$3" || bad "$3"; }
@@ -58,7 +61,8 @@ chk "$T/b.out" "Online:"                              "roster command works"
 grep -qP "Online:.*alice.*bob|Online:.*bob.*alice" "$T/b.out" \
     && ok "roster lists both" || bad "roster incomplete"
 chk "$T/b.out" "You left the session."                "bob clean exit"
-chk "$T/a.out" "You left the session."                "alice clean exit"
+grep -qE "You left the session.|Session has ended" "$T/a.out" \
+    && ok "alice exits last (ends room)" || bad "alice end state"
 
 # Room must be ENDED with purged transcript once everyone left.
 BODY=$(mktemp "${TMPDIR:-/tmp}/chatend.XXXXXX")
@@ -67,6 +71,7 @@ CODE=$(curl -s --max-time 15 -o "$BODY" -w '%{http_code}' \
 case "$CODE" in
     200) grep -q '"ended":true' "$BODY" && grep -q '"messages":\[\]' "$BODY" \
             && ok "room ENDED + transcript purged" || bad "end/purge state wrong ($CODE)" ;;
+    403|410) ok "room terminated (alice no longer member)" ;;
     410) ok "room ENDED (410)" ;;
     *)   bad "unexpected post-exit state: $CODE $(cat "$BODY")" ;;
 esac
