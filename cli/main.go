@@ -689,6 +689,8 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 		printer.resumeOffset = completedBytes
 		printer.resumeTime = time.Now()
 
+		sentBytes := completedBytes // cumulative bytes already uploaded (resume-aware)
+
 		for i := 1; i <= partsCount; i++ {
 			partIdx := i - 1
 			partOffset := int64(partIdx) * chunkSize
@@ -711,6 +713,7 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			progReader := &ProgressReader{
 				reader:  partReader,
 				printer: printer,
+				base:    sentBytes,
 			}
 
 			uploadUrl := initResp.UploadUrls[partIdx]
@@ -747,7 +750,13 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			resumeState.Done = append(resumeState.Done, i)
 			resumeState.Parts = confirmedParts
 			_ = resumeState.Save(stateFilename)
+
+			sentBytes += partSize
 		}
+
+		// Force the bar to render exactly 100% — the last buffered read may
+		// never trigger another Print call before EOF.
+		printer.Print(fileInfo.Size())
 	} else {
 		_, _ = file.Seek(0, 0)
 		progReader := &ProgressReader{
@@ -773,6 +782,8 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			bodyBytes, _ := io.ReadAll(putResp.Body)
 			return "", "", "", 0, fmt.Errorf("file upload failed: status %d: %s", putResp.StatusCode, string(bodyBytes))
 		}
+
+		printer.Print(fileInfo.Size())
 	}
 
 	// Confirm Upload
@@ -1377,6 +1388,7 @@ func (pp *ProgressPrinter) Print(read int64) {
 type ProgressReader struct {
 	reader  io.Reader
 	printer *ProgressPrinter
+	base    int64 // cumulative bytes already reported before THIS reader (multipart parts start mid-file)
 	read    int64
 }
 
@@ -1384,7 +1396,7 @@ func (pr *ProgressReader) Read(p []byte) (int, error) {
 	n, err := pr.reader.Read(p)
 	if n > 0 {
 		pr.read += int64(n)
-		pr.printer.Print(pr.read)
+		pr.printer.Print(pr.base + pr.read)
 	}
 	return n, err
 }
