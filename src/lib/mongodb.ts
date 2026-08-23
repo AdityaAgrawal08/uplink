@@ -67,6 +67,12 @@ export function initIndexes(): Promise<void> {
     // Unique sparse index for short downloadCode
     await db.collection("shares").createIndex({ downloadCode: 1 }, { unique: true, sparse: true });
 
+    // Session-based sharing indexes
+    await db.collection("sessions").createIndex({ sessionId: 1 }, { unique: true });
+    await db.collection("session_participants").createIndex({ sessionId: 1, username: 1 }, { unique: true });
+    await db.collection("session_files").createIndex({ sessionId: 1, fileId: 1 }, { unique: true });
+    await db.collection("session_files").createIndex({ sessionId: 1, filename: 1 });
+
     // Initialize quota tracking document if not present
     const quotaDoc = await db.collection<QuotaDocument>("quotas").findOne({ _id: "r2_quota" });
     if (!quotaDoc) {

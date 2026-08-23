@@ -2,12 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strconv"
-	"strings"
 )
 
 type Config struct {
@@ -23,7 +20,7 @@ func defaultConfig() *Config {
 	return &Config{
 		Server:         "https://uplink-delta-xi.vercel.app",
 		Expiry:         "1h",
-		DownloadDir:    "", // empty means current directory or system default
+		DownloadDir:    "",
 		LanPort:        9090,
 		AdaptiveChunks: true,
 		ShowQR:         "auto",
@@ -97,107 +94,4 @@ func LoadConfig() *Config {
 	}
 
 	return cfg
-}
-
-func saveConfig(cfg *Config) error {
-	path := getConfigPath()
-	dir := filepath.Dir(path)
-	err := os.MkdirAll(dir, 0700)
-	if err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	err = enc.Encode(cfg)
-	if err != nil {
-		return err
-	}
-	f.Close()
-	return os.Rename(tmp, path)
-}
-
-func handleConfigSubcommand(args []string) {
-	if len(args) == 0 {
-		// Print current config
-		cfg := LoadConfig()
-		data, _ := json.MarshalIndent(cfg, "", "  ")
-		fmt.Println(string(data))
-		return
-	}
-
-	sub := args[0]
-	switch sub {
-	case "set":
-		if len(args) < 3 {
-			fmt.Println("Usage: uplink config set <key> <value>")
-			os.Exit(1)
-		}
-		key := args[1]
-		value := args[2]
-		err := setConfigKey(key, value)
-		if err != nil {
-			fmt.Printf("Error: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Config updated: %s = %s\n", key, value)
-	case "reset":
-		path := getConfigPath()
-		_ = os.Remove(path)
-		fmt.Println("Config reset to defaults.")
-	default:
-		fmt.Printf("Unknown config subcommand: %s\n", sub)
-		fmt.Println("Usage:\n  uplink config\n  uplink config set <key> <value>\n  uplink config reset")
-		os.Exit(1)
-	}
-}
-
-func setConfigKey(key, value string) error {
-	cfg := LoadConfig()
-	val := reflect.ValueOf(cfg).Elem()
-
-	// Map snake_case key to camelCase struct fields
-	camelKey := ""
-	parts := strings.Split(key, "_")
-	for _, p := range parts {
-		if len(p) > 0 {
-			camelKey += strings.ToUpper(p[:1]) + p[1:]
-		}
-	}
-	// Exceptional casing
-	if camelKey == "ShowQr" {
-		camelKey = "ShowQR"
-	}
-
-	field := val.FieldByName(camelKey)
-	if !field.IsValid() {
-		return fmt.Errorf("unknown config key: %s", key)
-	}
-
-	switch field.Kind() {
-	case reflect.String:
-		field.SetString(value)
-	case reflect.Int:
-		intVal, err := strconv.Atoi(value)
-		if err != nil {
-			return fmt.Errorf("invalid integer: %s", value)
-		}
-		field.SetInt(int64(intVal))
-	case reflect.Bool:
-		boolVal, err := strconv.ParseBool(value)
-		if err != nil {
-			return fmt.Errorf("invalid boolean: %s", value)
-		}
-		field.SetBool(boolVal)
-	default:
-		return fmt.Errorf("unsupported config field type for key %s", key)
-	}
-
-	return saveConfig(cfg)
 }

@@ -1,4 +1,6 @@
 const BASE_URL = "http://localhost:3000";
+const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "9ab7c7af79c9757067e0087cb05c6a9c4aab1ca985ab8c8ba71ac01af0167a57";
+const adminHeaders = { "Authorization": `Bearer ${ADMIN_API_KEY}` };
 
 async function runTests() {
   console.log("=== STARTING QUOTA ENFORCEMENT SYSTEM TESTS ===");
@@ -6,7 +8,9 @@ async function runTests() {
   try {
     // 1. Fetch current quota status
     console.log("\n[Test 1] Querying current administrative quota status...");
-    const statusRes = await fetch(`${BASE_URL}/api/v1/admin/quota`);
+    const statusRes = await fetch(`${BASE_URL}/api/v1/admin/quota`, {
+      headers: adminHeaders,
+    });
     if (!statusRes.ok) {
       throw new Error(`Failed to fetch quota status: ${statusRes.statusText}`);
     }
@@ -19,6 +23,12 @@ async function runTests() {
 
     // 2. Validate normal upload reservation and confirmation
     console.log("\n[Test 2] Testing normal upload session initialization (single-part)...");
+    const fs = await import("fs");
+    const path = await import("path");
+    const crypto = await import("crypto");
+    const mockContent = "a".repeat(5 * 1024 * 1024);
+    const realSha256 = crypto.createHash("sha256").update(mockContent).digest("hex");
+
     const initRes = await fetch(`${BASE_URL}/api/v1/share/init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -26,7 +36,7 @@ async function runTests() {
         filename: "test_normal.txt",
         size: 5 * 1024 * 1024, // 5 MB
         mimeType: "text/plain",
-        hashValue: "a".repeat(64), // Dummy SHA-256
+        hashValue: realSha256,
       }),
     });
 
@@ -39,20 +49,20 @@ async function runTests() {
     console.log("Upload initialized successfully. Share ID:", initData.shareId);
 
     // Check reserved bytes changed
-    const statusRes2 = await fetch(`${BASE_URL}/api/v1/admin/quota`);
+    const statusRes2 = await fetch(`${BASE_URL}/api/v1/admin/quota`, {
+      headers: adminHeaders,
+    });
     const statusData2 = await statusRes2.json();
     console.log("Updated Reserved Bytes (expected +5MB):", statusData2.storageReservedBytes);
 
     // Write dummy mock file to filesystem to satisfy confirm check in mock mode
-    const fs = await import("fs");
-    const path = await import("path");
     const mockFilePath = path.join(process.cwd(), "uploads_dev", initData.objectKey);
     const mockDir = path.dirname(mockFilePath);
     if (!fs.existsSync(mockDir)) {
       fs.mkdirSync(mockDir, { recursive: true });
     }
-    fs.writeFileSync(mockFilePath, "a".repeat(5 * 1024 * 1024));
-    fs.writeFileSync(mockFilePath + ".meta", JSON.stringify({ sha256: "a".repeat(64) }));
+    fs.writeFileSync(mockFilePath, mockContent);
+    fs.writeFileSync(mockFilePath + ".meta", JSON.stringify({ sha256: realSha256 }));
 
     // Confirm upload to commit storage bytes
     console.log("Confirming upload to commit reservation...");
@@ -67,7 +77,9 @@ async function runTests() {
     }
     console.log("Upload confirmed successfully!");
 
-    const statusRes3 = await fetch(`${BASE_URL}/api/v1/admin/quota`);
+    const statusRes3 = await fetch(`${BASE_URL}/api/v1/admin/quota`, {
+      headers: adminHeaders,
+    });
     const statusData3 = await statusRes3.json();
     console.log("Committed Storage Bytes:", statusData3.storageUsageBytes);
     console.log("Reserved Bytes after commit:", statusData3.storageReservedBytes);
@@ -127,13 +139,18 @@ async function runTests() {
 
     // Clean up created unconfirmed shares to free up the reservation
     console.log("Purging unconfirmed reservations via cleanup endpoint...");
-    const cleanupRes = await fetch(`${BASE_URL}/api/v1/cleanup`, { method: "POST" });
+    const cleanupRes = await fetch(`${BASE_URL}/api/v1/cleanup`, {
+      method: "POST",
+      headers: adminHeaders,
+    });
     const cleanupData = await cleanupRes.json();
     console.log("Cleanup output:", cleanupData.message);
 
     // 5. Test Class B operational checks
     console.log("\n[Test 5] Testing download Class B operations incrementation...");
-    const statusBeforeDownload = await (await fetch(`${BASE_URL}/api/v1/admin/quota`)).json();
+    const statusBeforeDownload = await (await fetch(`${BASE_URL}/api/v1/admin/quota`, {
+      headers: adminHeaders,
+    })).json();
     console.log("Class B usage before download check:", statusBeforeDownload.classBUsage);
 
     console.log("Hitting authorize-download endpoint (fails correct auth but registers attempt)...");
@@ -144,7 +161,9 @@ async function runTests() {
     });
     console.log("Download check HTTP response status:", downloadRes.status);
 
-    const statusAfterDownload = await (await fetch(`${BASE_URL}/api/v1/admin/quota`)).json();
+    const statusAfterDownload = await (await fetch(`${BASE_URL}/api/v1/admin/quota`, {
+      headers: adminHeaders,
+    })).json();
     console.log("Class B usage after download check (expected increment):", statusAfterDownload.classBUsage);
 
     console.log("\n=== ALL QUOTA SYSTEM TESTS FINISHED SUCCESSFULLY ===");

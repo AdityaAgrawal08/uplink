@@ -163,7 +163,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 4. Share ID and Key construction
-    const shareId = generateShareId();
+    const shareId = body.shareId || generateShareId();
     const storageFilename = sanitizeFilename(filename);
     const date = new Date();
     const year = date.getUTCFullYear();
