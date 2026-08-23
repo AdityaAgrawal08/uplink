@@ -3,6 +3,7 @@ import { getDb } from "@/lib/mongodb";
 import { verifyPassword } from "@/lib/crypto";
 import { apiError } from "@/lib/api-utils";
 import { BloomFilter } from "@/lib/bloom";
+import { appendMessage } from "@/lib/sessionChat";
 
 export async function POST(
   req: NextRequest,
@@ -97,6 +98,8 @@ export async function POST(
         $inc: { participantCount: 1 },
       }
     );
+
+    await appendMessage(db, sessionId, "system", "system", `${username} joined`);
 
     // Fetch active participants to return
     const activeParticipants = await db

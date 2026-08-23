@@ -14,7 +14,7 @@ export async function performSessionCleanup() {
   try {
     const db = await getDb();
     const now = new Date();
-    const heartbeatTimeout = 120 * 1000; // 120 seconds timeout
+    const heartbeatTimeout = 45 * 1000; // 45 s — clients beat every 15 s (3 missed = gone)
     const gracePeriod = 120 * 1000; // 120 seconds grace period
 
     // 1. Find all ACTIVE sessions
@@ -97,6 +97,11 @@ export async function performSessionCleanup() {
         // Delete session_files references as they are expired
         const deleteFilesResult = await db
           .collection("session_files")
+          .deleteMany({ sessionId });
+
+        // Chat transcript dies with the room (privacy: purge-on-end policy)
+        const deleteMessagesResult = await db
+          .collection("session_messages")
           .deleteMany({ sessionId });
 
         results.push({
