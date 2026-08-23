@@ -47,6 +47,7 @@ fi
 
 echo "Installing to ${INSTALL_DIR}/${BINARY_NAME}..."
 
+mkdir -p "${INSTALL_DIR}"
 if [ -w "${INSTALL_DIR}" ]; then
   mv "${TEMP_DIR}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
 else
