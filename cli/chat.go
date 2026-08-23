@@ -90,7 +90,7 @@ func (c *chatClient) fetchBacklog() error {
 // pollOnce fetches messages newer than the cursor. Returns ended=true when
 // the room has terminated.
 func (c *chatClient) pollOnce() (ended bool, err error) {
-	code, body, err := getJSON(c.endpoint(fmt.Sprintf("/messages?after=%d", c.lastSeq)), c.authHeaders())
+	code, body, err := getJSON(c.endpoint(fmt.Sprintf("/messages?after=%d&wait=2500", c.lastSeq)), c.authHeaders())
 	if err != nil {
 		return false, err
 	}
@@ -198,13 +198,12 @@ func runChatPlain(serverURL, key, me string) {
 	fmt.Printf("Connected to session %s as '%s'. Type /exit to leave.\n", key, me)
 
 	go func() {
-		poll := time.NewTicker(1500 * time.Millisecond)
-		defer poll.Stop()
 		beat := time.NewTicker(15 * time.Second)
 		defer beat.Stop()
+		pollFailures := 0
 		for {
 			select {
-			case <-poll.C:
+			default:
 				ended, err := client.pollOnce()
 				if ended {
 					reason := "Session has ended"
@@ -215,8 +214,11 @@ func runChatPlain(serverURL, key, me string) {
 					client.onEnded(reason)
 					return
 				}
-				if err != nil && client.onTransientErr != nil {
-					client.onTransientErr(err)
+				if err != nil {
+					pollFailures++
+					time.Sleep(time.Duration(400*pollFailures) * time.Millisecond) // backoff
+				} else {
+					pollFailures = 0
 				}
 			case <-beat.C:
 				if _, err := client.beatOnce(); err != nil {

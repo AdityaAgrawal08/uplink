@@ -63,6 +63,7 @@ type chatScreen struct {
 	input        textinput.Model
 	status       string
 	beatFailures int
+	pollFailures int
 	lastSeqSeen  bool
 }
 
@@ -106,11 +107,16 @@ func (c chatScreen) statusView() string {
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	return tea.Batch(schedulePoll(), scheduleBeat())
+	return tea.Batch(schedulePoll(0), scheduleBeat())
 }
 
-func schedulePoll() tea.Cmd {
-	return tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg { return pollTickMsg{} })
+// Long-poll chain: the server holds each request up to 2.5 s, so we simply
+// re-issue immediately after every result (with backoff on errors).
+func schedulePoll(backoff time.Duration) tea.Cmd {
+	if backoff > 0 {
+		return tea.Tick(backoff, func(time.Time) tea.Msg { return pollTickMsg{} })
+	}
+	return func() tea.Msg { return pollTickMsg{} }
 }
 func scheduleBeat() tea.Cmd {
 	return tea.Tick(15*time.Second, func(time.Time) tea.Msg { return beatTickMsg{} })
@@ -156,7 +162,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.vp.SetContent(strings.Join(c.lines, "\n"))
 
 	case pollTickMsg:
-		cmds = append(cmds, c.doPoll(), schedulePoll())
+		cmds = append(cmds, c.doPoll())
 
 	case pollResultMsg:
 		if msg.ended {
@@ -173,7 +179,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			c.status = ""
 		}
-		cmds = append(cmds, schedulePoll())
+		cmds = append(cmds, schedulePoll(0))
 
 	case beatTickMsg:
 		cmds = append(cmds, c.doBeat(), scheduleBeat())

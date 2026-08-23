@@ -99,19 +99,38 @@ export async function GET(
     maybeCleanup();
 
     const afterParam = req.nextUrl.searchParams.get("after");
-    const filter: Record<string, unknown> = { sessionId };
-    if (afterParam !== null) {
-      const afterSeq = Number(afterParam);
-      if (!Number.isSafeInteger(afterSeq)) {
-        return apiError("after must be an integer sequence number", 400);
-      }
-      filter.seq = { $gt: afterSeq };
-      const docs = await db
+    const afterSeq = afterParam === null ? null : Number(afterParam);
+    if (afterParam !== null && !Number.isSafeInteger(afterSeq)) {
+      return apiError("after must be an integer sequence number", 400);
+    }
+
+    // Long-poll: hold the request open (≤2.5 s) until data shows up, then
+    // return immediately. Cuts perceived delivery to <~300 ms while lowering
+    // total request rate versus a fixed-interval client tick.
+    const waitMs = Math.min(Math.max(Number(req.nextUrl.searchParams.get("wait") ?? 0) || 0, 0), 2500);
+    const deadline = Date.now() + waitMs;
+
+    const queryNew = () =>
+      db
         .collection("session_messages")
-        .find(filter)
+        .find({ sessionId, seq: { $gt: afterSeq as number } })
         .sort({ seq: 1 })
         .limit(POLL_LIMIT)
-        .toArray() as unknown as ChatDoc[];
+        .toArray() as unknown as Promise<ChatDoc[]>;
+
+    if (afterSeq !== null) {
+      maybeCleanup();
+      let docs = await queryNew();
+      for (;;) {
+        if (docs.length > 0 || Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 200));
+        // Surface room termination without waiting out the full hold.
+        const fresh = (await db
+          .collection("sessions")
+          .findOne({ sessionId }, { projection: { status: 1, expiresAt: 1 } })) as unknown as SessionAliveDoc | null;
+        if (!isSessionAlive(fresh)) break;
+        docs = await queryNew();
+      }
       return NextResponse.json({
         messages: docs.map(toMessageDTO),
         ended: !alive,
@@ -121,7 +140,7 @@ export async function GET(
     // No cursor → backlog: latest BACKLOG_LIMIT messages, oldest-first.
     const docs = await db
       .collection("session_messages")
-      .find(filter)
+      .find({ sessionId })
       .sort({ seq: -1 })
       .limit(BACKLOG_LIMIT)
       .toArray() as unknown as ChatDoc[];
