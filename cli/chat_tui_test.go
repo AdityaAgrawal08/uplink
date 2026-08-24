@@ -2,9 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -153,11 +157,16 @@ func TestSidebarResponsiveCollapse(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func newFilterScreen(me, target string, users ...string) *chatScreen {
+	ti := textinput.New()
+	ti.Placeholder = "Type a message…"
+	ti.Focus()
+	ti.CharLimit = 500
 	return &chatScreen{
 		me:         me,
 		targetUser: target,
 		users:      users,
 		rendered:   map[int]bool{},
+		input:      ti,
 	}
 }
 
@@ -478,4 +487,141 @@ func maxLineWidth(s string) int {
 		}
 	}
 	return max
+}
+
+// ---------------------------------------------------------------------------
+// Wire-level send integration: Update(Enter) must produce a command whose
+// invocation performs the HTTP POST. Regression for the silent-send bug where
+// the optimistic echo painted but no request ever left the process.
+// ---------------------------------------------------------------------------
+
+func newFakeChatServer(t *testing.T, got *[][]byte) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/messages") {
+			http.Error(w, "unexpected", http.StatusNotFound)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if got != nil {
+			*got = append(*got, body)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"seq":%d}`, len(*got)+100)
+	}))
+}
+
+func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
+	var received [][]byte
+	srv := newFakeChatServer(t, &received)
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.client = newChatClient(srv.URL, "123456", "bob")
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+
+	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter, Runes: []rune{}})
+	_ = model
+	if cmd != nil {
+		cmd() // empty-input Enter is local-only; harmless if fires
+	}
+
+	// Type "hello" then press Enter.
+	for _, r := range []rune("hello") {
+		m2, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = m2
+	}
+	m3, sendCmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if sendCmd == nil {
+		t.Fatal("Update(KeyEnter) returned nil command — NOTHING WOULD BE SENT (regression)")
+	}
+	msg := sendCmd()
+	sd, ok := msg.(sendDoneMsg)
+	if !ok {
+		t.Fatalf("send cmd yielded %T; want sendDoneMsg", msg)
+	}
+	if len(received) != 1 || !strings.Contains(string(received[0]), "hello") {
+		t.Fatalf("wire payload wrong: %v", received)
+	}
+
+	// Feed the confirmation back through Update; echo must resolve.
+	m4, promo := m3.(chatScreen).Update(sd)
+	got := m4.(chatScreen)
+	if got.pending != nil {
+		t.Fatal("pending not cleared after settle")
+	}
+	if len(got.lines) != 1 || strings.Contains(got.lines[0], "[you →]") {
+		t.Errorf("echo not replaced with confirmed line: %q", got.lines)
+	}
+	if promo != nil {
+		t.Fatal("promotion cmd emitted with empty outbox")
+	}
+}
+
+func TestOutboxPromotionGoesOverWire(t *testing.T) {
+	var received [][]byte
+	srv := newFakeChatServer(t, &received)
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.client = newChatClient(srv.URL, "123456", "bob")
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	scr := m.(chatScreen)
+
+	type keyed interface {
+		Update(tea.Msg) (tea.Model, tea.Cmd)
+	}
+	var km keyed = scr
+
+	typeText := func(s string) {
+		for _, r := range []rune(s) {
+			nm, _ := km.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			km = nm.(keyed)
+		}
+	}
+	enter := func() (keyed, tea.Cmd) {
+		nm, cmd := km.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		return nm.(keyed), cmd
+	}
+
+	typeText("one")
+	km, c1 := enter()
+	typeText("two")
+	km, c2 := enter() // queued while one is in flight
+	typeText("three")
+	km, c3 := enter()
+
+	if c1 == nil || c2 != nil || c3 != nil {
+		t.Fatalf("only in-flight send may carry a cmd; got %v %v %v", c1, c2, c3)
+	}
+	sd1 := c1().(sendDoneMsg)
+	km, promo1 := km.Update(sd1)
+	if promo1 == nil {
+		t.Fatal("settle must return promotion cmd for queued head (regression)")
+	}
+	sd2 := promo1().(sendDoneMsg)
+	if sd2.text != "two" {
+		t.Fatalf("promoted %q; want two", sd2.text)
+	}
+	km, promo2 := km.Update(sd2)
+	sd3 := promo2().(sendDoneMsg)
+	km, promo3 := km.Update(sd3)
+
+	final := km.(chatScreen)
+	if final.pending != nil || len(final.outbox) != 0 {
+		t.Fatalf("pipeline undrained: pending=%+v outbox=%v", final.pending, final.outbox)
+	}
+	if promo3 != nil {
+		t.Fatal("spurious promotion after last message")
+	}
+	if len(received) != 3 {
+		t.Fatalf("wire saw %d posts; want 3 (%v)", len(received), received)
+	}
+	for i, want := range []string{"one", "two", "three"} {
+		if !strings.Contains(string(received[i]), want) {
+			t.Errorf("post %d = %q; want %q", i, received[i], want)
+		}
+	}
 }

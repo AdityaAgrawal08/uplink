@@ -504,26 +504,36 @@ func (c *chatScreen) exitPrivate() {
 	c.appendLine(tuiSystemStyle.Render("* Back in the common room"))
 }
 
-func (c *chatScreen) submitLine(text string) {
+// submitLine handles one committed input line. It returns the tea.Cmd that
+// performs the network send (nil for local-only commands). CRITICAL: the
+// caller MUST append this command — it is the ONLY thing that actually puts
+// the message on the wire.
+func (c *chatScreen) submitLine(text string) tea.Cmd {
 	switch strings.ToLower(text) {
 	case "/users":
 		c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
+		return nil
 	case "/help":
 		hint := "* Commands: /users · /exit · click a name in the sidebar for private chat"
 		c.appendLine(tuiSystemStyle.Render(hint))
+		return nil
 	default:
 		if c.pending != nil {
 			c.outbox = append(c.outbox, text) // one wire message at a time
-			return
+			return nil
 		}
-		c.dispatchSend(text)
+		return c.dispatchSend(text)
 	}
 }
-func (c *chatScreen) dispatchSend(text string) {
+
+// dispatchSend paints the optimistic echo, latches the in-flight slot and
+// returns the wire command. Pure bookkeeping + cmd factory.
+func (c *chatScreen) dispatchSend(text string) tea.Cmd {
 	c.lines = append(c.lines, tuiMeStyle.Render("[you →] "+text))
 	idx := len(c.lines) - 1
 	c.pending = &pendingSend{lineIdx: idx, text: text}
 	c.refreshViewport()
+	return c.doSend(text)
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -595,7 +605,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, scheduleBeat())
 
 	case sendDoneMsg:
-		c.settleSend(msg)
+		if nc := c.settleSend(msg); nc != nil {
+			cmds = append(cmds, nc)
+		}
 
 	case leaveDoneMsg:
 		return c, tea.Quit
@@ -626,7 +638,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, c.doLeave(), tea.Quit)
 				return c, tea.Batch(cmds...)
 			}
-			c.submitLine(text)
+			if sc := c.submitLine(text); sc != nil {
+				cmds = append(cmds, sc)
+			}
 			var ic tea.Cmd
 			c.input, ic = c.input.Update(msg)
 			cmds = append(cmds, ic)
@@ -645,9 +659,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return c, tea.Batch(cmds...)
 }
 
-// settleSend resolves the optimistic echo for the completed send and pumps
-// the outbox so queued lines go out one at a time.
-func (c *chatScreen) settleSend(msg sendDoneMsg) {
+// settleSend resolves the optimistic echo for the completed send and promotes
+// the next queued line. It returns the wire command for that promotion — the
+// caller MUST append it, otherwise queued messages would stall forever.
+func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	var replacement string
 	switch {
 	case msg.code == 429:
@@ -678,7 +693,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) {
 	}
 	if msg.code == 410 {
 		c.refreshViewport()
-		return
+		return nil // room ended; nothing further to promote
 	}
 	c.pending = nil
 	c.refreshViewport()
@@ -687,8 +702,9 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) {
 	if n := len(c.outbox); n > 0 {
 		next := c.outbox[0]
 		c.outbox = c.outbox[1:]
-		c.dispatchSend(next)
+		return c.dispatchSend(next)
 	}
+	return nil
 }
 
 // handleMouse translates a click into a sidebar selection using the SAME
