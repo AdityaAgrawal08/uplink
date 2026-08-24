@@ -87,7 +87,7 @@ func ServeFileLAN(ctx context.Context, path string, port int, cert tls.Certifica
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, info.ModTime().Unix(), info.Size()))
-		
+
 		http.ServeFile(w, r, path)
 
 		// Serve completed, run completion callback

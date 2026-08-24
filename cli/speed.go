@@ -58,7 +58,7 @@ func (ac *AdaptiveChunker) RecordSpeed(speed float64) {
 
 func (ac *AdaptiveChunker) ChunkSize() int64 {
 	if ac.measuredSpeed <= 0 {
-		return 10 * 1024 * 1024 // default 10 MB
+		return maxChunk // default: largest safe part
 	}
 	cs := int64(ac.measuredSpeed * targetSec)
 	switch {

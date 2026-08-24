@@ -31,7 +31,7 @@ func DownloadFileLAN(url, dest string, offset int64, expectedFingerprint string,
 	client := &http.Client{Transport: tr}
 
 	req, _ := http.NewRequest("GET", url, nil)
-	
+
 	// Attach security validation headers
 	req.Header.Set("X-Uplink-Share-Code", shareCode)
 	if password != "" {

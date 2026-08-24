@@ -48,7 +48,7 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 					if stat.Size() > metaOffset {
 						_ = os.Truncate(partialFile, metaOffset)
 					}
-					
+
 					h := sha256.New()
 					pf, err := os.Open(partialFile)
 					if err == nil {
