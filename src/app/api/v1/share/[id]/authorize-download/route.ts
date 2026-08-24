@@ -100,38 +100,43 @@ export async function POST(
     }
 
     // 4. Atomic Download Counter and Limit Check
-    const result = await db.collection("shares").findOneAndUpdate(
-      {
-        shareId: share.shareId,
-        status: "ACTIVE",
-        $expr: { $lt: ["$downloadsCount", "$downloadLimit"] },
-      },
-      [
-        {
-          $set: {
-            downloadsCount: { $add: ["$downloadsCount", 1] },
-            lastDownloadedAt: now,
-            firstDownloadedAt: { $ifNull: ["$firstDownloadedAt", now] },
-          },
-        },
-      ],
-      { returnDocument: "after" }
-    );
-
-    if (!result) {
-      // Limit exceeded or transition conflict. Check state.
-      const refreshedShare = await db.collection("shares").findOne({ shareId: share.shareId });
-      if (refreshedShare && refreshedShare.downloadsCount >= refreshedShare.downloadLimit) {
-        await db.collection("shares").updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
-        return apiError("Download limit exceeded for this file", 410);
-      }
-      return apiError("Download authorization failed", 400);
-    }
-
-    // 5. Generate Presigned GET URL
+    // Inline preview requests (preview=true for safe types) must NOT burn a
+    // download credit — otherwise merely opening the web page kills shares.
     const isSafePreview = SAFE_PREVIEW_TYPES.includes(share.mimeType);
     const wantPreview = preview === true && isSafePreview;
 
+    let result = null;
+    if (!wantPreview) {
+      result = await db.collection("shares").findOneAndUpdate(
+        {
+          shareId: share.shareId,
+          status: "ACTIVE",
+          $expr: { $lt: ["$downloadsCount", "$downloadLimit"] },
+        },
+        [
+          {
+            $set: {
+              downloadsCount: { $add: ["$downloadsCount", 1] },
+              lastDownloadedAt: now,
+              firstDownloadedAt: { $ifNull: ["$firstDownloadedAt", now] },
+            },
+          },
+        ],
+        { returnDocument: "after" }
+      );
+
+      if (!result) {
+        // Limit exceeded or transition conflict. Check state.
+        const refreshedShare = await db.collection("shares").findOne({ shareId: share.shareId });
+        if (refreshedShare && refreshedShare.downloadsCount >= refreshedShare.downloadLimit) {
+          await db.collection("shares").updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
+          return apiError("Download limit exceeded for this file", 410);
+        }
+        return apiError("Download authorization failed", 400);
+      }
+    }
+
+    // 5. Generate Presigned GET URL
     const downloadUrlExpiry = 3600; // 1h expiry for download link
     const downloadUrl = await getPresignedDownloadUrl(
       share.objectKey,
@@ -149,8 +154,8 @@ export async function POST(
       event: "DownloadAuthorized",
       shareId: id,
       preview: wantPreview,
-      downloadsCount: result.downloadsCount,
-      downloadLimit: result.downloadLimit,
+      downloadsCount: result?.downloadsCount ?? share.downloadsCount,
+      downloadLimit: result?.downloadLimit ?? share.downloadLimit,
       latencyMs: Date.now() - now.getTime(),
       ipHash,
       userAgentParsed: {
