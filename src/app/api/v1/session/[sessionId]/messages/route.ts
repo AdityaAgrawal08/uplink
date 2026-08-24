@@ -2,7 +2,7 @@ import { NextRequest, NextResponse, after } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { redis } from "@/lib/redis";
 import { performSessionCleanup } from "../../cleanup/route";
-import { apiError } from "@/lib/api-utils";
+import { apiError, parseJsonBody } from "@/lib/api-utils";
 import {
   isSessionAlive,
   isMember,
@@ -44,17 +44,25 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
 
-    const bodyText = await req.text();
-    const body = bodyText ? JSON.parse(bodyText) : {};
-    const text = sanitizeChatText(body.text);
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
+    const text = sanitizeChatText(parsed.body.text);
     if (!text) return apiError("text must be 1-500 printable characters", 400);
 
     const db = await getDb();
 
-    // Per-user flood guard (Redis-backed; degrades to per-instance in mock mode).
-    const rateKey = `chat:${sessionId}:${username}`;
-    const hits = await redis.incr(rateKey);
-    if (hits === 1) await redis.expire(rateKey, RATE_WINDOW_SEC);
+    // Per-user flood guard (Redis-backed; degrades to per-instance in mock
+    // mode). The limiter is abuse DEFENSE, never correctness: if the counter
+    // itself is unreachable we fail OPEN so chat delivery cannot 500.
+    let hits = 1;
+    try {
+      const rateKey = `chat:${sessionId}:${username}`;
+      hits = await redis.incr(rateKey);
+      if (hits === 1) await redis.expire(rateKey, RATE_WINDOW_SEC);
+    } catch (limiterErr) {
+      console.warn("chat rate-limiter unavailable; failing open:", limiterErr);
+      hits = 1;
+    }
     if (hits > RATE_LIMIT) {
       return apiError("You are sending messages too quickly", 429);
     }
