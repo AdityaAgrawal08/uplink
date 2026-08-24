@@ -60,14 +60,13 @@ export function generateShareId(): string {
 }
 
 export function sanitizeFilename(filename: string): string {
-  if (!filename) return "unnamed_file";
-  // Extract basename to prevent path traversal
-  const base = path.basename(filename);
-  // Restrict to whitelisted characters [a-zA-Z0-9._-]
-  let sanitized = base.replace(/[^a-zA-Z0-9._-]/g, "_");
-  // Fallback if empty or purely special characters
+  // Extract basename to prevent path traversal. NOTE: the empty-string case
+  // deliberately flows into the same "file" fallback used by the Go CLI
+  // (cli/main.go sanitizeFilename) so both ends agree on every input.
+  const base = path.basename(String(filename ?? ""));
+  const sanitized = base.replace(/[^a-zA-Z0-9._-]/g, "_");
   if (!sanitized || sanitized === "." || sanitized === "..") {
-    sanitized = "file";
+    return "file";
   }
   return sanitized;
 }
