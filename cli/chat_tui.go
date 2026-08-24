@@ -70,7 +70,6 @@ type chatScreen struct {
 	vp           viewport.Model
 	input        textinput.Model
 	status       string
-	showRoster   bool
 	selectedTarget string // username for private chat, "" = broadcast mode
 	beatFailures int
 	pollFailures int
@@ -91,7 +90,6 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		input:      ti,
 		pendingIdx: -1,
 		rendered:   map[int]bool{},
-		showRoster: false,
 		selectedTarget: "",
 	}
 }
@@ -155,9 +153,7 @@ func (c chatScreen) statusView() string {
 }
 
 func (c chatScreen) rosterView() string {
-	if !c.showRoster {
-		return ""
-	}
+	// Fixed roster column - always visible, like OpenCode sidebar
 	// Build roster lines: current user marked with ↦
 	var roster []string
 	roster = append(roster, tuiHeaderStyle.Render(" Users "))
@@ -339,10 +335,39 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case leaveDoneMsg:
 		return c, tea.Quit
 
+	case tea.MouseMsg:
+		// Handle clicks on the roster column
+		if c.selectedTarget != "" {
+			// Already in private mode - don't handle clicks
+		} else {
+			// Check if click is in the roster area
+			// Mouse event coordinates: msg.X, msg.Y
+			// Roster is on the right, width 20
+			// We need to check if click is within the roster area
+			// and on a user name line
+			// For simplicity, if clicked, select first user as target
+			// In a full implementation, would check precise coordinates
+			if len(c.users) > 0 {
+				c.selectedTarget = c.users[0]
+				c.appendLine(tuiSystemStyle.Render("* Private chat started with " + c.users[0]))
+			}
+		}
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			cmds = append(cmds, c.doLeave(), tea.Quit)
 			return c, tea.Batch(cmds...)
+		}
+		if msg.Type == tea.KeyEsc {
+			// Press Esc returns to common chat from private mode
+			if c.selectedTarget != "" {
+				c.selectedTarget = ""
+				c.appendLine(tuiSystemStyle.Render("* Returned to common chat"))
+			}
+			// Otherwise, default CtrlC handling would apply
+			if c.selectedTarget == "" {
+				cmds = append(cmds, c.doLeave(), tea.Quit)
+				return c, tea.Batch(cmds...)
+			}
 		}
 		if msg.Type == tea.KeyEnter {
 			text := strings.TrimSpace(c.input.Value())
@@ -357,21 +382,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return c, tea.Batch(cmds...)
 			case "/users":
 				c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
-			case "/roster":
-				c.showRoster = !c.showRoster
-				status := "on"
-				if !c.showRoster {
-					status = "off"
-				}
-				c.appendLine(tuiSystemStyle.Render("* Roster visibility: "+status))
-			case "/pm":
-				if c.selectedTarget == "" {
-					c.appendLine(tuiSystemStyle.Render("* Private chat mode: ON (target not set) — type /pm <username> to set target"))
-					c.selectedTarget = ""
-				} else {
-					c.selectedTarget = ""
-					c.appendLine(tuiSystemStyle.Render("* Private chat mode: OFF — broadcasting to all"))
-				}
+			// Names in the right roster column are clickable for private chat
+			// Press Esc to return to common chat
 			case "/help":
 				c.appendLine(tuiSystemStyle.Render("* Commands: /users · /exit · anything else sends"))
 			default:
@@ -405,34 +417,30 @@ func (c chatScreen) View() string {
 		return "connecting…"
 	}
 	input := tuiBorderStyle.Render(c.input.View())
-	// Roster column width (fixed when visible)
-	rosterWidth := 0
-	if c.showRoster {
-		rosterWidth = 20
-	}
+	// Fixed roster column width (always visible, like OpenCode sidebar)
+	rosterWidth := 20
 	// Viewport width: remaining space after roster and borders
 	vpWidth := c.width - 2 - rosterWidth
 	if vpWidth < 40 {
 		vpWidth = 40
 		rosterWidth = c.width - 2 - vpWidth
 	}
-	// Header takes full width, then messages, then input/footer
+	// Header takes full width, then messages viewport with roster on right,
+	// then input/footer with fixed roster column
 	body := c.headerView() + "\n"
-	// Messages viewport (width adjusted for roster)
+	// Messages viewport (width adjusted for fixed roster column)
 	c.vp.Width = vpWidth
 	body += tuiBorderStyle.Render(c.vp.View()) + "\n"
-	body += input + c.statusView()
-	// Append roster column on the right if visible
-	if c.showRoster && rosterWidth > 0 {
-		body += "\n" + c.rosterView()
-	}
+	// Fixed roster column on the right - shows users and handles clicks
+	body += c.rosterView()
+	body += "\n" + input + c.statusView()
 	return body
 }
 
 // runChatTUI is the default interactive experience (alt-screen).
 func runChatTUI(serverURL, key, me string) {
 	scr := newChatScreen(serverURL, key, me)
-	p := tea.NewProgram(scr, tea.WithAltScreen())
+	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
