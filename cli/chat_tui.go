@@ -28,7 +28,76 @@ var (
 	tuiTimeStyle   = lipgloss.NewStyle().Faint(true)
 	tuiBorderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240"))
+
+	tuiRosterTitleStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.Color("15")).
+				Background(lipgloss.Color("62")).
+				Width(rosterWidthInner).
+				Padding(0, 0)
+
+	tuiRosterBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("240")).
+				Width(rosterWidthInner)
+
+	tuiRosterSelectedStyle = lipgloss.NewStyle().
+				Bold(true).
+				Background(lipgloss.Color("236"))
 )
+
+// ---- layout constants --------------------------------------------------------
+
+const (
+	rosterTotalWidth  = 24 // outer width of the sidebar incl. borders
+	rosterWidthInner  = rosterTotalWidth - 2
+	rosterMaxVisible  = 12 // max user rows shown before "... +N more"
+	inputChromeHeight = 3  // rounded-border box around the text input
+	headerHeight      = 1  // top banner line
+	minViewportHeight = 4  // never give the transcript fewer lines
+	minViewportWidth  = 30 // never narrow the transcript below this
+)
+
+// layout is the single source of truth for frame geometry. Both View() and the
+// mouse hit-test derive their math from this struct so a click always maps to
+// exactly what is on screen.
+type layout struct {
+	vpWidth    int // transcript viewport inner width
+	vpHeight   int // transcript viewport visible rows
+	rosterX    int // leftmost column of the sidebar
+	rosterY0   int // first terminal row inside the sidebar that holds a user
+	statusRows int // extra rows consumed by the status line (0 or 1)
+}
+
+// computeLayout derives frame geometry purely from terminal size and whether
+// the status line is visible. Pure function => trivially unit-testable.
+func computeLayout(termW, termH int, showStatus bool) layout {
+	l := layout{}
+	if termW <= 0 || termH <= 0 {
+		return l
+	}
+	l.statusRows = 0
+	if showStatus {
+		l.statusRows = 1
+	}
+	fixed := headerHeight + inputChromeHeight + l.statusRows
+
+	l.vpHeight = termH - fixed
+	if l.vpHeight < minViewportHeight {
+		l.vpHeight = minViewportHeight
+	}
+	// Sidebar sits to the RIGHT of the bordered transcript.
+	// Border adds 2 columns; keep 1 spacer col between panels.
+	l.rosterX = termW - rosterTotalWidth
+	l.vpWidth = l.rosterX - 3 // 2 border cols + 1 spacer
+	if l.vpWidth < minViewportWidth {
+		l.vpWidth = minViewportWidth
+		l.rosterX = l.vpWidth + 3
+	}
+	// Row just after the header is the top border; first user row is inside.
+	l.rosterY0 = headerHeight + 2 // header + top border row
+	return l
+}
 
 // ---- messages --------------------------------------------------------------
 
@@ -65,14 +134,22 @@ type chatScreen struct {
 	height       int
 	lines        []string
 	rendered     map[int]bool // server seqs already on screen (dedupes optimistic echo)
-	pendingIdx   int          // index of unconfirmed outgoing line (-1 = none)
+	pending      *pendingSend // single in-flight send (nil = idle)
+	outbox       []string     // queued lines waiting for the in-flight send to settle
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
 	status       string
-	selectedTarget string // username for private chat, "" = broadcast mode
+	targetUser   string // private-chat peer; "" = common room
 	beatFailures int
 	pollFailures int
+}
+
+// pendingSend tracks the optimistic echo line for the in-flight send so the
+// confirmation can swap it in place (or mark failure) without ambiguity.
+type pendingSend struct {
+	lineIdx int
+	text    string
 }
 
 func newChatScreen(serverURL, key, me string) chatScreen {
@@ -83,15 +160,46 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 	ti.Prompt = "> "
 	vp := viewport.New(80, 20)
 	return chatScreen{
-		client:     newChatClient(serverURL, key, me),
-		key:        key,
-		me:         me,
-		vp:         vp,
-		input:      ti,
-		pendingIdx: -1,
-		rendered:   map[int]bool{},
-		selectedTarget: "",
+		client:   newChatClient(serverURL, key, me),
+		key:      key,
+		me:       me,
+		vp:       vp,
+		input:    ti,
+		rendered: map[int]bool{},
+		outbox:   nil,
 	}
+}
+
+// isOwnPresence reports whether a system presence line refers to me.
+// Server format is strictly "<username> joined" / "<username> left", so an
+// exact prefix+" joined/left" match avoids the bob/bobby false positive that
+// a bare strings.Contains would produce.
+func isOwnPresence(systemText, me string) bool {
+	return systemText == me+" joined" || systemText == me+" left"
+}
+
+// mentionsUser reports whether a presence line concerns the given user.
+func mentionsUser(systemText, user string) bool {
+	return systemText == user+" joined" || systemText == user+" left"
+}
+
+// shouldRender decides visibility BEFORE any styling, so filtered messages
+// never leave blank husks in the transcript.
+func (c *chatScreen) shouldRender(m chatMessage) bool {
+	if m.Kind == "system" {
+		if isOwnPresence(m.Text, c.me) {
+			return false // never announce my own entry/exit to myself
+		}
+		if c.targetUser != "" &&
+			!mentionsUser(m.Text, c.targetUser) && !mentionsUser(m.Text, c.me) {
+			return false // private view: only presence involving the pair
+		}
+		return true
+	}
+	if c.targetUser != "" && m.Username != c.me && m.Username != c.targetUser {
+		return false
+	}
+	return true
 }
 
 func (c *chatScreen) renderLine(m chatMessage) string {
@@ -100,37 +208,28 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		ts = tuiTimeStyle.Render("[" + t.Local().Format("15:04") + "]")
 	}
 	if m.Kind == "system" {
-		// Hide own entry/exit messages from the viewing user
-		if m.Text != "" && strings.Contains(m.Text, c.me) {
-			return ""
-		}
-		// In private mode, show system messages only if involving target
-		if c.selectedTarget != "" {
-			if !strings.Contains(m.Text, c.me) && !strings.Contains(m.Text, c.selectedTarget) {
-				return ""
-			}
-		}
 		return ts + " " + tuiSystemStyle.Render("* "+m.Text)
 	}
 	name := tuiNameStyle.Render(m.Username)
 	if m.Username == c.me {
 		name = tuiMeStyle.Render(name + " (you)")
 	}
-	// In private mode, filter out messages not involving current user or target
-	if c.selectedTarget != "" {
-		if m.Username != c.me && m.Username != c.selectedTarget {
-			return ""
-		}
+	if c.targetUser != "" && m.Username == c.targetUser {
+		name = tuiRosterSelectedStyle.Render(m.Username)
 	}
 	return ts + " " + name + ": " + m.Text
 }
 
-// addMessage renders a confirmed server message exactly once.
+// addMessage renders a confirmed server message exactly once — and only when
+// the current view wants it (own presence suppressed, private-mode filter).
 func (c *chatScreen) addMessage(m chatMessage) {
 	if c.rendered[m.Seq] {
 		return
 	}
 	c.rendered[m.Seq] = true
+	if !c.shouldRender(m) {
+		return // filtered: no blank line, nothing appended
+	}
 	c.appendLine(c.renderLine(m))
 }
 
@@ -140,32 +239,57 @@ func (c *chatScreen) appendLine(s string) {
 	c.vp.GotoBottom()
 }
 
+// refreshViewport re-serializes the transcript (used after in-place edits).
+func (c *chatScreen) refreshViewport() {
+	c.vp.SetContent(strings.Join(c.lines, "\n"))
+	c.vp.GotoBottom()
+}
+
 func (c chatScreen) headerView() string {
+	mode := ""
+	if c.targetUser != "" {
+		mode = fmt.Sprintf(" · private: %s (Esc to exit)", c.targetUser)
+	}
 	return tuiHeaderStyle.Render(fmt.Sprintf(
-		" uplink chat · key %s · you are %s · %d online ", c.key, c.me, len(c.users)))
+		" uplink chat · key %s · you are %s · %d online%s ", c.key, c.me, len(c.users), mode))
 }
 
 func (c chatScreen) statusView() string {
 	if c.status == "" {
 		return ""
 	}
-	return "\n" + tuiErrStyle.Render(c.status)
+	return tuiErrStyle.Render(c.status)
 }
 
-func (c chatScreen) rosterView() string {
-	// Fixed roster column - always visible, like OpenCode sidebar
-	// Build roster lines: current user marked with ↦
-	var roster []string
-	roster = append(roster, tuiHeaderStyle.Render(" Users "))
-	for _, u := range c.users {
-		if u == c.me {
-			roster = append(roster, tuiMeStyle.Render(" ↦ "+u+" (you)"))
-		} else {
-			roster = append(roster, fmt.Sprintf("   %s", u))
+// rosterRow renders one sidebar entry; selected highlights the active peer.
+func rosterRow(u, me, target string) string {
+	switch {
+	case u == me:
+		return tuiMeStyle.Render("· " + u + " (you)")
+	case u == target:
+		return tuiRosterSelectedStyle.Render("● " + u)
+	default:
+		return "○ " + u
+	}
+}
+
+// rosterBody produces the raw (bordered) sidebar content. Height is fully
+// deterministic: title + rosterMaxVisible slots (+2 border rows) regardless of
+// participant count — the overflow indicator REPLACES the final slot.
+func (c chatScreen) rosterBody() string {
+	rows := []string{tuiRosterTitleStyle.Render("Users")}
+	for i := 0; i < rosterMaxVisible; i++ {
+		switch {
+		case i >= len(c.users):
+			rows = append(rows, "")
+		case i == rosterMaxVisible-1 && len(c.users) > rosterMaxVisible:
+			more := len(c.users) - (rosterMaxVisible - 1)
+			rows = append(rows, tuiTimeStyle.Render(fmt.Sprintf("… +%d more", more)))
+		default:
+			rows = append(rows, rosterRow(c.users[i], c.me, c.targetUser))
 		}
 	}
-	roster = append(roster, tuiHeaderStyle.Render("────────────────"))
-	return strings.Join(roster, "\n")
+	return tuiRosterBoxStyle.Render(strings.Join(rows, "\n"))
 }
 
 // ---- async commands --------------------------------------------------------
@@ -221,18 +345,51 @@ func (c chatScreen) fetchBacklogCmd() tea.Cmd {
 	}
 }
 
-func (c chatScreen) initialBeatCmd() tea.Cmd {
-	return c.doBeat()
-}
-
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	return tea.Batch(c.fetchBacklogCmd(), c.initialBeatCmd(), schedulePoll(0), scheduleBeat())
+	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), schedulePoll(0), scheduleBeat())
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
+}
+
+// enterPrivate switches to a 1:1 view; returns a system line to append.
+func (c *chatScreen) enterPrivate(user string) {
+	c.targetUser = user
+	c.appendLine(tuiSystemStyle.Render("* Private chat with " + user + " — Esc for common room"))
+}
+
+// exitPrivate returns to the common room; returns a system line or "".
+func (c *chatScreen) exitPrivate() {
+	if c.targetUser == "" {
+		return
+	}
+	c.targetUser = ""
+	c.appendLine(tuiSystemStyle.Render("* Back in the common room"))
+}
+
+func (c *chatScreen) submitLine(text string) {
+	switch strings.ToLower(text) {
+	case "/users":
+		c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
+	case "/help":
+		hint := "* Commands: /users · /exit · click a name in the sidebar for private chat"
+		c.appendLine(tuiSystemStyle.Render(hint))
+	default:
+		if c.pending != nil {
+			c.outbox = append(c.outbox, text) // one wire message at a time
+			return
+		}
+		c.dispatchSend(text)
+	}
+}
+func (c *chatScreen) dispatchSend(text string) {
+	c.lines = append(c.lines, tuiMeStyle.Render("[you →] "+text))
+	idx := len(c.lines) - 1
+	c.pending = &pendingSend{lineIdx: idx, text: text}
+	c.refreshViewport()
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -242,8 +399,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		c.width, c.height = msg.Width, msg.Height
-		c.vp.Width = c.width - 2
-		c.vp.Height = c.height - 7
+		l := computeLayout(c.width, c.height, c.status != "")
+		c.vp.Width = l.vpWidth
+		c.vp.Height = l.vpHeight
 
 	case backlogMsg:
 		if msg.err != nil {
@@ -296,78 +454,31 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if c.status == "connection lost… retrying" {
 				c.status = ""
 			}
-			if len(msg.users) > 0 {
-				c.users = msg.users
-			}
+			// Authoritative snapshot — INCLUDING shrinking to empty.
+			c.users = msg.users
 		}
 		cmds = append(cmds, scheduleBeat())
 
 	case sendDoneMsg:
-		switch {
-		case msg.code == 429:
-			c.lines[c.pendingIdx] = tuiErrStyle.Render("✗ slow down — try again")
-			c.pendingIdx = -1
-			c.vp.SetContent(strings.Join(c.lines, "\n"))
-			c.vp.GotoBottom()
-		case msg.code == 410:
-			c.appendLine(tuiSystemStyle.Render("* Session has ended"))
-			cmds = append(cmds, c.doLeave(), tea.Quit)
-			return c, tea.Batch(cmds...)
-		case msg.err != nil:
-			c.lines[c.pendingIdx] = tuiErrStyle.Render("✗ send failed: " + msg.err.Error())
-			c.pendingIdx = -1
-			c.vp.SetContent(strings.Join(c.lines, "\n"))
-			c.vp.GotoBottom()
-		default:
-			// Confirmed by server — replace the pending echo with the real one.
-			m := chatMessage{Seq: msg.seq, Username: c.me, Kind: "chat", Text: msg.text}
-			c.rendered[m.Seq] = true
-			if c.pendingIdx >= 0 && c.pendingIdx < len(c.lines) {
-				c.lines[c.pendingIdx] = c.renderLine(m)
-			} else {
-				c.appendLine(c.renderLine(m))
-			}
-			c.pendingIdx = -1
-			c.vp.SetContent(strings.Join(c.lines, "\n"))
-			c.vp.GotoBottom()
-		}
+		c.settleSend(msg)
 
 	case leaveDoneMsg:
 		return c, tea.Quit
 
 	case tea.MouseMsg:
-		// Handle clicks on the roster column
-		if c.selectedTarget != "" {
-			// Already in private mode - don't handle clicks
-		} else {
-			// Check if click is in the roster area
-			// Mouse event coordinates: msg.X, msg.Y
-			// Roster is on the right, width 20
-			// We need to check if click is within the roster area
-			// and on a user name line
-			// For simplicity, if clicked, select first user as target
-			// In a full implementation, would check precise coordinates
-			if len(c.users) > 0 {
-				c.selectedTarget = c.users[0]
-				c.appendLine(tuiSystemStyle.Render("* Private chat started with " + c.users[0]))
-			}
+		if cmd := c.handleMouse(msg); cmd != nil {
+			cmds = append(cmds, cmd)
 		}
+
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			cmds = append(cmds, c.doLeave(), tea.Quit)
 			return c, tea.Batch(cmds...)
 		}
 		if msg.Type == tea.KeyEsc {
-			// Press Esc returns to common chat from private mode
-			if c.selectedTarget != "" {
-				c.selectedTarget = ""
-				c.appendLine(tuiSystemStyle.Render("* Returned to common chat"))
-			}
-			// Otherwise, default CtrlC handling would apply
-			if c.selectedTarget == "" {
-				cmds = append(cmds, c.doLeave(), tea.Quit)
-				return c, tea.Batch(cmds...)
-			}
+			// Esc ONLY leaves private view. It must NEVER quit the app.
+			c.exitPrivate()
+			break
 		}
 		if msg.Type == tea.KeyEnter {
 			text := strings.TrimSpace(c.input.Value())
@@ -375,25 +486,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if text == "" {
 				break
 			}
-			switch strings.ToLower(text) {
-			case "/exit", "/quit":
+			if strings.EqualFold(text, "/exit") || strings.EqualFold(text, "/quit") {
 				c.appendLine(tuiSystemStyle.Render("* You left the session."))
 				cmds = append(cmds, c.doLeave(), tea.Quit)
 				return c, tea.Batch(cmds...)
-			case "/users":
-				c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
-			// Names in the right roster column are clickable for private chat
-			// Press Esc to return to common chat
-			case "/help":
-				c.appendLine(tuiSystemStyle.Render("* Commands: /users · /exit · anything else sends"))
-			default:
-				// Optimistic echo — WhatsApp-style instant feedback.
-				c.lines = append(c.lines, tuiMeStyle.Render("[you →] "+text))
-				c.pendingIdx = len(c.lines) - 1
-				c.vp.SetContent(strings.Join(c.lines, "\n"))
-				c.vp.GotoBottom()
-				cmds = append(cmds, c.doSend(text))
 			}
+			c.submitLine(text)
 			var ic tea.Cmd
 			c.input, ic = c.input.Update(msg)
 			cmds = append(cmds, ic)
@@ -404,7 +502,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, ic)
 	}
 
-	// Viewport keeps its own scroll/resize handling for every message.
+	// Viewport keeps its own scroll handling for every message.
 	var vpc tea.Cmd
 	c.vp, vpc = c.vp.Update(msg)
 	cmds = append(cmds, vpc)
@@ -412,32 +510,112 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return c, tea.Batch(cmds...)
 }
 
-func (c chatScreen) View() string {
-	if c.width == 0 {
-		return "connecting…"
+// settleSend resolves the optimistic echo for the completed send and pumps
+// the outbox so queued lines go out one at a time.
+func (c *chatScreen) settleSend(msg sendDoneMsg) {
+	var replacement string
+	switch {
+	case msg.code == 429:
+		replacement = tuiErrStyle.Render("✗ slow down — try again")
+	case msg.code == 410:
+		replacement = tuiSystemStyle.Render("* Session has ended")
+	case msg.err != nil:
+		replacement = tuiErrStyle.Render("✗ send failed: " + msg.err.Error())
+	default:
+		m := chatMessage{Seq: msg.seq, Username: c.me, Kind: "chat", Text: msg.text}
+		c.rendered[m.Seq] = true
+		if c.shouldRender(m) {
+			replacement = c.renderLine(m)
+		} else {
+			replacement = "" // filtered mid-flight (rare): drop the echo
+		}
 	}
-	input := tuiBorderStyle.Render(c.input.View())
-	// Fixed roster column width (always visible, like OpenCode sidebar)
-	rosterWidth := 20
-	// Viewport width: remaining space after roster and borders
-	vpWidth := c.width - 2 - rosterWidth
-	if vpWidth < 40 {
-		vpWidth = 40
-		rosterWidth = c.width - 2 - vpWidth
+
+	if c.pending != nil && c.pending.lineIdx >= 0 && c.pending.lineIdx < len(c.lines) {
+		if replacement == "" {
+			_ = copy(c.lines[c.pending.lineIdx:], c.lines[c.pending.lineIdx+1:])
+			c.lines = c.lines[:len(c.lines)-1]
+		} else {
+			c.lines[c.pending.lineIdx] = replacement
+		}
+	} else if replacement != "" {
+		c.appendLine(replacement)
 	}
-	// Header takes full width, then messages viewport with roster on right,
-	// then input/footer with fixed roster column
-	body := c.headerView() + "\n"
-	// Messages viewport (width adjusted for fixed roster column)
-	c.vp.Width = vpWidth
-	body += tuiBorderStyle.Render(c.vp.View()) + "\n"
-	// Fixed roster column on the right - shows users and handles clicks
-	body += c.rosterView()
-	body += "\n" + input + c.statusView()
-	return body
+	if msg.code == 410 {
+		c.refreshViewport()
+		return
+	}
+	c.pending = nil
+	c.refreshViewport()
+
+	// Drain exactly one queued line per settled send.
+	if n := len(c.outbox); n > 0 {
+		next := c.outbox[0]
+		c.outbox = c.outbox[1:]
+		c.dispatchSend(next)
+	}
 }
 
-// runChatTUI is the default interactive experience (alt-screen).
+// handleMouse translates a click into a sidebar selection using the SAME
+// geometry View() will paint. Returns a tea.Cmd (send-free) or nil.
+func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	if msg.Type != tea.MouseLeft {
+		return nil
+	}
+	if c.width == 0 || c.height == 0 {
+		return nil
+	}
+	// Reject coordinates outside the painted terminal area entirely.
+	if msg.X < 0 || msg.X >= c.width || msg.Y < 0 || msg.Y >= c.height {
+		return nil
+	}
+	l := computeLayout(c.width, c.height, c.status != "")
+	inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+rosterTotalWidth
+	row := msg.Y - l.rosterY0
+	if !inColumn || row < 0 || row >= rosterMaxVisible || row >= len(c.users) {
+		return nil
+	}
+	u := c.users[row]
+	if u == c.me {
+		return nil // clicking yourself is a no-op
+	}
+	if u == c.targetUser {
+		return nil // already chatting privately with them
+	}
+	c.enterPrivate(u)
+	return nil
+}
+
+func (c chatScreen) View() string {
+	if c.width == 0 || c.height == 0 {
+		return "connecting…"
+	}
+	l := computeLayout(c.width, c.height, c.status != "")
+
+	// Keep viewport dims in lockstep with the painted layout.
+	vp := c.vp
+	vp.Width = l.vpWidth
+	vp.Height = l.vpHeight
+
+	left := tuiBorderStyle.Render(vp.View())
+
+	sidebar := c.rosterBody()
+	// Pad the sidebar to the transcript height so both columns align at top.
+	sidebarH := lipgloss.Height(left)
+	sidebar = lipgloss.NewStyle().Height(sidebarH).Render(sidebar)
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", sidebar)
+
+	rows := []string{c.headerView(), body}
+	input := tuiBorderStyle.Render(c.input.View())
+	rows = append(rows, input)
+	if c.status != "" {
+		rows = append(rows, c.statusView())
+	}
+	return strings.Join(rows, "\n")
+}
+
+// runChatTUI is the default interactive experience (alt-screen + mouse).
 func runChatTUI(serverURL, key, me string) {
 	scr := newChatScreen(serverURL, key, me)
 	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseCellMotion())
