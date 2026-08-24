@@ -51,28 +51,60 @@ var (
 const (
 	rosterTotalWidth  = 24 // outer width of the sidebar incl. borders
 	rosterWidthInner  = rosterTotalWidth - 2
-	rosterMaxVisible  = 12 // max user rows shown before "... +N more"
+	rosterMaxVisible  = 12 // cap on user rows before "... +N more"
 	inputChromeHeight = 3  // rounded-border box around the text input
 	headerHeight      = 1  // top banner line
-	minViewportHeight = 4  // never give the transcript fewer lines
-	minViewportWidth  = 30 // never narrow the transcript below this
+	transcriptBorder  = 2  // rows consumed by the transcript box border
+	minSidebarTermW   = 62 // below this width the sidebar collapses entirely
 )
 
 // layout is the single source of truth for frame geometry. Both View() and the
 // mouse hit-test derive their math from this struct so a click always maps to
 // exactly what is on screen.
+//
+// Height invariant (the contract that keeps us inside the terminal):
+//
+//	headerHeight + (vpHeight + transcriptBorder) + inputChromeHeight + statusRows
+//	    == termH   (exactly; never more)
 type layout struct {
-	vpWidth    int // transcript viewport inner width
-	vpHeight   int // transcript viewport visible rows
-	rosterX    int // leftmost column of the sidebar
-	rosterY0   int // first terminal row inside the sidebar that holds a user
-	statusRows int // extra rows consumed by the status line (0 or 1)
+	vpWidth         int  // transcript viewport inner width
+	vpHeight        int  // transcript viewport visible rows (inside its border)
+	sidebarOn       bool // false on narrow terminals — panel collapses
+	rosterX         int  // leftmost column of the sidebar
+	rosterY0        int  // first terminal row inside the sidebar that holds a user
+	rosterSlots     int  // how many roster rows fit under the current vpHeight
+	statusRows      int  // extra rows consumed by the status line (0 or 1)
+	showHeader      bool // staged degradation: hide banner on tiny heights
+	boxedTranscript bool // staged degradation: drop border rows on tiny heights
+	inputBoxed      bool // staged degradation: bare prompt on absurd heights
+}
+
+// totalRows reports the exact number of terminal rows a frame will occupy.
+func (l layout) totalRows() int {
+	h := l.vpHeight + l.statusRows
+	if l.inputBoxed {
+		h += inputChromeHeight
+	} else {
+		h++ // bare prompt line
+	}
+	if l.showHeader {
+		h += headerHeight
+	}
+	if l.boxedTranscript {
+		h += transcriptBorder
+	}
+	return h
 }
 
 // computeLayout derives frame geometry purely from terminal size and whether
-// the status line is visible. Pure function => trivially unit-testable.
+// the status line is visible. Guarantees, in order:
+//  1. totalRows() <= termH always (staged chrome degradation on tiny screens)
+//  2. sidebar collapses below minSidebarTermW or whenever its frame is gone
+//  3. viewport absorbs all remaining space (floors at zero rows)
+//
+// Pure function => trivially unit-testable.
 func computeLayout(termW, termH int, showStatus bool) layout {
-	l := layout{}
+	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
 	}
@@ -80,23 +112,102 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	if showStatus {
 		l.statusRows = 1
 	}
-	fixed := headerHeight + inputChromeHeight + l.statusRows
+	l.showHeader = true
+	l.boxedTranscript = true
+	l.inputBoxed = true
 
-	l.vpHeight = termH - fixed
-	if l.vpHeight < minViewportHeight {
-		l.vpHeight = minViewportHeight
+	// --- width pass ---------------------------------------------------------
+	l.sidebarOn = termW >= minSidebarTermW
+	if l.sidebarOn {
+		l.rosterX = termW - rosterTotalWidth
+		l.vpWidth = l.rosterX - 3 // 2 transcript border cols + 1 spacer
+	} else {
+		l.rosterX = 0
+		l.vpWidth = termW - 2
 	}
-	// Sidebar sits to the RIGHT of the bordered transcript.
-	// Border adds 2 columns; keep 1 spacer col between panels.
-	l.rosterX = termW - rosterTotalWidth
-	l.vpWidth = l.rosterX - 3 // 2 border cols + 1 spacer
-	if l.vpWidth < minViewportWidth {
-		l.vpWidth = minViewportWidth
-		l.rosterX = l.vpWidth + 3
+	if l.vpWidth < 10 { // last-resort floor on absurdly narrow terms
+		l.vpWidth = 10
 	}
-	// Row just after the header is the top border; first user row is inside.
-	l.rosterY0 = headerHeight + 2 // header + top border row
+
+	// --- height pass: degrade until the frame provably fits -----------------
+	shrink := func() {
+		switch {
+		case l.statusRows == 1:
+			l.statusRows = 0
+		case l.boxedTranscript:
+			l.boxedTranscript = false
+			if l.sidebarOn { // nothing to sit beside once unframed
+				l.sidebarOn = false
+				l.rosterX = 0
+				l.vpWidth = termW - 2
+				if l.vpWidth < 10 {
+					l.vpWidth = 10
+				}
+			}
+		case l.showHeader:
+			l.showHeader = false
+		default:
+			l.inputBoxed = false
+		}
+	}
+	for l.totalRows() > termH {
+		before := l.totalRows()
+		shrink()
+		if l.totalRows() == before {
+			break // fully degraded; impossible beyond this point
+		}
+	}
+
+	l.vpHeight = termH - l.totalRows()
+	if l.vpHeight < 0 {
+		l.vpHeight = 0
+	}
+
+	if l.vpHeight < 3 && l.sidebarOn {
+		l.sidebarOn = false // no room for border+title+even one user
+		l.rosterX = 0
+		l.vpWidth = termW - 2
+		if l.vpWidth < 10 {
+			l.vpWidth = 10
+		}
+	}
+
+	// Roster adapts to the transcript height: title row eats one slot,
+	// overflow indicator reuses the final slot (see rosterBody).
+	l.rosterSlots = l.vpHeight - 1
+	if l.rosterSlots > rosterMaxVisible {
+		l.rosterSlots = rosterMaxVisible
+	}
+	if l.rosterSlots < 0 || !l.sidebarOn {
+		l.rosterSlots = 0
+	}
+
+	// Sidebar stack above the first user row: [optional header] +
+	// sidebar-box top border + "Users" title. (Sidebar implies boxed frame.)
+	l.rosterY0 = 2
+	if l.showHeader {
+		l.rosterY0 += headerHeight
+	}
 	return l
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// truncateStringPlain hard-cuts a string to n cells (runes), no styling.
+func truncateStringPlain(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 // ---- messages --------------------------------------------------------------
@@ -239,9 +350,20 @@ func (c *chatScreen) appendLine(s string) {
 	c.vp.GotoBottom()
 }
 
-// refreshViewport re-serializes the transcript (used after in-place edits).
+// refreshViewport re-serializes the transcript, hard-wrapping every line to
+// the current viewport width. lipgloss Width() wraps ANSI-aware, so styled
+// lines fold instead of being clipped by the viewport on narrow terminals.
 func (c *chatScreen) refreshViewport() {
-	c.vp.SetContent(strings.Join(c.lines, "\n"))
+	w := c.vp.Width
+	if w <= 0 {
+		w = 40
+	}
+	st := lipgloss.NewStyle().Width(w)
+	wrapped := make([]string, len(c.lines))
+	for i, ln := range c.lines {
+		wrapped[i] = st.Render(ln)
+	}
+	c.vp.SetContent(strings.Join(wrapped, "\n"))
 	c.vp.GotoBottom()
 }
 
@@ -250,8 +372,16 @@ func (c chatScreen) headerView() string {
 	if c.targetUser != "" {
 		mode = fmt.Sprintf(" · private: %s (Esc to exit)", c.targetUser)
 	}
-	return tuiHeaderStyle.Render(fmt.Sprintf(
-		" uplink chat · key %s · you are %s · %d online%s ", c.key, c.me, len(c.users), mode))
+	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
+		c.key, c.me, len(c.users), mode)
+	w := c.width
+	// Width() wraps long banners into multiple lines — fatal for our exact
+	// height contract. Overflowing text degrades to a hard-truncated plain
+	// run instead; otherwise the banner fills the full terminal width.
+	if w <= 0 || lipgloss.Width(text) > w {
+		return truncateStringPlain(text, maxInt(w, 0))
+	}
+	return tuiHeaderStyle.Width(w).Render(text)
 }
 
 func (c chatScreen) statusView() string {
@@ -273,17 +403,21 @@ func rosterRow(u, me, target string) string {
 	}
 }
 
-// rosterBody produces the raw (bordered) sidebar content. Height is fully
-// deterministic: title + rosterMaxVisible slots (+2 border rows) regardless of
-// participant count — the overflow indicator REPLACES the final slot.
-func (c chatScreen) rosterBody() string {
-	rows := []string{tuiRosterTitleStyle.Render("Users")}
-	for i := 0; i < rosterMaxVisible; i++ {
+// rosterBody renders the bordered sidebar with EXACTLY slots content rows
+// (title + users), so its height always matches the transcript column. The
+// overflow indicator replaces the final slot when participants overflow.
+func (c chatScreen) rosterBody(slots int) string {
+	if slots < 0 {
+		slots = 0
+	}
+	rows := make([]string, 0, slots+1)
+	rows = append(rows, tuiRosterTitleStyle.Render("Users"))
+	for i := 0; i < slots; i++ {
 		switch {
 		case i >= len(c.users):
 			rows = append(rows, "")
-		case i == rosterMaxVisible-1 && len(c.users) > rosterMaxVisible:
-			more := len(c.users) - (rosterMaxVisible - 1)
+		case i == slots-1 && len(c.users) > slots:
+			more := len(c.users) - (slots - 1)
 			rows = append(rows, tuiTimeStyle.Render(fmt.Sprintf("… +%d more", more)))
 		default:
 			rows = append(rows, rosterRow(c.users[i], c.me, c.targetUser))
@@ -402,6 +536,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		l := computeLayout(c.width, c.height, c.status != "")
 		c.vp.Width = l.vpWidth
 		c.vp.Height = l.vpHeight
+		c.refreshViewport() // re-wrap transcript to the new width
 
 	case backlogMsg:
 		if msg.err != nil {
@@ -570,9 +705,12 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	l := computeLayout(c.width, c.height, c.status != "")
+	if !l.sidebarOn {
+		return nil // sidebar collapsed on narrow terminals: nothing to click
+	}
 	inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+rosterTotalWidth
 	row := msg.Y - l.rosterY0
-	if !inColumn || row < 0 || row >= rosterMaxVisible || row >= len(c.users) {
+	if !inColumn || row < 0 || row >= l.rosterSlots || row >= len(c.users) {
 		return nil
 	}
 	u := c.users[row]
@@ -597,19 +735,44 @@ func (c chatScreen) View() string {
 	vp.Width = l.vpWidth
 	vp.Height = l.vpHeight
 
-	left := tuiBorderStyle.Render(vp.View())
+	var body string
+	switch {
+	case l.vpHeight == 0:
+		// viewport.View() emits one padded blank row even at Height 0;
+		// omitting the block keeps the exact-row contract intact.
+		body = ""
+	case l.boxedTranscript:
+		body = tuiBorderStyle.Render(vp.View()) // exactly vpHeight+2 rows
+	default:
+		body = vp.View() // degraded: border dropped on tiny terminals
+	}
 
-	sidebar := c.rosterBody()
-	// Pad the sidebar to the transcript height so both columns align at top.
-	sidebarH := lipgloss.Height(left)
-	sidebar = lipgloss.NewStyle().Height(sidebarH).Render(sidebar)
+	if l.sidebarOn && body != "" {
+		// Sidebar height is forced to match the transcript column exactly;
+		// its content truncates to l.rosterSlots so it can never inflate
+		// the joined block beyond vpHeight+2 rows.
+		sidebar := lipgloss.NewStyle().
+			Height(l.vpHeight + transcriptBorder).
+			MaxHeight(l.vpHeight + transcriptBorder).
+			Render(c.rosterBody(l.rosterSlots))
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", sidebar)
+	}
 
-	body := lipgloss.JoinHorizontal(lipgloss.Top, left, " ", sidebar)
-
-	rows := []string{c.headerView(), body}
-	input := tuiBorderStyle.Render(c.input.View())
+	rows := make([]string, 0, 4)
+	if l.showHeader {
+		rows = append(rows, c.headerView())
+	}
+	if body != "" {
+		rows = append(rows, body)
+	}
+	var input string
+	if l.inputBoxed {
+		input = tuiBorderStyle.Render(c.input.View())
+	} else {
+		input = "> " + c.input.View()
+	}
 	rows = append(rows, input)
-	if c.status != "" {
+	if l.statusRows == 1 {
 		rows = append(rows, c.statusView())
 	}
 	return strings.Join(rows, "\n")

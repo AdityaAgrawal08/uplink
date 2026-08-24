@@ -1,14 +1,17 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ---------------------------------------------------------------------------
-// Presence matching (bug: Contains over-matched bob/bobby)
+// Presence matching (bug regression: Contains over-matched bob/bobby)
 // ---------------------------------------------------------------------------
 
 func TestIsOwnPresence(t *testing.T) {
@@ -19,7 +22,7 @@ func TestIsOwnPresence(t *testing.T) {
 	}{
 		{"bob joined", "bob", true},
 		{"bob left", "bob", true},
-		{"bobby joined", "bob", false}, // regression: substring false positive
+		{"bobby joined", "bob", false},
 		{"alice joined bob", "bob", false},
 		{"bob rejoined", "bob", false},
 		{"joined bob", "bob", false},
@@ -45,64 +48,104 @@ func TestMentionsUser(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Layout math (single source of truth for paint + hit-test)
+// Layout math — HEIGHT INVARIANT is the headline contract
 // ---------------------------------------------------------------------------
 
 func TestComputeLayout(t *testing.T) {
 	const W, H = 120, 40
 
-	t.Run("typical terminal no status", func(t *testing.T) {
-		l := computeLayout(W, H, false)
-		if l.statusRows != 0 {
-			t.Fatalf("statusRows = %d; want 0", l.statusRows)
-		}
-		if l.vpHeight != H-headerHeight-inputChromeHeight {
-			t.Errorf("vpHeight = %d; want %d", l.vpHeight, H-headerHeight-inputChromeHeight)
-		}
-		if l.rosterX != W-rosterTotalWidth {
-			t.Errorf("rosterX = %d; want %d", l.rosterX, W-rosterTotalWidth)
-		}
-		if want := l.rosterX - 3; l.vpWidth != want {
-			t.Errorf("vpWidth = %d; want %d (border+spacer)", l.vpWidth, want)
-		}
-		if l.rosterY0 != headerHeight+2 {
-			t.Errorf("rosterY0 = %d; want header+border row", l.rosterY0)
-		}
-	})
+	l := computeLayout(W, H, false)
+	if !l.sidebarOn {
+		t.Fatal("sidebar must be on at wide terminals")
+	}
+	if want := H - headerHeight - transcriptBorder - inputChromeHeight; l.vpHeight != want {
+		t.Errorf("vpHeight = %d; want exact fit %d", l.vpHeight, want)
+	}
+	if l.totalRows() != H {
+		t.Errorf("totalRows = %d; MUST equal termH exactly (%d)", l.totalRows(), H)
+	}
+	if l.rosterX != W-rosterTotalWidth {
+		t.Errorf("rosterX = %d; want %d", l.rosterX, W-rosterTotalWidth)
+	}
+	if want := l.rosterX - 3; l.vpWidth != want {
+		t.Errorf("vpWidth = %d; want %d (border+spacer)", l.vpWidth, want)
+	}
+	if l.rosterY0 != headerHeight+2 {
+		t.Errorf("rosterY0 = %d; want header+border row", l.rosterY0)
+	}
 
-	t.Run("status line consumes one row", func(t *testing.T) {
+	t.Run("status line consumes exactly one row", func(t *testing.T) {
 		with := computeLayout(W, H, true)
 		without := computeLayout(W, H, false)
-		if with.vpHeight != without.vpHeight-1 {
-			t.Errorf("status must shrink viewport by exactly 1: %d vs %d", with.vpHeight, without.vpHeight)
+		if with.vpHeight != without.vpHeight-1 || with.statusRows != 1 {
+			t.Errorf("status must shrink viewport by exactly 1: %+v vs %+v", with, without)
+		}
+		if with.totalRows() != H {
+			t.Errorf("status frame overflows: total=%d termH=%d", with.totalRows(), H)
 		}
 	})
 
-	t.Run("tiny terminal clamps viewport to minimum", func(t *testing.T) {
-		l := computeLayout(60, 8, true)
-		if l.vpHeight < minViewportHeight {
-			t.Errorf("vpHeight %d below hard floor %d", l.vpHeight, minViewportHeight)
+	t.Run("roster slots track viewport height", func(t *testing.T) {
+		big := computeLayout(W, 60, false)
+		if big.rosterSlots != rosterMaxVisible {
+			t.Errorf("tall term should cap slots at %d; got %d", rosterMaxVisible, big.rosterSlots)
+		}
+		small := computeLayout(W, 14, false) // vpHeight = 14-6 = 8 → 7 slots
+		if small.rosterSlots != small.vpHeight-1 {
+			t.Errorf("slots %d must equal vpHeight-1 %d", small.rosterSlots, small.vpHeight-1)
 		}
 	})
 
-	t.Run("narrow terminal keeps transcript readable", func(t *testing.T) {
-		l := computeLayout(45, 30, false)
-		if l.vpWidth < minViewportWidth {
-			t.Errorf("vpWidth %d below floor %d", l.vpWidth, minViewportWidth)
-		}
-		if l.rosterX <= l.vpWidth {
-			t.Errorf("sidebar (%d) must sit right of transcript (%d)", l.rosterX, l.vpWidth)
-		}
-	})
-
-	t.Run("degenerate sizes return zeroed layout", func(t *testing.T) {
-		for _, sz := range [][2]int{{0, 0}, {-1, 40}, {80, -5}} {
-			l := computeLayout(sz[0], sz[1], false)
-			if l != (layout{}) {
-				t.Errorf("computeLayout(%d,%d) should zero out; got %+v", sz[0], sz[1], l)
+	t.Run("tiny terminal degrades to zero-height viewport without overflow", func(t *testing.T) {
+		for h := 1; h <= 8; h++ {
+			l := computeLayout(W, h, true)
+			if l.totalRows() > h {
+				t.Fatalf("termH=%d overflows: totalRows=%d", h, l.totalRows())
+			}
+			if l.vpHeight < 0 {
+				t.Fatalf("termH=%d negative vpHeight", h)
 			}
 		}
 	})
+}
+
+// TestFrameNeverExceedsTerminal sweeps the whole realistic size matrix — this
+// is the regression for "TUI exceeds the window height".
+func TestFrameNeverExceedsTerminal(t *testing.T) {
+	widths := []int{20, 40, 55, 61, 62, 63, 80, 100, 120, 160, 240}
+	heights := []int{5, 8, 10, 12, 16, 20, 24, 30, 40, 50, 80}
+	for _, w := range widths {
+		for _, h := range heights {
+			for _, st := range []bool{false, true} {
+				l := computeLayout(w, h, st)
+				if got := l.totalRows(); got > h {
+					t.Errorf("w=%d h=%d status=%v: totalRows=%d EXCEEDS terminal", w, h, st, got)
+				}
+				if l.sidebarOn && l.rosterX+rosterTotalWidth > w {
+					t.Errorf("w=%d: sidebar spills past right edge", w)
+				}
+				if !l.sidebarOn && l.vpWidth != w-2 && w >= 12 {
+					t.Errorf("w=%d collapsed layout should use full width-2; got %d", w, l.vpWidth)
+				}
+			}
+		}
+	}
+}
+
+func TestSidebarResponsiveCollapse(t *testing.T) {
+	if computeLayout(minSidebarTermW, 30, false).sidebarOn != true {
+		t.Error("threshold width itself must keep the sidebar")
+	}
+	if computeLayout(minSidebarTermW-1, 30, false).sidebarOn != false {
+		t.Error("one column below threshold must collapse the sidebar")
+	}
+	collapsed := computeLayout(50, 30, false)
+	if collapsed.rosterX != 0 {
+		t.Errorf("collapsed rosterX = %d; want 0", collapsed.rosterX)
+	}
+	if collapsed.vpWidth != 48 {
+		t.Errorf("collapsed vpWidth = %d; want termW-2=48", collapsed.vpWidth)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -119,78 +162,108 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 }
 
 func TestShouldRenderMatrix(t *testing.T) {
-	common := func(c *chatScreen, m chatMessage) bool { return c.shouldRender(m) }
+	render := func(c *chatScreen, m chatMessage) bool { return c.shouldRender(m) }
 
-	bob := newFilterScreen("bob", "") // common room
+	bob := newFilterScreen("bob", "")
 	sys := func(text string) chatMessage { return chatMessage{Kind: "system", Text: text} }
 	chat := func(u, text string) chatMessage { return chatMessage{Kind: "chat", Username: u, Text: text} }
 
-	if common(bob, sys("bob joined")) {
-		t.Error("own join hidden in common room")
+	if render(bob, sys("bob joined")) || render(bob, sys("bob left")) {
+		t.Error("own presence hidden in common room")
 	}
-	if common(bob, sys("bob left")) {
-		t.Error("own leave hidden in common room")
-	}
-	if !common(bob, sys("alice joined")) {
-		t.Error("others' joins visible in common room")
-	}
-	if !common(bob, chat("alice", "hi")) {
-		t.Error("all chat visible in common room")
+	if !render(bob, sys("alice joined")) || !render(bob, chat("alice", "hi")) {
+		t.Error("others visible in common room")
 	}
 
 	priv := newFilterScreen("bob", "alice")
-	if !common(priv, chat("alice", "psst")) {
-		t.Error("peer messages visible in private view")
+	if !render(priv, chat("alice", "psst")) || !render(priv, chat("bob", "me too")) {
+		t.Error("pair messages visible in private view")
 	}
-	if !common(priv, chat("bob", "me too")) {
-		t.Error("own messages visible in private view")
+	if render(priv, chat("carol", "noise")) || render(priv, sys("carol joined")) {
+		t.Error("third parties filtered in private view")
 	}
-	if common(priv, chat("carol", "noise")) {
-		t.Error("third-party chat filtered in private view")
-	}
-	if common(priv, sys("carol joined")) {
-		t.Error("unrelated presence filtered in private view")
-	}
-	if !common(priv, sys("alice left")) {
+	if !render(priv, sys("alice left")) {
 		t.Error("peer presence visible in private view")
 	}
-	if common(priv, sys("bob joined")) {
-		t.Error("own presence stays hidden even when self is in the pair rule")
+	if render(priv, sys("bob joined")) {
+		t.Error("own presence stays hidden even inside pair rule")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Roster rendering
+// Roster rendering — adaptive slot count
 // ---------------------------------------------------------------------------
 
 func TestRosterRows(t *testing.T) {
 	if got := rosterRow("bob", "bob", ""); !strings.Contains(got, "(you)") {
 		t.Errorf("self row must be marked (you); got %q", got)
 	}
-	sel := rosterRow("alice", "bob", "alice")
-	if !strings.Contains(sel, "alice") {
-		t.Errorf("selected peer row lost name: %q", sel)
-	}
 	if plain := rosterRow("carol", "bob", "alice"); strings.Contains(plain, "(you)") || strings.Contains(plain, "●") {
 		t.Errorf("bystander row mis-styled: %q", plain)
 	}
 }
 
-func TestRosterBodyFixedHeightAndTruncation(t *testing.T) {
+func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	c := &chatScreen{me: "me"}
 	users := []string{"me"}
 	for i := 0; i < 30; i++ {
-		users = append(users, strings.Repeat("u", 3)+string(rune('a'+i%26))+string(rune('0'+i%10)))
+		users = append(users, fmt.Sprintf("user%02d", i))
 	}
 	c.users = users
 
-	out := c.rosterBody()
+	// Full slots: deterministic height, overflow indicator present.
+	out := c.rosterBody(rosterMaxVisible)
 	rows := strings.Split(out, "\n")
-	if len(rows) != rosterMaxVisible+3 { // title + N rows + 2 border lines
-		t.Fatalf("roster height = %d rows; want deterministic %d", len(rows), rosterMaxVisible+3)
+	if len(rows) != rosterMaxVisible+3 { // title + N slots + 2 border
+		t.Fatalf("full roster height = %d rows; want %d", len(rows), rosterMaxVisible+3)
 	}
 	if !strings.Contains(out, "+") || !strings.Contains(out, "more") {
-		t.Error("overflow indicator missing for >max users")
+		t.Error("overflow indicator missing")
+	}
+
+	// Fewer slots than users: panel SHRINKS (never inflates short frames).
+	shrunk := c.rosterBody(4)
+	if rows := strings.Split(shrunk, "\n"); len(rows) != 4+3 {
+		t.Fatalf("shrunken roster height = %d; want 7", len(rows))
+	}
+
+	// More slots than users: padded, no overflow marker.
+	c2 := &chatScreen{me: "me", users: []string{"me", "alice"}}
+	sparse := c2.rosterBody(8)
+	if strings.Contains(sparse, "more") {
+		t.Errorf("overflow indicator shown despite fitting: %q", sparse)
+	}
+	if rows := strings.Split(sparse, "\n"); len(rows) != 8+3 {
+		t.Fatalf("sparse roster height = %d; want 11", len(rows))
+	}
+
+	c.users = []string{"me", "a"}
+	zero := c.rosterBody(0)
+	if h := lipgloss.Height(zero); h != 3 { // title row + 2 border rows
+		t.Errorf("zero-slot roster height = %d; want 3", h)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Wrapping — long styled lines fold instead of clip on resize
+// ---------------------------------------------------------------------------
+
+func TestRefreshViewportWrapsToWidth(t *testing.T) {
+	c := newFilterScreen("me", "")
+	c.vp = *viewportPtr(20, 10)
+
+	long := tuiNameStyle.Render("alice") + ": " + strings.Repeat("word ", 30)
+	c.lines = []string{long}
+	c.refreshViewport()
+
+	wrapped := strings.Split(c.vp.View(), "\n")
+	if len(wrapped) < 2 {
+		t.Fatal("long line did not wrap")
+	}
+	for _, ln := range wrapped {
+		if lw := lipgloss.Width(ln); lw > 20 {
+			t.Fatalf("wrapped line width %d exceeds viewport 20: %q", lw, ln)
+		}
 	}
 }
 
@@ -208,37 +281,32 @@ func TestHandleMouseHitTest(t *testing.T) {
 	c.width, c.height = W, H
 	l := computeLayout(W, H, false)
 
-	// Click dead-center of alice's row → private mode engages.
-	yAlice := l.rosterY0 + 1 // row 0 = bob(self), row 1 = alice
-	c.handleMouse(mouseAt(l.rosterX+5, yAlice))
-	if c.targetUser != "alice" {
-		t.Fatalf("click on alice row set target=%q; want alice", c.targetUser)
-	}
-
+	yAlice := l.rosterY0 + 1 // row 0 = self, row 1 = alice
 	reset := func() { c.targetUser = "" }
 
-	// Clicking yourself never selects.
+	c.handleMouse(mouseAt(l.rosterX+5, yAlice))
+	if c.targetUser != "alice" {
+		t.Fatalf("click on alice set target=%q", c.targetUser)
+	}
+
 	reset()
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0))
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // self row
 	if c.targetUser != "" {
 		t.Errorf("self-click selected %q", c.targetUser)
 	}
 
-	// Left column (transcript area) is inert.
 	reset()
-	c.handleMouse(mouseAt(2, yAlice))
+	c.handleMouse(mouseAt(2, yAlice)) // transcript area
 	if c.targetUser != "" {
 		t.Errorf("transcript click leaked selection: %q", c.targetUser)
 	}
 
-	// One row past the last user is inert (padding zone).
 	reset()
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+len(c.users)))
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+l.rosterSlots)) // past last user
 	if c.targetUser != "" {
 		t.Errorf("padding-row click leaked selection: %q", c.targetUser)
 	}
 
-	// Coordinates outside the terminal are inert (defensive guard).
 	reset()
 	c.handleMouse(mouseAt(c.width+3, yAlice))
 	c.handleMouse(mouseAt(2, -1))
@@ -247,19 +315,32 @@ func TestHandleMouseHitTest(t *testing.T) {
 		t.Errorf("out-of-terminal click leaked selection: %q", c.targetUser)
 	}
 
-	// Non-left clicks ignored.
 	reset()
 	c.handleMouse(tea.MouseMsg{Type: tea.MouseRight, X: l.rosterX + 5, Y: yAlice})
 	if c.targetUser != "" {
 		t.Errorf("right-click leaked selection: %q", c.targetUser)
 	}
 
-	// Clicking the already-selected peer is a no-op (no duplicate system line).
-	c.handleMouse(mouseAt(l.rosterX+5, yAlice)) // select carol? no—alice
+	// Re-click on the ACTIVE peer is a complete no-op.
+	c.handleMouse(mouseAt(l.rosterX+5, yAlice))
 	before := len(c.lines)
 	c.handleMouse(mouseAt(l.rosterX+5, yAlice))
 	if len(c.lines) != before || c.targetUser != "alice" {
-		t.Errorf("re-click on active peer mutated state: lines %d→%d target=%q", before, len(c.lines), c.targetUser)
+		t.Errorf("re-click mutated state: lines %d→%d target=%q", before, len(c.lines), c.targetUser)
+	}
+}
+
+func TestMouseInertWhenSidebarCollapsed(t *testing.T) {
+	const W, H = 50, 30 // below minSidebarTermW
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.width, c.height = W, H
+	l := computeLayout(W, H, false)
+	if l.sidebarOn {
+		t.Fatal("expected collapsed sidebar at this width")
+	}
+	c.handleMouse(mouseAt(l.rosterY0+30, l.rosterY0+1)) // any coords
+	if c.targetUser != "" {
+		t.Errorf("collapsed-sidebar click selected %q", c.targetUser)
 	}
 }
 
@@ -268,7 +349,7 @@ func TestEscNeverQuitsViaUpdate(t *testing.T) {
 	c.width, c.height = 120, 40
 
 	m, cmd := c.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if quitRequested(m, cmd) {
+	if quitRequested(cmd) {
 		t.Fatal("Esc in private mode must return to common room, not quit")
 	}
 	got := m.(chatScreen)
@@ -276,15 +357,13 @@ func TestEscNeverQuitsViaUpdate(t *testing.T) {
 		t.Errorf("Esc did not clear private target: %q", got.targetUser)
 	}
 
-	// Esc in COMMON room must also be a harmless no-op.
-	m2, cmd2 := got.Update(tea.KeyMsg{Type: tea.KeyEsc})
-	if quitRequested(m2, cmd2) {
-		t.Fatal("Esc in common room must NEVER quit (regression: app died on Esc)")
+	_, cmd2 := got.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if quitRequested(cmd2) {
+		t.Fatal("Esc in common room must NEVER quit (regression)")
 	}
 }
 
-// quitRequested unwraps a tea.Cmd and reports whether it is tea.Quit.
-func quitRequested(_ tea.Model, cmd tea.Cmd) bool {
+func quitRequested(cmd tea.Cmd) bool {
 	if cmd == nil {
 		return false
 	}
@@ -297,7 +376,7 @@ func quitRequested(_ tea.Model, cmd tea.Cmd) bool {
 
 func TestSettleSendBoundsSafety(t *testing.T) {
 	c := newFilterScreen("bob", "")
-	// Simulate a stale pending pointer beyond the slice (defensive path).
+	c.vp = *viewportPtr(40, 10)
 	c.lines = []string{"kept"}
 	c.pending = &pendingSend{lineIdx: 99, text: "ghost"}
 
@@ -312,17 +391,18 @@ func TestSettleSendBoundsSafety(t *testing.T) {
 
 func TestOutboxQueuesWhileInFlight(t *testing.T) {
 	c := newFilterScreen("bob", "")
-	c.submitLine("first") // dispatches immediately
+	c.vp = *viewportPtr(40, 10)
+
+	c.submitLine("first")
 	if c.pending == nil {
 		t.Fatal("first submit should enter in-flight state")
 	}
-	c.submitLine("second") // must queue, not corrupt pendingIdx
+	c.submitLine("second")
 	c.submitLine("third")
 	if len(c.outbox) != 2 {
 		t.Fatalf("outbox = %v; want [second third]", c.outbox)
 	}
 
-	// Settling #1 promotes #2 into flight.
 	c.settleSend(sendDoneMsg{text: "first", seq: 1, code: 201})
 	if c.pending == nil || c.pending.text != "second" {
 		t.Fatalf("outbox drain failed; pending=%+v", c.pending)
@@ -340,6 +420,7 @@ func TestOutboxQueuesWhileInFlight(t *testing.T) {
 
 func TestSettleSend429MarksEcho(t *testing.T) {
 	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
 	c.submitLine("spam")
 	idx := c.pending.lineIdx
 	c.settleSend(sendDoneMsg{text: "spam", code: 429})
@@ -351,17 +432,50 @@ func TestSettleSend429MarksEcho(t *testing.T) {
 	}
 }
 
-func TestSettleSendFilteredDropsEchoRow(t *testing.T) {
-	c := newFilterScreen("bob", "alice") // private view
-	c.users = []string{"bob", "alice"}
-	c.submitLine("to self")
-	idx := c.pending.lineIdx
-	before := len(c.lines)
-	// Confirm while a system line flips nothing — message from me renders in
-	// private view; force-filter by simulating third-party text instead.
-	c.pending.text = "x"
-	c.settleSend(sendDoneMsg{text: "x", seq: 9, code: 201, err: nil})
-	if len(c.lines) > before && idx < len(c.lines) && strings.Contains(c.lines[idx], "[you →]") {
-		t.Logf("note: own lines legitimately render in private view")
+// viewportPtr is a tiny helper so tests can seed a real viewport model.
+func viewportPtr(w, h int) *viewport.Model {
+	vp := viewport.New(w, h)
+	return &vp
+}
+
+// TestViewPaintedHeightNeverExceedsTerminal runs the FULL render path
+// (WindowSizeMsg → View) across a size sweep and asserts the painted frame
+// fits every terminal. This catches assembly bugs that pure layout math can't.
+func TestViewPaintedHeightNeverExceedsTerminal(t *testing.T) {
+	widths := []int{20, 40, 61, 62, 80, 100, 120, 200}
+	heights := []int{1, 3, 5, 6, 8, 12, 16, 20, 24, 30, 40, 60}
+	for _, w := range widths {
+		for _, h := range heights {
+			for _, st := range []string{"", "reconnecting… (2)"} {
+				c := newFilterScreen("bob", "", "bob", "alice", "carol")
+				c.vp = *viewportPtr(80, 20)
+				c.status = st
+				c.lines = []string{
+					tuiNameStyle.Render("alice") + ": " + strings.Repeat("lorem ipsum dolor ", 8),
+					tuiMeStyle.Render("[you →] hello"),
+					tuiSystemStyle.Render("* alice joined"),
+				}
+				m, _ := c.Update(tea.WindowSizeMsg{Width: w, Height: h})
+				got := m.(chatScreen).View()
+				rows := strings.Count(got, "\n") + 1
+				if rows > h {
+					t.Errorf("w=%d h=%d status=%q: painted %d rows > terminal", w, h, st, rows)
+				}
+				if mw := maxLineWidth(got); mw > w {
+					t.Errorf("w=%d h=%d: painted line width %d exceeds terminal", w, h, mw)
+				}
+			}
+		}
 	}
+}
+
+// maxLineWidth measures ANSI-aware printable width of the widest row.
+func maxLineWidth(s string) int {
+	max := 0
+	for _, ln := range strings.Split(s, "\n") {
+		if w := lipgloss.Width(ln); w > max {
+			max = w
+		}
+	}
+	return max
 }

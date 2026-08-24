@@ -35,7 +35,7 @@ sleep 1.5                  # let backlog fetch settle
 # Joiner: username + scripted conversation.
 ( printf 'bob\n'
   sleep 4; printf 'hi alice!\n'
-  sleep 2.5; printf '/users\n'
+  sleep 3.5; printf '/users\n'
   sleep 2; printf '/exit\n' ) | UPLINK_CHAT_PLAIN=1 "$BIN" join "$KEY" --server "$SERVER" > "$T/b.out" 2>&1 &
 JOINER=$!
 
