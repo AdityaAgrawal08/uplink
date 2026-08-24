@@ -167,7 +167,7 @@ func (c *chatClient) leave() {
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
 func runChat(serverURL, key, me string) {
 	if os.Getenv("UPLINK_CHAT_PLAIN") == "1" || !term.IsTerminal(int(os.Stdin.Fd())) {
-		runChatPlain(serverURL, key, me)
+		runChatPlain(serverURL, key, me, "")
 		return
 	}
 	runChatTUI(serverURL, key, me)
@@ -175,7 +175,7 @@ func runChat(serverURL, key, me string) {
 
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
-func runChatPlain(serverURL, key, me string) {
+func runChatPlain(serverURL, key, me string, selectedTarget string) {
 	client := newChatClient(serverURL, key, me)
 
 	printMsg := func(m chatMessage) {
@@ -185,8 +185,20 @@ func runChatPlain(serverURL, key, me string) {
 			if m.Text != "" && strings.Contains(m.Text, me) {
 				return
 			}
+			// In private mode, show system messages only if involving target
+			if selectedTarget != "" {
+				if !strings.Contains(m.Text, me) && !strings.Contains(m.Text, selectedTarget) {
+					return
+				}
+			}
 			fmt.Printf("[%s] * %s\n", ts, m.Text)
 			return
+		}
+		// In private mode, filter out messages not involving current user or target
+		if selectedTarget != "" {
+			if m.Username != me && m.Username != selectedTarget {
+				return
+			}
 		}
 		fmt.Printf("[%s] %s: %s\n", ts, m.Username, m.Text)
 	}

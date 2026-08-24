@@ -71,6 +71,7 @@ type chatScreen struct {
 	input        textinput.Model
 	status       string
 	showRoster   bool
+	selectedTarget string // username for private chat, "" = broadcast mode
 	beatFailures int
 	pollFailures int
 }
@@ -91,6 +92,7 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		pendingIdx: -1,
 		rendered:   map[int]bool{},
 		showRoster: false,
+		selectedTarget: "",
 	}
 }
 
@@ -104,11 +106,23 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		if m.Text != "" && strings.Contains(m.Text, c.me) {
 			return ""
 		}
+		// In private mode, show system messages only if involving target
+		if c.selectedTarget != "" {
+			if !strings.Contains(m.Text, c.me) && !strings.Contains(m.Text, c.selectedTarget) {
+				return ""
+			}
+		}
 		return ts + " " + tuiSystemStyle.Render("* "+m.Text)
 	}
 	name := tuiNameStyle.Render(m.Username)
 	if m.Username == c.me {
 		name = tuiMeStyle.Render(name + " (you)")
+	}
+	// In private mode, filter out messages not involving current user or target
+	if c.selectedTarget != "" {
+		if m.Username != c.me && m.Username != c.selectedTarget {
+			return ""
+		}
 	}
 	return ts + " " + name + ": " + m.Text
 }
@@ -350,6 +364,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					status = "off"
 				}
 				c.appendLine(tuiSystemStyle.Render("* Roster visibility: "+status))
+			case "/pm":
+				if c.selectedTarget == "" {
+					c.appendLine(tuiSystemStyle.Render("* Private chat mode: ON (target not set) — type /pm <username> to set target"))
+					c.selectedTarget = ""
+				} else {
+					c.selectedTarget = ""
+					c.appendLine(tuiSystemStyle.Render("* Private chat mode: OFF — broadcasting to all"))
+				}
 			case "/help":
 				c.appendLine(tuiSystemStyle.Render("* Commands: /users · /exit · anything else sends"))
 			default:
