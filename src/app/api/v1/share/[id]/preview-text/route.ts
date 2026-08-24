@@ -19,6 +19,7 @@ export async function POST(
       status: string;
       passwordHash?: string;
       objectKey: string;
+      isEncrypted?: boolean;
     } | null;
 
     if (!share) {
@@ -27,6 +28,11 @@ export async function POST(
 
     if (share.status !== "ACTIVE") {
       return apiError("Share is not active", 400);
+    }
+
+    // Encrypted shares hold ciphertext — text preview would only leak noise.
+    if ((share as { isEncrypted?: boolean }).isEncrypted) {
+      return apiError("Encrypted shares cannot be previewed as text", 400);
     }
 
     if (share.passwordHash) {
