@@ -70,6 +70,7 @@ type chatScreen struct {
 	vp           viewport.Model
 	input        textinput.Model
 	status       string
+	showRoster   bool
 	beatFailures int
 	pollFailures int
 }
@@ -89,6 +90,7 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		input:      ti,
 		pendingIdx: -1,
 		rendered:   map[int]bool{},
+		showRoster: false,
 	}
 }
 
@@ -136,6 +138,24 @@ func (c chatScreen) statusView() string {
 		return ""
 	}
 	return "\n" + tuiErrStyle.Render(c.status)
+}
+
+func (c chatScreen) rosterView() string {
+	if !c.showRoster {
+		return ""
+	}
+	// Build roster lines: current user marked with ↦
+	var roster []string
+	roster = append(roster, tuiHeaderStyle.Render(" Users "))
+	for _, u := range c.users {
+		if u == c.me {
+			roster = append(roster, tuiMeStyle.Render(" ↦ "+u+" (you)"))
+		} else {
+			roster = append(roster, fmt.Sprintf("   %s", u))
+		}
+	}
+	roster = append(roster, tuiHeaderStyle.Render("────────────────"))
+	return strings.Join(roster, "\n")
 }
 
 // ---- async commands --------------------------------------------------------
@@ -323,6 +343,13 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return c, tea.Batch(cmds...)
 			case "/users":
 				c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
+			case "/roster":
+				c.showRoster = !c.showRoster
+				status := "on"
+				if !c.showRoster {
+					status = "off"
+				}
+				c.appendLine(tuiSystemStyle.Render("* Roster visibility: "+status))
 			case "/help":
 				c.appendLine(tuiSystemStyle.Render("* Commands: /users · /exit · anything else sends"))
 			default:
@@ -356,9 +383,27 @@ func (c chatScreen) View() string {
 		return "connecting…"
 	}
 	input := tuiBorderStyle.Render(c.input.View())
-	body := c.headerView() + "\n" +
-		tuiBorderStyle.Render(c.vp.View()) + "\n" +
-		input + c.statusView()
+	// Roster column width (fixed when visible)
+	rosterWidth := 0
+	if c.showRoster {
+		rosterWidth = 20
+	}
+	// Viewport width: remaining space after roster and borders
+	vpWidth := c.width - 2 - rosterWidth
+	if vpWidth < 40 {
+		vpWidth = 40
+		rosterWidth = c.width - 2 - vpWidth
+	}
+	// Header takes full width, then messages, then input/footer
+	body := c.headerView() + "\n"
+	// Messages viewport (width adjusted for roster)
+	c.vp.Width = vpWidth
+	body += tuiBorderStyle.Render(c.vp.View()) + "\n"
+	body += input + c.statusView()
+	// Append roster column on the right if visible
+	if c.showRoster && rosterWidth > 0 {
+		body += "\n" + c.rosterView()
+	}
 	return body
 }
 
