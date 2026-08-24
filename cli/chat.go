@@ -63,7 +63,10 @@ func (c *chatClient) endpoint(path string) string {
 	return fmt.Sprintf("%s/api/v1/session/%s%s", c.serverURL, c.key, path)
 }
 
-// fetchBacklog seeds history (latest 50) and positions the cursor.
+// fetchBacklog seeds history (latest 50), positions the cursor and RETURNS
+// the messages. It deliberately does NOT fire onMessage — callers own the
+// rendering path (TUI routes through Update; plain mode prints the return
+// value once). Firing both caused every history line to render twice.
 func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 	code, body, err := getJSON(c.endpoint("/messages"), c.authHeaders())
 	if err != nil {
@@ -79,9 +82,6 @@ func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 	for _, m := range poll.Messages {
 		if int64(m.Seq) > c.lastSeq {
 			c.lastSeq = int64(m.Seq)
-		}
-		if c.onMessage != nil {
-			c.onMessage(m)
 		}
 	}
 	return poll.Messages, nil
@@ -167,7 +167,7 @@ func (c *chatClient) leave() {
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
 func runChat(serverURL, key, me string) {
 	if os.Getenv("UPLINK_CHAT_PLAIN") == "1" || !term.IsTerminal(int(os.Stdin.Fd())) {
-		runChatPlain(serverURL, key, me, "")
+		runChatPlain(serverURL, key, me)
 		return
 	}
 	runChatTUI(serverURL, key, me)
@@ -175,30 +175,21 @@ func runChat(serverURL, key, me string) {
 
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
-func runChatPlain(serverURL, key, me string, selectedTarget string) {
+// Private 1:1 chat is an interactive (TUI-only) feature; plain mode always
+// shows the common room with own entry/exit presence suppressed.
+func runChatPlain(serverURL, key, me string) {
 	client := newChatClient(serverURL, key, me)
 
 	printMsg := func(m chatMessage) {
 		ts := time.Now().Format("15:04")
 		if m.Kind == "system" {
-			// Hide own entry/exit messages from the viewing user
-			if m.Text != "" && strings.Contains(m.Text, me) {
+			// Never announce my own join/leave to me (exact match — see
+			// isOwnPresence for why Contains would over-match bob/bobby).
+			if isOwnPresence(m.Text, me) {
 				return
-			}
-			// In private mode, show system messages only if involving target
-			if selectedTarget != "" {
-				if !strings.Contains(m.Text, me) && !strings.Contains(m.Text, selectedTarget) {
-					return
-				}
 			}
 			fmt.Printf("[%s] * %s\n", ts, m.Text)
 			return
-		}
-		// In private mode, filter out messages not involving current user or target
-		if selectedTarget != "" {
-			if m.Username != me && m.Username != selectedTarget {
-				return
-			}
 		}
 		fmt.Printf("[%s] %s: %s\n", ts, m.Username, m.Text)
 	}
