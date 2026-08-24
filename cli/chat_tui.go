@@ -98,6 +98,10 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		ts = tuiTimeStyle.Render("[" + t.Local().Format("15:04") + "]")
 	}
 	if m.Kind == "system" {
+		// Hide own entry/exit messages from the viewing user
+		if m.Text != "" && strings.Contains(m.Text, c.me) {
+			return ""
+		}
 		return ts + " " + tuiSystemStyle.Render("* "+m.Text)
 	}
 	name := tuiNameStyle.Render(m.Username)

@@ -181,6 +181,10 @@ func runChatPlain(serverURL, key, me string) {
 	printMsg := func(m chatMessage) {
 		ts := time.Now().Format("15:04")
 		if m.Kind == "system" {
+			// Hide own entry/exit messages from the viewing user
+			if m.Text != "" && strings.Contains(m.Text, me) {
+				return
+			}
 			fmt.Printf("[%s] * %s\n", ts, m.Text)
 			return
 		}
