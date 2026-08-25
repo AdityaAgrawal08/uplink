@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -17,12 +18,14 @@ type chatMessage struct {
 	Username  string `json:"username"`
 	Kind      string `json:"kind"`
 	Text      string `json:"text"`
+	To        string `json:"to,omitempty"` // recipient of a 1:1 message
 	CreatedAt string `json:"createdAt"`
 }
 
 type chatPollResponse struct {
-	Messages []chatMessage `json:"messages"`
-	Ended    bool          `json:"ended"`
+	Messages    []chatMessage `json:"messages"`
+	ActiveUsers []string      `json:"activeUsers"`
+	Ended       bool          `json:"ended"`
 }
 
 type heartbeatResponse struct {
@@ -38,6 +41,7 @@ type chatClient struct {
 	lastSeq        int64
 	users          []string
 	beatFailures   int
+	exiting        int32 // atomic: set when leave() starts; polls must stand down
 	http           *http.Client
 	onMessage      func(chatMessage)
 	onSystem       func(string)
@@ -57,6 +61,18 @@ func newChatClient(serverURL, key, me string) *chatClient {
 
 func (c *chatClient) authHeaders() map[string]string {
 	return map[string]string{"X-Uplink-Username": c.me}
+}
+
+// applyRoster adopts an authoritative participant snapshot (never grows stale
+// by skipping empty lists) and notifies the hook when it changed.
+func (c *chatClient) applyRoster(users []string) {
+	if len(users) == 0 && len(c.users) == 0 {
+		return
+	}
+	c.users = users
+	if c.onUsers != nil {
+		c.onUsers(users)
+	}
 }
 
 func (c *chatClient) endpoint(path string) string {
@@ -84,12 +100,16 @@ func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 			c.lastSeq = int64(m.Seq)
 		}
 	}
+	c.applyRoster(poll.ActiveUsers)
 	return poll.Messages, nil
 }
 
 // pollOnce fetches messages newer than the cursor and RETURNS them (the TUI
 // routes them through Update; plain mode prints via its onMessage hook).
 func (c *chatClient) pollOnce() (newMsgs []chatMessage, ended bool, err error) {
+	if c.isExiting() {
+		return nil, false, nil
+	}
 	code, body, err := getJSON(c.endpoint(fmt.Sprintf("/messages?after=%d&wait=2500", c.lastSeq)), c.authHeaders())
 	if err != nil {
 		return nil, false, err
@@ -114,11 +134,17 @@ func (c *chatClient) pollOnce() (newMsgs []chatMessage, ended bool, err error) {
 			c.onMessage(m)
 		}
 	}
+	c.applyRoster(poll.ActiveUsers)
 	return newMsgs, poll.Ended, nil
 }
 
-func (c *chatClient) sendMessage(text string) (code int, msg chatMessage, err error) {
-	code, body, err := postJSON(c.endpoint("/messages"), map[string]any{"text": text}, c.authHeaders())
+// sendMessage posts one chat line; to names an optional 1:1 recipient.
+func (c *chatClient) sendMessage(text, to string) (code int, msg chatMessage, err error) {
+	payload := map[string]any{"text": text}
+	if to != "" {
+		payload["to"] = to
+	}
+	code, body, err := postJSON(c.endpoint("/messages"), payload, c.authHeaders())
 	if err != nil {
 		return code, msg, err
 	}
@@ -128,7 +154,7 @@ func (c *chatClient) sendMessage(text string) (code int, msg chatMessage, err er
 	}
 	_ = json.Unmarshal(body, &r)
 	if r.Seq > 0 {
-		msg = chatMessage{Seq: r.Seq, Username: c.me, Kind: "chat", Text: text}
+		msg = chatMessage{Seq: r.Seq, Username: c.me, Kind: "chat", Text: text, To: to}
 		if int64(r.Seq) > c.lastSeq {
 			c.lastSeq = int64(r.Seq) // own message already counted toward cursor
 		}
@@ -150,18 +176,17 @@ func (c *chatClient) beatOnce() (hb heartbeatResponse, err error) {
 	if err := json.Unmarshal(body, &hb); err != nil {
 		return hb, err
 	}
-	if len(hb.ActiveUsers) > 0 {
-		c.users = hb.ActiveUsers
-		if c.onUsers != nil {
-			c.onUsers(c.users)
-		}
-	}
+	c.applyRoster(hb.ActiveUsers)
 	return hb, nil
 }
 
 func (c *chatClient) leave() {
+	atomic.StoreInt32(&c.exiting, 1)
 	_, _, _ = postJSON(c.endpoint("/leave"), map[string]any{}, c.authHeaders())
 }
+
+// isExiting reports whether leave() has been initiated locally.
+func (c *chatClient) isExiting() bool { return atomic.LoadInt32(&c.exiting) == 1 }
 
 // runChat picks the rendering mode: full-screen TUI by default, plain lines
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
@@ -272,7 +297,7 @@ func runChatPlain(serverURL, key, me string) {
 		case "/help":
 			fmt.Println("* Commands: /users · /exit · anything else sends a message")
 		default:
-			code, msg, err := client.sendMessage(line)
+			code, msg, err := client.sendMessage(line, "")
 			if code == 429 {
 				fmt.Println("* Slow down — too many messages.")
 			} else if code == 410 {

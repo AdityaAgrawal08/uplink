@@ -386,7 +386,7 @@ func quitRequested(cmd tea.Cmd) bool {
 func TestSettleSendBoundsSafety(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.lines = []string{"kept"}
+	c.appendLine("kept")
 	c.pending = &pendingSend{lineIdx: 99, text: "ghost"}
 
 	c.settleSend(sendDoneMsg{text: "ghost", seq: 7, code: 201})

@@ -220,6 +220,7 @@ type backlogMsg struct {
 }
 type pollDoneMsg struct {
 	newMsgs []chatMessage
+	users   []string // authoritative roster snapshot at poll time
 	ended   bool
 	err     error
 }
@@ -243,10 +244,12 @@ type chatScreen struct {
 	me           string
 	width        int
 	height       int
-	lines        []string
-	rendered     map[int]bool // server seqs already on screen (dedupes optimistic echo)
-	pending      *pendingSend // single in-flight send (nil = idle)
-	outbox       []string     // queued lines waiting for the in-flight send to settle
+	history      []chatMessage // every confirmed server message (deduped by seq)
+	localLines   []string      // echoes & system notes not backed by server docs
+	lines        []string      // DERIVED paint buffer: rebuildView() owns it
+	rendered     map[int]bool  // server seqs already rendered
+	pending      *pendingSend  // single in-flight send (nil = idle)
+	outbox       []string      // queued lines waiting for the in-flight send to settle
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -328,26 +331,44 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if c.targetUser != "" && m.Username == c.targetUser {
 		name = tuiRosterSelectedStyle.Render(m.Username)
 	}
-	return ts + " " + name + ": " + m.Text
+	line := ts + " " + name + ": " + m.Text
+	if m.To != "" {
+		line += tuiTimeStyle.Render("  ·1:1") // visual marker for DM lines
+	}
+	return line
 }
 
-// addMessage renders a confirmed server message exactly once — and only when
-// the current view wants it (own presence suppressed, private-mode filter).
+// addMessage records a confirmed server message and refreshes the view.
 func (c *chatScreen) addMessage(m chatMessage) {
 	if c.rendered[m.Seq] {
 		return
 	}
 	c.rendered[m.Seq] = true
-	if !c.shouldRender(m) {
-		return // filtered: no blank line, nothing appended
-	}
-	c.appendLine(c.renderLine(m))
+	c.history = append(c.history, m)
+	c.rebuildView()
 }
 
 func (c *chatScreen) appendLine(s string) {
-	c.lines = append(c.lines, s)
-	c.vp.SetContent(strings.Join(c.lines, "\n"))
-	c.vp.GotoBottom()
+	c.localLines = append(c.localLines, s)
+	c.rebuildView()
+}
+
+// rebuildView derives the painted transcript from raw history + local lines,
+// applying the CURRENT visibility filter. Entering/leaving private mode just
+// calls this — historical lines re-filter retroactively.
+func (c *chatScreen) rebuildView() {
+	c.lines = c.lines[:0]
+	for _, m := range c.history {
+		if !c.shouldRender(m) {
+			continue
+		}
+		c.lines = append(c.lines, c.renderLine(m))
+	}
+	c.lines = append(c.lines, c.localLines...)
+	if c.pending != nil {
+		c.pending.lineIdx = len(c.lines) - 1 // echo is always the last local line
+	}
+	c.refreshViewport()
 }
 
 // refreshViewport re-serializes the transcript, hard-wrapping every line to
@@ -443,7 +464,7 @@ func (c chatScreen) doPoll() tea.Cmd {
 	client := c.client
 	return func() tea.Msg {
 		newMsgs, ended, err := client.pollOnce()
-		return pollDoneMsg{newMsgs: newMsgs, ended: ended, err: err}
+		return pollDoneMsg{newMsgs: newMsgs, users: client.users, ended: ended, err: err}
 	}
 }
 
@@ -455,10 +476,10 @@ func (c chatScreen) doBeat() tea.Cmd {
 	}
 }
 
-func (c chatScreen) doSend(text string) tea.Cmd {
+func (c chatScreen) doSend(text, to string) tea.Cmd {
 	client := c.client
 	return func() tea.Msg {
-		code, msg, err := client.sendMessage(text)
+		code, msg, err := client.sendMessage(text, to)
 		return sendDoneMsg{text: text, seq: msg.Seq, code: code, err: err}
 	}
 }
@@ -492,6 +513,7 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 // enterPrivate switches to a 1:1 view; returns a system line to append.
 func (c *chatScreen) enterPrivate(user string) {
 	c.targetUser = user
+	c.rebuildView() // retro-filter history BEFORE the note lands
 	c.appendLine(tuiSystemStyle.Render("* Private chat with " + user + " — Esc for common room"))
 }
 
@@ -501,6 +523,7 @@ func (c *chatScreen) exitPrivate() {
 		return
 	}
 	c.targetUser = ""
+	c.rebuildView()
 	c.appendLine(tuiSystemStyle.Render("* Back in the common room"))
 }
 
@@ -527,13 +550,17 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 }
 
 // dispatchSend paints the optimistic echo, latches the in-flight slot and
-// returns the wire command. Pure bookkeeping + cmd factory.
+// returns the wire command. Private view targets the message at the selected
+// peer; common room sends broadcast.
 func (c *chatScreen) dispatchSend(text string) tea.Cmd {
-	c.lines = append(c.lines, tuiMeStyle.Render("[you →] "+text))
-	idx := len(c.lines) - 1
-	c.pending = &pendingSend{lineIdx: idx, text: text}
-	c.refreshViewport()
-	return c.doSend(text)
+	echo := tuiMeStyle.Render("[you →] " + text)
+	if c.targetUser != "" {
+		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
+	}
+	c.localLines = append(c.localLines, echo)
+	c.pending = &pendingSend{text: text}
+	c.rebuildView() // fixes pending.lineIdx to the echo position
+	return c.doSend(text, c.targetUser)
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -579,6 +606,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.pollFailures > 0 {
 			c.pollFailures = 0
 			c.status = ""
+		}
+		if msg.users != nil {
+			c.users = msg.users // join/leave freshness without waiting for heartbeat
 		}
 		for _, m := range msg.newMsgs {
 			c.handleNewMessage(m)
@@ -681,22 +711,22 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		}
 	}
 
-	if c.pending != nil && c.pending.lineIdx >= 0 && c.pending.lineIdx < len(c.lines) {
-		if replacement == "" {
-			_ = copy(c.lines[c.pending.lineIdx:], c.lines[c.pending.lineIdx+1:])
-			c.lines = c.lines[:len(c.lines)-1]
-		} else {
-			c.lines[c.pending.lineIdx] = replacement
-		}
-	} else if replacement != "" {
+	pendingIsLastLocal := len(c.localLines) > 0 && c.pending != nil &&
+		c.pending.lineIdx == len(c.history)+len(c.localLines)-1
+	switch {
+	case pendingIsLastLocal && replacement == "":
+		c.localLines = c.localLines[:len(c.localLines)-1] // filtered drop
+	case pendingIsLastLocal:
+		c.localLines[len(c.localLines)-1] = replacement
+	case replacement != "":
 		c.appendLine(replacement)
 	}
 	if msg.code == 410 {
-		c.refreshViewport()
+		c.rebuildView()
 		return nil // room ended; nothing further to promote
 	}
 	c.pending = nil
-	c.refreshViewport()
+	c.rebuildView()
 
 	// Drain exactly one queued line per settled send.
 	if n := len(c.outbox); n > 0 {
