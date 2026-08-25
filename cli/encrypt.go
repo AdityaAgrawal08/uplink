@@ -62,13 +62,13 @@ func EncryptFileStream(srcPath, dstPath string) (string, error) {
 			binary.BigEndian.PutUint64(nonce[4:], binary.BigEndian.Uint64(nonce[4:])^chunkIndex)
 
 			ciphertext := aesgcm.Seal(nil, nonce, buf[:n], nil)
-			
+
 			lengthBuf := make([]byte, 2)
 			binary.BigEndian.PutUint16(lengthBuf, uint16(len(ciphertext)))
 			if _, err := dst.Write(lengthBuf); err != nil {
 				return "", err
 			}
-			
+
 			if _, err := dst.Write(ciphertext); err != nil {
 				return "", err
 			}

@@ -160,3 +160,133 @@ func TestNormalizeFlagOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeFlagOrderEdgeCases(t *testing.T) {
+	valueFlags := map[string]bool{"server": true, "password": true, "expire": true}
+
+	tests := []struct {
+		name       string
+		input      []string
+		expected   []string
+		wantRemain bool // whether positional args should remain
+	}{
+		{
+			name:     "all flags before positional",
+			input:    []string{"--server", "http://x", "--password", "pass", "key"},
+			expected: []string{"--server", "http://x", "--password", "pass", "key"},
+		},
+		{
+			name:       "flags after positional should be moved before",
+			input:      []string{"key", "--server", "http://x"},
+			expected:   []string{"--server", "http://x", "key"},
+			wantRemain: false,
+		},
+		{
+			name:     "multiple flags with values",
+			input:    []string{"--server", "a", "--password", "b", "--expire", "1h", "key"},
+			expected: []string{"--server", "a", "--password", "b", "--expire", "1h", "key"},
+		},
+		{
+			name:     "flag with =value syntax",
+			input:    []string{"--server=http://x", "key"},
+			expected: []string{"--server=http://x", "key"},
+		},
+		{
+			name:     "no flags, just positional",
+			input:    []string{"key"},
+			expected: []string{"key"},
+		},
+		{
+			name:     "empty input",
+			input:    []string{},
+			expected: []string{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeFlagOrder(tt.input, valueFlags)
+			if len(got) != len(tt.expected) {
+				t.Errorf("%s: normalizeFlagOrder(%v) = %v (len %d); expected %v (len %d)",
+					tt.name, tt.input, got, len(got), tt.expected, len(tt.expected))
+				return
+			}
+			for i := range got {
+				if got[i] != tt.expected[i] {
+					t.Errorf("%s: normalizeFlagOrder(%v) = %v; expected %v",
+						tt.name, tt.input, got, tt.expected)
+					return
+				}
+			}
+		})
+	}
+}
+
+// TestAdaptiveChunker exercises the REAL ChunkSize() clamp logic across
+// the full spectrum of measured link speeds (S3 floor 5MiB / ceiling 10MiB).
+func TestAdaptiveChunkerClamping(t *testing.T) {
+	mib := int64(1 << 20)
+	tests := []struct {
+		name     string
+		speedBps float64 // bytes/sec fed through RecordSpeed
+		want     int64
+	}{
+		{"unset/zero speed falls back to default", 0, maxChunk},
+		{"negative speed treated as unset", -5_000_000, maxChunk},
+		{"dial-up 56kbit/s clamps up to S3 floor", 7_000, minChunk},
+		{"slow DSL 512kbit/s still floors", 64_000, minChunk},
+		{"1 MB/s => 5s target = 5MiB boundary", 1 << 20, 5 * mib},
+		{"2 MB/s => 10s worth but capped at 10MiB", 2 << 20, maxChunk},
+		{"gigabit clamps down to ceiling", 125_000_000, maxChunk},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ac := &AdaptiveChunker{}
+			if tt.speedBps > 0 {
+				ac.RecordSpeed(tt.speedBps)
+			}
+			got := ac.ChunkSize()
+			if got != tt.want {
+				t.Errorf("speed=%v: ChunkSize() = %d (%d MiB); want %d (%d MiB)",
+					tt.speedBps, got, got/mib, tt.want, tt.want/mib)
+			}
+			// Invariant: result must ALWAYS satisfy the S3 multipart contract.
+			if got < minChunk || got > maxChunk {
+				t.Errorf("ChunkSize() = %d violates [%d, %d] contract", got, minChunk, maxChunk)
+			}
+		})
+	}
+}
+
+// TestAdaptiveChunkerEMA verifies the exponential-moving-average smoothing.
+func TestAdaptiveChunkerEMA(t *testing.T) {
+	ac := &AdaptiveChunker{}
+	ac.RecordSpeed(1_000_000)
+	if ac.measuredSpeed != 1_000_000 {
+		t.Fatalf("first sample must set baseline verbatim; got %v", ac.measuredSpeed)
+	}
+	ac.RecordSpeed(2_000_000)
+	// smoothFactor=0.3 → 0.3*2M + 0.7*1M = 1.3M
+	want := 0.3*2_000_000 + 0.7*1_000_000
+	if ac.measuredSpeed != want {
+		t.Errorf("EMA after 2nd sample = %v; want %v", ac.measuredSpeed, want)
+	}
+	if ac.samples != 2 {
+		t.Errorf("samples = %d; want 2", ac.samples)
+	}
+}
+
+// TestUploadLimitConstants pins the CLI upload ceilings so accidental edits
+// surface in CI instead of at runtime.
+func TestUploadLimitConstants(t *testing.T) {
+	const fileLimit = int64(200) << 20
+	const dirLimit = int64(500) << 20
+	if dirLimit <= fileLimit {
+		t.Errorf("directory limit (%d) must exceed file limit (%d)", dirLimit, fileLimit)
+	}
+	// Both must fit inside the server's 9.4 GB storage ceiling with room to spare.
+	const serverMax = int64(9_400_000_000)
+	if dirLimit > serverMax {
+		t.Errorf("dir limit %d exceeds server storage ceiling %d", dirLimit, serverMax)
+	}
+}

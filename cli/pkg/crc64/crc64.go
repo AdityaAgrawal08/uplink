@@ -36,7 +36,7 @@ func New() hash.Hash64 {
 	return &digest{crc: 0, tab: TableNVME}
 }
 
-func (d *digest) Size() int { return 8 }
+func (d *digest) Size() int      { return 8 }
 func (d *digest) BlockSize() int { return 1 }
 
 func (d *digest) Reset() { d.crc = 0 }

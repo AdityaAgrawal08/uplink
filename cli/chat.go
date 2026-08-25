@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -17,12 +19,25 @@ type chatMessage struct {
 	Username  string `json:"username"`
 	Kind      string `json:"kind"`
 	Text      string `json:"text"`
+	To        string `json:"to,omitempty"` // recipient of a 1:1 message
+	ConvID    string `json:"convId"`       // "general" or canonical "a|b"
 	CreatedAt string `json:"createdAt"`
 }
 
+// conversationKey builds the canonical bucket id for a 1:1 thread.
+// MUST match src/lib/sessionChat.ts conversationKey exactly.
+func conversationKey(a, b string) string {
+	pair := []string{a, b}
+	sort.Strings(pair)
+	return strings.Join(pair, "|")
+}
+
+const generalConv = "general"
+
 type chatPollResponse struct {
-	Messages []chatMessage `json:"messages"`
-	Ended    bool          `json:"ended"`
+	Messages    []chatMessage `json:"messages"`
+	ActiveUsers []string      `json:"activeUsers"`
+	Ended       bool          `json:"ended"`
 }
 
 type heartbeatResponse struct {
@@ -38,6 +53,7 @@ type chatClient struct {
 	lastSeq        int64
 	users          []string
 	beatFailures   int
+	exiting        int32 // atomic: set when leave() starts; polls must stand down
 	http           *http.Client
 	onMessage      func(chatMessage)
 	onSystem       func(string)
@@ -59,11 +75,26 @@ func (c *chatClient) authHeaders() map[string]string {
 	return map[string]string{"X-Uplink-Username": c.me}
 }
 
+// applyRoster adopts an authoritative participant snapshot (never grows stale
+// by skipping empty lists) and notifies the hook when it changed.
+func (c *chatClient) applyRoster(users []string) {
+	if len(users) == 0 && len(c.users) == 0 {
+		return
+	}
+	c.users = users
+	if c.onUsers != nil {
+		c.onUsers(users)
+	}
+}
+
 func (c *chatClient) endpoint(path string) string {
 	return fmt.Sprintf("%s/api/v1/session/%s%s", c.serverURL, c.key, path)
 }
 
-// fetchBacklog seeds history (latest 50) and positions the cursor.
+// fetchBacklog seeds history (latest 50), positions the cursor and RETURNS
+// the messages. It deliberately does NOT fire onMessage — callers own the
+// rendering path (TUI routes through Update; plain mode prints the return
+// value once). Firing both caused every history line to render twice.
 func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 	code, body, err := getJSON(c.endpoint("/messages"), c.authHeaders())
 	if err != nil {
@@ -80,16 +111,54 @@ func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 		if int64(m.Seq) > c.lastSeq {
 			c.lastSeq = int64(m.Seq)
 		}
-		if c.onMessage != nil {
-			c.onMessage(m)
-		}
+	}
+	c.applyRoster(poll.ActiveUsers)
+	return poll.Messages, nil
+}
+
+// fetchConvBacklog pulls the latest page of ONE conversation ("general" or a
+// 1:1 pair key). Lets the UI open a thread whose history predates the initial
+// mixed backlog window. Does NOT move lastSeq backwards; seq dedupe happens
+// in the caller.
+func (c *chatClient) fetchConvBacklog(conv string) ([]chatMessage, error) {
+	code, body, err := getJSON(c.endpoint("/messages?conv="+urlQueryEscape(conv)), c.authHeaders())
+	if err != nil {
+		return nil, err
+	}
+	if code == 403 || code == 410 {
+		return nil, fmt.Errorf("conversation unavailable (%d)", code)
+	}
+	var poll chatPollResponse
+	if err := json.Unmarshal(body, &poll); err != nil {
+		return nil, err
 	}
 	return poll.Messages, nil
+}
+
+// urlQueryEscape escapes a query-parameter value without importing net/url
+// wholesale at this call depth.
+func urlQueryEscape(v string) string {
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '~':
+			b.WriteRune(r)
+		case r == '|':
+			b.WriteString("%7C")
+		default:
+			fmt.Fprintf(&b, "%%%02X", r)
+		}
+	}
+	return b.String()
 }
 
 // pollOnce fetches messages newer than the cursor and RETURNS them (the TUI
 // routes them through Update; plain mode prints via its onMessage hook).
 func (c *chatClient) pollOnce() (newMsgs []chatMessage, ended bool, err error) {
+	if c.isExiting() {
+		return nil, false, nil
+	}
 	code, body, err := getJSON(c.endpoint(fmt.Sprintf("/messages?after=%d&wait=2500", c.lastSeq)), c.authHeaders())
 	if err != nil {
 		return nil, false, err
@@ -114,11 +183,17 @@ func (c *chatClient) pollOnce() (newMsgs []chatMessage, ended bool, err error) {
 			c.onMessage(m)
 		}
 	}
+	c.applyRoster(poll.ActiveUsers)
 	return newMsgs, poll.Ended, nil
 }
 
-func (c *chatClient) sendMessage(text string) (code int, msg chatMessage, err error) {
-	code, body, err := postJSON(c.endpoint("/messages"), map[string]any{"text": text}, c.authHeaders())
+// sendMessage posts one chat line; to names an optional 1:1 recipient.
+func (c *chatClient) sendMessage(text, to string) (code int, msg chatMessage, err error) {
+	payload := map[string]any{"text": text}
+	if to != "" {
+		payload["to"] = to
+	}
+	code, body, err := postJSON(c.endpoint("/messages"), payload, c.authHeaders())
 	if err != nil {
 		return code, msg, err
 	}
@@ -128,7 +203,7 @@ func (c *chatClient) sendMessage(text string) (code int, msg chatMessage, err er
 	}
 	_ = json.Unmarshal(body, &r)
 	if r.Seq > 0 {
-		msg = chatMessage{Seq: r.Seq, Username: c.me, Kind: "chat", Text: text}
+		msg = chatMessage{Seq: r.Seq, Username: c.me, Kind: "chat", Text: text, To: to}
 		if int64(r.Seq) > c.lastSeq {
 			c.lastSeq = int64(r.Seq) // own message already counted toward cursor
 		}
@@ -150,18 +225,17 @@ func (c *chatClient) beatOnce() (hb heartbeatResponse, err error) {
 	if err := json.Unmarshal(body, &hb); err != nil {
 		return hb, err
 	}
-	if len(hb.ActiveUsers) > 0 {
-		c.users = hb.ActiveUsers
-		if c.onUsers != nil {
-			c.onUsers(c.users)
-		}
-	}
+	c.applyRoster(hb.ActiveUsers)
 	return hb, nil
 }
 
 func (c *chatClient) leave() {
+	atomic.StoreInt32(&c.exiting, 1)
 	_, _, _ = postJSON(c.endpoint("/leave"), map[string]any{}, c.authHeaders())
 }
+
+// isExiting reports whether leave() has been initiated locally.
+func (c *chatClient) isExiting() bool { return atomic.LoadInt32(&c.exiting) == 1 }
 
 // runChat picks the rendering mode: full-screen TUI by default, plain lines
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
@@ -175,12 +249,19 @@ func runChat(serverURL, key, me string) {
 
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
+// Private 1:1 chat is an interactive (TUI-only) feature; plain mode always
+// shows the common room with own entry/exit presence suppressed.
 func runChatPlain(serverURL, key, me string) {
 	client := newChatClient(serverURL, key, me)
 
 	printMsg := func(m chatMessage) {
 		ts := time.Now().Format("15:04")
 		if m.Kind == "system" {
+			// Never announce my own join/leave to me (exact match — see
+			// isOwnPresence for why Contains would over-match bob/bobby).
+			if isOwnPresence(m.Text, me) {
+				return
+			}
 			fmt.Printf("[%s] * %s\n", ts, m.Text)
 			return
 		}
@@ -265,7 +346,7 @@ func runChatPlain(serverURL, key, me string) {
 		case "/help":
 			fmt.Println("* Commands: /users · /exit · anything else sends a message")
 		default:
-			code, msg, err := client.sendMessage(line)
+			code, msg, err := client.sendMessage(line, "")
 			if code == 429 {
 				fmt.Println("* Slow down — too many messages.")
 			} else if code == 410 {

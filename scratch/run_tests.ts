@@ -6,7 +6,8 @@ import { crc64nvme, crc64nvmeBase64 } from "../src/lib/crc64";
 test("Sanitize Filename traversal and chars", () => {
   assert.strictEqual(sanitizeFilename("../../etc/passwd"), "passwd");
   assert.strictEqual(sanitizeFilename("hello world! @123.txt"), "hello_world___123.txt");
-  assert.strictEqual(sanitizeFilename(""), "unnamed_file");
+  // Unified fallback token — must match the Go CLI (cli/main.go) exactly.
+  assert.strictEqual(sanitizeFilename(""), "file");
   assert.strictEqual(sanitizeFilename("."), "file");
   assert.strictEqual(sanitizeFilename(".."), "file");
 });

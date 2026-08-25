@@ -1357,7 +1357,7 @@ func (pp *ProgressPrinter) Print(read int64) {
 	if pp.resumeOffset > 0 && !pp.resumeTime.IsZero() {
 		elapsedResume := time.Since(pp.resumeTime).Seconds()
 		if elapsedResume > 0 {
-			speed = float64(read - pp.resumeOffset) / elapsedResume
+			speed = float64(read-pp.resumeOffset) / elapsedResume
 		}
 	} else if elapsed > 0 {
 		speed = float64(read) / elapsed

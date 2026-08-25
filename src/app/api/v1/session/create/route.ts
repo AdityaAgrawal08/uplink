@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { getDb, initIndexes } from "@/lib/mongodb";
 import { hashPassword } from "@/lib/crypto";
-import { apiError } from "@/lib/api-utils";
+import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { BloomFilter } from "@/lib/bloom";
 
 // 6-digit numeric key (e.g. "042917") — the shareable chat room code.
@@ -12,9 +12,9 @@ function generateSessionId(): string {
 
 export async function POST(req: NextRequest) {
   try {
-    const text = await req.text();
-    const body = text ? JSON.parse(text) : {};
-    const { username, password, duration } = body;
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
+    const { username, password, duration } = parsed.body;
 
     // 1. Username validation
     if (!username || typeof username !== "string") {

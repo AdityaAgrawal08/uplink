@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { verifyPassword } from "@/lib/crypto";
-import { apiError } from "@/lib/api-utils";
+import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { BloomFilter } from "@/lib/bloom";
 import { appendMessage } from "@/lib/sessionChat";
 
@@ -11,9 +11,9 @@ export async function POST(
 ) {
   try {
     const { sessionId } = await props.params;
-    const text = await req.text();
-    const body = text ? JSON.parse(text) : {};
-    const { username, password } = body;
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
+    const { username, password } = parsed.body as { username?: unknown; password?: unknown };
 
     // 1. Validations
     if (!username || typeof username !== "string") {

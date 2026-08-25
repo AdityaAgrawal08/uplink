@@ -1,5 +1,27 @@
 import type { Db } from "mongodb";
 
+// Conversation model: every transcript line belongs to exactly one
+// conversation. "general" is the room-wide channel; 1:1 threads use a
+// canonical pair key "a|b" (usernames are [a-zA-Z0-9_]{3,20}, so "|" is an
+// unambiguous separator and sorting makes the key order-independent).
+export const GENERAL_CONV = "general";
+
+export function conversationKey(a: string, b: string): string {
+  return [a, b].sort().join("|");
+}
+
+export function isPairConv(conv: unknown): conv is string {
+  return typeof conv === "string" && /^[a-zA-Z0-9_]{3,20}\|[a-zA-Z0-9_]{3,20}$/.test(conv);
+}
+
+// resolveConvId normalizes any stored doc (including pre-convId legacy rows)
+// to its conversation bucket.
+export function resolveConvId(d: { username: string; kind: string; to?: string; convId?: string }): string {
+  if (d.convId) return d.convId;
+  if (d.kind === "system") return GENERAL_CONV;
+  return d.to ? conversationKey(d.username, d.to) : GENERAL_CONV;
+}
+
 export interface ChatMemberGuard {
   ok: boolean;
   ended?: boolean;
@@ -34,22 +56,29 @@ export async function nextSeq(db: Db, sessionId: string): Promise<number> {
   return updated?.msgSeq ?? 0;
 }
 
+// appendMessage stores one transcript entry in its conversation bucket.
+// `to` marks a private 1:1 message (recipient username); omitted/empty means
+// the general room. System events always land in "general".
 export async function appendMessage(
   db: Db,
   sessionId: string,
   username: string,
   kind: "chat" | "system",
-  text: string
+  text: string,
+  to?: string
 ): Promise<number> {
   const seq = await nextSeq(db, sessionId);
-  await db.collection("session_messages").insertOne({
+  const doc: Record<string, unknown> = {
     sessionId,
     seq,
     username,
     kind,
     text,
+    convId: to ? conversationKey(username, to) : GENERAL_CONV,
     createdAt: new Date(),
-  });
+  };
+  if (to) doc.to = to;
+  await db.collection("session_messages").insertOne(doc);
   return seq;
 }
 
@@ -67,6 +96,8 @@ export interface ChatMessageDTO {
   kind: "chat" | "system";
   text: string;
   createdAt: string;
+  to?: string;
+  convId: string;
 }
 
 export interface ChatDoc {
@@ -75,6 +106,8 @@ export interface ChatDoc {
   kind: string;
   text: string;
   createdAt: Date;
+  to?: string;
+  convId?: string;
 }
 
 export interface SessionAliveDoc {
@@ -88,12 +121,18 @@ export function toMessageDTO(m: {
   kind: string;
   text: string;
   createdAt: Date;
+  to?: string;
+  convId?: string;
 }): ChatMessageDTO {
-  return {
+  // Legacy docs (pre-convId) derive their bucket from `to`.
+  const dto: ChatMessageDTO = {
     seq: m.seq,
     username: m.username,
     kind: m.kind === "system" ? "system" : "chat",
     text: m.text,
     createdAt: m.createdAt.toISOString(),
+    convId: resolveConvId(m),
   };
+  if (m.to) dto.to = m.to;
+  return dto;
 }

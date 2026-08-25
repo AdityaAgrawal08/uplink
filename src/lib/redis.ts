@@ -8,7 +8,8 @@ export interface IRedisClient {
   del(key: string): Promise<number>;
 }
 
-class MockRedis implements IRedisClient {
+// Exported for unit tests (and available as a last-resort embeddable store).
+export class MockRedis implements IRedisClient {
   private store: Map<string, { value: unknown; expiry: number | null; isObject: boolean }> = new Map();
 
   async get(key: string): Promise<unknown> {

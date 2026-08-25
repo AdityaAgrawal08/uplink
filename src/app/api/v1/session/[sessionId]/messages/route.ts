@@ -2,17 +2,22 @@ import { NextRequest, NextResponse, after } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { redis } from "@/lib/redis";
 import { performSessionCleanup } from "../../cleanup/route";
-import { apiError } from "@/lib/api-utils";
+import { apiError, parseJsonBody } from "@/lib/api-utils";
 import {
   isSessionAlive,
   isMember,
   appendMessage,
   sanitizeChatText,
   toMessageDTO,
+  GENERAL_CONV,
+  conversationKey,
+  isPairConv,
   type ChatDoc,
   type SessionAliveDoc,
 } from "@/lib/sessionChat";
 
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const usernameRegex = USERNAME_RE;
 const BACKLOG_LIMIT = 50;
 const POLL_LIMIT = 200;
 const RATE_LIMIT = 20; // messages per window
@@ -44,17 +49,37 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
 
-    const bodyText = await req.text();
-    const body = bodyText ? JSON.parse(bodyText) : {};
-    const text = sanitizeChatText(body.text);
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
+    const text = sanitizeChatText(parsed.body.text);
     if (!text) return apiError("text must be 1-500 printable characters", 400);
+
+    // Optional 1:1 recipient. Absent/empty => broadcast to the whole room.
+    let to = "";
+    if (parsed.body.to !== undefined && parsed.body.to !== null && parsed.body.to !== "") {
+      if (typeof parsed.body.to !== "string" || !usernameRegex.test(parsed.body.to)) {
+        return apiError("to must be a valid username", 400);
+      }
+      if (parsed.body.to === username) {
+        return apiError("cannot send a private message to yourself", 400);
+      }
+      to = parsed.body.to;
+    }
 
     const db = await getDb();
 
-    // Per-user flood guard (Redis-backed; degrades to per-instance in mock mode).
-    const rateKey = `chat:${sessionId}:${username}`;
-    const hits = await redis.incr(rateKey);
-    if (hits === 1) await redis.expire(rateKey, RATE_WINDOW_SEC);
+    // Per-user flood guard (Redis-backed; degrades to per-instance in mock
+    // mode). The limiter is abuse DEFENSE, never correctness: if the counter
+    // itself is unreachable we fail OPEN so chat delivery cannot 500.
+    let hits = 1;
+    try {
+      const rateKey = `chat:${sessionId}:${username}`;
+      hits = await redis.incr(rateKey);
+      if (hits === 1) await redis.expire(rateKey, RATE_WINDOW_SEC);
+    } catch (limiterErr) {
+      console.warn("chat rate-limiter unavailable; failing open:", limiterErr);
+      hits = 1;
+    }
     if (hits > RATE_LIMIT) {
       return apiError("You are sending messages too quickly", 429);
     }
@@ -69,7 +94,16 @@ export async function POST(
 
     maybeCleanup();
 
-    const seq = await appendMessage(db, sessionId, username, "chat", text);
+    if (to) {
+      const recipient = await db.collection("session_participants").findOne({
+        sessionId,
+        username: to,
+        status: "ACTIVE",
+      });
+      if (!recipient) return apiError("recipient is not in this session", 404);
+    }
+
+    const seq = await appendMessage(db, sessionId, username, "chat", text, to || undefined);
     return NextResponse.json({ seq }, { status: 201 });
   } catch (error) {
     console.error("Error in POST /api/v1/session/[sessionId]/messages:", error);
@@ -104,16 +138,50 @@ export async function GET(
       return apiError("after must be an integer sequence number", 400);
     }
 
+    // Optional conversation scope. Absent => everything visible to me
+    // (general + every 1:1 thread I belong to). "general" => room channel
+    // only. "a|b" => that exact thread, and I MUST be one of the two.
+    const convParam = req.nextUrl.searchParams.get("conv");
+    let convScope: string | null = null;
+    if (convParam !== null && convParam !== "") {
+      if (convParam === GENERAL_CONV) {
+        convScope = GENERAL_CONV;
+      } else if (isPairConv(convParam)) {
+        const [u1, u2] = convParam.split("|");
+        if (username !== u1 && username !== u2) {
+          return apiError("not a participant of this conversation", 403);
+        }
+        convScope = convParam;
+      } else {
+        return apiError('conv must be "general" or a "userA|userB" pair', 400);
+      }
+    }
+
     // Long-poll: hold the request open (≤2.5 s) until data shows up, then
     // return immediately. Cuts perceived delivery to <~300 ms while lowering
     // total request rate versus a fixed-interval client tick.
     const waitMs = Math.min(Math.max(Number(req.nextUrl.searchParams.get("wait") ?? 0) || 0, 0), 2500);
     const deadline = Date.now() + waitMs;
 
+    // Delivery visibility: system lines and public broadcasts reach everyone;
+    // a message with `to` reaches ONLY sender and recipient.
+    const visibleFilter = () => ({
+      sessionId,
+      $or: [
+        { kind: "system" },
+        { to: { $in: [null, ""] } },
+        { to: username },
+        { username },
+      ],
+    });
+
+    const baseFilter = () =>
+      convScope === null ? visibleFilter() : { sessionId, convId: convScope };
+
     const queryNew = () =>
       db
         .collection("session_messages")
-        .find({ sessionId, seq: { $gt: afterSeq as number } })
+        .find({ ...baseFilter(), seq: { $gt: afterSeq as number } })
         .sort({ seq: 1 })
         .limit(POLL_LIMIT)
         .toArray() as unknown as Promise<ChatDoc[]>;
@@ -131,21 +199,38 @@ export async function GET(
         if (!isSessionAlive(fresh)) break;
         docs = await queryNew();
       }
+      const roster = await db
+        .collection("session_participants")
+        .find({ sessionId, status: "ACTIVE" })
+        .project({ username: 1, _id: 0 })
+        .toArray();
       return NextResponse.json({
         messages: docs.map(toMessageDTO),
+        activeUsers: roster.map((r) => r.username).sort(),
         ended: !alive,
       });
     }
 
-    // No cursor → backlog: latest BACKLOG_LIMIT messages, oldest-first.
+    // No cursor → backlog: latest BACKLOG_LIMIT messages for the requested
+    // scope (whole visible stream by default; one exact thread with ?conv=).
     const docs = await db
       .collection("session_messages")
-      .find({ sessionId })
+      .find(baseFilter())
       .sort({ seq: -1 })
       .limit(BACKLOG_LIMIT)
       .toArray() as unknown as ChatDoc[];
+
+    // Roster rides along with EVERY response so sidebars stay fresh without
+    // waiting for the next heartbeat tick (join/leave latency ≤ poll cadence).
+    const roster = await db
+      .collection("session_participants")
+      .find({ sessionId, status: "ACTIVE" })
+      .project({ username: 1, _id: 0 })
+      .toArray();
+
     return NextResponse.json({
       messages: docs.reverse().map(toMessageDTO),
+      activeUsers: roster.map((r) => r.username).sort(),
       ended: !alive,
     });
   } catch (error) {

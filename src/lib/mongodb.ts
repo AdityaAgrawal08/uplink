@@ -73,8 +73,9 @@ export function initIndexes(): Promise<void> {
     await db.collection("session_files").createIndex({ sessionId: 1, fileId: 1 }, { unique: true });
     await db.collection("session_files").createIndex({ sessionId: 1, filename: 1 });
 
-    // Chat transcript indexes (ordered delivery per room)
+    // Chat transcript indexes (ordered delivery per room, per-conversation)
     await db.collection("session_messages").createIndex({ sessionId: 1, seq: 1 });
+    await db.collection("session_messages").createIndex({ sessionId: 1, convId: 1, seq: 1 });
     await db.collection("session_messages").createIndex({ createdAt: 1 });
 
     // Initialize quota tracking document if not present
