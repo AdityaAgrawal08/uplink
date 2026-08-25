@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -42,6 +43,10 @@ var (
 	tuiRosterSelectedStyle = lipgloss.NewStyle().
 				Bold(true).
 				Background(lipgloss.Color("236"))
+
+	tuiUnreadStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("203"))
 
 	tuiComposerStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
@@ -313,13 +318,15 @@ type chatScreen struct {
 	me           string
 	width        int
 	height       int
-	history      []chatMessage   // every confirmed server message (deduped by seq)
-	localLines   []localLine     // echoes & notes not backed by server docs
-	fetchedConvs map[string]bool // threads already deep-fetched this session
-	lines        []string        // DERIVED paint buffer: rebuildView() owns it
-	rendered     map[int]bool    // server seqs already rendered
-	pending      *pendingSend    // single in-flight send (nil = idle)
-	outbox       []queuedLine    // queued sends waiting for the in-flight one
+	history      []chatMessage        // every confirmed server message (deduped by seq)
+	localLines   []localLine          // echoes & notes not backed by server docs
+	fetchedConvs map[string]bool      // threads already deep-fetched this session
+	unread       map[string]int       // peer -> unread DM count (cleared on open)
+	lastDMAt     map[string]time.Time // peer -> newest incoming DM (recency sort)
+	lines        []string             // DERIVED paint buffer: rebuildView() owns it
+	rendered     map[int]bool         // server seqs already rendered
+	pending      *pendingSend         // single in-flight send (nil = idle)
+	outbox       []queuedLine         // queued sends waiting for the in-flight one
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -377,9 +384,39 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		vp:           vp,
 		input:        ti,
 		rendered:     map[int]bool{},
+		unread:       map[string]int{},
+		lastDMAt:     map[string]time.Time{},
 		fetchedConvs: map[string]bool{generalConv: true},
 		outbox:       nil,
 	}
+}
+
+// orderedUsers produces the sidebar display order:
+//
+//	[me] ++ peers with a DM history, NEWEST incoming DM first,
+//	     then never-messaged peers in their original roster order.
+//
+// Pure function so rendering and mouse hit-testing share one truth.
+func orderedUsers(users []string, me string, lastDMAt map[string]time.Time) []string {
+	out := make([]string, 0, len(users))
+	var messaged, fresh []string
+	for _, u := range users {
+		if u == me {
+			continue
+		}
+		if _, ok := lastDMAt[u]; ok {
+			messaged = append(messaged, u)
+		} else {
+			fresh = append(fresh, u)
+		}
+	}
+	sort.SliceStable(messaged, func(i, j int) bool {
+		return lastDMAt[messaged[i]].After(lastDMAt[messaged[j]])
+	})
+	out = append(out, me)
+	out = append(out, messaged...)
+	out = append(out, fresh...)
+	return out
 }
 
 // isOwnPresence reports whether a system presence line refers to me.
@@ -432,8 +469,34 @@ func (c *chatScreen) addMessage(m chatMessage) {
 		return
 	}
 	c.rendered[m.Seq] = true
+	if m.ConvID != "" && m.ConvID != generalConv && m.Username != c.me {
+		if c.unread == nil {
+			c.unread = map[string]int{}
+		}
+		if c.lastDMAt == nil {
+			c.lastDMAt = map[string]time.Time{}
+		}
+		peer := peerOf(c.me, m.ConvID)
+		if peer != "" {
+			c.lastDMAt[peer] = time.Now() // recency bump on EVERY arrival
+			if c.activeConv() != m.ConvID {
+				c.unread[peer]++ // badge only when the thread is out of sight
+			}
+		}
+	}
 	c.history = append(c.history, m)
 	c.rebuildView()
+}
+
+// peerOf extracts the OTHER participant from a canonical "a|b" pair key.
+func peerOf(me, conv string) string {
+	parts := strings.Split(conv, "|")
+	for _, p := range parts {
+		if p != me {
+			return p
+		}
+	}
+	return ""
 }
 
 func (c *chatScreen) appendLine(s string) {
@@ -512,6 +575,19 @@ func (c chatScreen) statusView() string {
 	return tuiErrStyle.Render(c.status)
 }
 
+// unreadBadge renders the pending-DM marker (" ●3") for a peer, if any.
+func (c chatScreen) unreadBadge(peer string) string {
+	n := c.unread[peer]
+	if n <= 0 {
+		return ""
+	}
+	label := fmt.Sprintf(" ●%d", n)
+	if n > 99 {
+		label = " ●99+"
+	}
+	return tuiUnreadStyle.Render(label)
+}
+
 // rosterRow renders one sidebar entry; selected highlights the active peer.
 func rosterRow(u, me, target string) string {
 	switch {
@@ -564,7 +640,7 @@ func (c chatScreen) rosterBody(fill int) string {
 		rows = append(rows, " "+trunc(text))
 	}
 
-	online := c.users
+	online := orderedUsers(c.users, c.me, c.lastDMAt)
 	title := fmt.Sprintf("ONLINE — %d", len(online))
 	rows = append(rows, tuiSectionTitleStyle.Render(trunc(title)))
 	bodySlots := maxInt(slots-1, 0)
@@ -581,9 +657,9 @@ func (c chatScreen) rosterBody(fill int) string {
 		case u == c.me:
 			add(tuiMeStyle.Render("● "+u+" (you)"), false)
 		case u == c.targetUser:
-			add("● "+u, true)
+			add("● "+u+c.unreadBadge(u), true)
 		default:
-			add("○ "+u, false)
+			add("○ "+u+c.unreadBadge(u), false)
 		}
 		shown++
 	}
@@ -683,6 +759,7 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 // Returns nil or the backlog command - caller MUST schedule it.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
+	delete(c.unread, user) // opening the thread clears its badge
 	conv := conversationKey(c.me, user)
 	c.rebuildView()
 	if c.fetchedConvs == nil {
@@ -829,6 +906,20 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// Authoritative snapshot — INCLUDING shrinking to empty.
 			c.users = msg.users
+			live := map[string]bool{c.me: true}
+			for _, u := range msg.users {
+				live[u] = true
+			}
+			for peer := range c.unread {
+				if !live[peer] {
+					delete(c.unread, peer)
+				}
+			}
+			for peer := range c.lastDMAt {
+				if !live[peer] {
+					delete(c.lastDMAt, peer)
+				}
+			}
 		}
 		cmds = append(cmds, scheduleBeat())
 
@@ -996,7 +1087,7 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if !inColumn || row < 0 || row >= l.rosterSlots || row >= len(c.users) {
 		return nil
 	}
-	u := c.users[row]
+	u := orderedUsers(c.users, c.me, c.lastDMAt)[row]
 	if u == c.me {
 		return nil // clicking yourself is a no-op
 	}

@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -176,6 +177,8 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 		targetUser: target,
 		users:      users,
 		rendered:   map[int]bool{},
+		unread:     map[string]int{},
+		lastDMAt:   map[string]time.Time{},
 		input:      ti,
 	}
 }
