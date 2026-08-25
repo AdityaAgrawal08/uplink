@@ -40,17 +40,17 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("240"))
 
-	tuiRosterSelectedStyle = lipgloss.NewStyle().
-				Bold(true).
-				Background(lipgloss.Color("236"))
+	tuiHoverStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("213")) // pink — hover only, one row max
 
 	tuiUnreadStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("203"))
+			Foreground(lipgloss.Color("16")). // near-black digits
+			Background(lipgloss.Color("2"))   // green disc: glyph interior reads as the fill
 
 	tuiComposerStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("62")). // accent border: writing area matters
+				BorderForeground(lipgloss.Color("62")).
 				Padding(0, 1)
 )
 
@@ -321,6 +321,7 @@ type chatScreen struct {
 	history      []chatMessage        // every confirmed server message (deduped by seq)
 	localLines   []localLine          // echoes & notes not backed by server docs
 	fetchedConvs map[string]bool      // threads already deep-fetched this session
+	hoverPeer    string               // sidebar row under the mouse ("" = none)
 	unread       map[string]int       // peer -> unread DM count (cleared on open)
 	lastDMAt     map[string]time.Time // peer -> newest incoming DM (recency sort)
 	lines        []string             // DERIVED paint buffer: rebuildView() owns it
@@ -453,9 +454,6 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if m.Username == c.me {
 		name = tuiMeStyle.Render(name + " (you)")
 	}
-	if c.targetUser != "" && m.Username == c.targetUser {
-		name = tuiRosterSelectedStyle.Render(m.Username)
-	}
 	line := ts + " " + name + ": " + m.Text
 	if m.ConvID != generalConv && m.Username == c.me && c.targetUser != "" {
 		line += tuiTimeStyle.Render("  → " + c.targetUser)
@@ -575,29 +573,30 @@ func (c chatScreen) statusView() string {
 	return tuiErrStyle.Render(c.status)
 }
 
-// unreadBadge renders the pending-DM marker (" ●3") for a peer, if any.
+// circledNum maps 1..50 onto Unicode circled digits (①…⑳ ㉑…㉟ ㊱…㊿).
+// Enclosed glyphs read visually smaller than body text and their interior
+// takes the BACKGROUND colour, so styling them black-on-green yields exactly
+// a "green circle, dark number" chip without any font tricks.
+func circledNum(n int) string {
+	switch {
+	case n >= 1 && n <= 20:
+		return string(rune(0x2460 + n - 1))
+	case n <= 35:
+		return string(rune(0x3251 + n - 21))
+	case n <= 50:
+		return string(rune(0x32B1 + n - 36))
+	default:
+		return string(rune(0x32BF)) // ㊿ saturates
+	}
+}
+
+// unreadBadge renders the pending-DM chip for a peer ("" when none).
 func (c chatScreen) unreadBadge(peer string) string {
 	n := c.unread[peer]
 	if n <= 0 {
 		return ""
 	}
-	label := fmt.Sprintf(" ●%d", n)
-	if n > 99 {
-		label = " ●99+"
-	}
-	return tuiUnreadStyle.Render(label)
-}
-
-// rosterRow renders one sidebar entry; selected highlights the active peer.
-func rosterRow(u, me, target string) string {
-	switch {
-	case u == me:
-		return tuiMeStyle.Render("· " + u + " (you)")
-	case u == target:
-		return tuiRosterSelectedStyle.Render("● " + u)
-	default:
-		return "○ " + u
-	}
+	return tuiUnreadStyle.Render(circledNum(n))
 }
 
 // rosterBody renders the bordered sidebar with EXACTLY slots content rows
@@ -620,24 +619,12 @@ func (c chatScreen) rosterBody(fill int) string {
 		}
 		return t
 	}
-	pad := func(t string) string {
-		gap := inner - lipgloss.Width(t)
-		if gap < 0 {
-			gap = 0
-		}
-		return t + strings.Repeat(" ", gap)
-	}
-
 	rows := make([]string, 0, slots+1)
-	add := func(text string, highlight bool) {
-		if len(rows)-1 >= slots { // reserve: never exceed slot budget
+	addPlain := func(text string) {
+		if len(rows)-1 >= slots { // never exceed the slot budget
 			return
 		}
-		if highlight {
-			rows = append(rows, tuiRosterSelectedStyle.Render(pad(trunc(" "+text))))
-			return
-		}
-		rows = append(rows, " "+trunc(text))
+		rows = append(rows, " "+text)
 	}
 
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
@@ -649,18 +636,41 @@ func (c chatScreen) rosterBody(fill int) string {
 	for _, u := range online {
 		if shown == bodySlots && len(online) > bodySlots {
 			more := len(online) - shown
-			add(tuiDimStyle.Render(fmt.Sprintf("… +%d more", more)), false)
+			addPlain(tuiDimStyle.Render(fmt.Sprintf("… +%d more", more)))
 			shown++
 			break
 		}
-		switch {
-		case u == c.me:
-			add(tuiMeStyle.Render("● "+u+" (you)"), false)
-		case u == c.targetUser:
-			add("● "+u+c.unreadBadge(u), true)
-		default:
-			add("○ "+u+c.unreadBadge(u), false)
+		dot := "○"
+		switch u {
+		case c.me:
+			dot = "●"
+		case c.targetUser:
+			dot = "●"
 		}
+		name := u
+		if u == c.me {
+			name += " (you)"
+		}
+		line := dot + " " + name
+
+		if badge := c.unreadBadge(u); badge != "" {
+			// Right-align the chip with a guaranteed gap from the name.
+			bw := lipgloss.Width(badge)
+			nameW := lipgloss.Width(line)
+			gap := inner - nameW - bw - 1
+			if gap < 2 {
+				gap = 2 // minimum distance even on narrow columns
+			}
+			if nameW+gap+bw > inner {
+				line = trunc(line[:maxInt(inner-bw-gap, 1)]) // hard clip name
+			}
+			line += strings.Repeat(" ", gap) + badge
+		}
+
+		if u == c.hoverPeer {
+			line = tuiHoverStyle.Render(line) // pink on THIS row only
+		}
+		addPlain(line)
 		shown++
 	}
 
@@ -841,6 +851,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		c.width, c.height = msg.Width, msg.Height
+		c.hoverPeer = "" // geometry changed; stale hover is meaningless
 		l := computeLayout(c.width, c.height, c.status != "")
 		c.vp.Width = l.vpWidth
 		c.vp.Height = l.vpHeight
@@ -919,6 +930,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if !live[peer] {
 					delete(c.lastDMAt, peer)
 				}
+			}
+			if c.hoverPeer != "" && !live[c.hoverPeer] {
+				c.hoverPeer = ""
 			}
 		}
 		cmds = append(cmds, scheduleBeat())
@@ -1067,34 +1081,63 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 
 // handleMouse translates a click into a sidebar selection using the SAME
 // geometry View() will paint. Returns a tea.Cmd (send-free) or nil.
+// peerAtY maps a terminal Y coordinate onto the sidebar's DISPLAY-ordered
+// user list ("" when the point is outside any user row).
+func (c chatScreen) peerAtY(y int, l layout) string {
+	if c.width == 0 || c.height == 0 || !l.sidebarOn {
+		return ""
+	}
+	row := y - l.rosterY0
+	if row < 0 || row >= l.rosterSlots {
+		return ""
+	}
+	online := orderedUsers(c.users, c.me, c.lastDMAt)
+	if row >= len(online) {
+		return ""
+	}
+	return online[row]
+}
+
+// handleMouse routes hover motion and clicks. Hovering paints exactly one
+// pink row; clicking opens that peer's thread.
 func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	if msg.Type != tea.MouseLeft {
-		return nil
-	}
-	if c.width == 0 || c.height == 0 {
-		return nil
-	}
-	// Reject coordinates outside the painted terminal area entirely.
-	if msg.X < 0 || msg.X >= c.width || msg.Y < 0 || msg.Y >= c.height {
-		return nil
-	}
 	l := computeLayout(c.width, c.height, c.status != "")
-	if !l.sidebarOn {
-		return nil // sidebar collapsed on narrow terminals: nothing to click
-	}
-	inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
-	row := msg.Y - l.rosterY0
-	if !inColumn || row < 0 || row >= l.rosterSlots || row >= len(c.users) {
+
+	switch msg.Type {
+	case tea.MouseMotion:
+		c.hoverPeer = "" // default: outside every row
+		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
+			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
+			if inColumn && l.sidebarOn {
+				c.hoverPeer = c.peerAtY(msg.Y, l)
+			}
+		}
 		return nil
+
+	case tea.MouseLeft:
+		if c.width == 0 || c.height == 0 {
+			return nil
+		}
+		// Reject coordinates outside the painted terminal area entirely.
+		if msg.X < 0 || msg.X >= c.width || msg.Y < 0 || msg.Y >= c.height {
+			return nil
+		}
+		if !l.sidebarOn {
+			return nil // sidebar collapsed on narrow terminals
+		}
+		inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
+		if !inColumn {
+			return nil // clicks outside the sidebar never select
+		}
+		u := c.peerAtY(msg.Y, l)
+		switch {
+		case u == "", u == c.me:
+			return nil // no row / clicking yourself is a no-op
+		case u == c.targetUser:
+			return nil // already chatting privately with them
+		}
+		c.enterPrivate(u)
 	}
-	u := orderedUsers(c.users, c.me, c.lastDMAt)[row]
-	if u == c.me {
-		return nil // clicking yourself is a no-op
-	}
-	if u == c.targetUser {
-		return nil // already chatting privately with them
-	}
-	c.enterPrivate(u)
 	return nil
 }
 
@@ -1166,7 +1209,7 @@ func (c chatScreen) View() string {
 // runChatTUI is the default interactive experience (alt-screen + mouse).
 func runChatTUI(serverURL, key, me string) {
 	scr := newChatScreen(serverURL, key, me)
-	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)

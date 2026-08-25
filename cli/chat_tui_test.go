@@ -209,15 +209,6 @@ func TestShouldRenderConvBasics(t *testing.T) {
 // Roster rendering — adaptive slot count
 // ---------------------------------------------------------------------------
 
-func TestRosterRows(t *testing.T) {
-	if got := rosterRow("bob", "bob", ""); !strings.Contains(got, "(you)") {
-		t.Errorf("self row must be marked (you); got %q", got)
-	}
-	if plain := rosterRow("carol", "bob", "alice"); strings.Contains(plain, "(you)") || strings.Contains(plain, "●") {
-		t.Errorf("bystander row mis-styled: %q", plain)
-	}
-}
-
 func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	c := &chatScreen{me: "me"}
 	users := []string{"me"}

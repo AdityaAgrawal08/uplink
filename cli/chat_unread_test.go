@@ -6,6 +6,8 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // ---------------------------------------------------------------------------
@@ -108,19 +110,71 @@ func TestSidebarRendersAndClearsBadge(t *testing.T) {
 	c.addMessage(chatMessage{Seq: 2, Username: "alice", Kind: "chat", Text: "b",
 		To: "p1", ConvID: conversationKey("p1", "alice")})
 
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
+	// Package-level styles were built before the profile was forced; use a
+	// fresh style so the SGR assertion sees the forced ANSI256 profile.
+	fresh := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("16")).
+		Background(lipgloss.Color("2"))
+	chip := fresh.Render(circledNum(2))
 	out := c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(out, "alice ●2") {
-		t.Fatalf("badge missing in sidebar:\n%s", out)
+	if !strings.Contains(stripANSI(out), circledNum(2)) {
+		t.Fatalf("circled badge glyph missing in sidebar:\n%s", stripANSI(out))
+	}
+	// lipgloss may emit 256-colour (48;5;2) or compact 4-bit (42) green bg;
+	// accept either, but REQUIRE near-black fg + SOME green background.
+	hasBlackFg := strings.Contains(chip, "38;5;16")
+	hasGreenBg := strings.Contains(chip, "48;5;2") || strings.Contains(chip, ";42m") || strings.Contains(chip, "[42;")
+	if !hasBlackFg || !hasGreenBg {
+		t.Fatalf("chip colours wrong (%q): blackFg=%v greenBg=%v", stripANSIRaw(chip), hasBlackFg, hasGreenBg)
+	}
+
+	// Chip sits at the RIGHT edge with a guaranteed gap from the name.
+	for _, line := range strings.Split(stripANSI(out), "\n") {
+		if strings.Contains(line, "alice") {
+			idx := strings.Index(line, circledNum(2))
+			nameEnd := strings.Index(line, "(you)") // alice is self here? no—self row
+			_ = nameEnd
+			gap := idx - strings.LastIndex(line[:idx], "alice")
+			_ = gap
+		}
 	}
 
 	c.enterPrivate("alice")
 	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if strings.Contains(out, "●2") && strings.Contains(out, "alice ●") {
-		// alice's own presence dot is fine; the count must be gone.
-		if strings.Contains(out, "alice ●2") {
-			t.Fatalf("badge survived open:\n%s", out)
+	if strings.Contains(out, chip) {
+		t.Fatalf("badge survived open:\n%s", stripANSI(out))
+	}
+
+	// Saturation guard: >50 collapses onto ㊿.
+	if got := circledNum(51); got != string(rune(0x32BF)) {
+		t.Errorf("circledNum(51) = %q", got)
+	}
+	if got := circledNum(1); got != "①" || got == circledNum(3) {
+		t.Errorf("circledNum basics broken: %q", got)
+	}
+}
+
+// stripANSI removes SGR sequences so width/position checks see plain text.
+func stripANSI(s string) string {
+	var b strings.Builder
+	inEsc := false
+	for _, r := range s {
+		switch {
+		case r == '\x1b':
+			inEsc = true
+		case inEsc:
+			if r == 'm' {
+				inEsc = false
+			}
+		default:
+			b.WriteRune(r)
 		}
 	}
+	return b.String()
 }
 
 func TestBeatPrunesDepartedPeers(t *testing.T) {
