@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,8 +20,19 @@ type chatMessage struct {
 	Kind      string `json:"kind"`
 	Text      string `json:"text"`
 	To        string `json:"to,omitempty"` // recipient of a 1:1 message
+	ConvID    string `json:"convId"`       // "general" or canonical "a|b"
 	CreatedAt string `json:"createdAt"`
 }
+
+// conversationKey builds the canonical bucket id for a 1:1 thread.
+// MUST match src/lib/sessionChat.ts conversationKey exactly.
+func conversationKey(a, b string) string {
+	pair := []string{a, b}
+	sort.Strings(pair)
+	return strings.Join(pair, "|")
+}
+
+const generalConv = "general"
 
 type chatPollResponse struct {
 	Messages    []chatMessage `json:"messages"`
@@ -102,6 +114,43 @@ func (c *chatClient) fetchBacklog() ([]chatMessage, error) {
 	}
 	c.applyRoster(poll.ActiveUsers)
 	return poll.Messages, nil
+}
+
+// fetchConvBacklog pulls the latest page of ONE conversation ("general" or a
+// 1:1 pair key). Lets the UI open a thread whose history predates the initial
+// mixed backlog window. Does NOT move lastSeq backwards; seq dedupe happens
+// in the caller.
+func (c *chatClient) fetchConvBacklog(conv string) ([]chatMessage, error) {
+	code, body, err := getJSON(c.endpoint("/messages?conv="+urlQueryEscape(conv)), c.authHeaders())
+	if err != nil {
+		return nil, err
+	}
+	if code == 403 || code == 410 {
+		return nil, fmt.Errorf("conversation unavailable (%d)", code)
+	}
+	var poll chatPollResponse
+	if err := json.Unmarshal(body, &poll); err != nil {
+		return nil, err
+	}
+	return poll.Messages, nil
+}
+
+// urlQueryEscape escapes a query-parameter value without importing net/url
+// wholesale at this call depth.
+func urlQueryEscape(v string) string {
+	var b strings.Builder
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == '~':
+			b.WriteRune(r)
+		case r == '|':
+			b.WriteString("%7C")
+		default:
+			fmt.Fprintf(&b, "%%%02X", r)
+		}
+	}
+	return b.String()
 }
 
 // pollOnce fetches messages newer than the cursor and RETURNS them (the TUI

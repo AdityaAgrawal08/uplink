@@ -19,33 +19,38 @@ func TestPrivateViewRetroFiltersHistory(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
 
-	c.addMessage(chatMessage{Seq: 1, Username: "carol", Kind: "chat", Text: "public noise"})
-	c.addMessage(chatMessage{Seq: 2, Username: "alice", Kind: "chat", Text: "psst bob"})
-	c.addMessage(chatMessage{Seq: 3, Username: "system", Kind: "system", Text: "carol joined"})
+	c.addMessage(chatMessage{Seq: 1, Username: "carol", Kind: "chat", Text: "public noise", ConvID: generalConv})
+	c.addMessage(chatMessage{Seq: 2, Username: "alice", Kind: "chat", Text: "psst bob", To: "bob", ConvID: conversationKey("bob", "alice")})
+	c.addMessage(chatMessage{Seq: 3, Username: "system", Kind: "system", Text: "carol joined", ConvID: generalConv})
 
-	if n := len(c.lines); n != 3 {
-		t.Fatalf("common room should paint all 3; got %d", n)
+	// General view paints ONLY its own bucket: public line + system event.
+	// The DM is invisible here even though bob is a participant — the fix.
+	if n := len(c.lines); n != 2 {
+		t.Fatalf("general room should paint 2 rows; got %d:\n%s", n, strings.Join(c.lines, "\n"))
 	}
 
 	c.enterPrivate("alice")
 	got := strings.Join(c.lines, "\n")
-	if strings.Contains(got, "carol") {
-		t.Errorf("retro-filter leak — carol still painted:\n%s", got)
+	if strings.Contains(got, "public noise") || strings.Contains(got, "carol joined") {
+		t.Errorf("room content leaked into thread:\n%s", got)
 	}
 	if !strings.Contains(got, "psst bob") {
-		t.Errorf("peer history lost:\n%s", got)
+		t.Errorf("thread history missing:\n%s", got)
 	}
 	if len(c.history) != 3 {
-		t.Fatalf("raw history must survive for Esc-return; got %d", len(c.history))
+		t.Fatalf("raw store truncated: %d", len(c.history))
 	}
 
 	c.exitPrivate()
-	// 3 history + "private chat with" note + "back in common" note.
-	if n := len(c.lines); n != 5 {
-		t.Fatalf("exit didn't restore room view: %d lines", n)
+	got = strings.Join(c.lines, "\n")
+	if strings.Contains(got, "psst bob") {
+		t.Errorf("DM leaked back into room:\n%s", got)
 	}
-	if !strings.Contains(strings.Join(c.lines, "\n"), "public noise") {
-		t.Error("third-party lines missing after returning to common room")
+	if !strings.Contains(got, "public noise") || !strings.Contains(got, "Back in the common room") {
+		t.Errorf("room restore wrong:\n%s", got)
+	}
+	if n := len(c.lines); n != 3 { // 2 history + back-note (enter-note stayed in thread)
+		t.Fatalf("post-exit room rows = %d; want 3", n)
 	}
 }
 

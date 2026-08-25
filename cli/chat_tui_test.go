@@ -170,32 +170,25 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 	}
 }
 
-func TestShouldRenderMatrix(t *testing.T) {
-	render := func(c *chatScreen, m chatMessage) bool { return c.shouldRender(m) }
+// Visibility is now purely conversational; see chat_conv_test.go for the
+// full matrix (DM isolation, thread purity, multi-peer independence).
+func TestShouldRenderConvBasics(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	dm := chatMessage{Seq: 1, Username: "alice", Kind: "chat", Text: "x", ConvID: conversationKey("bob", "alice")}
+	pub := chatMessage{Seq: 2, Username: "carol", Kind: "chat", Text: "y", ConvID: generalConv}
 
-	bob := newFilterScreen("bob", "")
-	sys := func(text string) chatMessage { return chatMessage{Kind: "system", Text: text} }
-	chat := func(u, text string) chatMessage { return chatMessage{Kind: "chat", Username: u, Text: text} }
-
-	if render(bob, sys("bob joined")) || render(bob, sys("bob left")) {
-		t.Error("own presence hidden in common room")
+	if c.shouldRender(dm) {
+		t.Error("DM must be invisible in general view even for its participants")
 	}
-	if !render(bob, sys("alice joined")) || !render(bob, chat("alice", "hi")) {
-		t.Error("others visible in common room")
+	if !c.shouldRender(pub) {
+		t.Error("public must render in general view")
 	}
-
-	priv := newFilterScreen("bob", "alice")
-	if !render(priv, chat("alice", "psst")) || !render(priv, chat("bob", "me too")) {
-		t.Error("pair messages visible in private view")
+	c.targetUser = "alice"
+	if !c.shouldRender(dm) {
+		t.Error("thread view must show its own DM")
 	}
-	if render(priv, chat("carol", "noise")) || render(priv, sys("carol joined")) {
-		t.Error("third parties filtered in private view")
-	}
-	if !render(priv, sys("alice left")) {
-		t.Error("peer presence visible in private view")
-	}
-	if render(priv, sys("bob joined")) {
-		t.Error("own presence stays hidden even inside pair rule")
+	if c.shouldRender(pub) {
+		t.Error("room chatter must not leak into thread view")
 	}
 }
 

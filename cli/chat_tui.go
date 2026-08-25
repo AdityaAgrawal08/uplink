@@ -235,6 +235,11 @@ type sendDoneMsg struct {
 	err  error
 }
 type leaveDoneMsg struct{}
+type convBacklogMsg struct {
+	conv string
+	msgs []chatMessage
+	err  error
+}
 
 // ---- model -----------------------------------------------------------------
 
@@ -244,17 +249,18 @@ type chatScreen struct {
 	me           string
 	width        int
 	height       int
-	history      []chatMessage // every confirmed server message (deduped by seq)
-	localLines   []string      // echoes & system notes not backed by server docs
-	lines        []string      // DERIVED paint buffer: rebuildView() owns it
-	rendered     map[int]bool  // server seqs already rendered
-	pending      *pendingSend  // single in-flight send (nil = idle)
-	outbox       []string      // queued lines waiting for the in-flight send to settle
+	history      []chatMessage   // every confirmed server message (deduped by seq)
+	localLines   []localLine     // echoes & notes not backed by server docs
+	fetchedConvs map[string]bool // threads already deep-fetched this session
+	lines        []string        // DERIVED paint buffer: rebuildView() owns it
+	rendered     map[int]bool    // server seqs already rendered
+	pending      *pendingSend    // single in-flight send (nil = idle)
+	outbox       []string        // queued lines waiting for the in-flight send to settle
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
 	status       string
-	targetUser   string // private-chat peer; "" = common room
+	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
 	pollFailures int
 }
@@ -264,6 +270,23 @@ type chatScreen struct {
 type pendingSend struct {
 	lineIdx int
 	text    string
+	conv    string // conversation the optimistic echo belongs to
+}
+
+// localLine is a UI-generated transcript row scoped to one conversation so
+// mode switches never bleed it across views.
+type localLine struct {
+	conv string
+	text string
+}
+
+// activeConv is the conversation bucket currently painted on screen:
+// "general" in the common room, the canonical pair key inside a thread.
+func (c *chatScreen) activeConv() string {
+	if c.targetUser == "" {
+		return generalConv
+	}
+	return conversationKey(c.me, c.targetUser)
 }
 
 func newChatScreen(serverURL, key, me string) chatScreen {
@@ -274,13 +297,14 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 	ti.Prompt = "> "
 	vp := viewport.New(80, 20)
 	return chatScreen{
-		client:   newChatClient(serverURL, key, me),
-		key:      key,
-		me:       me,
-		vp:       vp,
-		input:    ti,
-		rendered: map[int]bool{},
-		outbox:   nil,
+		client:       newChatClient(serverURL, key, me),
+		key:          key,
+		me:           me,
+		vp:           vp,
+		input:        ti,
+		rendered:     map[int]bool{},
+		fetchedConvs: map[string]bool{generalConv: true},
+		outbox:       nil,
 	}
 }
 
@@ -297,23 +321,15 @@ func mentionsUser(systemText, user string) bool {
 	return systemText == user+" joined" || systemText == user+" left"
 }
 
-// shouldRender decides visibility BEFORE any styling, so filtered messages
-// never leave blank husks in the transcript.
+// shouldRender decides visibility BEFORE any styling. The rule is strictly
+// conversational: a row paints only if it belongs to the ACTIVE bucket.
+// General view therefore NEVER shows DM lines (they live exclusively in their
+// own threads), and a thread view shows nothing from the room.
 func (c *chatScreen) shouldRender(m chatMessage) bool {
-	if m.Kind == "system" {
-		if isOwnPresence(m.Text, c.me) {
-			return false // never announce my own entry/exit to myself
-		}
-		if c.targetUser != "" &&
-			!mentionsUser(m.Text, c.targetUser) && !mentionsUser(m.Text, c.me) {
-			return false // private view: only presence involving the pair
-		}
-		return true
+	if m.ConvID == "" { // defensive for servers predating convId
+		m.ConvID = generalConv
 	}
-	if c.targetUser != "" && m.Username != c.me && m.Username != c.targetUser {
-		return false
-	}
-	return true
+	return m.ConvID == c.activeConv()
 }
 
 func (c *chatScreen) renderLine(m chatMessage) string {
@@ -322,6 +338,9 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		ts = tuiTimeStyle.Render("[" + t.Local().Format("15:04") + "]")
 	}
 	if m.Kind == "system" {
+		if isOwnPresence(m.Text, c.me) {
+			return "" // never announce my own join/leave to me
+		}
 		return ts + " " + tuiSystemStyle.Render("* "+m.Text)
 	}
 	name := tuiNameStyle.Render(m.Username)
@@ -332,8 +351,8 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		name = tuiRosterSelectedStyle.Render(m.Username)
 	}
 	line := ts + " " + name + ": " + m.Text
-	if m.To != "" {
-		line += tuiTimeStyle.Render("  ·1:1") // visual marker for DM lines
+	if m.ConvID != generalConv && m.Username == c.me && c.targetUser != "" {
+		line += tuiTimeStyle.Render("  → " + c.targetUser)
 	}
 	return line
 }
@@ -349,7 +368,11 @@ func (c *chatScreen) addMessage(m chatMessage) {
 }
 
 func (c *chatScreen) appendLine(s string) {
-	c.localLines = append(c.localLines, s)
+	c.appendLocal(generalConv, s)
+}
+
+func (c *chatScreen) appendLocal(conv, text string) {
+	c.localLines = append(c.localLines, localLine{conv: conv, text: text})
 	c.rebuildView()
 }
 
@@ -364,9 +387,13 @@ func (c *chatScreen) rebuildView() {
 		}
 		c.lines = append(c.lines, c.renderLine(m))
 	}
-	c.lines = append(c.lines, c.localLines...)
-	if c.pending != nil {
-		c.pending.lineIdx = len(c.lines) - 1 // echo is always the last local line
+	for _, ll := range c.localLines {
+		if ll.conv == c.activeConv() {
+			c.lines = append(c.lines, ll.text)
+		}
+	}
+	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
+		c.pending.lineIdx = len(c.lines) - 1 // pending echo is last local of its conv
 	}
 	c.refreshViewport()
 }
@@ -500,6 +527,15 @@ func (c chatScreen) fetchBacklogCmd() tea.Cmd {
 	}
 }
 
+// doConvFetch deep-fetches one conversation's latest page from the server.
+func (c chatScreen) doConvFetch(conv string) tea.Cmd {
+	client := c.client
+	return func() tea.Msg {
+		msgs, err := client.fetchConvBacklog(conv)
+		return convBacklogMsg{conv: conv, msgs: msgs, err: err}
+	}
+}
+
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
@@ -510,11 +546,23 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// enterPrivate switches to a 1:1 view; returns a system line to append.
-func (c *chatScreen) enterPrivate(user string) {
+// enterPrivate switches to a 1:1 thread. History older than the mixed
+// backlog window is deep-fetched lazily the first time the thread opens.
+// Returns nil or the backlog command - caller MUST schedule it.
+func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
-	c.rebuildView() // retro-filter history BEFORE the note lands
-	c.appendLine(tuiSystemStyle.Render("* Private chat with " + user + " — Esc for common room"))
+	conv := conversationKey(c.me, user)
+	c.rebuildView()
+	if c.fetchedConvs == nil {
+		c.fetchedConvs = map[string]bool{}
+	}
+	var fetchCmd tea.Cmd
+	if !c.fetchedConvs[conv] {
+		c.fetchedConvs[conv] = true // ask once regardless of outcome
+		fetchCmd = c.doConvFetch(conv)
+	}
+	c.appendLocal(conv, tuiSystemStyle.Render("* Private chat with "+user+" — Esc for common room"))
+	return fetchCmd
 }
 
 // exitPrivate returns to the common room; returns a system line or "".
@@ -524,7 +572,7 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.rebuildView()
-	c.appendLine(tuiSystemStyle.Render("* Back in the common room"))
+	c.appendLocal(generalConv, tuiSystemStyle.Render("* Back in the common room"))
 }
 
 // submitLine handles one committed input line. It returns the tea.Cmd that
@@ -553,13 +601,14 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 // returns the wire command. Private view targets the message at the selected
 // peer; common room sends broadcast.
 func (c *chatScreen) dispatchSend(text string) tea.Cmd {
+	conv := c.activeConv()
 	echo := tuiMeStyle.Render("[you →] " + text)
 	if c.targetUser != "" {
 		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
 	}
-	c.localLines = append(c.localLines, echo)
-	c.pending = &pendingSend{text: text}
-	c.rebuildView() // fixes pending.lineIdx to the echo position
+	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
+	c.pending = &pendingSend{text: text, conv: conv}
+	c.rebuildView()
 	return c.doSend(text, c.targetUser)
 }
 
@@ -639,6 +688,13 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, nc)
 		}
 
+	case convBacklogMsg:
+		if msg.err == nil {
+			for _, m := range msg.msgs {
+				c.addMessage(m) // seq-deduped; pre-window history lands here
+			}
+		}
+
 	case leaveDoneMsg:
 		return c, tea.Quit
 
@@ -711,15 +767,21 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		}
 	}
 
-	pendingIsLastLocal := len(c.localLines) > 0 && c.pending != nil &&
-		c.pending.lineIdx == len(c.history)+len(c.localLines)-1
+	lastOfPending := -1
+	if c.pending != nil {
+		for i := range c.localLines {
+			if c.localLines[i].conv == c.pending.conv {
+				lastOfPending = i
+			}
+		}
+	}
 	switch {
-	case pendingIsLastLocal && replacement == "":
-		c.localLines = c.localLines[:len(c.localLines)-1] // filtered drop
-	case pendingIsLastLocal:
-		c.localLines[len(c.localLines)-1] = replacement
+	case lastOfPending >= 0 && replacement == "":
+		c.localLines = append(c.localLines[:lastOfPending], c.localLines[lastOfPending+1:]...)
+	case lastOfPending >= 0:
+		c.localLines[lastOfPending] = localLine{conv: c.pending.conv, text: replacement}
 	case replacement != "":
-		c.appendLine(replacement)
+		c.appendLocal(generalConv, replacement)
 	}
 	if msg.code == 410 {
 		c.rebuildView()
