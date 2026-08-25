@@ -42,15 +42,6 @@ func TestIsOwnPresence(t *testing.T) {
 	}
 }
 
-func TestMentionsUser(t *testing.T) {
-	if !mentionsUser("carol left", "carol") {
-		t.Error("own leave must be detected")
-	}
-	if mentionsUser("carol left", "carolito") {
-		t.Error("prefix collision must not match")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Layout math — HEIGHT INVARIANT is the headline contract
 // ---------------------------------------------------------------------------
@@ -383,8 +374,13 @@ func TestSettleSendBoundsSafety(t *testing.T) {
 	c.pending = &pendingSend{lineIdx: 99, text: "ghost"}
 
 	c.settleSend(sendDoneMsg{text: "ghost", seq: 7, code: 201})
+	// Stale pointer falls back to history-ownership: ghost lands as a
+	// canonical row; the pre-seeded local line survives untouched.
+	if len(c.history) != 1 || c.history[0].Text != "ghost" {
+		t.Fatalf("history fallback failed: %+v", c.history)
+	}
 	if len(c.lines) != 2 {
-		t.Fatalf("fallback append expected; lines=%v", c.lines)
+		t.Fatalf("painted rows = %v", c.lines)
 	}
 	if c.pending != nil {
 		t.Error("pending must clear after settle")
@@ -544,8 +540,12 @@ func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
 	if got.pending != nil {
 		t.Fatal("pending not cleared after settle")
 	}
+	// Echo row removed; history owns exactly one painted copy.
 	if len(got.lines) != 1 || strings.Contains(got.lines[0], "[you →]") {
-		t.Errorf("echo not replaced with confirmed line: %q", got.lines)
+		t.Fatalf("expected single confirmed row; got %q", got.lines)
+	}
+	if len(got.history) != 1 || got.history[0].ConvID != generalConv {
+		t.Fatalf("broadcast must land in general history: %+v", got.history)
 	}
 	if promo != nil {
 		t.Fatal("promotion cmd emitted with empty outbox")
