@@ -149,3 +149,89 @@ func TestEnterPrivateFetchesThreadOnce(t *testing.T) {
 		t.Error("deep-fetched history not stored")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression: a CONFIRMED DM must land in its thread — never painted into
+// the general room for either participant (reported bug #1).
+// ---------------------------------------------------------------------------
+
+func TestSettleRoutesDMIntoThreadNotGeneral(t *testing.T) {
+	c := newFilterScreen("p1", "")
+	c.vp = *viewportPtr(60, 20)
+	c.enterPrivate("p2") // active conv = p1|p2
+
+	c.submitLine("secret ping") // echo paints inside the thread
+	if c.pending == nil || c.pending.conv != conversationKey("p1", "p2") {
+		t.Fatalf("pending state wrong: %+v", c.pending)
+	}
+
+	c.exitPrivate() // user hops back to the room before confirmation lands
+
+	// Confirmation arrives while we are in GENERAL view.
+	c.settleSend(sendDoneMsg{text: "secret ping", to: "p2", seq: 42, code: 201})
+
+	// History owns it under the pair bucket.
+	found := false
+	for _, h := range c.history {
+		if h.Seq == 42 && h.ConvID == conversationKey("p1", "p2") && h.To == "p2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("DM not routed to pair history: %+v", c.history)
+	}
+
+	// General paint excludes it.
+	if got := strings.Join(c.lines, "\n"); strings.Contains(got, "secret ping") {
+		t.Fatalf("DM leaked into general paint after settle:\n%s", got)
+	}
+
+	// Thread paints it exactly once.
+	c.enterPrivate("p2")
+	got := strings.Join(c.lines, "\n")
+	if n := strings.Count(got, "secret ping"); n != 1 {
+		t.Fatalf("thread shows %d copies of the DM; want 1:\n%s", n, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression: navigation noise is BANNED from transcripts (bug #2). Context
+// lives solely in the permanent header.
+// ---------------------------------------------------------------------------
+
+func TestNoNavigationNotesInTranscripts(t *testing.T) {
+	c := newFilterScreen("me", "", "me", "a", "b")
+	c.vp = *viewportPtr(60, 20)
+
+	banned := []string{"Private chat with", "Back in the common", "Esc for common"}
+
+	for _, peer := range []string{"a", "b", "a"} { // rapid hopping
+		c.enterPrivate(peer)
+		c.exitPrivate()
+	}
+	painted := strings.Join(c.lines, "\n")
+	for _, b := range banned {
+		if strings.Contains(painted, b) {
+			t.Errorf("navigation note leaked into transcript: %q\n%s", b, painted)
+		}
+	}
+	for _, ll := range c.localLines {
+		for _, b := range banned {
+			if strings.Contains(ll.text, b) {
+				t.Errorf("navigation note persisted in locals: %+v", ll)
+			}
+		}
+	}
+
+	// Header carries the context INSTEAD: silent in general, explicit in DM.
+	c.width = 100 // banner needs a real width to render
+	c.targetUser = ""
+	if h := c.headerView(); strings.Contains(h, "private") || strings.Contains(h, "ESC") {
+		t.Errorf("general header must stay clean: %q", h)
+	}
+	c.targetUser = "a"
+	h := c.headerView()
+	if !strings.Contains(h, "private with a") || !strings.Contains(h, "ESC = general") {
+		t.Errorf("thread header missing permanent nav heading: %q", h)
+	}
+}

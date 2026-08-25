@@ -46,35 +46,43 @@ func TestPrivateViewRetroFiltersHistory(t *testing.T) {
 	if strings.Contains(got, "psst bob") {
 		t.Errorf("DM leaked back into room:\n%s", got)
 	}
-	if !strings.Contains(got, "public noise") || !strings.Contains(got, "Back in the common room") {
+	if !strings.Contains(got, "public noise") {
 		t.Errorf("room restore wrong:\n%s", got)
 	}
-	if n := len(c.lines); n != 3 { // 2 history + back-note (enter-note stayed in thread)
-		t.Fatalf("post-exit room rows = %d; want 3", n)
+	if n := len(c.lines); n != 2 {
+		t.Fatalf("post-exit room rows = %d; want exactly the 2 history rows (no nav notes)", n)
 	}
 }
 
 func TestPendingEchoSurvivesModeSwitch(t *testing.T) {
-	c := newFilterScreen("bob", "")
+	c := newFilterScreen("me", "alice")
 	c.vp = *viewportPtr(40, 10)
 	c.submitLine("in flight")
 	if c.pending == nil {
 		t.Fatal("precondition: send should be in flight")
 	}
 
-	c.enterPrivate("alice") // rebuild while a send is pending
+	c.exitPrivate() // rebuild while a send is pending
 	if c.pending == nil {
 		t.Fatal("pending lost on rebuild")
 	}
-	want := len(c.lines) - 1
-	if c.pending.lineIdx != want {
-		t.Fatalf("pending idx %d not relocated (last=%d)", c.pending.lineIdx, want)
-	}
 
+	// Settle routes by the PENDING conversation, not the active view:
+	// the thread's echo resolves even though we now sit in general.
 	c.settleSend(sendDoneMsg{text: "in flight", seq: 9, code: 201})
-	last := c.lines[len(c.lines)-1]
-	if strings.Contains(last, "[you →]") {
-		t.Errorf("settle missed relocated echo: %q", last)
+	for _, ll := range c.localLines {
+		if ll.conv != generalConv && strings.Contains(ll.text, "[you") {
+			t.Fatalf("thread echo not resolved: %+v", ll)
+		}
+	}
+	found := false
+	for _, h := range c.history {
+		if h.Seq == 9 && h.ConvID == conversationKey("me", "alice") && h.Text == "in flight" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("confirmed DM missing from thread history")
 	}
 }
 

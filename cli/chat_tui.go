@@ -230,6 +230,7 @@ type beatDoneMsg struct {
 }
 type sendDoneMsg struct {
 	text string
+	to   string // empty for broadcasts
 	seq  int
 	code int
 	err  error
@@ -255,7 +256,7 @@ type chatScreen struct {
 	lines        []string        // DERIVED paint buffer: rebuildView() owns it
 	rendered     map[int]bool    // server seqs already rendered
 	pending      *pendingSend    // single in-flight send (nil = idle)
-	outbox       []string        // queued lines waiting for the in-flight send to settle
+	outbox       []queuedLine    // queued sends waiting for the in-flight one
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -271,11 +272,20 @@ type pendingSend struct {
 	lineIdx int
 	text    string
 	conv    string // conversation the optimistic echo belongs to
+	to      string // recipient ("": broadcast) - needed to reconstruct on settle
 }
 
 // localLine is a UI-generated transcript row scoped to one conversation so
 // mode switches never bleed it across views.
 type localLine struct {
+	conv string
+	text string
+}
+
+// queuedLine remembers WHERE a typed line belonged when it was enqueued, so
+// draining it later cannot fire it into whatever thread the user has since
+// switched to.
+type queuedLine struct {
 	conv string
 	text string
 }
@@ -314,11 +324,6 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 // a bare strings.Contains would produce.
 func isOwnPresence(systemText, me string) bool {
 	return systemText == me+" joined" || systemText == me+" left"
-}
-
-// mentionsUser reports whether a presence line concerns the given user.
-func mentionsUser(systemText, user string) bool {
-	return systemText == user+" joined" || systemText == user+" left"
 }
 
 // shouldRender decides visibility BEFORE any styling. The rule is strictly
@@ -418,7 +423,7 @@ func (c *chatScreen) refreshViewport() {
 func (c chatScreen) headerView() string {
 	mode := ""
 	if c.targetUser != "" {
-		mode = fmt.Sprintf(" · private: %s (Esc to exit)", c.targetUser)
+		mode = fmt.Sprintf(" · private with %s · ESC = general", c.targetUser)
 	}
 	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
 		c.key, c.me, len(c.users), mode)
@@ -507,7 +512,7 @@ func (c chatScreen) doSend(text, to string) tea.Cmd {
 	client := c.client
 	return func() tea.Msg {
 		code, msg, err := client.sendMessage(text, to)
-		return sendDoneMsg{text: text, seq: msg.Seq, code: code, err: err}
+		return sendDoneMsg{text: text, to: msg.To, seq: msg.Seq, code: code, err: err}
 	}
 }
 
@@ -561,7 +566,6 @@ func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 		c.fetchedConvs[conv] = true // ask once regardless of outcome
 		fetchCmd = c.doConvFetch(conv)
 	}
-	c.appendLocal(conv, tuiSystemStyle.Render("* Private chat with "+user+" — Esc for common room"))
 	return fetchCmd
 }
 
@@ -572,7 +576,6 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.rebuildView()
-	c.appendLocal(generalConv, tuiSystemStyle.Render("* Back in the common room"))
 }
 
 // submitLine handles one committed input line. It returns the tea.Cmd that
@@ -590,7 +593,7 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 		return nil
 	default:
 		if c.pending != nil {
-			c.outbox = append(c.outbox, text) // one wire message at a time
+			c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
 			return nil
 		}
 		return c.dispatchSend(text)
@@ -601,15 +604,33 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 // returns the wire command. Private view targets the message at the selected
 // peer; common room sends broadcast.
 func (c *chatScreen) dispatchSend(text string) tea.Cmd {
-	conv := c.activeConv()
+	return c.dispatchInConv(c.activeConv(), text)
+}
+
+// dispatchInConv paints the echo into a specific conversation bucket and
+// targets the peer that conversation represents (empty conv => broadcast).
+func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
+	var peer string
+	if conv != generalConv {
+		parts := strings.Split(conv, "|")
+		for _, u := range parts {
+			if u != c.me {
+				peer = u
+			}
+		}
+	}
 	echo := tuiMeStyle.Render("[you →] " + text)
 	if c.targetUser != "" {
 		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
 	}
 	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
-	c.pending = &pendingSend{text: text, conv: conv}
+	c.pending = &pendingSend{text: text, conv: conv, to: peer}
+	target := peer
+	if target == "" && c.pending.conv == generalConv {
+		target = ""
+	}
 	c.rebuildView()
-	return c.doSend(text, c.targetUser)
+	return c.doSend(text, target)
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -745,56 +766,82 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return c, tea.Batch(cmds...)
 }
 
-// settleSend resolves the optimistic echo for the completed send and promotes
-// the next queued line. It returns the wire command for that promotion — the
-// caller MUST append it, otherwise queued messages would stall forever.
+// settleSend resolves the completed send against the transcript.
+//
+// Ownership model: a CONFIRMED message becomes part of history (the poll
+// copy is suppressed via rendered-dedupe), so its optimistic echo row is
+// REMOVED — never rewritten — which guarantees exactly one painted row in
+// exactly one conversation. Failures keep the echo row in place, annotated.
+// Either way the next queued line is promoted, preserving its origin conv.
 func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
-	var replacement string
-	switch {
-	case msg.code == 429:
-		replacement = tuiErrStyle.Render("✗ slow down — try again")
-	case msg.code == 410:
-		replacement = tuiSystemStyle.Render("* Session has ended")
-	case msg.err != nil:
-		replacement = tuiErrStyle.Render("✗ send failed: " + msg.err.Error())
-	default:
-		m := chatMessage{Seq: msg.seq, Username: c.me, Kind: "chat", Text: msg.text}
-		c.rendered[m.Seq] = true
-		if c.shouldRender(m) {
-			replacement = c.renderLine(m)
-		} else {
-			replacement = "" // filtered mid-flight (rare): drop the echo
-		}
+	pc := generalConv
+	if c.pending != nil {
+		pc = c.pending.conv
 	}
 
 	lastOfPending := -1
-	if c.pending != nil {
-		for i := range c.localLines {
-			if c.localLines[i].conv == c.pending.conv {
-				lastOfPending = i
-			}
+	for i := range c.localLines {
+		if c.localLines[i].conv == pc {
+			lastOfPending = i
 		}
 	}
+
 	switch {
-	case lastOfPending >= 0 && replacement == "":
-		c.localLines = append(c.localLines[:lastOfPending], c.localLines[lastOfPending+1:]...)
-	case lastOfPending >= 0:
-		c.localLines[lastOfPending] = localLine{conv: c.pending.conv, text: replacement}
-	case replacement != "":
-		c.appendLocal(generalConv, replacement)
+	case msg.code == 429:
+		if lastOfPending >= 0 {
+			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
+		}
+	case msg.code == 410:
+		if lastOfPending >= 0 {
+			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
+		}
+	case msg.err != nil:
+		if lastOfPending >= 0 {
+			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
+		} else {
+			c.appendLocal(generalConv, tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
+		}
+	default:
+		to := ""
+		if c.pending != nil {
+			to = c.pending.to
+		} else if msg.to != "" {
+			to = msg.to
+		}
+		conv := generalConv
+		if to != "" {
+			conv = conversationKey(c.me, to)
+		}
+		m := chatMessage{
+			Seq: msg.seq, Username: c.me, Kind: "chat",
+			Text: msg.text, To: to, ConvID: conv,
+		}
+		c.rendered[m.Seq] = true
+		known := false
+		for _, h := range c.history {
+			if h.Seq == m.Seq {
+				known = true
+				break
+			}
+		}
+		if !known {
+			c.history = append(c.history, m)
+		}
+		if lastOfPending >= 0 {
+			c.localLines = append(c.localLines[:lastOfPending], c.localLines[lastOfPending+1:]...)
+		}
 	}
-	if msg.code == 410 {
-		c.rebuildView()
-		return nil // room ended; nothing further to promote
-	}
+
 	c.pending = nil
 	c.rebuildView()
 
-	// Drain exactly one queued line per settled send.
+	if msg.code == 410 {
+		return nil // room ended; nothing further to promote
+	}
 	if n := len(c.outbox); n > 0 {
 		next := c.outbox[0]
 		c.outbox = c.outbox[1:]
-		return c.dispatchSend(next)
+		return c.dispatchInConv(next.conv, next.text)
 	}
 	return nil
 }
