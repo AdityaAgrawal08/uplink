@@ -86,25 +86,22 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 		t.Error("threads section rendered without room")
 	}
 
-	// Opening a thread registers it and marks it active in the sidebar.
+	// THREADS panel is intentionally gone: the transcript + header carry all
+	// conversation context. Opening a thread must not resurrect any section.
 	c.enterPrivate("bob")
 	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(out, "THREADS") || !strings.Contains(out, "▸ · bob") {
-		t.Errorf("active thread not highlighted:\n%s", out)
+	if strings.Contains(out, "THREADS") || strings.Contains(out, "▸ · bob") || strings.Contains(out, "# general") {
+		t.Errorf("thread panel remnants after removal:\n%s", out)
 	}
-	if !strings.Contains(out, "# general") {
-		t.Error("general channel missing from threads list")
+	if !strings.Contains(out, "● bob") {
+		t.Errorf("selected peer lost its highlight:\n%s", out)
 	}
 
-	// Full-row highlight for the selected peer.
-	hl := tuiRosterSelectedStyle.Render(strings.Repeat(" ", 1))
-	_ = hl // style smoke: exact padding asserted indirectly via no-panic above
-
-	// Switching to general marks the channel instead.
+	// Back to general: still just the ONLINE roster.
 	c.exitPrivate()
 	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(out, "▸ # general") {
-		t.Errorf("general not marked active after exit:\n%s", out)
+	if !strings.Contains(out, "ONLINE — 3") {
+		t.Errorf("roster damaged by mode switches:\n%s", out)
 	}
 }
 

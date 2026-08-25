@@ -308,26 +308,25 @@ type convBacklogMsg struct {
 // ---- model -----------------------------------------------------------------
 
 type chatScreen struct {
-	client        *chatClient
-	key           string
-	me            string
-	width         int
-	height        int
-	history       []chatMessage   // every confirmed server message (deduped by seq)
-	localLines    []localLine     // echoes & notes not backed by server docs
-	fetchedConvs  map[string]bool // threads already deep-fetched this session
-	openedThreads []string        // peers whose thread was opened this session
-	lines         []string        // DERIVED paint buffer: rebuildView() owns it
-	rendered      map[int]bool    // server seqs already rendered
-	pending       *pendingSend    // single in-flight send (nil = idle)
-	outbox        []queuedLine    // queued sends waiting for the in-flight one
-	users         []string
-	vp            viewport.Model
-	input         textinput.Model
-	status        string
-	targetUser    string // private-chat peer; "" = general room
-	beatFailures  int
-	pollFailures  int
+	client       *chatClient
+	key          string
+	me           string
+	width        int
+	height       int
+	history      []chatMessage   // every confirmed server message (deduped by seq)
+	localLines   []localLine     // echoes & notes not backed by server docs
+	fetchedConvs map[string]bool // threads already deep-fetched this session
+	lines        []string        // DERIVED paint buffer: rebuildView() owns it
+	rendered     map[int]bool    // server seqs already rendered
+	pending      *pendingSend    // single in-flight send (nil = idle)
+	outbox       []queuedLine    // queued sends waiting for the in-flight one
+	users        []string
+	vp           viewport.Model
+	input        textinput.Model
+	status       string
+	targetUser   string // private-chat peer; "" = general room
+	beatFailures int
+	pollFailures int
 }
 
 // pendingSend tracks the optimistic echo line for the in-flight send so the
@@ -365,22 +364,21 @@ func (c *chatScreen) activeConv() string {
 
 func newChatScreen(serverURL, key, me string) chatScreen {
 	ti := textinput.New()
-	ti.Placeholder = "Type a message…  ·  /help /users /exit"
+	ti.Placeholder = "Type a message…  ·  /help · /exit"
 	ti.Focus()
 	ti.CharLimit = 500
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
 	return chatScreen{
-		client:        newChatClient(serverURL, key, me),
-		key:           key,
-		me:            me,
-		vp:            vp,
-		input:         ti,
-		rendered:      map[int]bool{},
-		fetchedConvs:  map[string]bool{generalConv: true},
-		openedThreads: nil,
-		outbox:        nil,
+		client:       newChatClient(serverURL, key, me),
+		key:          key,
+		me:           me,
+		vp:           vp,
+		input:        ti,
+		rendered:     map[int]bool{},
+		fetchedConvs: map[string]bool{generalConv: true},
+		outbox:       nil,
 	}
 }
 
@@ -529,10 +527,10 @@ func rosterRow(u, me, target string) string {
 // rosterBody renders the bordered sidebar with EXACTLY slots content rows
 // (title + users), so its height always matches the transcript column. The
 // overflow indicator replaces the final slot when participants overflow.
-// sidebarBody renders the OpenCode-style right column: an ONLINE section
-// with presence dots (selected peer highlighted full-row), then a THREADS
-// section listing the general channel and every 1:1 thread opened this
-// session. Height is deterministic: exactly slots content rows (+border).
+// sidebarBody renders the right column: an ONLINE section with presence dots
+// and a full-row highlight on the selected peer. The transcript itself is
+// the single source of conversation context, so no thread list is shown.
+// Height is deterministic: exactly `fill` content rows (+border in View).
 func (c chatScreen) rosterBody(fill int) string {
 	if fill < 1 {
 		fill = 1 // always show the section header
@@ -588,28 +586,6 @@ func (c chatScreen) rosterBody(fill int) string {
 			add("○ "+u, false)
 		}
 		shown++
-	}
-
-	// THREADS section only when there is spare vertical room.
-	spent := shown + 1 // + title
-	if fill-spent >= 3 {
-		rows = append(rows, "") // spacer
-		rows = append(rows, tuiSectionTitleStyle.Render(trunc("THREADS")))
-		gen := "# general"
-		if c.targetUser == "" {
-			gen = "▸ # general"
-		}
-		add(gen, c.targetUser == "")
-		for _, peer := range c.openedThreads {
-			row := "· " + peer
-			if peer == c.targetUser {
-				row = "▸ · " + peer
-			}
-			add(row, peer == c.targetUser)
-			if len(rows) >= fill {
-				break
-			}
-		}
 	}
 
 	for len(rows) < fill {
@@ -707,16 +683,6 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 // Returns nil or the backlog command - caller MUST schedule it.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
-	known := false
-	for _, t := range c.openedThreads {
-		if t == user {
-			known = true
-			break
-		}
-	}
-	if !known {
-		c.openedThreads = append(c.openedThreads, user)
-	}
 	conv := conversationKey(c.me, user)
 	c.rebuildView()
 	if c.fetchedConvs == nil {
@@ -745,11 +711,8 @@ func (c *chatScreen) exitPrivate() {
 // the message on the wire.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
 	switch strings.ToLower(text) {
-	case "/users":
-		c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
-		return nil
 	case "/help":
-		hint := "* Commands: /users · /exit · click a name in the sidebar for private chat"
+		hint := "* Commands: /exit · click a name in the sidebar to chat privately"
 		c.appendLine(tuiSystemStyle.Render(hint))
 		return nil
 	default:
