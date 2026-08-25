@@ -34,22 +34,27 @@ export async function nextSeq(db: Db, sessionId: string): Promise<number> {
   return updated?.msgSeq ?? 0;
 }
 
+// appendMessage stores one transcript entry. `to` marks a private 1:1
+// message (recipient username); omitted/empty means public broadcast.
 export async function appendMessage(
   db: Db,
   sessionId: string,
   username: string,
   kind: "chat" | "system",
-  text: string
+  text: string,
+  to?: string
 ): Promise<number> {
   const seq = await nextSeq(db, sessionId);
-  await db.collection("session_messages").insertOne({
+  const doc: Record<string, unknown> = {
     sessionId,
     seq,
     username,
     kind,
     text,
     createdAt: new Date(),
-  });
+  };
+  if (to) doc.to = to; // keep public docs field-free for cheap $or matching
+  await db.collection("session_messages").insertOne(doc);
   return seq;
 }
 
@@ -67,6 +72,7 @@ export interface ChatMessageDTO {
   kind: "chat" | "system";
   text: string;
   createdAt: string;
+  to?: string;
 }
 
 export interface ChatDoc {
@@ -75,6 +81,7 @@ export interface ChatDoc {
   kind: string;
   text: string;
   createdAt: Date;
+  to?: string;
 }
 
 export interface SessionAliveDoc {
@@ -88,12 +95,15 @@ export function toMessageDTO(m: {
   kind: string;
   text: string;
   createdAt: Date;
+  to?: string;
 }): ChatMessageDTO {
-  return {
+  const dto: ChatMessageDTO = {
     seq: m.seq,
     username: m.username,
     kind: m.kind === "system" ? "system" : "chat",
     text: m.text,
     createdAt: m.createdAt.toISOString(),
   };
+  if (m.to) dto.to = m.to;
+  return dto;
 }

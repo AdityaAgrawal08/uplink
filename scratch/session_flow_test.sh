@@ -96,6 +96,37 @@ ST=$(code -X POST "$SERVER/api/v1/session/$SID/join" \
      -H 'Content-Type: application/json' -d '{"username":"ci_alice"}')
 [ "$ST" = "409" ] && ok "duplicate username 409" || bad "dup expected 409, got $ST"
 
+echo "=== S-C11: private delivery + roster-on-poll ==="
+# ci_bob sends a 1:1 to ci_alice; outsider must NOT receive it.
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/messages" \
+     -H 'Content-Type: application/json' -H 'X-Uplink-Username: ci_bob' \
+     -d '{"text":"psst secret","to":"ci_alice"}')
+grep -q '"seq":' "$BODY" && ok "private send accepted" || bad "private send status=$ST body=$(cat "$BODY")"
+
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0" -H 'X-Uplink-Username: ci_alice')
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert any(m["text"]=="psst secret" for m in d["messages"])' "$BODY" 2>/dev/null \
+    && ok "recipient sees 1:1" || bad "recipient missing DM"
+
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/join" -H 'Content-Type: application/json' -d '{"username":"ci_carol"}')
+[ "$ST" = "200" ] && ok "carol joined for leak test" || bad "carol join=$ST"
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0" -H 'X-Uplink-Username: ci_carol')
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert not any("psst secret"==m["text"] for m in d["messages"])' "$BODY" 2>/dev/null \
+    && ok "outsider CANNOT see DM" || bad "PRIVACY LEAK to carol"
+
+ROSTER=$(python3 -c "import json;print(json.load(open('$BODY')).get('activeUsers',[]))" 2>/dev/null)
+echo "$ROSTER" | grep -q "ci_alice" && echo "$ROSTER" | grep -q "ci_bob" \
+    && ok "activeUsers rides on poll ($ROSTER)" || bad "roster field wrong: $ROSTER"
+
+echo "=== S-C12: private-send guards ==="
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/messages" \
+     -H 'Content-Type: application/json' -H 'X-Uplink-Username: ci_bob' \
+     -d '{"text":"hi me","to":"ci_bob"}')
+[ "$ST" = "400" ] && ok "self-DM rejected (400)" || bad "self-DM expected 400, got $ST"
+ST=$(code -X POST "$SERVER/api/v1/session/$SID/messages" \
+     -H 'Content-Type: application/json' -H 'X-Uplink-Username: ci_bob' \
+     -d '{"text":"ghost","to":"nobody_here"}')
+[ "$ST" = "404" ] && ok "absent recipient rejected (404)" || bad "absent recipient expected 404, got $ST"
+
 echo "=== S-C10: cleanup run ==="
 ST=$(code -X POST "$SERVER/api/v1/session/cleanup")
 [ "$ST" = "200" ] && ok "cleanup executed" || bad "status=$ST"

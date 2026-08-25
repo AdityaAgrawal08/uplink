@@ -13,6 +13,8 @@ import {
   type SessionAliveDoc,
 } from "@/lib/sessionChat";
 
+const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
+const usernameRegex = USERNAME_RE;
 const BACKLOG_LIMIT = 50;
 const POLL_LIMIT = 200;
 const RATE_LIMIT = 20; // messages per window
@@ -49,6 +51,18 @@ export async function POST(
     const text = sanitizeChatText(parsed.body.text);
     if (!text) return apiError("text must be 1-500 printable characters", 400);
 
+    // Optional 1:1 recipient. Absent/empty => broadcast to the whole room.
+    let to = "";
+    if (parsed.body.to !== undefined && parsed.body.to !== null && parsed.body.to !== "") {
+      if (typeof parsed.body.to !== "string" || !usernameRegex.test(parsed.body.to)) {
+        return apiError("to must be a valid username", 400);
+      }
+      if (parsed.body.to === username) {
+        return apiError("cannot send a private message to yourself", 400);
+      }
+      to = parsed.body.to;
+    }
+
     const db = await getDb();
 
     // Per-user flood guard (Redis-backed; degrades to per-instance in mock
@@ -77,7 +91,16 @@ export async function POST(
 
     maybeCleanup();
 
-    const seq = await appendMessage(db, sessionId, username, "chat", text);
+    if (to) {
+      const recipient = await db.collection("session_participants").findOne({
+        sessionId,
+        username: to,
+        status: "ACTIVE",
+      });
+      if (!recipient) return apiError("recipient is not in this session", 404);
+    }
+
+    const seq = await appendMessage(db, sessionId, username, "chat", text, to || undefined);
     return NextResponse.json({ seq }, { status: 201 });
   } catch (error) {
     console.error("Error in POST /api/v1/session/[sessionId]/messages:", error);
@@ -118,10 +141,22 @@ export async function GET(
     const waitMs = Math.min(Math.max(Number(req.nextUrl.searchParams.get("wait") ?? 0) || 0, 0), 2500);
     const deadline = Date.now() + waitMs;
 
+    // Delivery visibility: system lines and public broadcasts reach everyone;
+    // a message with `to` reaches ONLY sender and recipient.
+    const visibleFilter = () => ({
+      sessionId,
+      $or: [
+        { kind: "system" },
+        { to: { $in: [null, ""] } },
+        { to: username },
+        { username },
+      ],
+    });
+
     const queryNew = () =>
       db
         .collection("session_messages")
-        .find({ sessionId, seq: { $gt: afterSeq as number } })
+        .find({ ...visibleFilter(), seq: { $gt: afterSeq as number } })
         .sort({ seq: 1 })
         .limit(POLL_LIMIT)
         .toArray() as unknown as Promise<ChatDoc[]>;
@@ -139,21 +174,37 @@ export async function GET(
         if (!isSessionAlive(fresh)) break;
         docs = await queryNew();
       }
+      const roster = await db
+        .collection("session_participants")
+        .find({ sessionId, status: "ACTIVE" })
+        .project({ username: 1, _id: 0 })
+        .toArray();
       return NextResponse.json({
         messages: docs.map(toMessageDTO),
+        activeUsers: roster.map((r) => r.username).sort(),
         ended: !alive,
       });
     }
 
-    // No cursor → backlog: latest BACKLOG_LIMIT messages, oldest-first.
+    // No cursor → backlog: latest BACKLOG_LIMIT visible messages, oldest-first.
     const docs = await db
       .collection("session_messages")
-      .find({ sessionId })
+      .find(visibleFilter())
       .sort({ seq: -1 })
       .limit(BACKLOG_LIMIT)
       .toArray() as unknown as ChatDoc[];
+
+    // Roster rides along with EVERY response so sidebars stay fresh without
+    // waiting for the next heartbeat tick (join/leave latency ≤ poll cadence).
+    const roster = await db
+      .collection("session_participants")
+      .find({ sessionId, status: "ACTIVE" })
+      .project({ username: 1, _id: 0 })
+      .toArray();
+
     return NextResponse.json({
       messages: docs.reverse().map(toMessageDTO),
+      activeUsers: roster.map((r) => r.username).sort(),
       ended: !alive,
     });
   } catch (error) {
