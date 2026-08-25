@@ -102,6 +102,7 @@ func composerRowsFor(termH int) int {
 // Height invariant (the contract that keeps us inside the terminal):
 //
 //	headerHeight + (vpHeight + transcriptBorder) + inputChromeHeight + statusRows
+//	    + paletteRows
 //	    == termH   (exactly; never more)
 type layout struct {
 	vpWidth         int  // transcript viewport inner width
@@ -111,6 +112,7 @@ type layout struct {
 	rosterY0        int  // first terminal row inside the sidebar that holds a user
 	rosterSlots     int  // how many roster rows fit under the current vpHeight
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
+	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
 	boxedTranscript bool // staged degradation: drop border rows on tiny heights
 	inputBoxed      bool // false => bare one-line prompt
@@ -121,7 +123,7 @@ type layout struct {
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
-	h := l.vpHeight + l.statusRows
+	h := l.vpHeight + l.statusRows + l.paletteRows
 	if l.boxedTranscript {
 		h += transcriptBorder
 	}
@@ -140,8 +142,16 @@ func (l layout) totalRows() int {
 }
 
 // computeLayout derives frame geometry purely from terminal size and whether
-// the status line is visible. Guarantees, in order:
-//  1. totalRows() <= termH always (staged chrome degradation on tiny screens)
+// the status line is visible. See computeLayoutWithPalette for the full
+// contract; paletteRows defaults to 0 (drawer closed).
+func computeLayout(termW, termH int, showStatus bool) layout {
+	return computeLayoutWithPalette(termW, termH, showStatus, 0)
+}
+
+// computeLayoutWithPalette reserves paletteRows extra rows for the "/" drawer
+// before handing the remainder to the viewport. Guarantees, in order:
+//  1. totalRows() <= termH always (staged chrome degradation on tiny screens;
+//     the drawer itself is sacrificed late — only after the frame is gone)
 //  2. full-screen app frame whenever height allows (OpenCode-style shell)
 //  3. sidebar collapses below minSidebarTermW / tiny content, else its width
 //     scales with terminal width for comfortable reading
@@ -150,7 +160,7 @@ func (l layout) totalRows() int {
 //  5. viewport absorbs all remaining space (floors at zero rows)
 //
 // Pure function => trivially unit-testable.
-func computeLayout(termW, termH int, showStatus bool) layout {
+func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int) layout {
 	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
@@ -159,6 +169,7 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	if showStatus {
 		l.statusRows = 1
 	}
+	l.paletteRows = paletteRows
 	l.showHeader = true
 	l.boxedTranscript = true
 	l.frameOn = termH >= 12 // below this the shell cannot fit its own border
@@ -200,7 +211,7 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 			if l.sidebarOn { // nothing to sit beside once unframed
 				l.sidebarOn = false
 				l.rosterX = 0
-				l.vpWidth = termW - transcriptBorder
+				l.vpWidth = widthInsideFrame(termW, l.frameOn) - transcriptBorder
 			}
 		case l.frameOn:
 			l.frameOn = false
@@ -214,6 +225,8 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 			if l.vpWidth < 10 {
 				l.vpWidth = 10
 			}
+		case l.paletteRows > 0:
+			l.paletteRows = 0 // absurdly tiny terminal: dissolve the drawer
 		default:
 			l.showHeader = false
 		}
@@ -241,7 +254,7 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	if l.vpHeight < 3 && l.sidebarOn {
 		l.sidebarOn = false // no room for border+title+even one user
 		l.rosterX = 0
-		l.vpWidth = termW - transcriptBorder
+		l.vpWidth = widthInsideFrame(termW, l.frameOn) - transcriptBorder
 		if l.vpWidth < 10 {
 			l.vpWidth = 10
 		}
@@ -257,6 +270,15 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 		l.rosterY0++
 	}
 	return l
+}
+
+// widthInsideFrame is the usable content width before the transcript border:
+// the full terminal when unframed, minus the shell's side borders otherwise.
+func widthInsideFrame(termW int, frameOn bool) int {
+	if frameOn {
+		return termW - frameChrome
+	}
+	return termW
 }
 
 func maxInt(a, b int) int {
@@ -331,6 +353,7 @@ type chatScreen struct {
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
+	palette      paletteState // "/" command drawer above the composer
 	status       string
 	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
@@ -372,7 +395,7 @@ func (c *chatScreen) activeConv() string {
 
 func newChatScreen(serverURL, key, me string) chatScreen {
 	ti := textinput.New()
-	ti.Placeholder = "Type a message…  ·  /help · /exit"
+	ti.Placeholder = "Type a message…  ·  / for commands"
 	ti.Focus()
 	ti.CharLimit = 500
 	ti.Prompt = "❯ "
@@ -552,7 +575,7 @@ func (c chatScreen) headerView() string {
 	}
 	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
 		c.key, c.me, len(c.users), mode)
-	l := computeLayout(c.width, c.height, c.status != "")
+	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
 		w -= frameChrome // banner lives inside the app shell
@@ -685,7 +708,7 @@ func (c chatScreen) rosterBody(fill int) string {
 
 // sidebarInnerWidth is the writable width inside the sidebar border.
 func (c chatScreen) sidebarInnerWidth() int {
-	l := computeLayout(c.width, c.height, c.status != "")
+	l := c.layoutFor()
 	if !l.sidebarOn {
 		return rosterWidthInner
 	}
@@ -769,6 +792,7 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 // Returns nil or the backlog command - caller MUST schedule it.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
+	c.palette.close()      // stale "/" query must not survive a mode switch
 	delete(c.unread, user) // opening the thread clears its badge
 	conv := conversationKey(c.me, user)
 	c.rebuildView()
@@ -789,26 +813,27 @@ func (c *chatScreen) exitPrivate() {
 		return
 	}
 	c.targetUser = ""
+	c.palette.close()
 	c.rebuildView()
 }
 
 // submitLine handles one committed input line. It returns the tea.Cmd that
 // performs the network send (nil for local-only commands). CRITICAL: the
 // caller MUST append this command — it is the ONLY thing that actually puts
-// the message on the wire.
+// the message on the wire. Registry commands are executed here too, so a
+// typed "/help" behaves exactly like one picked from the palette.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
-	switch strings.ToLower(text) {
-	case "/help":
-		hint := "* Commands: /exit · click a name in the sidebar to chat privately"
-		c.appendLine(tuiSystemStyle.Render(hint))
-		return nil
-	default:
-		if c.pending != nil {
-			c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
-			return nil
+	t := strings.ToLower(strings.TrimSpace(text))
+	for _, cmd := range slashCommands {
+		if t == cmd.Name {
+			return c.runCommand(t)
 		}
-		return c.dispatchSend(text)
 	}
+	if c.pending != nil {
+		c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
+		return nil
+	}
+	return c.dispatchSend(text)
 }
 
 // dispatchSend paints the optimistic echo, latches the in-flight slot and
@@ -852,7 +877,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		c.width, c.height = msg.Width, msg.Height
 		c.hoverPeer = "" // geometry changed; stale hover is meaningless
-		l := computeLayout(c.width, c.height, c.status != "")
+		l := c.layoutFor()
 		c.vp.Width = l.vpWidth
 		c.vp.Height = l.vpHeight
 		// Keep the composer inside its column: textinput pads/clips to Width.
@@ -962,6 +987,15 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, c.doLeave(), tea.Quit)
 			return c, tea.Batch(cmds...)
 		}
+		// "/" command drawer eats navigation + selection keys while open.
+		// Early return keeps those keys away from the viewport so moving the
+		// highlight never scrolls the transcript underneath.
+		if handled, action := c.handlePaletteKeys(msg); handled {
+			if action != nil {
+				cmds = append(cmds, action())
+			}
+			return c, tea.Batch(cmds...)
+		}
 		if msg.Type == tea.KeyEsc {
 			// Esc ONLY leaves private view. It must NEVER quit the app.
 			c.exitPrivate()
@@ -972,11 +1006,6 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.SetValue("")
 			if text == "" {
 				break
-			}
-			if strings.EqualFold(text, "/exit") || strings.EqualFold(text, "/quit") {
-				c.appendLine(tuiSystemStyle.Render("* You left the session."))
-				cmds = append(cmds, c.doLeave(), tea.Quit)
-				return c, tea.Batch(cmds...)
 			}
 			if sc := c.submitLine(text); sc != nil {
 				cmds = append(cmds, sc)
@@ -989,6 +1018,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var ic tea.Cmd
 		c.input, ic = c.input.Update(msg)
 		cmds = append(cmds, ic)
+		ensurePaletteOpen(&c) // plain edits may open/close the "/" drawer
 	}
 
 	// Viewport keeps its own scroll handling for every message.
@@ -1101,7 +1131,7 @@ func (c chatScreen) peerAtY(y int, l layout) string {
 // handleMouse routes hover motion and clicks. Hovering paints exactly one
 // pink row; clicking opens that peer's thread.
 func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	l := computeLayout(c.width, c.height, c.status != "")
+	l := c.layoutFor()
 
 	switch msg.Type {
 	case tea.MouseMotion:
@@ -1145,7 +1175,7 @@ func (c chatScreen) View() string {
 	if c.width == 0 || c.height == 0 {
 		return "connecting…"
 	}
-	l := computeLayout(c.width, c.height, c.status != "")
+	l := c.layoutFor()
 
 	// Keep viewport dims in lockstep with the painted layout.
 	vp := c.vp
@@ -1194,6 +1224,12 @@ func (c chatScreen) View() string {
 		input = tuiBorderStyle.Render(c.input.View())
 	default:
 		input = "❯ " + c.input.View()
+	}
+	// OpenCode-style pop-out: with a leading "/" the command drawer emerges
+	// upward out of the composer. A blank spacer row sells the "lifted off
+	// the input" look; it is transient (only while the query starts with "/").
+	if pal := c.paletteView(maxInt(l.vpWidth+2, 0)); pal != "" {
+		rows = append(rows, "", pal)
 	}
 	rows = append(rows, input)
 	if l.statusRows == 1 {
