@@ -113,6 +113,21 @@ ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0" -H 'X-Uplink-Username: 
 python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert not any("psst secret"==m["text"] for m in d["messages"])' "$BODY" 2>/dev/null \
     && ok "outsider CANNOT see DM" || bad "PRIVACY LEAK to carol"
 
+CONV="ci_alice|ci_bob"
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0" -H 'X-Uplink-Username: ci_alice')
+HAS_CONV=$(python3 -c "import json;d=json.load(open('$BODY'));print(any(m['text']=='psst secret' and m.get('convId')=='$CONV' for m in d['messages']))")
+[ "$HAS_CONV" = "True" ] && ok "DM tagged convId=$CONV" || bad "DM missing/carrying wrong convId"
+
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0&conv=general" -H 'X-Uplink-Username: ci_alice')
+python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));assert not any("psst secret"==m["text"] for m in d["messages"])' "$BODY" 2>/dev/null \
+    && ok "general channel excludes own DMs" || bad "DM bled into general channel"
+
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0&conv=$CONV" -H 'X-Uplink-Username: ci_alice')
+grep -q 'psst secret' "$BODY" && ok "?conv= thread returns history" || bad "thread fetch empty"
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0&conv=$CONV" -H 'X-Uplink-Username: ci_carol')
+[ "$ST" = "403" ] && ok "foreign pair read rejected (403)" || bad "expected 403 for foreign conv, got $ST"
+
+ST=$(code "$SERVER/api/v1/session/$SID/messages?after=0&conv=general" -H 'X-Uplink-Username: ci_alice')
 ROSTER=$(python3 -c "import json;print(json.load(open('$BODY')).get('activeUsers',[]))" 2>/dev/null)
 echo "$ROSTER" | grep -q "ci_alice" && echo "$ROSTER" | grep -q "ci_bob" \
     && ok "activeUsers rides on poll ($ROSTER)" || bad "roster field wrong: $ROSTER"

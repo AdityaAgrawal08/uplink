@@ -9,6 +9,9 @@ import {
   appendMessage,
   sanitizeChatText,
   toMessageDTO,
+  GENERAL_CONV,
+  conversationKey,
+  isPairConv,
   type ChatDoc,
   type SessionAliveDoc,
 } from "@/lib/sessionChat";
@@ -135,6 +138,25 @@ export async function GET(
       return apiError("after must be an integer sequence number", 400);
     }
 
+    // Optional conversation scope. Absent => everything visible to me
+    // (general + every 1:1 thread I belong to). "general" => room channel
+    // only. "a|b" => that exact thread, and I MUST be one of the two.
+    const convParam = req.nextUrl.searchParams.get("conv");
+    let convScope: string | null = null;
+    if (convParam !== null && convParam !== "") {
+      if (convParam === GENERAL_CONV) {
+        convScope = GENERAL_CONV;
+      } else if (isPairConv(convParam)) {
+        const [u1, u2] = convParam.split("|");
+        if (username !== u1 && username !== u2) {
+          return apiError("not a participant of this conversation", 403);
+        }
+        convScope = convParam;
+      } else {
+        return apiError('conv must be "general" or a "userA|userB" pair', 400);
+      }
+    }
+
     // Long-poll: hold the request open (≤2.5 s) until data shows up, then
     // return immediately. Cuts perceived delivery to <~300 ms while lowering
     // total request rate versus a fixed-interval client tick.
@@ -153,10 +175,13 @@ export async function GET(
       ],
     });
 
+    const baseFilter = () =>
+      convScope === null ? visibleFilter() : { sessionId, convId: convScope };
+
     const queryNew = () =>
       db
         .collection("session_messages")
-        .find({ ...visibleFilter(), seq: { $gt: afterSeq as number } })
+        .find({ ...baseFilter(), seq: { $gt: afterSeq as number } })
         .sort({ seq: 1 })
         .limit(POLL_LIMIT)
         .toArray() as unknown as Promise<ChatDoc[]>;
@@ -186,10 +211,11 @@ export async function GET(
       });
     }
 
-    // No cursor → backlog: latest BACKLOG_LIMIT visible messages, oldest-first.
+    // No cursor → backlog: latest BACKLOG_LIMIT messages for the requested
+    // scope (whole visible stream by default; one exact thread with ?conv=).
     const docs = await db
       .collection("session_messages")
-      .find(visibleFilter())
+      .find(baseFilter())
       .sort({ seq: -1 })
       .limit(BACKLOG_LIMIT)
       .toArray() as unknown as ChatDoc[];
