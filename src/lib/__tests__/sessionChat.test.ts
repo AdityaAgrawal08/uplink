@@ -45,7 +45,24 @@ describe("toMessageDTO", () => {
   it("maps a chat doc with ISO date", () => {
     const d = new Date("2026-08-25T10:00:00Z");
     const dto = toMessageDTO({ seq: 3, username: "bob", kind: "chat", text: "hi", createdAt: d });
-    expect(dto).toEqual({ seq: 3, username: "bob", kind: "chat", text: "hi", createdAt: d.toISOString() });
+    expect(dto).toEqual({
+      seq: 3, username: "bob", kind: "chat", text: "hi",
+      createdAt: d.toISOString(), convId: "general",
+    });
+  });
+
+  it("derives convId for legacy docs", () => {
+    const d = new Date();
+    const base = { seq: 0, username: "x", kind: "chat" as const, text: "t", createdAt: d };
+    expect(toMessageDTO({ ...base, seq: 1 }).convId).toBe("general");
+    expect(toMessageDTO({ ...base, seq: 2, username: "b", to: "a" }).convId).toBe("a|b");
+    expect(toMessageDTO({ ...base, seq: 3, username: "system", kind: "system" }).convId).toBe("general");
+  });
+
+  it("conversationKey is order-independent", async () => {
+    const { conversationKey } = await import("../sessionChat");
+    expect(conversationKey("zeta", "alpha")).toBe(conversationKey("alpha", "zeta"));
+    expect(conversationKey("zeta", "alpha")).toBe("alpha|zeta");
   });
 
   it("coerces unknown kinds to chat (fail-visible default)", () => {
