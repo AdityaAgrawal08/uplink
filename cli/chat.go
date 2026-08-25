@@ -341,10 +341,8 @@ func runChatPlain(serverURL, key, me string) {
 			client.leave()
 			fmt.Println("* You left the session.")
 			os.Exit(0)
-		case "/users":
-			fmt.Printf("* Online: %s\n", strings.Join(client.users, ", "))
 		case "/help":
-			fmt.Println("* Commands: /users · /exit · anything else sends a message")
+			fmt.Println("* Commands: /exit · anything else sends a message")
 		default:
 			code, msg, err := client.sendMessage(line, "")
 			if code == 429 {

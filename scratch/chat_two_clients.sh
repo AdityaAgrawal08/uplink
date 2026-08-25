@@ -35,12 +35,12 @@ sleep 1.5                  # let backlog fetch settle
 # Joiner: username + scripted conversation.
 ( printf 'bob\n'
   sleep 4; printf 'hi alice!\n'
-  sleep 3.5; printf '/users\n'
+  sleep 3.5
   sleep 2; printf '/exit\n' ) | UPLINK_CHAT_PLAIN=1 "$BIN" join "$KEY" --server "$SERVER" > "$T/b.out" 2>&1 &
 JOINER=$!
 
 sleep 5; printf 'hello from alice\n' >&3
-sleep 3; printf '/users\n' >&3
+sleep 3
 sleep 2; printf '/exit\n' >&3       # alice leaves LAST -> she ends the room
 for _ in $(seq 1 48); do
     grep -qE "You left|Disconnected|Session has ended" "$T/a.out" && break
@@ -57,9 +57,8 @@ chk "$T/a.out" "hello from alice"                     "alice self-message render
 chk "$T/b.out" "Connected to session $KEY as 'bob'"   "bob connected"
 chk "$T/b.out" "hello from alice"                     "cross-delivery A→B"
 chk "$T/b.out" "hi alice!"                            "cross-delivery B→A"
-chk "$T/b.out" "Online:"                              "roster command works"
-grep -qP "Online:.*alice.*bob|Online:.*bob.*alice" "$T/b.out" \
-    && ok "roster lists both" || bad "roster incomplete"
+grep -qP "Online \(2\): .*alice.*bob|Online \(2\): .*bob.*alice" "$T/b.out" \
+    && ok "connect banner lists both users" || bad "roster incomplete at connect"
 chk "$T/b.out" "You left the session."                "bob clean exit"
 grep -qE "You left the session.|Session has ended" "$T/a.out" \
     && ok "alice exits last (ends room)" || bad "alice end state"

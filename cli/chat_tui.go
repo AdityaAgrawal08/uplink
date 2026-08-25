@@ -29,34 +29,66 @@ var (
 	tuiBorderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("240"))
 
-	tuiRosterTitleStyle = lipgloss.NewStyle().
+	tuiSectionTitleStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("15")).
-				Background(lipgloss.Color("62")).
-				Width(rosterWidthInner).
-				Padding(0, 0)
+				Foreground(lipgloss.Color("250"))
+
+	tuiDimStyle = lipgloss.NewStyle().Faint(true)
 
 	tuiRosterBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				Width(rosterWidthInner)
+				BorderForeground(lipgloss.Color("240"))
 
 	tuiRosterSelectedStyle = lipgloss.NewStyle().
 				Bold(true).
 				Background(lipgloss.Color("236"))
+
+	tuiComposerStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("62")). // accent border: writing area matters
+				Padding(0, 1)
 )
 
 // ---- layout constants --------------------------------------------------------
 
 const (
-	rosterTotalWidth  = 24 // outer width of the sidebar incl. borders
-	rosterWidthInner  = rosterTotalWidth - 2
-	rosterMaxVisible  = 12 // cap on user rows before "... +N more"
-	inputChromeHeight = 3  // rounded-border box around the text input
-	headerHeight      = 1  // top banner line
-	transcriptBorder  = 2  // rows consumed by the transcript box border
-	minSidebarTermW   = 62 // below this width the sidebar collapses entirely
+	rosterTotalWidth = 24 // DEFAULT sidebar outer width (density scales it)
+	rosterWidthInner = rosterTotalWidth - 2
+	rosterMaxVisible = 16 // cap on user rows before "... +N more"
+	composerRowsMax  = 3  // tall composer on roomy terminals
+	headerHeight     = 1  // top banner line
+	frameChrome      = 2  // outer app-frame border (top+bottom / left+right)
+	transcriptBorder = 2  // rows consumed by the transcript box border
+	minSidebarTermW  = 66 // below this width the sidebar collapses entirely
 )
+
+// sidebarWidthFor picks a comfortable reading column that grows with the
+// terminal ("font size" adaptation for terminals happens via density).
+func sidebarWidthFor(termW int) int {
+	switch {
+	case termW >= 130:
+		return 30
+	case termW >= 90:
+		return 26
+	default:
+		return rosterTotalWidth
+	}
+}
+
+// composerRowsFor gives the message box breathing room on tall screens and
+// shrinks gracefully on small ones (0 => bare prompt, no border).
+func composerRowsFor(termH int) int {
+	switch {
+	case termH >= 22:
+		return composerRowsMax
+	case termH >= 14:
+		return 2
+	case termH >= 10:
+		return 1
+	default:
+		return 0
+	}
+}
 
 // layout is the single source of truth for frame geometry. Both View() and the
 // mouse hit-test derive their math from this struct so a click always maps to
@@ -76,22 +108,28 @@ type layout struct {
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	showHeader      bool // staged degradation: hide banner on tiny heights
 	boxedTranscript bool // staged degradation: drop border rows on tiny heights
-	inputBoxed      bool // staged degradation: bare prompt on absurd heights
+	inputBoxed      bool // false => bare one-line prompt
+	sidebarWidth    int  // density-scaled reading column (outer, incl border)
+	composerRows    int  // writable rows inside the composer box (3/2/1/0)
+	frameOn         bool // full-screen app frame (dropped only on tiny H)
 }
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
 	h := l.vpHeight + l.statusRows
-	if l.inputBoxed {
-		h += inputChromeHeight
+	if l.boxedTranscript {
+		h += transcriptBorder
+	}
+	if l.composerRows > 0 {
+		h += l.composerRows + 2 // composer border
 	} else {
 		h++ // bare prompt line
 	}
 	if l.showHeader {
 		h += headerHeight
 	}
-	if l.boxedTranscript {
-		h += transcriptBorder
+	if l.frameOn {
+		h += frameChrome
 	}
 	return h
 }
@@ -99,8 +137,12 @@ func (l layout) totalRows() int {
 // computeLayout derives frame geometry purely from terminal size and whether
 // the status line is visible. Guarantees, in order:
 //  1. totalRows() <= termH always (staged chrome degradation on tiny screens)
-//  2. sidebar collapses below minSidebarTermW or whenever its frame is gone
-//  3. viewport absorbs all remaining space (floors at zero rows)
+//  2. full-screen app frame whenever height allows (OpenCode-style shell)
+//  3. sidebar collapses below minSidebarTermW / tiny content, else its width
+//     scales with terminal width for comfortable reading
+//  4. composer gets a tall writable box on roomy terminals, shrinking to a
+//     bare prompt on absurd heights
+//  5. viewport absorbs all remaining space (floors at zero rows)
 //
 // Pure function => trivially unit-testable.
 func computeLayout(termW, termH int, showStatus bool) layout {
@@ -114,16 +156,26 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	}
 	l.showHeader = true
 	l.boxedTranscript = true
-	l.inputBoxed = true
+	l.frameOn = termH >= 12 // below this the shell cannot fit its own border
+	l.composerRows = composerRowsFor(termH)
+	l.sidebarWidth = sidebarWidthFor(termW)
+
+	innerW := termW - frameChrome
+	if !l.frameOn {
+		innerW = termW
+	}
 
 	// --- width pass ---------------------------------------------------------
 	l.sidebarOn = termW >= minSidebarTermW
 	if l.sidebarOn {
-		l.rosterX = termW - rosterTotalWidth
-		l.vpWidth = l.rosterX - 3 // 2 transcript border cols + 1 spacer
+		l.rosterX = innerW - l.sidebarWidth
+		if l.frameOn {
+			l.rosterX++ // shift past the left frame border
+		}
+		l.vpWidth = innerW - l.sidebarWidth - 1 - transcriptBorder // spacer + own border
 	} else {
 		l.rosterX = 0
-		l.vpWidth = termW - 2
+		l.vpWidth = innerW - transcriptBorder
 	}
 	if l.vpWidth < 10 { // last-resort floor on absurdly narrow terms
 		l.vpWidth = 10
@@ -132,22 +184,33 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	// --- height pass: degrade until the frame provably fits -----------------
 	shrink := func() {
 		switch {
+		case l.composerRows > 1:
+			l.composerRows--
 		case l.statusRows == 1:
 			l.statusRows = 0
+		case l.composerRows == 1:
+			l.composerRows = 0 // bare prompt
 		case l.boxedTranscript:
 			l.boxedTranscript = false
 			if l.sidebarOn { // nothing to sit beside once unframed
 				l.sidebarOn = false
 				l.rosterX = 0
-				l.vpWidth = termW - 2
-				if l.vpWidth < 10 {
-					l.vpWidth = 10
-				}
+				l.vpWidth = termW - transcriptBorder
 			}
-		case l.showHeader:
-			l.showHeader = false
+		case l.frameOn:
+			l.frameOn = false
+			innerW = termW
+			if l.sidebarOn { // recompute width pass without the frame inset
+				l.rosterX = innerW - l.sidebarWidth
+				l.vpWidth = innerW - l.sidebarWidth - 1 - transcriptBorder
+			} else {
+				l.vpWidth = innerW - transcriptBorder
+			}
+			if l.vpWidth < 10 {
+				l.vpWidth = 10
+			}
 		default:
-			l.inputBoxed = false
+			l.showHeader = false
 		}
 	}
 	for l.totalRows() > termH {
@@ -157,23 +220,12 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 			break // fully degraded; impossible beyond this point
 		}
 	}
-
-	l.vpHeight = termH - l.totalRows()
+	l.vpHeight = termH - l.totalRows() // chrome settled with vp=0; fill remainder
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
 	}
 
-	if l.vpHeight < 3 && l.sidebarOn {
-		l.sidebarOn = false // no room for border+title+even one user
-		l.rosterX = 0
-		l.vpWidth = termW - 2
-		if l.vpWidth < 10 {
-			l.vpWidth = 10
-		}
-	}
-
-	// Roster adapts to the transcript height: title row eats one slot,
-	// overflow indicator reuses the final slot (see rosterBody).
+	// Roster adapts to the transcript height: title row eats one slot.
 	l.rosterSlots = l.vpHeight - 1
 	if l.rosterSlots > rosterMaxVisible {
 		l.rosterSlots = rosterMaxVisible
@@ -181,12 +233,23 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 	if l.rosterSlots < 0 || !l.sidebarOn {
 		l.rosterSlots = 0
 	}
+	if l.vpHeight < 3 && l.sidebarOn {
+		l.sidebarOn = false // no room for border+title+even one user
+		l.rosterX = 0
+		l.vpWidth = termW - transcriptBorder
+		if l.vpWidth < 10 {
+			l.vpWidth = 10
+		}
+	}
 
-	// Sidebar stack above the first user row: [optional header] +
-	// sidebar-box top border + "Users" title. (Sidebar implies boxed frame.)
+	// Sidebar stack above the first user row: [optional header] + sidebar-box
+	// top border + "ONLINE" title (+1 if app frame is on).
 	l.rosterY0 = 2
 	if l.showHeader {
 		l.rosterY0 += headerHeight
+	}
+	if l.frameOn {
+		l.rosterY0++
 	}
 	return l
 }
@@ -301,10 +364,11 @@ func (c *chatScreen) activeConv() string {
 
 func newChatScreen(serverURL, key, me string) chatScreen {
 	ti := textinput.New()
-	ti.Placeholder = "Type a message… (/help)"
+	ti.Placeholder = "Type a message…  ·  /help · /exit"
 	ti.Focus()
 	ti.CharLimit = 500
-	ti.Prompt = "> "
+	ti.Prompt = "❯ "
+	ti.Width = 36
 	vp := viewport.New(80, 20)
 	return chatScreen{
 		client:       newChatClient(serverURL, key, me),
@@ -427,7 +491,11 @@ func (c chatScreen) headerView() string {
 	}
 	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
 		c.key, c.me, len(c.users), mode)
+	l := computeLayout(c.width, c.height, c.status != "")
 	w := c.width
+	if l.frameOn {
+		w -= frameChrome // banner lives inside the app shell
+	}
 	// Width() wraps long banners into multiple lines — fatal for our exact
 	// height contract. Overflowing text degrades to a hard-truncated plain
 	// run instead; otherwise the banner fills the full terminal width.
@@ -459,24 +527,83 @@ func rosterRow(u, me, target string) string {
 // rosterBody renders the bordered sidebar with EXACTLY slots content rows
 // (title + users), so its height always matches the transcript column. The
 // overflow indicator replaces the final slot when participants overflow.
-func (c chatScreen) rosterBody(slots int) string {
-	if slots < 0 {
-		slots = 0
+// sidebarBody renders the right column: an ONLINE section with presence dots
+// and a full-row highlight on the selected peer. The transcript itself is
+// the single source of conversation context, so no thread list is shown.
+// Height is deterministic: exactly `fill` content rows (+border in View).
+func (c chatScreen) rosterBody(fill int) string {
+	if fill < 1 {
+		fill = 1 // always show the section header
 	}
-	rows := make([]string, 0, slots+1)
-	rows = append(rows, tuiRosterTitleStyle.Render("Users"))
-	for i := 0; i < slots; i++ {
-		switch {
-		case i >= len(c.users):
-			rows = append(rows, "")
-		case i == slots-1 && len(c.users) > slots:
-			more := len(c.users) - (slots - 1)
-			rows = append(rows, tuiTimeStyle.Render(fmt.Sprintf("… +%d more", more)))
-		default:
-			rows = append(rows, rosterRow(c.users[i], c.me, c.targetUser))
+	slots := fill - 1 // title owns the first row
+	inner := c.sidebarInnerWidth()
+	trunc := func(t string) string {
+		r := []rune(t)
+		if len(r) > inner {
+			return string(r[:maxInt(inner-1, 0)]) + "…"
 		}
+		return t
 	}
-	return tuiRosterBoxStyle.Render(strings.Join(rows, "\n"))
+	pad := func(t string) string {
+		gap := inner - lipgloss.Width(t)
+		if gap < 0 {
+			gap = 0
+		}
+		return t + strings.Repeat(" ", gap)
+	}
+
+	rows := make([]string, 0, slots+1)
+	add := func(text string, highlight bool) {
+		if len(rows)-1 >= slots { // reserve: never exceed slot budget
+			return
+		}
+		if highlight {
+			rows = append(rows, tuiRosterSelectedStyle.Render(pad(trunc(" "+text))))
+			return
+		}
+		rows = append(rows, " "+trunc(text))
+	}
+
+	online := c.users
+	title := fmt.Sprintf("ONLINE — %d", len(online))
+	rows = append(rows, tuiSectionTitleStyle.Render(trunc(title)))
+	bodySlots := maxInt(slots-1, 0)
+
+	shown := 0
+	for _, u := range online {
+		if shown == bodySlots && len(online) > bodySlots {
+			more := len(online) - shown
+			add(tuiDimStyle.Render(fmt.Sprintf("… +%d more", more)), false)
+			shown++
+			break
+		}
+		switch {
+		case u == c.me:
+			add(tuiMeStyle.Render("● "+u+" (you)"), false)
+		case u == c.targetUser:
+			add("● "+u, true)
+		default:
+			add("○ "+u, false)
+		}
+		shown++
+	}
+
+	for len(rows) < fill {
+		rows = append(rows, "")
+	}
+	if len(rows) > fill {
+		rows = rows[:fill]
+	}
+	return strings.Join(rows, "\n")
+}
+
+// sidebarInnerWidth is the writable width inside the sidebar border.
+func (c chatScreen) sidebarInnerWidth() int {
+	l := computeLayout(c.width, c.height, c.status != "")
+	if !l.sidebarOn {
+		return rosterWidthInner
+	}
+	return l.sidebarWidth - 2
 }
 
 // ---- async commands --------------------------------------------------------
@@ -584,11 +711,8 @@ func (c *chatScreen) exitPrivate() {
 // the message on the wire.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
 	switch strings.ToLower(text) {
-	case "/users":
-		c.appendLine(tuiSystemStyle.Render("* Online: " + strings.Join(c.users, ", ")))
-		return nil
 	case "/help":
-		hint := "* Commands: /users · /exit · click a name in the sidebar for private chat"
+		hint := "* Commands: /exit · click a name in the sidebar to chat privately"
 		c.appendLine(tuiSystemStyle.Render(hint))
 		return nil
 	default:
@@ -643,6 +767,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		l := computeLayout(c.width, c.height, c.status != "")
 		c.vp.Width = l.vpWidth
 		c.vp.Height = l.vpHeight
+		// Keep the composer inside its column: textinput pads/clips to Width.
+		if c.input.Width != l.vpWidth-4 {
+			c.input.Width = maxInt(l.vpWidth-4, 8)
+		}
 		c.refreshViewport() // re-wrap transcript to the new width
 
 	case backlogMsg:
@@ -863,7 +991,7 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	if !l.sidebarOn {
 		return nil // sidebar collapsed on narrow terminals: nothing to click
 	}
-	inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+rosterTotalWidth
+	inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
 	row := msg.Y - l.rosterY0
 	if !inColumn || row < 0 || row >= l.rosterSlots || row >= len(c.users) {
 		return nil
@@ -903,17 +1031,17 @@ func (c chatScreen) View() string {
 	}
 
 	if l.sidebarOn && body != "" {
-		// Sidebar height is forced to match the transcript column exactly;
-		// its content truncates to l.rosterSlots so it can never inflate
-		// the joined block beyond vpHeight+2 rows.
-		sidebar := lipgloss.NewStyle().
-			Height(l.vpHeight + transcriptBorder).
-			MaxHeight(l.vpHeight + transcriptBorder).
-			Render(c.rosterBody(l.rosterSlots))
+		// Sidebar height forced to match the transcript column exactly; its
+		// content truncates to l.rosterSlots so it can never inflate the row.
+		sidebar := tuiRosterBoxStyle.
+			Width(c.sidebarInnerWidth()).
+			Height(l.vpHeight). // interior rows; border completes the column
+			MaxHeight(l.vpHeight).
+			Render(c.rosterBody(l.vpHeight))
 		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", sidebar)
 	}
 
-	rows := make([]string, 0, 4)
+	rows := make([]string, 0, 5)
 	if l.showHeader {
 		rows = append(rows, c.headerView())
 	}
@@ -921,16 +1049,27 @@ func (c chatScreen) View() string {
 		rows = append(rows, body)
 	}
 	var input string
-	if l.inputBoxed {
+	switch {
+	case l.composerRows > 0:
+		// Significant writing area: accent-bordered box with inner padding.
+		input = tuiComposerStyle.
+			Width(l.vpWidth). // border completes alignment with transcript
+			Height(l.composerRows).
+			Render(c.input.View())
+	case l.inputBoxed:
 		input = tuiBorderStyle.Render(c.input.View())
-	} else {
-		input = "> " + c.input.View()
+	default:
+		input = "❯ " + c.input.View()
 	}
 	rows = append(rows, input)
 	if l.statusRows == 1 {
 		rows = append(rows, c.statusView())
 	}
-	return strings.Join(rows, "\n")
+	out := strings.Join(rows, "\n")
+	if l.frameOn {
+		out = tuiBorderStyle.Render(out) // full-screen app shell
+	}
+	return out
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).

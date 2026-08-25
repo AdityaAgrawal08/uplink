@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -53,20 +54,25 @@ func TestComputeLayout(t *testing.T) {
 	if !l.sidebarOn {
 		t.Fatal("sidebar must be on at wide terminals")
 	}
-	if want := H - headerHeight - transcriptBorder - inputChromeHeight; l.vpHeight != want {
+	if want := H - frameChrome - headerHeight - transcriptBorder - (composerRowsFor(H) + 2); l.vpHeight != want {
 		t.Errorf("vpHeight = %d; want exact fit %d", l.vpHeight, want)
 	}
 	if l.totalRows() != H {
 		t.Errorf("totalRows = %d; MUST equal termH exactly (%d)", l.totalRows(), H)
 	}
-	if l.rosterX != W-rosterTotalWidth {
-		t.Errorf("rosterX = %d; want %d", l.rosterX, W-rosterTotalWidth)
+	if want := W - 1 - l.sidebarWidth; l.rosterX != want {
+		t.Errorf("rosterX = %d; want %d (inner right edge)", l.rosterX, want)
 	}
-	if want := l.rosterX - 3; l.vpWidth != want {
-		t.Errorf("vpWidth = %d; want %d (border+spacer)", l.vpWidth, want)
+	innerW := W - frameChrome
+	if want := innerW - l.sidebarWidth - 1 - transcriptBorder; l.vpWidth != want {
+		t.Errorf("vpWidth = %d; want %d (spacer+own border)", l.vpWidth, want)
 	}
-	if l.rosterY0 != headerHeight+2 {
-		t.Errorf("rosterY0 = %d; want header+border row", l.rosterY0)
+	wantY0 := headerHeight + 2 // body top border + section title
+	if l.frameOn {
+		wantY0++ // left frame border shifts everything down one row
+	}
+	if l.rosterY0 != wantY0 {
+		t.Errorf("rosterY0 = %d; want %d", l.rosterY0, wantY0)
 	}
 
 	t.Run("status line consumes exactly one row", func(t *testing.T) {
@@ -116,11 +122,22 @@ func TestFrameNeverExceedsTerminal(t *testing.T) {
 				if got := l.totalRows(); got > h {
 					t.Errorf("w=%d h=%d status=%v: totalRows=%d EXCEEDS terminal", w, h, st, got)
 				}
-				if l.sidebarOn && l.rosterX+rosterTotalWidth > w {
+				if l.sidebarOn && l.rosterX+l.sidebarWidth > w-(func() int {
+					if computeLayout(w, h, st).frameOn {
+						return 1
+					}
+					return 0
+				})() {
 					t.Errorf("w=%d: sidebar spills past right edge", w)
 				}
-				if !l.sidebarOn && l.vpWidth != w-2 && w >= 12 {
-					t.Errorf("w=%d collapsed layout should use full width-2; got %d", w, l.vpWidth)
+				if !l.sidebarOn && w >= 12 {
+					inner := w
+					if computeLayout(w, h, st).frameOn {
+						inner = w - frameChrome
+					}
+					if want := inner - transcriptBorder; l.vpWidth != want {
+						t.Errorf("w=%d collapsed vpWidth=%d; want %d", w, l.vpWidth, want)
+					}
 				}
 			}
 		}
@@ -138,8 +155,9 @@ func TestSidebarResponsiveCollapse(t *testing.T) {
 	if collapsed.rosterX != 0 {
 		t.Errorf("collapsed rosterX = %d; want 0", collapsed.rosterX)
 	}
-	if collapsed.vpWidth != 48 {
-		t.Errorf("collapsed vpWidth = %d; want termW-2=48", collapsed.vpWidth)
+	wantInner := 50 - frameChrome // frame survives at this height
+	if want := wantInner - transcriptBorder; collapsed.vpWidth != want {
+		t.Errorf("collapsed vpWidth = %d; want %d", collapsed.vpWidth, want)
 	}
 }
 
@@ -150,6 +168,7 @@ func TestSidebarResponsiveCollapse(t *testing.T) {
 func newFilterScreen(me, target string, users ...string) *chatScreen {
 	ti := textinput.New()
 	ti.Placeholder = "Type a message…"
+	ti.Prompt = "❯ "
 	ti.Focus()
 	ti.CharLimit = 500
 	return &chatScreen{
@@ -205,10 +224,10 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	c.users = users
 
 	// Full slots: deterministic height, overflow indicator present.
-	out := c.rosterBody(rosterMaxVisible)
+	out := c.rosterBody(rosterMaxVisible + 1) // fill = title + N slots
 	rows := strings.Split(out, "\n")
-	if len(rows) != rosterMaxVisible+3 { // title + N slots + 2 border
-		t.Fatalf("full roster height = %d rows; want %d", len(rows), rosterMaxVisible+3)
+	if len(rows) != rosterMaxVisible+1 {
+		t.Fatalf("full roster height = %d rows; want %d", len(rows), rosterMaxVisible+1)
 	}
 	if !strings.Contains(out, "+") || !strings.Contains(out, "more") {
 		t.Error("overflow indicator missing")
@@ -216,8 +235,12 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 
 	// Fewer slots than users: panel SHRINKS (never inflates short frames).
 	shrunk := c.rosterBody(4)
-	if rows := strings.Split(shrunk, "\n"); len(rows) != 4+3 {
-		t.Fatalf("shrunken roster height = %d; want 7", len(rows))
+	shrunkRows := strings.Split(shrunk, "\n")
+	if len(shrunkRows) != 4 {
+		t.Fatalf("shrunken roster height = %d; want 4", len(rows))
+	}
+	if !regexp.MustCompile(`\+\d+ more`).MatchString(shrunk) {
+		t.Errorf("overflow indicator missing in tight column:\n%s", shrunk)
 	}
 
 	// More slots than users: padded, no overflow marker.
@@ -226,14 +249,14 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	if strings.Contains(sparse, "more") {
 		t.Errorf("overflow indicator shown despite fitting: %q", sparse)
 	}
-	if rows := strings.Split(sparse, "\n"); len(rows) != 8+3 {
-		t.Fatalf("sparse roster height = %d; want 11", len(rows))
+	if rows := strings.Split(sparse, "\n"); len(rows) != 8 {
+		t.Fatalf("sparse roster height = %d; want 8", len(rows))
 	}
 
 	c.users = []string{"me", "a"}
 	zero := c.rosterBody(0)
-	if h := lipgloss.Height(zero); h != 3 { // title row + 2 border rows
-		t.Errorf("zero-slot roster height = %d; want 3", h)
+	if h := lipgloss.Height(zero); h != 1 { // title row only; border lives in View
+		t.Errorf("zero-slot roster height = %d; want 1", h)
 	}
 }
 
