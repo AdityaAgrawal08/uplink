@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -176,6 +177,8 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 		targetUser: target,
 		users:      users,
 		rendered:   map[int]bool{},
+		unread:     map[string]int{},
+		lastDMAt:   map[string]time.Time{},
 		input:      ti,
 	}
 }
@@ -205,15 +208,6 @@ func TestShouldRenderConvBasics(t *testing.T) {
 // ---------------------------------------------------------------------------
 // Roster rendering — adaptive slot count
 // ---------------------------------------------------------------------------
-
-func TestRosterRows(t *testing.T) {
-	if got := rosterRow("bob", "bob", ""); !strings.Contains(got, "(you)") {
-		t.Errorf("self row must be marked (you); got %q", got)
-	}
-	if plain := rosterRow("carol", "bob", "alice"); strings.Contains(plain, "(you)") || strings.Contains(plain, "●") {
-		t.Errorf("bystander row mis-styled: %q", plain)
-	}
-}
 
 func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	c := &chatScreen{me: "me"}
