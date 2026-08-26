@@ -486,7 +486,7 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if m.Username == c.me {
 		name = tuiMeStyle.Render(name + " (you)")
 	}
-	line := ts + " " + name + ": " + m.Text
+	line := ts + " " + name + ": " + renderMarkdown(m.Text)
 	if m.ConvID != generalConv && m.Username == c.me && c.targetUser != "" {
 		line += tuiTimeStyle.Render("  → " + c.targetUser)
 	}
@@ -864,7 +864,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
-	echo := tuiMeStyle.Render("[you →] " + text)
+	echo := tuiMeStyle.Render("[you →] " + renderMarkdown(text))
 	if c.targetUser != "" {
 		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
 	}
