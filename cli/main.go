@@ -119,6 +119,10 @@ func main() {
 		cmdCreateSession(os.Args[3:], cfg)
 	case "config":
 		handleConfig(os.Args[2:])
+	case "version":
+		handleVersion()
+	case "update":
+		handleUpdate()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -153,6 +157,9 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("  config           Manage configuration (~/.uplink/config.json)")
 	fmt.Println("                   uplink config ls | get <key> | set <key> <val>")
+	fmt.Println()
+	fmt.Println("  version          Show version")
+	fmt.Println("  update           Self-update to latest release")
 	fmt.Println()
 	fmt.Println("  help        Show available commands")
 	fmt.Println("              uplink --help")
