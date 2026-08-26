@@ -1159,10 +1159,17 @@ func handleReceive(args []string) {
 			firstPrint: true,
 		}
 		err := wan.DownloadFileWAN(context.Background(), shareId, outputFilepath, *passwordFlag, "", func(written int64) {
-			if printer.total == 0 {
-				printer.total = written * 2 // estimate until we know
+			if printer.total == 0 && written > 0 {
+				// Unknown total: show bytes downloaded without percentage
+				elapsed := time.Since(printer.startTime).Seconds()
+				speed := float64(0)
+				if elapsed > 0 {
+					speed = float64(written) / elapsed
+				}
+				fmt.Printf("\r\033[K%s %s | %s/s", printer.title, formatBytes(written), formatBytes(int64(speed)))
+			} else if printer.total > 0 {
+				printer.Print(written)
 			}
-			printer.Print(written)
 		})
 		if err != nil {
 			fmt.Printf("\n✗ WAN download failed: %v\n", err)
