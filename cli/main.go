@@ -117,6 +117,8 @@ func main() {
 			os.Exit(1)
 		}
 		cmdCreateSession(os.Args[3:], cfg)
+	case "config":
+		handleConfig(os.Args[2:])
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -148,6 +150,9 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("  join <key>       Join a chat room with the 6-digit key")
 	fmt.Println("                   uplink join 482716")
+	fmt.Println()
+	fmt.Println("  config           Manage configuration (~/.uplink/config.json)")
+	fmt.Println("                   uplink config ls | get <key> | set <key> <val>")
 	fmt.Println()
 	fmt.Println("  help        Show available commands")
 	fmt.Println("              uplink --help")
