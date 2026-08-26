@@ -168,15 +168,16 @@ func TestPaletteNavigationAndTabCompletes(t *testing.T) {
 	down := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown}); return m.(chatScreen) }
 	up := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyUp}); return m.(chatScreen) }
 
-	// Ranked "" = [/help, /upload]; down lands on /upload, up returns.
+	// Ranked "" = [/download, /help, /upload]; down lands on /help, up
+	// returns to the top (= /download).
 	c = down(c)
 	if got := c.input.Value(); got != "/" || c.palette.sel != 1 {
 		t.Fatalf("down did not move to second row: input=%q sel=%d", got, c.palette.sel)
 	}
 	c = up(c)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyTab})
-	if got := c.input.Value(); got != "/help " {
-		t.Fatalf("tab completion gave %q; want \"/help \"", got)
+	if got := c.input.Value(); got != "/download " {
+		t.Fatalf("tab completion gave %q; want \"/download \"", got)
 	}
 	if c.palette.visible() {
 		t.Fatal("tab completion must close the drawer")
@@ -338,8 +339,10 @@ func TestViewHeightContractWithPaletteOpen(t *testing.T) {
 			if mw := maxLineWidth(view); mw > w {
 				t.Errorf("w=%d h=%d: widest row %d exceeds terminal width", w, h, mw)
 			}
-			if !strings.Contains(view, "/help") {
-				t.Errorf("w=%d h=%d: palette missing from view", w, h)
+			// The drawer may be legitimately dissolved on tiny terminals;
+			// whenever the budget kept it, it must be visible.
+			if sc.layoutFor().paletteRows > 0 && !strings.Contains(view, "/help") {
+				t.Errorf("w=%d h=%d: palette budgeted but missing from view", w, h)
 			}
 		}
 	}
