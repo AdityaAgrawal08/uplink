@@ -362,6 +362,7 @@ func handleSend(args []string) {
 	code, shareLink, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
 	if err != nil {
 		fmt.Printf("\n✗ Upload failed: %v\n", err)
+		notifyTransferFailed(inputPath, err)
 		os.Exit(1)
 	}
 
@@ -1303,6 +1304,7 @@ func handleReceive(args []string) {
 			if computedHex != meta.HashValue {
 				fmt.Println("\n✗ Error: File integrity check failed!")
 				os.Remove(tempTarFile)
+				notifyTransferFailed(meta.Filename, fmt.Errorf("integrity check failed"))
 				os.Exit(1)
 			}
 		}
@@ -1311,6 +1313,7 @@ func handleReceive(args []string) {
 	if err != nil {
 		os.Remove(tempTarFile)
 		fmt.Printf("\n✗ Error: Download interrupted: %v\n", err)
+		notifyTransferFailed(meta.Filename, err)
 		os.Exit(1)
 	}
 
