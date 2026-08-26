@@ -27,6 +27,7 @@ import (
 	"github.com/AdityaAgrawal08/uplink-delta/cli/lan"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/crc64"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/tarball"
+	"github.com/AdityaAgrawal08/uplink-delta/cli/wan"
 	"golang.org/x/term"
 )
 
@@ -299,6 +300,7 @@ func handleSend(args []string) {
 	qrFlag := sendCmd.Bool("qr", false, "Force display QR code")
 	noQrFlag := sendCmd.Bool("no-qr", false, "Suppress QR code display")
 	encryptFlag := sendCmd.Bool("encrypt", false, "Enable Client-Side End-to-End Encryption")
+	wanFlag := sendCmd.Bool("wan", false, "Enable internet-wide P2P transfer via DHT")
 
 	sendValueFlags := map[string]bool{
 		"password": true,
@@ -357,6 +359,41 @@ func handleSend(args []string) {
 	}
 
 	serverUrl := sanitizeServerUrl(*serverFlag)
+
+	// WAN P2P mode (if enabled) — bypass cloud entirely
+	if *wanFlag {
+		fileInfo, err := os.Stat(inputPath)
+		if err != nil {
+			fmt.Printf("✗ Error: %v\n", err)
+			os.Exit(1)
+		}
+		filePath := inputPath
+		if fileInfo.IsDir() {
+			tmpTar, err := tarballDirForWAN(inputPath)
+			if err != nil {
+				fmt.Printf("✗ Error: %v\n", err)
+				os.Exit(1)
+			}
+			defer os.Remove(tmpTar)
+			filePath = tmpTar
+		}
+		shareCode := generateShareCode()
+		fmt.Printf("\n✓ WAN P2P Transfer Initialized\n")
+		fmt.Printf("Share Code: %s\n", shareCode)
+		fmt.Printf("Peers can connect: uplink receive %s --wan\n", shareCode)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			err := wan.ServeFileWAN(ctx, shareCode, filePath, *passwordFlag, nil)
+			if err != nil && err != context.Canceled {
+				fmt.Printf("\n✗ WAN Server Error: %v\n", err)
+			}
+		}()
+		fmt.Println("Publishing to DHT... waiting for peer (Ctrl+C to stop)")
+		<-make(chan struct{})
+		os.Exit(0)
+	}
 
 	// Perform actual upload
 	code, shareLink, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
@@ -886,6 +923,21 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 	return displayCode, shareLink, originalName, fileInfo.Size(), nil
 }
 
+func tarballDirForWAN(dir string) (string, error) {
+	base := filepath.Base(dir)
+	out := filepath.Join(os.TempDir(), fmt.Sprintf("uplink-wan-%d-%s.tar.gz", time.Now().UnixNano(), base))
+	f, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := tarball.Pack(dir, f); err != nil {
+		os.Remove(out)
+		return "", err
+	}
+	return out, nil
+}
+
 func handleReceive(args []string) {
 	cfg := LoadConfig()
 
@@ -899,6 +951,7 @@ func handleReceive(args []string) {
 	mkdirFlag := recvCmd.Bool("mkdir", false, "Create destination directory if it doesn't exist")
 	mkdirShortFlag := recvCmd.Bool("p", false, "Create destination directory (shortcut)")
 	lanFlag := recvCmd.Bool("lan", false, "Enable direct LAN P2P transfer")
+	wanRecvFlag := recvCmd.Bool("wan", false, "Enable internet-wide P2P transfer via DHT")
 
 	receiveValueFlags := map[string]bool{
 		"password": true,
@@ -1083,6 +1136,39 @@ func handleReceive(args []string) {
 		} else {
 			fmt.Printf("No LAN peer found (%v). Falling back to cloud...\n", mdnsErr)
 		}
+	}
+
+	// WAN P2P mode (if enabled)
+	if *wanRecvFlag {
+		sanitizedName := sanitizeFilename(shareInput)
+		outputFilepath := sanitizedName
+		if destPath != "" {
+			if info, err := os.Stat(destPath); err == nil && info.IsDir() {
+				outputFilepath = filepath.Join(destPath, sanitizedName)
+			} else {
+				outputFilepath = destPath
+			}
+		}
+		fmt.Printf("Discovering WAN peer for share %s...\n", shareId)
+		printer := &ProgressPrinter{
+			title:      "Downloading (WAN)...",
+			total:      0,
+			startTime:  time.Now(),
+			firstPrint: true,
+		}
+		err := wan.DownloadFileWAN(context.Background(), shareId, outputFilepath, *passwordFlag, "", func(written int64) {
+			if printer.total == 0 {
+				printer.total = written * 2 // estimate until we know
+			}
+			printer.Print(written)
+		})
+		if err != nil {
+			fmt.Printf("\n✗ WAN download failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\n✓ WAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n", sanitizedName, outputFilepath)
+		notifyTransferComplete(sanitizedName)
+		os.Exit(0)
 	}
 
 	// Fetch Share Metadata
