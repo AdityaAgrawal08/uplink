@@ -45,6 +45,17 @@ type heartbeatResponse struct {
 	ActiveUsers []string `json:"activeUsers"`
 }
 
+// sessionFile mirrors the server's session_files document shape returned by
+// GET /files (subset of fields the TUI needs).
+type sessionFile struct {
+	FileId     string `json:"fileId"`
+	Filename   string `json:"filename"`
+	Username   string `json:"username"`
+	Size       int64  `json:"size"`
+	Status     string `json:"status"`
+	UploadedAt string `json:"uploadedAt"`
+}
+
 type chatClient struct {
 	serverURL string
 	key       string

@@ -353,7 +353,12 @@ type chatScreen struct {
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
-	palette      paletteState // "/" command drawer above the composer
+	palette      paletteState    // "/" command drawer above the composer
+	picker       pickerState     // file-browser mode of that drawer (/upload)
+	uploadQ      uploadState     // sequential session-file transfer queue
+	dlQ          dlState         // sequential shared-file download queue
+	filesSeen    map[string]bool // room files already announced to me
+	lastFilesAt  string          // newest uploadedAt fed into /files?since=
 	status       string
 	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
@@ -393,9 +398,12 @@ func (c *chatScreen) activeConv() string {
 	return conversationKey(c.me, c.targetUser)
 }
 
+// composerPlaceholder doubles as the restore text whenever a drawer closes.
+const composerPlaceholder = "Type a message…  ·  / commands  ·  tab picks a peer"
+
 func newChatScreen(serverURL, key, me string) chatScreen {
 	ti := textinput.New()
-	ti.Placeholder = "Type a message…  ·  / for commands"
+	ti.Placeholder = composerPlaceholder
 	ti.Focus()
 	ti.CharLimit = 500
 	ti.Prompt = "❯ "
@@ -411,6 +419,7 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		unread:       map[string]int{},
 		lastDMAt:     map[string]time.Time{},
 		fetchedConvs: map[string]bool{generalConv: true},
+		filesSeen:    map[string]bool{},
 		outbox:       nil,
 	}
 }
@@ -780,7 +789,7 @@ func (c chatScreen) doConvFetch(conv string) tea.Cmd {
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), schedulePoll(0), scheduleBeat())
+	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), c.doFetchFiles(), schedulePoll(0), scheduleBeat())
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
@@ -960,7 +969,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				c.hoverPeer = ""
 			}
 		}
-		cmds = append(cmds, scheduleBeat())
+		cmds = append(cmds, scheduleBeat(), c.doFetchFiles()) // roster + room files
 
 	case sendDoneMsg:
 		if nc := c.settleSend(msg); nc != nil {
@@ -972,6 +981,54 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			for _, m := range msg.msgs {
 				c.addMessage(m) // seq-deduped; pre-window history lands here
 			}
+		}
+
+	case uploadProgressMsg:
+		if c.uploadQ.active && msg.total > 0 {
+			pct := 100 * msg.done / msg.total
+			c.paintUploadLine(tuiUploadRunStyle.Render(
+				fmt.Sprintf("[↑] %s %d%%", c.uploadQ.name, pct)))
+		}
+		cmds = append(cmds, drainUploadProgressCmd(c.uploadQ.progCh))
+
+	case uploadDrainMsg:
+		// channel closed; the done msg lands separately
+
+	case uploadDoneMsg:
+		if nc := c.settleUploadDone(msg); nc != nil {
+			cmds = append(cmds, nc)
+		}
+		cmds = append(cmds, c.doFetchFiles()) // instant self-feedback
+
+	case filesFetchedMsg:
+		if msg.err == nil {
+			c.applyRoomFiles(msg.files)
+		}
+
+	case filesListMsg:
+		if msg.err != nil {
+			if c.picker.isActive() && c.picker.mode == modeFiles {
+				c.picker.loading = false
+				c.picker.notice = truncateStringPlain(msg.err.Error(), 40)
+			}
+			break
+		}
+		c.applyFilesList(msg.files)
+
+	case dlProgressMsg:
+		if c.dlQ.active && msg.total > 0 {
+			pct := 100 * msg.done / msg.total
+			c.paintDlLine(tuiDownloadRunStyle.Render(
+				fmt.Sprintf("[↓] %s %d%%", c.dlQ.name, pct)))
+		}
+		cmds = append(cmds, drainDlProgressCmd(c.dlQ.progCh))
+
+	case dlDrainMsg:
+		// channel closed; the done msg lands separately
+
+	case dlDoneMsg:
+		if nc := c.settleDownloadDone(msg); nc != nil {
+			cmds = append(cmds, nc)
 		}
 
 	case leaveDoneMsg:
@@ -987,6 +1044,27 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, c.doLeave(), tea.Quit)
 			return c, tea.Batch(cmds...)
 		}
+		// The file browser owns ALL keys while open (it sits where the "/"
+		// drawer paints, one mode at a time).
+		if c.picker.isActive() {
+			if handled, action := c.handlePickerKeys(msg); handled {
+				if action != nil {
+					cmds = append(cmds, action())
+				}
+				return c, tea.Batch(cmds...)
+			}
+			break // unknown keys do nothing in browser mode
+		}
+		// Esc during a transfer cancels it before anything else sees the key.
+		if msg.Type == tea.KeyEsc && (c.uploadQ.isActive() || c.dlQ.isActive()) {
+			if c.uploadQ.isActive() {
+				c.cancelUploads()
+			}
+			if c.dlQ.isActive() {
+				c.cancelDownloads()
+			}
+			break
+		}
 		// "/" command drawer eats navigation + selection keys while open.
 		// Early return keeps those keys away from the viewport so moving the
 		// highlight never scrolls the transcript underneath.
@@ -1001,10 +1079,23 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.exitPrivate()
 			break
 		}
+		// Tab / Shift+Tab cycle the roster highlight — the KEYBOARD way to
+		// reach a peer (mouse-less terminals otherwise have no path to DMs).
+		if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
+			c.cycleRosterFocus(msg.Type == tea.KeyShiftTab)
+			break
+		}
 		if msg.Type == tea.KeyEnter {
 			text := strings.TrimSpace(c.input.Value())
 			c.input.SetValue("")
 			if text == "" {
+				// Empty Enter on a highlighted roster row OPENS that thread.
+				if c.hoverPeer != "" && c.hoverPeer != c.me && c.hoverPeer != c.targetUser {
+					cmd := c.enterPrivate(c.hoverPeer)
+					if cmd != nil {
+						cmds = append(cmds, cmd)
+					}
+				}
 				break
 			}
 			if sc := c.submitLine(text); sc != nil {
@@ -1107,6 +1198,41 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		return c.dispatchInConv(next.conv, next.text)
 	}
 	return nil
+}
+
+// cycleRosterFocus moves the pink highlight through the sidebar roster
+// (skipping me), wrapping at both ends. The highlighted peer is what empty
+// Enter opens — the keyboard twin of clicking a row.
+func (c *chatScreen) cycleRosterFocus(reverse bool) {
+	online := orderedUsers(c.users, c.me, c.lastDMAt)
+	if len(online) <= 1 { // only me in the room
+		return
+	}
+	// Current position within the display order.
+	cur := -1
+	for i, u := range online {
+		if u == c.hoverPeer {
+			cur = i
+			break
+		}
+	}
+	step := 1
+	if reverse {
+		step = -1
+	}
+	for i := 0; i < len(online); i++ {
+		cur += step
+		if cur < 0 {
+			cur = len(online) - 1
+		}
+		if cur >= len(online) {
+			cur = 0
+		}
+		if online[cur] != c.me {
+			c.hoverPeer = online[cur]
+			return
+		}
+	}
 }
 
 // handleMouse translates a click into a sidebar selection using the SAME
@@ -1226,10 +1352,14 @@ func (c chatScreen) View() string {
 		input = "❯ " + c.input.View()
 	}
 	// OpenCode-style pop-out: with a leading "/" the command drawer emerges
-	// upward out of the composer. A blank spacer row sells the "lifted off
-	// the input" look; it is transient (only while the query starts with "/").
-	if pal := c.paletteView(maxInt(l.vpWidth+2, 0)); pal != "" {
-		rows = append(rows, "", pal)
+	// upward out of the composer; in /upload|/download mode the same slot
+	// paints a browser instead. A blank spacer row sells the "lifted off the
+	// input" look. When the layout budget DISSOLVED the drawer (absurdly tiny
+	// terminals), paletteRows==0 wins over visibility — never paint unbudgeted.
+	if l.paletteRows > 0 {
+		if pal := c.drawerView(maxInt(l.vpWidth+2, 0)); pal != "" {
+			rows = append(rows, "", pal)
+		}
 	}
 	rows = append(rows, input)
 	if l.statusRows == 1 {

@@ -162,6 +162,9 @@ jobs:
       - name: Two-client chat E2E (cross-delivery, roster, end-propagation)
         run: SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh
 
+      - name: Session /upload flow (watermark, visibility, byte-identity)
+        run: SERVER=http://localhost:3000 ./scratch/session_upload_flow.sh
+
       - name: API contract probes
         # NOTE: deliberately NO /share/init calls here — the init rate limiter
         # (10 per 5 min per instance on mock Redis) is already budgeted by the

@@ -37,6 +37,7 @@ type InitRequest struct {
 	Size              int64  `json:"size"`
 	MimeType          string `json:"mimeType"`
 	HashValue         string `json:"hashValue"`
+	ShareId           string `json:"shareId,omitempty"` // session files: reuse the announced id
 	Password          string `json:"password,omitempty"`
 	ExpiresInSeconds  int    `json:"expiresInSeconds,omitempty"`
 	DownloadLimit     int    `json:"downloadLimit,omitempty"`
