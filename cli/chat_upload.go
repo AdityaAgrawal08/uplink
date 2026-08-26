@@ -1,9 +1,7 @@
 package main
 
 import (
-	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/tarball"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -387,49 +386,25 @@ func sha256File(ctx context.Context, path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// tarballDir packs dir into a temp <name>.tar.gz and returns its path.
+// tarballDir packs dir into a temp <name>.tar.gz preserving the full
+// directory tree (subdirectories included). Uses the shared tarball.Pack
+// which also excludes .git, .env, and other standard junk.
 func tarballDir(dir string) (string, error) {
 	base := filepath.Base(dir)
 	out := filepath.Join(os.TempDir(), fmt.Sprintf("uplink-%d-%s%s",
 		time.Now().UnixNano(), base, tarballSuffix))
 
-	var buf bytes.Buffer
-	gz := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(gz)
-
-	err := filepath.Walk(dir, func(path string, fi os.FileInfo, werr error) error {
-		if werr != nil {
-			return werr
-		}
-		if fi.IsDir() {
-			return nil // flat v1: files inside the folder, no subdirs
-		}
-		hdr, err := tar.FileInfoHeader(fi, "")
-		if err != nil {
-			return err
-		}
-		hdr.Name = filepath.Base(path)
-		if err := tw.WriteHeader(hdr); err != nil {
-			return err
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		_, err = io.Copy(tw, f)
-		return err
-	})
+	f, err := os.Create(out)
 	if err != nil {
 		return "", err
 	}
-	if err := tw.Close(); err != nil {
+	defer f.Close()
+
+	if err := tarball.Pack(dir, f); err != nil {
+		os.Remove(out)
 		return "", err
 	}
-	if err := gz.Close(); err != nil {
-		return "", err
-	}
-	return out, os.WriteFile(out, buf.Bytes(), 0o644)
+	return out, nil
 }
 
 // putShareBytes runs share/init (reusing our announced shareId), PUTs the

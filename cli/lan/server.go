@@ -20,7 +20,35 @@ func GetActiveConnections() int32 {
 	return atomic.LoadInt32(&ActiveConnections)
 }
 
+// progressWriter wraps http.ResponseWriter to track bytes written.
+type progressWriter struct {
+	http.ResponseWriter
+	total    int64
+	written  int64
+	onProg   func(written, total int64)
+	once     sync.Once
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.ResponseWriter.Write(p)
+	pw.written += int64(n)
+	if pw.onProg != nil {
+		pw.once.Do(func() {
+			go pw.onProg(pw.written, pw.total)
+		})
+		// Throttle callbacks to ~every 256KB
+		if pw.written%256*1024 < int64(len(p)) {
+			go pw.onProg(pw.written, pw.total)
+		}
+	}
+	return n, err
+}
+
 func ServeFileLAN(ctx context.Context, path string, port int, cert tls.Certificate, shareCode string, password string, downloadLimit int, onComplete func()) error {
+	return ServeFileLANWithProgress(ctx, path, port, cert, shareCode, password, downloadLimit, nil, onComplete)
+}
+
+func ServeFileLANWithProgress(ctx context.Context, path string, port int, cert tls.Certificate, shareCode string, password string, downloadLimit int, onProgress func(written, total int64), onComplete func()) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
@@ -88,7 +116,12 @@ func ServeFileLAN(ctx context.Context, path string, port int, cert tls.Certifica
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, info.ModTime().Unix(), info.Size()))
 
-		http.ServeFile(w, r, path)
+		if r.Method == "GET" && onProgress != nil {
+			pw := &progressWriter{ResponseWriter: w, total: info.Size(), onProg: onProgress}
+			http.ServeFile(pw, r, path)
+		} else {
+			http.ServeFile(w, r, path)
+		}
 
 		// Serve completed, run completion callback
 		if r.Method == "GET" {

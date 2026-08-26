@@ -318,6 +318,10 @@ type beatDoneMsg struct {
 	users []string
 	err   error
 }
+
+type wsConnectedMsg struct {
+	ws *wsClient
+}
 type sendDoneMsg struct {
 	text string
 	to   string // empty for broadcasts
@@ -338,6 +342,7 @@ type chatScreen struct {
 	client       *chatClient
 	key          string
 	me           string
+	persist      bool
 	width        int
 	height       int
 	history      []chatMessage        // every confirmed server message (deduped by seq)
@@ -359,6 +364,7 @@ type chatScreen struct {
 	dlQ          dlState         // sequential shared-file download queue
 	filesSeen    map[string]bool // room files already announced to me
 	lastFilesAt  string          // newest uploadedAt fed into /files?since=
+	ws           *wsClient       // WebSocket connection (nil = using long-poll)
 	status       string
 	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
@@ -486,7 +492,7 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if m.Username == c.me {
 		name = tuiMeStyle.Render(name + " (you)")
 	}
-	line := ts + " " + name + ": " + m.Text
+	line := ts + " " + name + ": " + renderMarkdown(m.Text)
 	if m.ConvID != generalConv && m.Username == c.me && c.targetUser != "" {
 		line += tuiTimeStyle.Render("  → " + c.targetUser)
 	}
@@ -755,7 +761,14 @@ func (c chatScreen) doBeat() tea.Cmd {
 
 func (c chatScreen) doSend(text, to string) tea.Cmd {
 	client := c.client
+	ws := c.ws
 	return func() tea.Msg {
+		if ws != nil {
+			if err := ws.send(text, to); err == nil {
+				return sendDoneMsg{text: text, to: to, code: 200}
+			}
+			// WS send failed — fall back to HTTP
+		}
 		code, msg, err := client.sendMessage(text, to)
 		return sendDoneMsg{text: text, to: msg.To, seq: msg.Seq, code: code, err: err}
 	}
@@ -763,7 +776,11 @@ func (c chatScreen) doSend(text, to string) tea.Cmd {
 
 func (c chatScreen) doLeave() tea.Cmd {
 	client := c.client
+	ws := c.ws
 	return func() tea.Msg {
+		if ws != nil {
+			ws.Close()
+		}
 		client.leave()
 		return leaveDoneMsg{}
 	}
@@ -789,7 +806,27 @@ func (c chatScreen) doConvFetch(conv string) tea.Cmd {
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), c.doFetchFiles(), schedulePoll(0), scheduleBeat())
+	// Try WebSocket first; fall back to long-polling if unavailable.
+	return tea.Batch(c.fetchBacklogCmd(), c.tryWS(), c.doBeat(), c.doFetchFiles(), scheduleBeat())
+}
+
+// tryWS attempts a WebSocket upgrade. On success it starts the readLoop
+// and heartbeat goroutines and returns nil (no polling needed). On
+// failure it returns the initial long-poll schedule.
+func (c chatScreen) tryWS() tea.Cmd {
+	client := c.client
+	return func() tea.Msg {
+		ws := client.wsConnect()
+		if ws == nil {
+			return schedulePoll(0)() // fallback: start HTTP long-polling
+		}
+		// WebSocket connected — stash it and start background goroutines.
+		// We can't mutate chatScreen from a Cmd goroutine, so we return
+		// a special message that Update handles.
+		go ws.readLoop(client)
+		go ws.heartbeat(client)
+		return wsConnectedMsg{ws: ws}
+	}
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
@@ -864,7 +901,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
-	echo := tuiMeStyle.Render("[you →] " + text)
+	echo := tuiMeStyle.Render("[you →] " + renderMarkdown(text))
 	if c.targetUser != "" {
 		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
 	}
@@ -905,7 +942,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case pollTickMsg:
-		cmds = append(cmds, c.doPoll())
+		if c.ws == nil {
+			cmds = append(cmds, c.doPoll())
+		}
 
 	case pollDoneMsg:
 		if msg.ended {
@@ -975,6 +1014,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if nc := c.settleSend(msg); nc != nil {
 			cmds = append(cmds, nc)
 		}
+
+	case wsConnectedMsg:
+		c.ws = msg.ws
+		c.status = "connected (websocket)"
 
 	case convBacklogMsg:
 		if msg.err == nil {
@@ -1373,12 +1416,16 @@ func (c chatScreen) View() string {
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).
-func runChatTUI(serverURL, key, me string) {
+func runChatTUI(serverURL, key, me string, persist bool) {
 	scr := newChatScreen(serverURL, key, me)
+	scr.persist = persist
 	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
+	}
+	if persist {
+		_ = saveHistory(key, scr.history)
 	}
 	scr.client.leave()
 	fmt.Printf("\nYou left session %s.\n", key)

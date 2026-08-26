@@ -10,8 +10,21 @@ export async function POST(
 ) {
   try {
     const { sessionId, fileId } = await props.params;
+    const username = req.headers.get("X-Uplink-Username") || "";
 
     const db = await getDb();
+
+    // 0. Verify requester is an active session participant
+    if (username) {
+      const participant = await db.collection("session_participants").findOne({
+        sessionId,
+        username,
+        status: "ACTIVE",
+      });
+      if (!participant) {
+        return apiError("You are not an active participant in this session", 403);
+      }
+    }
 
     // 1. Find file in session_files
     const sessionFile = await db.collection("session_files").findOne({ sessionId, fileId });

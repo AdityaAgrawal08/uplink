@@ -74,6 +74,8 @@ type pickerState struct {
 	buffered []string // ordered keys: absolute paths OR fileIds
 	inBuf    map[string]bool
 	notice   string // transient error line ("" = none)
+	filter   string // substring filter (active when filtering=true)
+	filtering bool  // true while the user is typing a filter query
 }
 
 func (p *pickerState) isActive() bool { return p.active }
@@ -164,6 +166,42 @@ func (c *chatScreen) loadPickerDir() {
 
 // ---- pure navigation helpers -------------------------------------------------
 
+// pickerMatchFilter reports whether the given entry passes the active filter.
+func pickerMatchFilter(name, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(name), strings.ToLower(filter))
+}
+
+// filteredEntries returns entries matching the active filter (browse mode).
+func (p *pickerState) filteredEntries() []pickerEntry {
+	if p.filter == "" {
+		return p.entries
+	}
+	var out []pickerEntry
+	for _, e := range p.entries {
+		if pickerMatchFilter(e.name, p.filter) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// filteredFiles returns files matching the active filter (files mode).
+func (p *pickerState) filteredFiles() []sessionFile {
+	if p.filter == "" {
+		return p.files
+	}
+	var out []sessionFile
+	for _, f := range p.files {
+		if pickerMatchFilter(f.Filename, p.filter) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // sortPickerEntries orders dirs first, then files, alphabetical (case-
 // insensitive) inside each group. Stable so equal names keep readdir order.
 func sortPickerEntries(entries []pickerEntry) []pickerEntry {
@@ -253,12 +291,13 @@ func humanSize(n int64) string {
 
 // rowCount is how many selectable rows exist: browse mode shows the
 // synthesized ".." parent row plus directory entries; files mode lists the
-// room's UPLOADED shared files.
+// room's UPLOADED shared files. When a filter is active, only matching
+// entries are counted.
 func (p *pickerState) rowCount() int {
 	if p.mode == modeFiles {
-		return len(p.files)
+		return len(p.filteredFiles())
 	}
-	n := len(p.entries)
+	n := len(p.filteredEntries())
 	if parentDir(p.cwd) != "" {
 		n++
 	}
@@ -269,10 +308,11 @@ func (p *pickerState) rowCount() int {
 // absolute path (browse) or fileId (files). ok=false for the ".." row.
 func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) {
 	if p.mode == modeFiles {
-		if row < 0 || row >= len(p.files) {
+		ff := p.filteredFiles()
+		if row < 0 || row >= len(ff) {
 			return pickerEntry{}, "", false
 		}
-		f := p.files[row]
+		f := ff[row]
 		return pickerEntry{name: f.Filename, size: f.Size}, f.FileId, true
 	}
 	base := 0
@@ -282,11 +322,12 @@ func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) 
 		}
 		base = 1
 	}
+	fe := p.filteredEntries()
 	idx := row - base
-	if idx < 0 || idx >= len(p.entries) {
+	if idx < 0 || idx >= len(fe) {
 		return pickerEntry{}, "", false
 	}
-	e := p.entries[idx]
+	e := fe[idx]
 	return e, filepath.Join(p.cwd, e.name), true
 }
 
@@ -404,6 +445,40 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 // handled=true plus an optional action for the caller to schedule.
 func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 	p := &c.picker
+
+	// Filter mode: capture keystrokes for the filter query.
+	if p.filtering {
+		switch {
+		case msg.Type == tea.KeyEsc:
+			p.filter = ""
+			p.filtering = false
+			p.cursor = 0
+			p.offset = 0
+			return true, nil
+		case msg.Type == tea.KeyEnter:
+			p.filtering = false
+			p.cursor = 0
+			p.offset = 0
+			p.clampCursor()
+			return true, nil
+		case msg.Type == tea.KeyBackspace || msg.Type == tea.KeyCtrlH:
+			if len(p.filter) > 0 {
+				p.filter = p.filter[:len(p.filter)-1]
+			} else {
+				p.filtering = false
+			}
+			p.cursor = 0
+			p.offset = 0
+			return true, nil
+		case msg.Type == tea.KeyRunes:
+			p.filter += string(msg.Runes)
+			p.cursor = 0
+			p.offset = 0
+			return true, nil
+		}
+		return true, nil
+	}
+
 	switch msg.Type {
 	case tea.KeyUp:
 		p.moveTo(p.cursor-1, p.visual)
@@ -450,6 +525,14 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		return true, nil
 	case tea.KeySpace:
 		c.pickerToggleBuffer()
+		return true, nil
+	}
+	// "/" enters filter mode.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 && msg.Runes[0] == '/' {
+		p.filtering = true
+		p.filter = ""
+		p.cursor = 0
+		p.offset = 0
 		return true, nil
 	}
 	if msg.Type == tea.KeyRunes && msg.String() == "v" {
@@ -515,7 +598,12 @@ func (c chatScreen) pickerView(maxW int) string {
 	var body []string
 	crumb := breadcrumb(p.cwd, p.home)
 	if p.mode == modeFiles {
-		crumb = fmt.Sprintf("shared files — %d", len(p.files))
+		crumb = fmt.Sprintf("shared files — %d", len(p.filteredFiles()))
+	}
+	if p.filtering {
+		crumb += fmt.Sprintf("  /%s▎", p.filter)
+	} else if p.filter != "" {
+		crumb += fmt.Sprintf("  /%s", p.filter)
 	}
 	body = append(body, tuiPickerCrumbStyle.Render(pad(crumb)))
 
@@ -595,8 +683,8 @@ func (c chatScreen) pickerView(maxW int) string {
 
 func parentRowAvailable(p *pickerState) bool { return parentRowCount(p) == 1 }
 
-const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · ^D upload · esc cancel"
-const pickerDlFooterHints = "↑↓ move · space buffer · v/⇧ range · enter save · ^D download · esc cancel"
+const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · ^D upload · / filter · esc cancel"
+const pickerDlFooterHints = "↑↓ move · space buffer · v/⇧ range · enter save · ^D download · / filter · esc cancel"
 
 // fileLabel resolves a buffered fileId to its filename for tray rendering.
 func (p *pickerState) fileLabel(fileId string) string {
@@ -618,10 +706,11 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 	}
 	check := " "
 	if p.mode == modeFiles {
-		if row < 0 || row >= len(p.files) {
+		ff := p.filteredFiles()
+		if row < 0 || row >= len(ff) {
 			return ""
 		}
-		f := p.files[row]
+		f := ff[row]
 		if p.inBuf[f.FileId] {
 			check = "✓"
 		}
@@ -633,14 +722,15 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 	if hasParent && row == 0 {
 		return marker + tuiPickerDirStyle.Render("../")
 	}
+	fe := p.filteredEntries()
 	idx := row
 	if hasParent {
 		idx--
 	}
-	if idx < 0 || idx >= len(p.entries) {
+	if idx < 0 || idx >= len(fe) {
 		return ""
 	}
-	e := p.entries[idx]
+	e := fe[idx]
 	if p.inBuf[filepath.Join(p.cwd, e.name)] {
 		check = "✓"
 	}

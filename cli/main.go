@@ -27,6 +27,7 @@ import (
 	"github.com/AdityaAgrawal08/uplink-delta/cli/lan"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/crc64"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/tarball"
+	"github.com/AdityaAgrawal08/uplink-delta/cli/wan"
 	"golang.org/x/term"
 )
 
@@ -117,6 +118,12 @@ func main() {
 			os.Exit(1)
 		}
 		cmdCreateSession(os.Args[3:], cfg)
+	case "config":
+		handleConfig(os.Args[2:])
+	case "version":
+		handleVersion()
+	case "update":
+		handleUpdate()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -148,6 +155,12 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("  join <key>       Join a chat room with the 6-digit key")
 	fmt.Println("                   uplink join 482716")
+	fmt.Println()
+	fmt.Println("  config           Manage configuration (~/.uplink/config.json)")
+	fmt.Println("                   uplink config ls | get <key> | set <key> <val>")
+	fmt.Println()
+	fmt.Println("  version          Show version")
+	fmt.Println("  update           Self-update to latest release")
 	fmt.Println()
 	fmt.Println("  help        Show available commands")
 	fmt.Println("              uplink --help")
@@ -277,6 +290,7 @@ func generateShareCode() string {
 
 func handleSend(args []string) {
 	cfg := LoadConfig()
+	CleanOldResumeStates()
 
 	sendCmd := flag.NewFlagSet("send", flag.ExitOnError)
 	passwordFlag := sendCmd.String("password", "", "Password to protect the share link")
@@ -286,6 +300,7 @@ func handleSend(args []string) {
 	qrFlag := sendCmd.Bool("qr", false, "Force display QR code")
 	noQrFlag := sendCmd.Bool("no-qr", false, "Suppress QR code display")
 	encryptFlag := sendCmd.Bool("encrypt", false, "Enable Client-Side End-to-End Encryption")
+	wanFlag := sendCmd.Bool("wan", false, "Enable internet-wide P2P transfer via DHT")
 
 	sendValueFlags := map[string]bool{
 		"password": true,
@@ -345,10 +360,46 @@ func handleSend(args []string) {
 
 	serverUrl := sanitizeServerUrl(*serverFlag)
 
+	// WAN P2P mode (if enabled) — bypass cloud entirely
+	if *wanFlag {
+		fileInfo, err := os.Stat(inputPath)
+		if err != nil {
+			fmt.Printf("✗ Error: %v\n", err)
+			os.Exit(1)
+		}
+		filePath := inputPath
+		if fileInfo.IsDir() {
+			tmpTar, err := tarballDirForWAN(inputPath)
+			if err != nil {
+				fmt.Printf("✗ Error: %v\n", err)
+				os.Exit(1)
+			}
+			defer os.Remove(tmpTar)
+			filePath = tmpTar
+		}
+		shareCode := generateShareCode()
+		fmt.Printf("\n✓ WAN P2P Transfer Initialized\n")
+		fmt.Printf("Share Code: %s\n", shareCode)
+		fmt.Printf("Peers can connect: uplink receive %s --wan\n", shareCode)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			err := wan.ServeFileWAN(ctx, shareCode, filePath, *passwordFlag, nil)
+			if err != nil && err != context.Canceled {
+				fmt.Printf("\n✗ WAN Server Error: %v\n", err)
+			}
+		}()
+		fmt.Println("Publishing to DHT... waiting for peer (Ctrl+C to stop)")
+		<-make(chan struct{})
+		os.Exit(0)
+	}
+
 	// Perform actual upload
-	code, _, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
+	code, shareLink, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
 	if err != nil {
 		fmt.Printf("\n✗ Upload failed: %v\n", err)
+		notifyTransferFailed(inputPath, err)
 		os.Exit(1)
 	}
 
@@ -357,7 +408,14 @@ func handleSend(args []string) {
 	if code != "" {
 		fmt.Printf("Code:\n%s\n", code)
 	}
+	if shareLink != "" {
+		fmt.Printf("Link:\n%s\n", shareLink)
+	}
 	fmt.Printf("Expires:\n%s\n", *expireFlag)
+
+	if shareLink != "" && copyToClipboard(shareLink) {
+		fmt.Println("\n✓ Link copied to clipboard")
+	}
 
 	notifyTransferComplete(filename)
 }
@@ -527,8 +585,16 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 				if mdnsErr == nil {
 					ctx, cancel := context.WithCancel(context.Background())
 					serverDone := make(chan struct{})
+					lanPrinter := &ProgressPrinter{
+						title:      "Sending (LAN)...",
+						total:      fileInfo.Size(),
+						startTime:  time.Now(),
+						firstPrint: true,
+					}
 					go func() {
-						err := lan.ServeFileLAN(ctx, filePath, port, cert, shareCode, password, 1, func() {
+						err := lan.ServeFileLANWithProgress(ctx, filePath, port, cert, shareCode, password, 1, func(written, total int64) {
+							lanPrinter.Print(written)
+						}, func() {
 							fmt.Println("\n✓ LAN Transfer completed successfully!")
 							cancel()
 							os.Exit(0)
@@ -857,6 +923,21 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 	return displayCode, shareLink, originalName, fileInfo.Size(), nil
 }
 
+func tarballDirForWAN(dir string) (string, error) {
+	base := filepath.Base(dir)
+	out := filepath.Join(os.TempDir(), fmt.Sprintf("uplink-wan-%d-%s.tar.gz", time.Now().UnixNano(), base))
+	f, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := tarball.Pack(dir, f); err != nil {
+		os.Remove(out)
+		return "", err
+	}
+	return out, nil
+}
+
 func handleReceive(args []string) {
 	cfg := LoadConfig()
 
@@ -870,6 +951,7 @@ func handleReceive(args []string) {
 	mkdirFlag := recvCmd.Bool("mkdir", false, "Create destination directory if it doesn't exist")
 	mkdirShortFlag := recvCmd.Bool("p", false, "Create destination directory (shortcut)")
 	lanFlag := recvCmd.Bool("lan", false, "Enable direct LAN P2P transfer")
+	wanRecvFlag := recvCmd.Bool("wan", false, "Enable internet-wide P2P transfer via DHT")
 
 	receiveValueFlags := map[string]bool{
 		"password": true,
@@ -892,6 +974,8 @@ func handleReceive(args []string) {
 	destPath := ""
 	if recvCmd.NArg() >= 2 {
 		destPath = recvCmd.Arg(1)
+	} else if cfg.DownloadDir != "" {
+		destPath = cfg.DownloadDir
 	}
 
 	// Client-side E2EE decryption key check
@@ -1054,6 +1138,46 @@ func handleReceive(args []string) {
 		} else {
 			fmt.Printf("No LAN peer found (%v). Falling back to cloud...\n", mdnsErr)
 		}
+	}
+
+	// WAN P2P mode (if enabled)
+	if *wanRecvFlag {
+		sanitizedName := sanitizeFilename(shareInput)
+		outputFilepath := sanitizedName
+		if destPath != "" {
+			if info, err := os.Stat(destPath); err == nil && info.IsDir() {
+				outputFilepath = filepath.Join(destPath, sanitizedName)
+			} else {
+				outputFilepath = destPath
+			}
+		}
+		fmt.Printf("Discovering WAN peer for share %s...\n", shareId)
+		printer := &ProgressPrinter{
+			title:      "Downloading (WAN)...",
+			total:      0,
+			startTime:  time.Now(),
+			firstPrint: true,
+		}
+		err := wan.DownloadFileWAN(context.Background(), shareId, outputFilepath, *passwordFlag, "", func(written int64) {
+			if printer.total == 0 && written > 0 {
+				// Unknown total: show bytes downloaded without percentage
+				elapsed := time.Since(printer.startTime).Seconds()
+				speed := float64(0)
+				if elapsed > 0 {
+					speed = float64(written) / elapsed
+				}
+				fmt.Printf("\r\033[K%s %s | %s/s", printer.title, formatBytes(written), formatBytes(int64(speed)))
+			} else if printer.total > 0 {
+				printer.Print(written)
+			}
+		})
+		if err != nil {
+			fmt.Printf("\n✗ WAN download failed: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("\n✓ WAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n", sanitizedName, outputFilepath)
+		notifyTransferComplete(sanitizedName)
+		os.Exit(0)
 	}
 
 	// Fetch Share Metadata
@@ -1283,6 +1407,7 @@ func handleReceive(args []string) {
 			if computedHex != meta.HashValue {
 				fmt.Println("\n✗ Error: File integrity check failed!")
 				os.Remove(tempTarFile)
+				notifyTransferFailed(meta.Filename, fmt.Errorf("integrity check failed"))
 				os.Exit(1)
 			}
 		}
@@ -1291,6 +1416,7 @@ func handleReceive(args []string) {
 	if err != nil {
 		os.Remove(tempTarFile)
 		fmt.Printf("\n✗ Error: Download interrupted: %v\n", err)
+		notifyTransferFailed(meta.Filename, err)
 		os.Exit(1)
 	}
 
