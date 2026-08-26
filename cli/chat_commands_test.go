@@ -168,19 +168,32 @@ func TestPaletteNavigationAndTabCompletes(t *testing.T) {
 	down := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown}); return m.(chatScreen) }
 	up := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyUp}); return m.(chatScreen) }
 
-	// Single-entry registry: navigation clamps to the one row, Tab completes.
+	// Ranked "" = [/help, /upload]; down lands on /upload, up returns.
 	c = down(c)
-	c = down(c)
-	c = up(c)
-	if c.palette.sel != 0 {
-		t.Fatalf("selection escaped the single visible row: %d", c.palette.sel)
+	if got := c.input.Value(); got != "/" || c.palette.sel != 1 {
+		t.Fatalf("down did not move to second row: input=%q sel=%d", got, c.palette.sel)
 	}
+	c = up(c)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyTab})
 	if got := c.input.Value(); got != "/help " {
 		t.Fatalf("tab completion gave %q; want \"/help \"", got)
 	}
 	if c.palette.visible() {
 		t.Fatal("tab completion must close the drawer")
+	}
+
+	// "/u" ranks /upload first; Enter selects it and OPENS THE PICKER.
+	c2 := newPaletteScreen()
+	c2, _ = typeKeys(c2, "/u")
+	got2, cmd := step(c2, tea.KeyMsg{Type: tea.KeyEnter})
+	if !got2.picker.isActive() {
+		t.Fatal("selecting /upload must open the file browser")
+	}
+	if cmd != nil {
+		t.Fatal("opening the picker is local-only")
+	}
+	if !strings.Contains(got2.View(), "~/") && !strings.Contains(got2.View(), breadcrumb(got2.picker.cwd, got2.picker.home)) {
+		t.Fatal("browser must paint a breadcrumb header")
 	}
 }
 

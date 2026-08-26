@@ -354,6 +354,8 @@ type chatScreen struct {
 	vp           viewport.Model
 	input        textinput.Model
 	palette      paletteState // "/" command drawer above the composer
+	picker       pickerState  // file-browser mode of that drawer (/upload)
+	uploadQ      uploadState  // sequential session-file transfer queue
 	status       string
 	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
@@ -974,6 +976,22 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case uploadProgressMsg:
+		if c.uploadQ.active && msg.total > 0 {
+			pct := 100 * msg.done / msg.total
+			c.paintUploadLine(tuiUploadRunStyle.Render(
+				fmt.Sprintf("[↑] %s %d%%", c.uploadQ.name, pct)))
+		}
+		cmds = append(cmds, drainUploadProgressCmd(c.uploadQ.progCh))
+
+	case uploadDrainMsg:
+		// channel closed; the done msg lands separately
+
+	case uploadDoneMsg:
+		if nc := c.settleUploadDone(msg); nc != nil {
+			cmds = append(cmds, nc)
+		}
+
 	case leaveDoneMsg:
 		return c, tea.Quit
 
@@ -986,6 +1004,22 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlC {
 			cmds = append(cmds, c.doLeave(), tea.Quit)
 			return c, tea.Batch(cmds...)
+		}
+		// The file browser owns ALL keys while open (it sits where the "/"
+		// drawer paints, one mode at a time).
+		if c.picker.isActive() {
+			if handled, action := c.handlePickerKeys(msg); handled {
+				if action != nil {
+					cmds = append(cmds, action())
+				}
+				return c, tea.Batch(cmds...)
+			}
+			break // unknown keys do nothing in browser mode
+		}
+		// Esc during a transfer cancels it before anything else sees the key.
+		if msg.Type == tea.KeyEsc && c.uploadQ.isActive() {
+			c.cancelUploads()
+			break
 		}
 		// "/" command drawer eats navigation + selection keys while open.
 		// Early return keeps those keys away from the viewport so moving the
@@ -1226,9 +1260,10 @@ func (c chatScreen) View() string {
 		input = "❯ " + c.input.View()
 	}
 	// OpenCode-style pop-out: with a leading "/" the command drawer emerges
-	// upward out of the composer. A blank spacer row sells the "lifted off
-	// the input" look; it is transient (only while the query starts with "/").
-	if pal := c.paletteView(maxInt(l.vpWidth+2, 0)); pal != "" {
+	// upward out of the composer; in /upload mode the same slot paints the
+	// file browser instead. A blank spacer row sells the "lifted off the
+	// input" look; it is transient (only while a drawer is up).
+	if pal := c.drawerView(maxInt(l.vpWidth+2, 0)); pal != "" {
 		rows = append(rows, "", pal)
 	}
 	rows = append(rows, input)

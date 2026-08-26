@@ -24,6 +24,7 @@ type slashCommand struct {
 // declared; execution switches on Name below.
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
+	{Name: "/upload", Desc: "send file(s) into the room"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -140,10 +141,14 @@ func (p *paletteState) close() {
 
 // paletteRows is the exact terminal-row budget the drawer consumes right now:
 // one blank spacer above the panel, the visible command rows, the keymap
-// footer, and the panel's own border. Width never affects it (rows truncate,
-// they do not wrap), so this number is deterministic BEFORE layout math runs
-// — which is what lets computeLayoutWithPalette reserve it up front.
+// footer, and the panel's own border. In file-browser mode (/upload) the
+// picker's budget takes over. Width never affects it (rows truncate, they do
+// not wrap), so this number is deterministic BEFORE layout math runs — which
+// is what lets computeLayoutWithPalette reserve it up front.
 func (c chatScreen) paletteRows() int {
+	if c.picker.isActive() {
+		return c.pickerRows()
+	}
 	if !c.palette.visible() {
 		return 0
 	}
@@ -165,6 +170,15 @@ func (c chatScreen) layoutFor() layout {
 }
 
 // ---- palette view ------------------------------------------------------------
+
+// drawerView renders whichever mode owns the drawer slot: the file browser
+// (picker) or the "/" command list.
+func (c chatScreen) drawerView(maxW int) string {
+	if c.picker.isActive() {
+		return c.pickerView(maxW)
+	}
+	return c.paletteView(maxW)
+}
 
 // paletteView renders the pop-out panel for the current composer text. maxW
 // is the outer width budget — the composer's full outer width, so the panel
@@ -291,6 +305,8 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 			" · type / for the picker · Ctrl+C leaves the session"
 		c.appendLine(tuiSystemStyle.Render(hint))
 		return nil
+	case "/upload":
+		return c.openPicker() // morphs the drawer into a file browser
 	default:
 		return nil
 	}
