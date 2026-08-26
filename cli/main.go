@@ -548,8 +548,16 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 				if mdnsErr == nil {
 					ctx, cancel := context.WithCancel(context.Background())
 					serverDone := make(chan struct{})
+					lanPrinter := &ProgressPrinter{
+						title:      "Sending (LAN)...",
+						total:      fileInfo.Size(),
+						startTime:  time.Now(),
+						firstPrint: true,
+					}
 					go func() {
-						err := lan.ServeFileLAN(ctx, filePath, port, cert, shareCode, password, 1, func() {
+						err := lan.ServeFileLANWithProgress(ctx, filePath, port, cert, shareCode, password, 1, func(written, total int64) {
+							lanPrinter.Print(written)
+						}, func() {
 							fmt.Println("\n✓ LAN Transfer completed successfully!")
 							cancel()
 							os.Exit(0)
