@@ -250,20 +250,22 @@ func (c *chatClient) isExiting() bool { return atomic.LoadInt32(&c.exiting) == 1
 
 // runChat picks the rendering mode: full-screen TUI by default, plain lines
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
-func runChat(serverURL, key, me string) {
+func runChat(serverURL, key, me string, persist bool) {
 	if os.Getenv("UPLINK_CHAT_PLAIN") == "1" || !term.IsTerminal(int(os.Stdin.Fd())) {
-		runChatPlain(serverURL, key, me)
+		runChatPlain(serverURL, key, me, persist)
 		return
 	}
-	runChatTUI(serverURL, key, me)
+	runChatTUI(serverURL, key, me, persist)
 }
 
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
 // Private 1:1 chat is an interactive (TUI-only) feature; plain mode always
 // shows the common room with own entry/exit presence suppressed.
-func runChatPlain(serverURL, key, me string) {
+func runChatPlain(serverURL, key, me string, persist bool) {
 	client := newChatClient(serverURL, key, me)
+
+	var history []chatMessage
 
 	printMsg := func(m chatMessage) {
 		ts := time.Now().Format("15:04")
@@ -277,12 +279,16 @@ func runChatPlain(serverURL, key, me string) {
 			return
 		}
 		fmt.Printf("[%s] %s: %s\n", ts, m.Username, m.Text)
+		history = append(history, m)
 	}
 	client.onMessage = printMsg
 	client.onSystem = func(s string) { fmt.Println("*", s) }
 	client.onUsers = func(users []string) {}
 	client.onEnded = func(reason string) {
 		fmt.Printf("\n* %s — disconnecting.\n", reason)
+		if persist {
+			_ = saveHistory(key, history)
+		}
 		os.Exit(0)
 	}
 	client.onTransientErr = func(err error) {}
@@ -350,6 +356,9 @@ func runChatPlain(serverURL, key, me string) {
 		switch strings.ToLower(line) {
 		case "/exit", "/quit":
 			client.leave()
+			if persist {
+				_ = saveHistory(key, history)
+			}
 			fmt.Println("* You left the session.")
 			os.Exit(0)
 		case "/help":
@@ -369,6 +378,9 @@ func runChatPlain(serverURL, key, me string) {
 	}
 	// stdin closed (EOF) — treat as exit
 	client.leave()
+	if persist {
+		_ = saveHistory(key, history)
+	}
 	fmt.Println("* Disconnected.")
 }
 

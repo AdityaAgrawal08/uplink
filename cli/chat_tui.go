@@ -338,6 +338,7 @@ type chatScreen struct {
 	client       *chatClient
 	key          string
 	me           string
+	persist      bool
 	width        int
 	height       int
 	history      []chatMessage        // every confirmed server message (deduped by seq)
@@ -1373,12 +1374,16 @@ func (c chatScreen) View() string {
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).
-func runChatTUI(serverURL, key, me string) {
+func runChatTUI(serverURL, key, me string, persist bool) {
 	scr := newChatScreen(serverURL, key, me)
+	scr.persist = persist
 	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
+	}
+	if persist {
+		_ = saveHistory(key, scr.history)
 	}
 	scr.client.leave()
 	fmt.Printf("\nYou left session %s.\n", key)

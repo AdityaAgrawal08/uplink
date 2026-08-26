@@ -98,6 +98,7 @@ func cmdCreateSession(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("create session", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
 	passwordFlag := fs.String("password", "", "Password-protect this session")
+	persistFlag := fs.Bool("persist", false, "Save chat history to ~/.uplink/history/ on exit")
 	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
@@ -149,7 +150,7 @@ func cmdCreateSession(args []string, cfg *Config) {
 
 	// The creator is already a participant server-side — drop them straight
 	// into the room so their username isn't stranded without a UI.
-	runChat(serverURL, created.SessionID, username)
+	runChat(serverURL, created.SessionID, username, *persistFlag)
 }
 
 // cmdJoinChat handles: uplink join <key> — resolves to the interactive chat.
@@ -157,6 +158,7 @@ func cmdJoinChat(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
 	passwordFlag := fs.String("password", "", "Session password")
+	persistFlag := fs.Bool("persist", false, "Save chat history to ~/.uplink/history/ on exit")
 	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
@@ -223,5 +225,5 @@ func cmdJoinChat(args []string, cfg *Config) {
 		}
 	}
 
-	runChat(serverURL, key, username)
+	runChat(serverURL, key, username, *persistFlag)
 }
