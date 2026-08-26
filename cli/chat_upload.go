@@ -77,6 +77,12 @@ type uploadDoneMsg struct {
 	err     error
 }
 
+// filesFetchedMsg lands after each room-files poll.
+type filesFetchedMsg struct {
+	files []sessionFile
+	err   error
+}
+
 // ---- queue control ---------------------------------------------------------------
 
 // startUploads enqueues jobs and kicks the first transfer.
@@ -173,6 +179,59 @@ func (c *chatClient) completeUpload(fileId, shareId string) error {
 		return fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
 	}
 	return nil
+}
+
+// fetchFiles lists room files uploaded after `since` (RFC3339; "" = all).
+func (c *chatClient) fetchFiles(since string) ([]sessionFile, error) {
+	url := c.endpoint("/files")
+	if since != "" {
+		url += "?since=" + urlQueryEscape(since)
+	}
+	code, body, err := getJSON(url, c.authHeaders())
+	if err != nil {
+		return nil, err
+	}
+	if code != 200 {
+		return nil, fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
+	}
+	var r struct {
+		Files []sessionFile `json:"files"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	return r.Files, nil
+}
+
+// doFetchFiles polls the room file list (receiver side).
+func (c *chatScreen) doFetchFiles() tea.Cmd {
+	client := c.client
+	since := c.lastFilesAt
+	return func() tea.Msg {
+		files, err := client.fetchFiles(since)
+		return filesFetchedMsg{files: files, err: err}
+	}
+}
+
+// applyRoomFiles paints unseen UPLOADED files as system announcements.
+func (c *chatScreen) applyRoomFiles(files []sessionFile) {
+	for _, f := range files {
+		if f.Status != "UPLOADED" {
+			continue // ANNOUNCED/FAILED never announce
+		}
+		if c.filesSeen[f.FileId] {
+			continue
+		}
+		c.filesSeen[f.FileId] = true
+		if f.UploadedAt > c.lastFilesAt {
+			c.lastFilesAt = f.UploadedAt
+		}
+		if f.Username == c.me {
+			continue // own uploads already painted by the engine
+		}
+		c.appendLocal(generalConv, tuiSystemStyle.Render(
+			fmt.Sprintf("* %s shared %s (%s)", f.Username, f.Filename, humanSize(f.Size))))
+	}
 }
 
 // ---- transcript paint --------------------------------------------------------------

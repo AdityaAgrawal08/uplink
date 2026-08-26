@@ -315,6 +315,43 @@ func TestUploadLocalGuards(t *testing.T) {
 	}
 }
 
+// Receiver side: unseen UPLOADED room files paint announcements; own files,
+// duplicates and non-UPLOADED statuses never do.
+func TestApplyRoomFilesAnnounces(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.filesSeen = map[string]bool{}
+	files := []sessionFile{
+		{FileId: "f1", Username: "alice", Filename: "report.pdf", Size: 2400000, Status: "UPLOADED", UploadedAt: "2026-08-26T01:00:00Z"},
+		{FileId: "f2", Username: "bob", Filename: "mine.zip", Size: 10, Status: "UPLOADED", UploadedAt: "2026-08-26T01:01:00Z"},
+		{FileId: "f3", Username: "alice", Filename: "again.pdf", Size: 5, Status: "ANNOUNCED", UploadedAt: "2026-08-26T01:02:00Z"},
+	}
+	c.applyRoomFiles(files)
+	var lines []string
+	for _, ll := range c.localLines {
+		lines = append(lines, ll.text)
+	}
+	joined := strings.Join(lines, "|")
+	if !strings.Contains(joined, "alice shared report.pdf (2.3 MB)") {
+		t.Fatalf("missing alice announcement: %v", lines)
+	}
+	if strings.Contains(joined, "mine.zip") || strings.Contains(joined, "again.pdf") {
+		t.Fatalf("own or unannounced file leaked: %v", lines)
+	}
+	// Cursor advances only over PAINTED uploads: skipping ANNOUNCED rows
+	// must not move it, or their later completion (which bumps uploadedAt)
+	// would fall behind the watermark and never be announced.
+	if c.lastFilesAt != "2026-08-26T01:01:00Z" {
+		t.Fatalf("cursor = %q; want newest UPLOADED uploadedAt", c.lastFilesAt)
+	}
+
+	// Re-delivery of the same fileId must not duplicate the line.
+	before := len(c.localLines)
+	c.applyRoomFiles(files[:1])
+	if len(c.localLines) != before {
+		t.Fatal("duplicate fileId painted twice")
+	}
+}
+
 func TestTarballDirPacksFiles(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "one.txt"), []byte("1"), 0o644)

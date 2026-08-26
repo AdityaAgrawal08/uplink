@@ -353,9 +353,11 @@ type chatScreen struct {
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
-	palette      paletteState // "/" command drawer above the composer
-	picker       pickerState  // file-browser mode of that drawer (/upload)
-	uploadQ      uploadState  // sequential session-file transfer queue
+	palette      paletteState    // "/" command drawer above the composer
+	picker       pickerState     // file-browser mode of that drawer (/upload)
+	uploadQ      uploadState     // sequential session-file transfer queue
+	filesSeen    map[string]bool // room files already announced to me
+	lastFilesAt  string          // newest uploadedAt fed into /files?since=
 	status       string
 	targetUser   string // private-chat peer; "" = general room
 	beatFailures int
@@ -413,6 +415,7 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 		unread:       map[string]int{},
 		lastDMAt:     map[string]time.Time{},
 		fetchedConvs: map[string]bool{generalConv: true},
+		filesSeen:    map[string]bool{},
 		outbox:       nil,
 	}
 }
@@ -782,7 +785,7 @@ func (c chatScreen) doConvFetch(conv string) tea.Cmd {
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), schedulePoll(0), scheduleBeat())
+	return tea.Batch(c.fetchBacklogCmd(), c.doBeat(), c.doFetchFiles(), schedulePoll(0), scheduleBeat())
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
@@ -962,7 +965,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				c.hoverPeer = ""
 			}
 		}
-		cmds = append(cmds, scheduleBeat())
+		cmds = append(cmds, scheduleBeat(), c.doFetchFiles()) // roster + room files
 
 	case sendDoneMsg:
 		if nc := c.settleSend(msg); nc != nil {
@@ -990,6 +993,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case uploadDoneMsg:
 		if nc := c.settleUploadDone(msg); nc != nil {
 			cmds = append(cmds, nc)
+		}
+		cmds = append(cmds, c.doFetchFiles()) // instant self-feedback
+
+	case filesFetchedMsg:
+		if msg.err == nil {
+			c.applyRoomFiles(msg.files)
 		}
 
 	case leaveDoneMsg:
