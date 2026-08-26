@@ -20,7 +20,7 @@ curl -sSfL https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/i
 ```
 
 Installs to `/usr/local/bin` (falls back to `~/.local/bin`, honors `PREFIX`).
-Build from source instead: `cd cli && go build -o uplink .`
+Build from source instead: `make build`
 
 ---
 
@@ -38,13 +38,16 @@ uplink send invoice.xlsx --encrypt
 
 # Custom expiry (5m / 30m / 2h / 1d) and password protection
 uplink send report.pdf --expire 30m --password hunter2
+
+# Publish to WAN DHT for internet-wide discovery (no cloud)
+uplink send report.pdf --wan
 ```
 
 ```bash
 # Download by code into the current directory
 uplink receive 4827165038
 
-# Into a specific destination
+# Into a specific destination (or use download_dir config)
 uplink receive 4827165038 ~/Downloads
 
 # Handle existing targets
@@ -53,6 +56,9 @@ uplink receive 4827165038 --rename   # save as "report (1).pdf" (-r)
 
 # Encrypted shares decrypt automatically when the key is in the code
 uplink receive 4827165038:7c4a8d8e9...
+
+# Download via WAN DHT (internet-wide, no cloud)
+uplink receive 4827165038 --wan
 ```
 
 Integrity is verified end-to-end with SHA-256 on every download; large files
@@ -67,11 +73,15 @@ uplink send video.mp4 --lan           # mDNS discovery + ephemeral TLS
 uplink receive <share-code> --lan     # falls back to cloud if peer not found
 ```
 
+LAN transfers show a live progress bar with bytes transferred and speed.
+
 ## Terminal Chat
 
 ```bash
-uplink create session      # pick a nickname → get a 6-digit room key
-uplink join 482716         # friends join anywhere on the internet
+uplink create session               # pick a nickname → get a 6-digit room key
+uplink create session --password x  # require a password to join
+uplink join 482716                  # friends join anywhere on the internet
+uplink join 482716 --password x     # join a password-protected room
 ```
 
 Full-screen chat UI with OpenCode-style chrome: messages deliver in ~0.5 s,
@@ -102,6 +112,7 @@ home directory:
 - `..` pinned first, directories before files, alphabetical, dotfiles included
 - **Space** buffers items · **v** or **Shift+↑↓** range-select · **Ctrl+D** uploads everything buffered
 - **Enter** on a folder opens it; **Enter** on a file uploads it instantly
+- **/** opens filter mode — type a substring to narrow the listing
 - Backspace/Left goes up one level; **Esc** cancels
 
 Uploads run sequentially with live `[↑] name %` progress. Folders are packed
@@ -113,8 +124,9 @@ room sees `* alice shared report.pdf (2.3 MB)` announcements as files land.
 Selecting `/download` lists the room's shared files, most recent first
 (`name · uploader · size`). Same interaction grammar: Space buffers,
 ranges select, **Enter** saves instantly, **Ctrl+D** grabs everything
-buffered. Files land in `~/Downloads` (created on demand); name collisions
-become `name (1).ext`. Esc cancels mid-transfer.
+buffered. Files land in `~/Downloads` (created on demand) or the
+configured `download_dir`; name collisions become `name (1).ext`. Esc
+cancels mid-transfer.
 
 ### Private threads
 
@@ -124,6 +136,28 @@ opens that thread. Messages inside a thread go only to that peer and never
 leak into the general room; **Esc** returns to general. Unread threads show
 a green badge chip next to their names.
 
+### Chat history
+
+Use `--persist` to save chat history to `~/.uplink/history/`:
+
+```bash
+uplink create session --persist
+uplink join 482716 --persist
+```
+
+Transcripts are saved as JSON on exit and restored on next join.
+
+### Markdown in chat
+
+Messages render with basic markdown: `**bold**`, `` `code` ``, fenced code
+blocks, and `[text](url)` links.
+
+### WebSocket (optional)
+
+When the server supports WebSocket upgrades, the client automatically
+connects via WebSocket for lower-latency messaging. Falls back to HTTP
+long-polling otherwise.
+
 ## Web Previews
 
 Every share gets a browser page with inline previews for text/code, images,
@@ -131,15 +165,33 @@ video, audio, and PDFs — plus a QR code for phone downloads.
 
 ---
 
-## Configuration (optional)
+## Configuration
 
-| Env var | Default | Purpose |
+### CLI subcommands
+
+```bash
+uplink config ls              # list all settings
+uplink config get <key>       # get a setting
+uplink config set <key> <val> # set a setting
+```
+
+### Version and update
+
+```bash
+uplink version    # show version
+uplink update     # download latest release from GitHub
+```
+
+### Settings
+
+| Key / Env var | Default | Purpose |
 |---|---|---|
-| `UPLINK_SERVER` | `https://uplink-delta-xi.vercel.app` | Backend to talk to |
-| `UPLINK_EXPIRY` | `1h` | Default share expiry |
-| `UPLINK_LAN_PORT` | `9090` | Base port for LAN transfers |
-| `UPLINK_SHOW_QR` | `auto` | QR display after uploads |
-| `UPLINK_CHAT_PLAIN` | unset | Force plain-text chat rendering |
+| `server` / `UPLINK_SERVER` | `https://uplink-delta-xi.vercel.app` | Backend to talk to |
+| `expiry` / `UPLINK_EXPIRY` | `1h` | Default share expiry |
+| `download_dir` / `UPLINK_DOWNLOAD_DIR` | `~/Downloads` | Default download destination |
+| `lan_port` / `UPLINK_LAN_PORT` | `9090` | Base port for LAN transfers |
+| `show_qr` / `UPLINK_SHOW_QR` | `auto` | QR display after uploads |
+| `chat_plain` / `UPLINK_CHAT_PLAIN` | unset | Force plain-text chat rendering |
 
 A JSON config file at `~/.uplink/config.json` mirrors these settings.
 
@@ -161,7 +213,7 @@ npx tsc --noEmit
 cd cli
 go vet ./...
 go test ./...
-go build -o build/uplink .
+make build
 ```
 
 ### End-to-end tests (need a local server on :3000)
