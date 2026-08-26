@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
@@ -108,7 +110,7 @@ func cmdCreateSession(args []string, cfg *Config) {
 	username := promptChatUsername(reader)
 
 	password := *passwordFlag
-	if password == "" {
+	if password == "" && term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Print("Session password (optional, press Enter to skip): ")
 		pwdBytes, err := reader.ReadString('\n')
 		if err == nil {
