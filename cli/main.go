@@ -358,7 +358,7 @@ func handleSend(args []string) {
 	serverUrl := sanitizeServerUrl(*serverFlag)
 
 	// Perform actual upload
-	code, _, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
+	code, shareLink, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
 	if err != nil {
 		fmt.Printf("\n✗ Upload failed: %v\n", err)
 		os.Exit(1)
@@ -369,7 +369,14 @@ func handleSend(args []string) {
 	if code != "" {
 		fmt.Printf("Code:\n%s\n", code)
 	}
+	if shareLink != "" {
+		fmt.Printf("Link:\n%s\n", shareLink)
+	}
 	fmt.Printf("Expires:\n%s\n", *expireFlag)
+
+	if shareLink != "" && copyToClipboard(shareLink) {
+		fmt.Println("\n✓ Link copied to clipboard")
+	}
 
 	notifyTransferComplete(filename)
 }
