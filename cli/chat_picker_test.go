@@ -284,6 +284,25 @@ func drainCmds(cmd tea.Cmd) []tea.Msg {
 	return []tea.Msg{msg}
 }
 
+// pump feeds every message back through Update AND executes any follow-up
+// command the model schedules (queue promotions), until quiescent.
+func pump(sc chatScreen, cmds ...tea.Cmd) chatScreen {
+	queue := append([]tea.Cmd(nil), cmds...)
+	for len(queue) > 0 {
+		cmd := queue[0]
+		queue = queue[1:]
+		if cmd == nil {
+			continue
+		}
+		for _, msg := range drainCmds(cmd) {
+			var next tea.Cmd
+			sc, next = step(sc, msg)
+			queue = append(queue, next)
+		}
+	}
+	return sc
+}
+
 // Oversized and empty files are rejected BEFORE any network call.
 func TestUploadLocalGuards(t *testing.T) {
 	hitServer := false
@@ -349,6 +368,195 @@ func TestApplyRoomFilesAnnounces(t *testing.T) {
 	c.applyRoomFiles(files[:1])
 	if len(c.localLines) != before {
 		t.Fatal("duplicate fileId painted twice")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// /download drawer + keyboard peer access
+// ---------------------------------------------------------------------------
+
+// Tab cycles the roster highlight and empty-Enter opens that thread — the
+// keyboard path to private chat (mouse-less terminals had none).
+func TestKeyboardPeerCycleAndOpen(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice", "carol")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	sc := m.(chatScreen)
+
+	tab := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyTab}); return m.(chatScreen) }
+
+	if sc.hoverPeer != "" {
+		t.Fatalf("initial focus = %q; want none", sc.hoverPeer)
+	}
+	sc = tab(sc)
+	if sc.hoverPeer == "" || sc.hoverPeer == "bob" {
+		t.Fatalf("tab did not focus a peer: %q", sc.hoverPeer)
+	}
+	first := sc.hoverPeer
+	sc = tab(sc)
+	sc = tab(sc)
+	if sc.hoverPeer != first {
+		t.Fatal("cycling must wrap and skip self (bob)")
+	}
+
+	// Empty Enter opens the highlighted thread.
+	sc2 := newFilterScreen("bob", "", "bob", "alice")
+	m2, _ := sc2.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	s2 := m2.(chatScreen)
+	s2.hoverPeer = "alice"
+	s2, cmd := step(s2, tea.KeyMsg{Type: tea.KeyEnter})
+	if s2.targetUser != "alice" {
+		t.Fatalf("empty enter did not open thread; target=%q", s2.targetUser)
+	}
+	_ = cmd // backlog fetch may be non-nil; harmless here
+}
+
+func newFilesDrawer(t *testing.T, files []sessionFile) chatScreen {
+	t.Helper()
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	sc := m.(chatScreen)
+	sc.picker = pickerState{
+		active: true, mode: modeFiles, home: ".", anchor: -1,
+		inBuf: map[string]bool{},
+	}
+	sc.applyFilesList(files)
+	return sc
+}
+
+// The /download listing shows only UPLOADED files, most recent first.
+func TestFilesDrawerSortsRecentFirst(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/d")
+	got, _ := step(c, tea.KeyMsg{Type: tea.KeyEnter})
+	if !got.picker.isActive() || got.picker.mode != modeFiles {
+		t.Fatal("/download must open the files drawer")
+	}
+
+	got.applyFilesList([]sessionFile{
+		{FileId: "old", Filename: "old.txt", Username: "alice", Size: 5, Status: "UPLOADED", UploadedAt: "2026-08-26T01:00:00Z"},
+		{FileId: "new", Filename: "new.txt", Username: "bob", Size: 6, Status: "UPLOADED", UploadedAt: "2026-08-26T03:00:00Z"},
+		{FileId: "pend", Filename: "pending.txt", Username: "carol", Size: 7, Status: "ANNOUNCED", UploadedAt: "2026-08-26T04:00:00Z"},
+	})
+	var order []string
+	for _, f := range got.picker.files {
+		order = append(order, f.Filename)
+	}
+	if strings.Join(order, ",") != "new.txt,old.txt" {
+		t.Fatalf("listing = %v; want newest first, ANNOUNCED excluded", order)
+	}
+	if !strings.Contains(got.View(), "shared files — 2") {
+		t.Fatal("breadcrumb must show the count")
+	}
+}
+
+// Enter on a row downloads it into ~/Downloads (byte-identical).
+func TestFilesDrawerEnterDownloads(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	payload := []byte("shared bytes for download")
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/download/fid-9"):
+			fmt.Fprint(w, `{"downloadUrl":"`+srv.URL+`/blob"}`)
+		case r.URL.Path == "/blob":
+			w.Write(payload)
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, 404)
+		}
+	}))
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.client = newChatClient(srv.URL, "123456", "bob")
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	sc := m.(chatScreen)
+	sc = newFilesDrawerAt(sc, []sessionFile{
+		{FileId: "fid-9", Filename: "grab.bin", Size: int64(len(payload)), Status: "UPLOADED"},
+	})
+
+	// Cursor sits on row 0; Enter quick-downloads.
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyEnter})
+	for _, msg := range drainCmds(cmd) {
+		sc, _ = step(sc, msg)
+	}
+	data, err := os.ReadFile(filepath.Join(tmpHome, "Downloads", "grab.bin"))
+	if err != nil {
+		t.Fatalf("downloaded file missing: %v", err)
+	}
+	if !bytes.Equal(data, payload) {
+		t.Fatal("downloaded bytes differ")
+	}
+	found := false
+	for _, ll := range sc.localLines {
+		if strings.Contains(ll.text, "saved grab.bin") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("missing save confirmation line: %v", sc.localLines)
+	}
+}
+
+// newFilesDrawerAt reuses an already-wired screen for pipeline tests.
+func newFilesDrawerAt(sc chatScreen, files []sessionFile) chatScreen {
+	sc.picker = pickerState{
+		active: true, mode: modeFiles, home: ".", anchor: -1,
+		inBuf: map[string]bool{},
+	}
+	sc.applyFilesList(files)
+	return sc
+}
+
+// Space buffers several, ^D downloads them sequentially.
+func TestFilesDrawerBufferedMultiDownload(t *testing.T) {
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/download/id") {
+			name := filepath.Base(r.URL.Path)
+			fmt.Fprint(w, `{"downloadUrl":"`+srv.URL+`/blob/`+name+`"}`)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/blob/") {
+			w.Write([]byte("data-of-" + filepath.Base(r.URL.Path)))
+			return
+		}
+		http.Error(w, "unexpected", 404)
+	}))
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.client = newChatClient(srv.URL, "123456", "bob")
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	sc := m.(chatScreen)
+	sc.client = c.client
+	sc = newFilesDrawerAt(sc, []sessionFile{
+		{FileId: "id1", Filename: "one.txt", Size: 12, Status: "UPLOADED"},
+		{FileId: "id2", Filename: "two.txt", Size: 12, Status: "UPLOADED"},
+	})
+
+	// Buffer both rows via space, then ^D.
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyDown})
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlD})
+	sc = pump(sc, cmd)
+	for name, id := range map[string]string{"one.txt": "id1", "two.txt": "id2"} {
+		data, err := os.ReadFile(filepath.Join(tmpHome, "Downloads", name))
+		if err != nil {
+			t.Fatalf("%s missing: %v", name, err)
+		}
+		if string(data) != "data-of-"+id {
+			t.Fatalf("%s content wrong: %q", name, data)
+		}
 	}
 }
 

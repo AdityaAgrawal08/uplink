@@ -213,6 +213,20 @@ func (c *chatScreen) doFetchFiles() tea.Cmd {
 	}
 }
 
+// filesListMsg fills the /download drawer (full listing, no watermark).
+type filesListMsg struct {
+	files []sessionFile
+	err   error
+}
+
+func (c *chatScreen) doFetchAllFiles() tea.Cmd {
+	client := c.client
+	return func() tea.Msg {
+		files, err := client.fetchFiles("")
+		return filesListMsg{files: files, err: err}
+	}
+}
+
 // applyRoomFiles paints unseen UPLOADED files as system announcements.
 func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 	for _, f := range files {
@@ -463,7 +477,12 @@ func putShareBytes(ctx context.Context, serverURL, path, display string, size in
 	}
 	defer f.Close()
 
-	putReq, err := http.NewRequestWithContext(ctx, "PUT", initResp.UploadUrl, &progressReader{r: f, total: size, prog: prog})
+	putReq, err := http.NewRequestWithContext(ctx, "PUT", initResp.UploadUrl, &progressReader{r: f, total: size, onProg: func(done, total int64) {
+		select {
+		case prog <- uploadProgressMsg{done: done, total: total}:
+		default:
+		}
+	}})
 	if err != nil {
 		return err
 	}
@@ -497,23 +516,23 @@ func putShareBytes(ctx context.Context, serverURL, path, display string, size in
 	return nil
 }
 
-// progressReader reports cumulative bytes onto prog without blocking.
+// progressReader reports cumulative bytes through onProg (throttled to
+// ~every 512KB or at EOF). Callbacks must not block; senders use select.
 type progressReader struct {
 	r        io.Reader
 	total    int64
 	n        int64
-	prog     chan<- uploadProgressMsg
 	lastEmit int64
+	onProg   func(done, total int64)
 }
 
 func (p *progressReader) Read(buf []byte) (int, error) {
 	n, err := p.r.Read(buf)
 	p.n += int64(n)
-	if p.n-p.lastEmit >= 512<<10 || err == io.EOF { // throttle to ~every 512KB
+	if p.n-p.lastEmit >= 512<<10 || err == io.EOF {
 		p.lastEmit = p.n
-		select {
-		case p.prog <- uploadProgressMsg{done: p.n, total: p.total}:
-		default:
+		if p.onProg != nil {
+			p.onProg(p.n, p.total)
 		}
 	}
 	return n, err

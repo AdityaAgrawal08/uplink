@@ -48,18 +48,30 @@ type pickerEntry struct {
 	size int64
 }
 
+// pickerMode selects what the drawer lists: the local file system (upload)
+// or the room's shared files (download).
+type pickerMode int
+
+const (
+	modeBrowse pickerMode = iota
+	modeFiles
+)
+
 // pickerState is the browser mode of the drawer. All list math goes through
 // pure helpers so navigation rules are unit-testable without a filesystem.
 type pickerState struct {
 	active   bool
-	cwd      string // absolute current directory
+	mode     pickerMode
+	cwd      string // absolute current directory (modeBrowse)
 	home     string // $HOME, for ~/ breadcrumb abbreviation
 	entries  []pickerEntry
+	files    []sessionFile // modeFiles listing, most recent first
+	loading  bool          // modeFiles: waiting on the /files response
 	cursor   int
 	offset   int      // first visible row in the scroll window
 	anchor   int      // range anchor (-1 = no active range)
 	visual   bool     // `v` visual mode: plain moves extend the range
-	buffered []string // ordered absolute paths (display order)
+	buffered []string // ordered keys: absolute paths OR fileIds
 	inBuf    map[string]bool
 	notice   string // transient error line ("" = none)
 }
@@ -77,6 +89,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 	c.input.Placeholder = ""
 	c.picker = pickerState{
 		active: true,
+		mode:   modeBrowse,
 		cwd:    home,
 		home:   home,
 		anchor: -1,
@@ -84,6 +97,49 @@ func (c *chatScreen) openPicker() tea.Cmd {
 	}
 	c.loadPickerDir()
 	return nil
+}
+
+// openFilesDrawer morphs the drawer into the room's shared-files list, most
+// recent first. The listing arrives asynchronously (filesListMsg).
+func (c *chatScreen) openFilesDrawer() tea.Cmd {
+	c.palette.close()
+	c.input.SetValue("")
+	c.input.Placeholder = ""
+	c.picker = pickerState{
+		active: true,
+		mode:   modeFiles,
+		home:   ".",
+		anchor: -1,
+		inBuf:  map[string]bool{},
+		notice: "loading shared files…",
+	}
+	return c.doFetchAllFiles()
+}
+
+// applyFilesList fills the drawer's listing; non-UPLOADED files never show.
+func (c *chatScreen) applyFilesList(files []sessionFile) {
+	if !c.picker.isActive() || c.picker.mode != modeFiles {
+		return
+	}
+	shown := make([]sessionFile, 0, len(files))
+	for _, f := range files {
+		if f.Status == "UPLOADED" {
+			shown = append(shown, f)
+		}
+	}
+	// Recent first: RFC3339 Z timestamps compare lexicographically.
+	for i := 1; i < len(shown); i++ {
+		for j := i; j > 0 && shown[j].UploadedAt > shown[j-1].UploadedAt; j-- {
+			shown[j], shown[j-1] = shown[j-1], shown[j]
+		}
+	}
+	c.picker.files = shown
+	c.picker.loading = false
+	c.picker.notice = ""
+	if len(shown) == 0 {
+		c.picker.notice = "no files shared yet"
+	}
+	c.picker.clampCursor()
 }
 
 // closePicker leaves browser mode; restore becomes the composer placeholder.
@@ -195,9 +251,13 @@ func humanSize(n int64) string {
 
 // ---- state mutations ----------------------------------------------------------
 
-// rowCount is how many selectable rows exist: the synthesized ".." parent row
-// followed by the directory entries.
+// rowCount is how many selectable rows exist: browse mode shows the
+// synthesized ".." parent row plus directory entries; files mode lists the
+// room's UPLOADED shared files.
 func (p *pickerState) rowCount() int {
+	if p.mode == modeFiles {
+		return len(p.files)
+	}
 	n := len(p.entries)
 	if parentDir(p.cwd) != "" {
 		n++
@@ -205,8 +265,16 @@ func (p *pickerState) rowCount() int {
 	return n
 }
 
-// entryAt maps a row index onto its target; ok=false for the ".." row.
-func (p *pickerState) entryAt(row int) (entry pickerEntry, abs string, ok bool) {
+// entryAt maps a row index onto its target. key is the buffer identity:
+// absolute path (browse) or fileId (files). ok=false for the ".." row.
+func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) {
+	if p.mode == modeFiles {
+		if row < 0 || row >= len(p.files) {
+			return pickerEntry{}, "", false
+		}
+		f := p.files[row]
+		return pickerEntry{name: f.Filename, size: f.Size}, f.FileId, true
+	}
 	base := 0
 	if parentDir(p.cwd) != "" {
 		if row == 0 {
@@ -273,38 +341,56 @@ func (c *chatScreen) pickerCd(path string) {
 	c.loadPickerDir()
 }
 
-// toggleBuffer adds/removes the highlighted item(s). With an active range the
-// WHOLE range flips in one press; without, only the cursor row. Folders are
-// buffered like files (the engine tarballs them).
+// pickerToggleBuffer adds/removes the highlighted item(s). With an active
+// range the WHOLE range flips in one press; without, only the cursor row.
+// Folders are buffered like files (the engine tarballs them).
 func (c *chatScreen) pickerToggleBuffer() {
 	lo, hi := pickerRange(c.picker.anchor, c.picker.cursor)
 	for row := lo; row <= hi; row++ {
-		_, abs, ok := c.picker.entryAt(row)
+		_, key, ok := c.picker.entryAt(row)
 		if !ok {
 			continue // ".." is not bufferable
 		}
-		if c.picker.inBuf[abs] {
-			delete(c.picker.inBuf, abs)
-			for i, p := range c.picker.buffered {
-				if p == abs {
+		if c.picker.inBuf[key] {
+			delete(c.picker.inBuf, key)
+			for i, k := range c.picker.buffered {
+				if k == key {
 					c.picker.buffered = append(c.picker.buffered[:i], c.picker.buffered[i+1:]...)
 					break
 				}
 			}
 		} else {
-			c.picker.inBuf[abs] = true
-			c.picker.buffered = append(c.picker.buffered, abs)
+			c.picker.inBuf[key] = true
+			c.picker.buffered = append(c.picker.buffered, key)
 		}
 	}
 }
 
-// pickerConfirm hands the buffered set to the upload engine and closes.
+// pickerConfirm hands the buffered set to the active engine and closes:
+// browse mode uploads buffered paths; files mode downloads buffered fileIds.
 func (c *chatScreen) pickerConfirm() tea.Cmd {
+	restore := composerPlaceholder
+	if c.picker.mode == modeFiles {
+		jobs := make([]dlJob, 0, len(c.picker.buffered))
+		for _, id := range c.picker.buffered {
+			for _, f := range c.picker.files {
+				if f.FileId == id {
+					jobs = append(jobs, dlJob{FileId: f.FileId, Filename: f.Filename, Size: f.Size})
+					break
+				}
+			}
+		}
+		c.closePicker(restore)
+		if len(jobs) == 0 {
+			return nil
+		}
+		return c.startDownloads(jobs)
+	}
+
 	jobs := make([]uploadJob, 0, len(c.picker.buffered))
 	for _, abs := range c.picker.buffered {
 		jobs = append(jobs, uploadJob{Path: abs})
 	}
-	restore := "Type a message…  ·  / for commands"
 	c.closePicker(restore)
 	if len(jobs) == 0 {
 		return nil
@@ -334,26 +420,32 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		p.visual = true
 		return true, nil
 	case tea.KeyLeft, tea.KeyBackspace, tea.KeyCtrlH:
-		if parent := parentDir(p.cwd); parent != "" {
-			c.pickerCd(parent)
+		if p.mode == modeBrowse {
+			if parent := parentDir(p.cwd); parent != "" {
+				c.pickerCd(parent)
+			}
 		}
 		return true, nil
 	case tea.KeyEnter:
-		entry, abs, _ := p.entryAt(p.cursor)
+		entry, key, _ := p.entryAt(p.cursor)
+		if p.mode == modeFiles {
+			c.pickerToggleBuffer() // quick path: grab this one now
+			return true, c.pickerConfirm
+		}
 		switch {
 		case !entry.dir:
 			c.pickerToggleBuffer() // quick path: buffer this file…
 			return true, c.pickerConfirm
-		case abs == parentDir(p.cwd):
-			c.pickerCd(abs) // the ".." row
+		case key == parentDir(p.cwd):
+			c.pickerCd(key) // the ".." row
 		default:
-			c.pickerCd(abs) // browse into the folder
+			c.pickerCd(key) // browse into the folder
 		}
 		return true, nil
 	case tea.KeyCtrlD:
 		return true, c.pickerConfirm
 	case tea.KeyEsc:
-		restore := "Type a message…  ·  / for commands"
+		restore := composerPlaceholder
 		c.closePicker(restore)
 		return true, nil
 	case tea.KeySpace:
@@ -375,18 +467,18 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 // ---- rendering -------------------------------------------------------------------
 
 // pickerRows budget: spacer + border + breadcrumb + tray + notice? + entries
-// window (+ empty-dir note OR scroll overflow) + footer — must match
-// pickerView's painted output exactly so the layout reservation holds.
+// window (+ empty note OR scroll overflow) + footer — must match pickerView's
+// painted output exactly so the layout reservation holds.
 func (c chatScreen) pickerRows() int {
 	tray := len(c.picker.buffered)
 	if tray > pickerMaxTrayRows {
 		tray = pickerMaxTrayRows + 1 // collapsed tray shows a "+N more" row
 	}
-	rowCount := len(c.picker.entries) + parentRowCount(&c.picker)
+	rowCount := c.picker.rowCount()
 	rows := 1 /*breadcrumb*/ + tray + min(rowCount, pickerMaxVisible) + 1 /*footer*/
 	switch {
 	case rowCount == 0:
-		rows++ // "(empty directory)" note
+		rows++ // "(empty …)" note
 	case rowCount > pickerMaxVisible:
 		rows++ // "… +N more" overflow indicator
 	}
@@ -397,13 +489,14 @@ func (c chatScreen) pickerRows() int {
 }
 
 func parentRowCount(p *pickerState) int {
-	if parentDir(p.cwd) != "" {
+	if p.mode == modeBrowse && parentDir(p.cwd) != "" {
 		return 1
 	}
 	return 0
 }
 
-// pickerView paints the browser panel; same splice contract as paletteView.
+// pickerView paints the drawer panel in whichever mode is active; same splice
+// contract as paletteView.
 func (c chatScreen) pickerView(maxW int) string {
 	if !c.picker.isActive() || maxW < 6 {
 		return ""
@@ -420,21 +513,31 @@ func (c chatScreen) pickerView(maxW int) string {
 	pad := func(s string) string { return padVisible(fit(s), inner) }
 
 	var body []string
-	body = append(body, tuiPickerCrumbStyle.Render(pad(breadcrumb(p.cwd, p.home))))
+	crumb := breadcrumb(p.cwd, p.home)
+	if p.mode == modeFiles {
+		crumb = fmt.Sprintf("shared files — %d", len(p.files))
+	}
+	body = append(body, tuiPickerCrumbStyle.Render(pad(crumb)))
 
-	// Selection tray: checked paths pinned under the breadcrumb.
+	// Selection tray: checked keys pinned under the breadcrumb.
 	shownBuf := p.buffered
 	truncated := false
 	if len(shownBuf) > pickerMaxTrayRows {
 		shownBuf = shownBuf[:pickerMaxTrayRows]
 		truncated = true
 	}
-	for _, path := range shownBuf {
+	for _, key := range shownBuf {
 		mark := "✓ "
-		if !p.inBuf[path] {
-			mark = "· " // toggled off but recently touched; rare, still show
+		if !p.inBuf[key] {
+			mark = "· "
 		}
-		body = append(body, tuiPickerBufStyle.Render(pad(mark+filepath.Base(path))))
+		label := key
+		if p.mode == modeBrowse {
+			label = filepath.Base(key)
+		} else {
+			label = p.fileLabel(key)
+		}
+		body = append(body, tuiPickerBufStyle.Render(pad(mark+label)))
 	}
 	if truncated {
 		body = append(body, tuiDimStyle.Render(
@@ -442,11 +545,17 @@ func (c chatScreen) pickerView(maxW int) string {
 	}
 
 	if p.notice != "" {
-		body = append(body, tuiPickerNoticeStyle.Render(pad("✗ "+p.notice)))
+		style := tuiPickerNoticeStyle
+		if p.mode == modeFiles && p.loading {
+			style = tuiPaletteHintStyle // loading is not an error
+		} else if p.mode == modeFiles && strings.HasPrefix(p.notice, "no files") {
+			style = tuiDimStyle
+		}
+		body = append(body, style.Render(pad("· "+p.notice)))
 	}
 
 	hasParent := parentRowAvailable(&p)
-	visible := min(len(p.entries)+parentRowCount(&p), pickerMaxVisible)
+	visible := min(p.rowCount(), pickerMaxVisible)
 	lo, hi := pickerRange(p.anchor, p.cursor)
 	painted := 0
 	for row := p.offset; row < p.rowCount() && painted < visible; row++ {
@@ -461,14 +570,22 @@ func (c chatScreen) pickerView(maxW int) string {
 		}
 		painted++
 	}
-	if len(p.entries)+parentRowCount(&p) == 0 {
-		body = append(body, tuiDimStyle.Render(pad("(empty directory)")))
+	if p.rowCount() == 0 && p.notice == "" {
+		note := "(empty directory)"
+		if p.mode == modeFiles {
+			note = "(nothing shared yet)"
+		}
+		body = append(body, tuiDimStyle.Render(pad(note)))
 	}
 	if more := p.rowCount() - p.offset - painted; more > 0 {
 		body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("… +%d more", more))))
 	}
 
-	body = append(body, tuiPaletteHintStyle.Render(pad(pickerFooterHints)))
+	hints := pickerFooterHints
+	if p.mode == modeFiles {
+		hints = pickerDlFooterHints
+	}
+	body = append(body, tuiPaletteHintStyle.Render(pad(hints)))
 	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
 	if lipgloss.Width(panel) > maxW {
 		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
@@ -476,17 +593,42 @@ func (c chatScreen) pickerView(maxW int) string {
 	return panel
 }
 
-func parentRowAvailable(p *pickerState) bool { return parentDir(p.cwd) != "" }
+func parentRowAvailable(p *pickerState) bool { return parentRowCount(p) == 1 }
 
 const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · ^D upload · esc cancel"
+const pickerDlFooterHints = "↑↓ move · space buffer · v/⇧ range · enter save · ^D download · esc cancel"
 
-// pickerRowView renders ONE selectable row ("": skip). Directories get a bold
-// blue name with trailing slash; files get a right-aligned size gutter built
-// from the inner width so columns line up under the panel border.
+// fileLabel resolves a buffered fileId to its filename for tray rendering.
+func (p *pickerState) fileLabel(fileId string) string {
+	for _, f := range p.files {
+		if f.FileId == fileId {
+			return f.Filename
+		}
+	}
+	return fileId
+}
+
+// pickerRowView renders ONE selectable row ("": skip). Browse mode: bold blue
+// dirs with trailing slash, files with a size gutter. Files mode: shared file
+// name, uploader and size.
 func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 	marker := "  "
 	if row >= lo && row <= hi && (p.visual || p.anchor >= 0) {
 		marker = "> "
+	}
+	check := " "
+	if p.mode == modeFiles {
+		if row < 0 || row >= len(p.files) {
+			return ""
+		}
+		f := p.files[row]
+		if p.inBuf[f.FileId] {
+			check = "✓"
+		}
+		return fmt.Sprintf("%s%s %s · %s %s", marker, check,
+			tuiPaletteMatchStyle.Render(f.Filename),
+			tuiPaletteDescStyle.Render(f.Username),
+			tuiDimStyle.Render(humanSize(f.Size)))
 	}
 	if hasParent && row == 0 {
 		return marker + tuiPickerDirStyle.Render("../")
@@ -499,7 +641,6 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 		return ""
 	}
 	e := p.entries[idx]
-	check := " "
 	if p.inBuf[filepath.Join(p.cwd, e.name)] {
 		check = "✓"
 	}
