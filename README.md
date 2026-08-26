@@ -74,11 +74,55 @@ uplink create session      # pick a nickname → get a 6-digit room key
 uplink join 482716         # friends join anywhere on the internet
 ```
 
-Full-screen chat UI (OpenCode-style chrome): messages deliver in ~0.5 s,
-live online roster (`/users`), graceful `/exit` or Ctrl+C.
-The room ends automatically the moment its last member leaves, and the
-transcript is purged. In scripts/CI, set `UPLINK_CHAT_PLAIN=1` for plain-line
-rendering.
+Full-screen chat UI with OpenCode-style chrome: messages deliver in ~0.5 s,
+a live online roster sits in the sidebar, and the room ends automatically
+the moment its last member leaves (transcript purged). Ctrl+C always exits.
+In scripts/CI, set `UPLINK_CHAT_PLAIN=1` for plain-line rendering.
+
+### Slash commands
+
+Type `/` at the start of the composer and a command drawer pops out of it,
+upward:
+
+| Command | What it does |
+|---|---|
+| `/help` | lists commands in the transcript |
+| `/upload` | opens a local file browser to share files into the room |
+| `/download` | lists everything shared in the room, newest first |
+
+As you type (`/u`, `/d`, …) prefix matches float to the top, then dictionary
+order. ↑/↓ move, Tab completes inline, Enter runs, Esc dismisses; deleting
+the `/` dissolves the panel.
+
+### Uploading files
+
+Selecting `/upload` morphs the drawer into an `ls -a` browser rooted at your
+home directory:
+
+- `..` pinned first, directories before files, alphabetical, dotfiles included
+- **Space** buffers items · **v** or **Shift+↑↓** range-select · **Ctrl+D** uploads everything buffered
+- **Enter** on a folder opens it; **Enter** on a file uploads it instantly
+- Backspace/Left goes up one level; **Esc** cancels
+
+Uploads run sequentially with live `[↑] name %` progress. Folders are packed
+into tarballs automatically; the v1 cap is 25 MB per item. Everyone in the
+room sees `* alice shared report.pdf (2.3 MB)` announcements as files land.
+
+### Downloading shared files
+
+Selecting `/download` lists the room's shared files, most recent first
+(`name · uploader · size`). Same interaction grammar: Space buffers,
+ranges select, **Enter** saves instantly, **Ctrl+D** grabs everything
+buffered. Files land in `~/Downloads` (created on demand); name collisions
+become `name (1).ext`. Esc cancels mid-transfer.
+
+### Private threads
+
+Click a name in the sidebar — or go keyboard-only: **Tab / Shift+Tab**
+cycles the highlight through online peers, and **Enter** on an empty line
+opens that thread. Messages inside a thread go only to that peer and never
+leak into the general room; **Esc** returns to general. Unread threads show
+a green badge chip next to their names.
 
 ## Web Previews
 
@@ -126,6 +170,7 @@ npm start &                                # terminal 1 (uses mock storage)
 SERVER=http://localhost:3000 ./scratch/e2e_phase0.sh            # file matrix
 SERVER=http://localhost:3000 ./scratch/session_flow_test.sh     # sessions API
 SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh      # two-client chat
+SERVER=http://localhost:3000 ./scratch/session_upload_flow.sh   # room file sharing
 ```
 
 CI runs all of this on every push (Go cross-build matrix, lint/typecheck/
