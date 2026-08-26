@@ -974,6 +974,8 @@ func handleReceive(args []string) {
 	destPath := ""
 	if recvCmd.NArg() >= 2 {
 		destPath = recvCmd.Arg(1)
+	} else if cfg.DownloadDir != "" {
+		destPath = cfg.DownloadDir
 	}
 
 	// Client-side E2EE decryption key check
