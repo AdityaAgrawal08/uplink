@@ -289,6 +289,7 @@ func generateShareCode() string {
 
 func handleSend(args []string) {
 	cfg := LoadConfig()
+	CleanOldResumeStates()
 
 	sendCmd := flag.NewFlagSet("send", flag.ExitOnError)
 	passwordFlag := sendCmd.String("password", "", "Password to protect the share link")
