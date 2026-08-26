@@ -97,7 +97,8 @@ func getJSON(url string, headers map[string]string) (int, []byte, error) {
 func cmdCreateSession(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("create session", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
-	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true})); err != nil {
+	passwordFlag := fs.String("password", "", "Password-protect this session")
+	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
 	serverURL := sanitizeServerUrl(*serverFlag)
@@ -105,8 +106,21 @@ func cmdCreateSession(args []string, cfg *Config) {
 	reader := bufio.NewReader(os.Stdin)
 	username := promptChatUsername(reader)
 
-	code, body, err := postJSON(serverURL+"/api/v1/session/create",
-		map[string]any{"username": username, "duration": 600}, nil)
+	password := *passwordFlag
+	if password == "" {
+		fmt.Print("Session password (optional, press Enter to skip): ")
+		pwdBytes, err := reader.ReadString('\n')
+		if err == nil {
+			password = strings.TrimSpace(pwdBytes)
+		}
+	}
+
+	payload := map[string]any{"username": username, "duration": 600}
+	if password != "" {
+		payload["password"] = password
+	}
+
+	code, body, err := postJSON(serverURL+"/api/v1/session/create", payload, nil)
 	if err != nil {
 		fmt.Printf("✗ Could not reach server: %v\n", err)
 		os.Exit(1)
@@ -142,7 +156,8 @@ func cmdCreateSession(args []string, cfg *Config) {
 func cmdJoinChat(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
-	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true})); err != nil {
+	passwordFlag := fs.String("password", "", "Session password")
+	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
 	serverURL := sanitizeServerUrl(*serverFlag)
@@ -160,12 +175,17 @@ func cmdJoinChat(args []string, cfg *Config) {
 		}
 	}
 
+	password := *passwordFlag
+
 	// Unique-username loop — server rejects duplicates with 409.
 	var username string
 	for {
 		username = promptChatUsername(reader)
-		code, body, err := postJSON(serverURL+"/api/v1/session/"+key+"/join",
-			map[string]any{"username": username}, nil)
+		payload := map[string]any{"username": username}
+		if password != "" {
+			payload["password"] = password
+		}
+		code, body, err := postJSON(serverURL+"/api/v1/session/"+key+"/join", payload, nil)
 		if err != nil {
 			fmt.Printf("✗ Could not reach server: %v\n", err)
 			os.Exit(1)
@@ -178,6 +198,20 @@ func cmdJoinChat(args []string, cfg *Config) {
 		}
 		_ = json.Unmarshal(body, &e)
 		switch code {
+		case 403:
+			if password == "" {
+				fmt.Print("This session is password-protected. Enter password: ")
+				pwdBytes, perr := reader.ReadString('\n')
+				if perr != nil {
+					fmt.Printf("Error reading password: %v\n", perr)
+					os.Exit(1)
+				}
+				password = strings.TrimSpace(pwdBytes)
+				continue // retry with password
+			}
+			fmt.Println("✗ Incorrect password.")
+			password = ""
+			continue
 		case 409:
 			fmt.Printf("'%s' is already in this session — choose another.\n", username)
 		case 410:
