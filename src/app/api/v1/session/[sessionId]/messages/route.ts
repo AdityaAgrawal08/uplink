@@ -10,7 +10,6 @@ import {
   sanitizeChatText,
   toMessageDTO,
   GENERAL_CONV,
-  conversationKey,
   isPairConv,
   type ChatDoc,
   type SessionAliveDoc,
@@ -26,7 +25,6 @@ const RATE_WINDOW_SEC = 10;
 // Instance-level debounce so the shared cleanup sweep runs at most once a
 // minute no matter how many poll requests arrive.
 declare global {
-  // eslint-disable-next-line no-var
   var __chatCleanupAt: number | undefined;
 }
 

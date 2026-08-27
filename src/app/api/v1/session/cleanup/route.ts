@@ -100,7 +100,7 @@ export async function performSessionCleanup() {
           .deleteMany({ sessionId });
 
         // Chat transcript dies with the room (privacy: purge-on-end policy)
-        const deleteMessagesResult = await db
+        await db
           .collection("session_messages")
           .deleteMany({ sessionId });
 
