@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { MockRedis } from "../redis";
 
 // MockRedis mirrors the tiny Redis surface the app relies on. These tests pin
