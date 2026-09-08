@@ -54,6 +54,7 @@ type sessionFile struct {
 	Size       int64  `json:"size"`
 	Status     string `json:"status"`
 	UploadedAt string `json:"uploadedAt"`
+	To         string `json:"to"` // empty = public/general
 }
 
 type chatClient struct {

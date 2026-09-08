@@ -165,7 +165,7 @@ func TestPickerRangeSelectBuffersWholeRange(t *testing.T) {
 	}
 }
 
-// Enter on a file quick-uploads it through the whole wire pipeline.
+// Enter on a file buffers it; Ctrl+D runs the upload pipeline.
 func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	var calls []string
 	var announced struct {
@@ -226,9 +226,14 @@ func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	sc.picker = pickerState{active: true, cwd: root, home: root, anchor: -1, inBuf: map[string]bool{}}
 	sc.loadPickerDir()
 
-	// Cursor onto the single file row and press Enter (quick upload).
+	// Cursor onto the single file row and press Enter (buffers it).
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyDown})
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyEnter})
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyEnter})
+	if len(sc.picker.buffered) != 1 {
+		t.Fatalf("Enter should buffer the file; got %d buffered", len(sc.picker.buffered))
+	}
+	// Ctrl+D triggers the upload pipeline.
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlD})
 	// Drain the batched cmds until the done message lands.
 	msgs := drainCmds(cmd)
 	var done *uploadDoneMsg
@@ -451,7 +456,7 @@ func TestFilesDrawerSortsRecentFirst(t *testing.T) {
 	}
 }
 
-// Enter on a row downloads it into ~/Downloads (byte-identical).
+// Enter on a row in a private conversation downloads it directly.
 func TestFilesDrawerEnterDownloads(t *testing.T) {
 	tmpHome := t.TempDir()
 	t.Setenv("HOME", tmpHome)
@@ -470,16 +475,19 @@ func TestFilesDrawerEnterDownloads(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := newFilterScreen("bob", "")
+	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(40, 10)
 	c.client = newChatClient(srv.URL, "123456", "bob")
+	c.targetUser = "alice" // simulate private conversation
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	sc := m.(chatScreen)
+	sc.client = c.client
+	sc.targetUser = "alice"
 	sc = newFilesDrawerAt(sc, []sessionFile{
 		{FileId: "fid-9", Filename: "grab.bin", Size: int64(len(payload)), Status: "UPLOADED"},
 	})
 
-	// Cursor sits on row 0; Enter quick-downloads.
+	// Cursor sits on row 0; Enter downloads directly in private conversation.
 	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyEnter})
 	for _, msg := range drainCmds(cmd) {
 		sc, _ = step(sc, msg)

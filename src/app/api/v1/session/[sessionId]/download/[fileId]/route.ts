@@ -36,6 +36,15 @@ export async function POST(
       return apiError("File upload is not complete", 400);
     }
 
+    // 1a. Private file access check: if file has a `to` field, only the
+    //     sender (username) and the recipient (to) may download it.
+    const fileTo = typeof sessionFile.to === "string" ? sessionFile.to : "";
+    if (fileTo && username) {
+      if (username !== sessionFile.username && username !== fileTo) {
+        return apiError("You do not have access to this private file", 403);
+      }
+    }
+
     // 2. Find associated share document
     const share = await db.collection("shares").findOne({ shareId: sessionFile.shareId });
     if (!share) {

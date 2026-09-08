@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -16,12 +17,11 @@ import (
 // Selecting "/upload" morphs the command drawer into an ls -a style browser:
 // ".." pinned first, directories before files, alphabetical within each group,
 // dotfiles included. A selection buffer accumulates paths across directories;
-// Ctrl+D hands them all to the upload engine, Esc discards.
+// Ctrl+Enter hands them all to the upload engine, Esc discards.
 //
-// NOTE ON CTRL+ENTER: bubbletea v1 cannot distinguish Ctrl+Enter from Enter on
-// classic terminals (both arrive as CR/LF), so buffering uses SPACE instead —
-// universally delivered — while Enter keeps the folder=browse / file=quick-
-// upload split the interaction spec calls for.
+// Selecting "/download" opens a search-driven file picker with a detail window
+// for confirming downloads. In private conversations, the detail window is
+// skipped (only one file from one uploader).
 
 const pickerMaxVisible = 8 // entry rows painted before scrolling
 const pickerMaxTrayRows = 3
@@ -40,6 +40,11 @@ var (
 
 	tuiPickerNoticeStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("203"))
+
+	tuiPickerDetailStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("62")).
+				Padding(1, 2)
 )
 
 type pickerEntry struct {
@@ -48,13 +53,14 @@ type pickerEntry struct {
 	size int64
 }
 
-// pickerMode selects what the drawer lists: the local file system (upload)
-// or the room's shared files (download).
+// pickerMode selects what the drawer lists: the local file system (upload),
+// the room's shared files (download), or a file detail view.
 type pickerMode int
 
 const (
 	modeBrowse pickerMode = iota
 	modeFiles
+	modeDetail // detail window for download confirmation
 )
 
 // pickerState is the browser mode of the drawer. All list math goes through
@@ -76,6 +82,9 @@ type pickerState struct {
 	notice   string // transient error line ("" = none)
 	filter   string // substring filter (active when filtering=true)
 	filtering bool  // true while the user is typing a filter query
+
+	// Detail window state (modeDetail).
+	detailFile *sessionFile // the file being inspected
 }
 
 func (p *pickerState) isActive() bool { return p.active }
@@ -189,13 +198,14 @@ func (p *pickerState) filteredEntries() []pickerEntry {
 }
 
 // filteredFiles returns files matching the active filter (files mode).
+// Search matches against filename OR uploader username.
 func (p *pickerState) filteredFiles() []sessionFile {
 	if p.filter == "" {
 		return p.files
 	}
 	var out []sessionFile
 	for _, f := range p.files {
-		if pickerMatchFilter(f.Filename, p.filter) {
+		if pickerMatchFilter(f.Filename, p.filter) || pickerMatchFilter(f.Username, p.filter) {
 			out = append(out, f)
 		}
 	}
@@ -291,9 +301,11 @@ func humanSize(n int64) string {
 
 // rowCount is how many selectable rows exist: browse mode shows the
 // synthesized ".." parent row plus directory entries; files mode lists the
-// room's UPLOADED shared files. When a filter is active, only matching
-// entries are counted.
+// room's UPLOADED shared files; detail mode returns 0 (no scrollable rows).
 func (p *pickerState) rowCount() int {
+	if p.mode == modeDetail {
+		return 0
+	}
 	if p.mode == modeFiles {
 		return len(p.filteredFiles())
 	}
@@ -407,6 +419,26 @@ func (c *chatScreen) pickerToggleBuffer() {
 	}
 }
 
+// pickerBufferFolder adds all files in the current directory (recursively)
+// to the buffer. In browse mode this walks the directory tree.
+func (c *chatScreen) pickerBufferFolder() {
+	p := &c.picker
+	if p.mode == modeBrowse {
+		// Buffer all files in current directory (non-recursive for now).
+		fe := p.filteredEntries()
+		for _, e := range fe {
+			if e.dir {
+				continue // skip subdirectories
+			}
+			key := filepath.Join(p.cwd, e.name)
+			if !p.inBuf[key] {
+				p.inBuf[key] = true
+				p.buffered = append(p.buffered, key)
+			}
+		}
+	}
+}
+
 // pickerConfirm hands the buffered set to the active engine and closes:
 // browse mode uploads buffered paths; files mode downloads buffered fileIds.
 func (c *chatScreen) pickerConfirm() tea.Cmd {
@@ -429,8 +461,13 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 	}
 
 	jobs := make([]uploadJob, 0, len(c.picker.buffered))
+	// Determine conversation scope for file segregation.
+	var toConv string
+	if c.targetUser != "" {
+		toConv = conversationKey(c.me, c.targetUser)
+	}
 	for _, abs := range c.picker.buffered {
-		jobs = append(jobs, uploadJob{Path: abs})
+		jobs = append(jobs, uploadJob{Path: abs, To: toConv})
 	}
 	c.closePicker(restore)
 	if len(jobs) == 0 {
@@ -445,6 +482,32 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 // handled=true plus an optional action for the caller to schedule.
 func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 	p := &c.picker
+
+	// Detail window mode: simple Enter/Esc only.
+	if p.mode == modeDetail {
+		switch msg.Type {
+		case tea.KeyEnter:
+			// Download the file shown in the detail window.
+			if p.detailFile != nil {
+				job := dlJob{
+					FileId:   p.detailFile.FileId,
+					Filename: p.detailFile.Filename,
+					Size:     p.detailFile.Size,
+				}
+				restore := composerPlaceholder
+				c.closePicker(restore)
+				return true, func() tea.Cmd { return c.startDownloads([]dlJob{job}) }
+			}
+			return true, nil
+		case tea.KeyEsc:
+			// Back to files list.
+			p.mode = modeFiles
+			p.detailFile = nil
+			p.clampCursor()
+			return true, nil
+		}
+		return true, nil
+	}
 
 	// Filter mode: capture keystrokes for the filter query.
 	if p.filtering {
@@ -502,15 +565,29 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		}
 		return true, nil
 	case tea.KeyEnter:
-		entry, key, _ := p.entryAt(p.cursor)
 		if p.mode == modeFiles {
-			c.pickerToggleBuffer() // quick path: grab this one now
-			return true, c.pickerConfirm
+			// Open detail window for the selected file.
+			ff := p.filteredFiles()
+			if p.cursor >= 0 && p.cursor < len(ff) {
+				f := ff[p.cursor]
+				// In private conversations, skip detail and download directly.
+				if c.targetUser != "" {
+					job := dlJob{FileId: f.FileId, Filename: f.Filename, Size: f.Size}
+					restore := composerPlaceholder
+					c.closePicker(restore)
+					return true, func() tea.Cmd { return c.startDownloads([]dlJob{job}) }
+				}
+				p.mode = modeDetail
+				p.detailFile = &f
+			}
+			return true, nil
 		}
+		// modeBrowse: Enter buffers the file or opens the directory.
+		entry, key, _ := p.entryAt(p.cursor)
 		switch {
 		case !entry.dir:
-			c.pickerToggleBuffer() // quick path: buffer this file…
-			return true, c.pickerConfirm
+			c.pickerToggleBuffer() // buffer this file
+			return true, nil
 		case key == parentDir(p.cwd):
 			c.pickerCd(key) // the ".." row
 		default:
@@ -518,6 +595,7 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		}
 		return true, nil
 	case tea.KeyCtrlD:
+		// Ctrl+D: upload/download all buffered.
 		return true, c.pickerConfirm
 	case tea.KeyEsc:
 		restore := composerPlaceholder
@@ -553,6 +631,9 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 // window (+ empty note OR scroll overflow) + footer — must match pickerView's
 // painted output exactly so the layout reservation holds.
 func (c chatScreen) pickerRows() int {
+	if c.picker.mode == modeDetail {
+		return 1 + 8 + 2 // spacer + detail box + border
+	}
 	tray := len(c.picker.buffered)
 	if tray > pickerMaxTrayRows {
 		tray = pickerMaxTrayRows + 1 // collapsed tray shows a "+N more" row
@@ -594,6 +675,11 @@ func (c chatScreen) pickerView(maxW int) string {
 		return s
 	}
 	pad := func(s string) string { return padVisible(fit(s), inner) }
+
+	// Detail window mode: render a centered info box.
+	if p.mode == modeDetail && p.detailFile != nil {
+		return c.pickerDetailView(maxW, inner, pad)
+	}
 
 	var body []string
 	crumb := breadcrumb(p.cwd, p.home)
@@ -681,10 +767,38 @@ func (c chatScreen) pickerView(maxW int) string {
 	return panel
 }
 
+// pickerDetailView renders the file detail window for download confirmation.
+func (c chatScreen) pickerDetailView(maxW, inner int, pad func(string) string) string {
+	f := c.picker.detailFile
+	var body []string
+
+	body = append(body, tuiPickerCrumbStyle.Render(pad("file details")))
+	body = append(body, "")
+
+	// Parse and format the upload time.
+	uploadTime := f.UploadedAt
+	if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
+		uploadTime = t.Format("2006-01-02 15:04:05")
+	}
+
+	body = append(body, pad(fmt.Sprintf("  Name:     %s", tuiPaletteMatchStyle.Render(f.Filename))))
+	body = append(body, pad(fmt.Sprintf("  Uploader: %s", tuiPaletteDescStyle.Render(f.Username))))
+	body = append(body, pad(fmt.Sprintf("  Size:     %s", humanSize(f.Size))))
+	body = append(body, pad(fmt.Sprintf("  Uploaded: %s", tuiDimStyle.Render(uploadTime))))
+	body = append(body, "")
+	body = append(body, tuiPaletteHintStyle.Render(pad("enter download · esc back")))
+
+	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
+	if lipgloss.Width(panel) > maxW {
+		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
+	}
+	return panel
+}
+
 func parentRowAvailable(p *pickerState) bool { return parentRowCount(p) == 1 }
 
-const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · ^D upload · / filter · esc cancel"
-const pickerDlFooterHints = "↑↓ move · space buffer · v/⇧ range · enter save · ^D download · / filter · esc cancel"
+const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · a buffer all · ^D upload · / filter · esc cancel"
+const pickerDlFooterHints = "↑↓ move · ⇧/⇧ range · enter details · / search · esc cancel"
 
 // fileLabel resolves a buffered fileId to its filename for tray rendering.
 func (p *pickerState) fileLabel(fileId string) string {

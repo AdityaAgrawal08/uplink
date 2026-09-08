@@ -1030,7 +1030,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.uploadQ.active && msg.total > 0 {
 			pct := 100 * msg.done / msg.total
 			c.paintUploadLine(tuiUploadRunStyle.Render(
-				fmt.Sprintf("[↑] %s %d%%", c.uploadQ.name, pct)))
+				fmt.Sprintf("[↑] %s %d%%", c.uploadQ.name, pct)), c.uploadQ.conv)
 		}
 		cmds = append(cmds, drainUploadProgressCmd(c.uploadQ.progCh))
 
@@ -1062,7 +1062,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.dlQ.active && msg.total > 0 {
 			pct := 100 * msg.done / msg.total
 			c.paintDlLine(tuiDownloadRunStyle.Render(
-				fmt.Sprintf("[↓] %s %d%%", c.dlQ.name, pct)))
+				fmt.Sprintf("[↓] %s %d%%", c.dlQ.name, pct)), c.dlQ.conv)
 		}
 		cmds = append(cmds, drainDlProgressCmd(c.dlQ.progCh))
 
