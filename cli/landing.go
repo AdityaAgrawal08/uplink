@@ -80,6 +80,23 @@ var (
 
 	landErrorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("203"))
+
+	landTitleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#1a7af0")).
+			Background(lipgloss.Color("#0a2a52")).
+			Bold(true).
+			Padding(0, 1).
+			Align(lipgloss.Center)
+
+	landSubtitleStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#8aa0c8")).
+				Faint(true).
+				Align(lipgloss.Center)
+
+	landHintStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#6b7280")).
+			Faint(true).
+			Align(lipgloss.Center)
 )
 
 type landingTab int
@@ -122,22 +139,31 @@ type landingModel struct {
 
 func newLandingModel(serverURL string) landingModel {
 	ui := textinput.New()
-	ui.Placeholder = ""
+	ui.Placeholder = "alice_42"
 	ui.CharLimit = 32
+	ui.Prompt = "> "
 	ui.Width = 40
 	ui.Focus()
+	ui.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	ui.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
 
 	pi := textinput.New()
-	pi.Placeholder = ""
+	pi.Placeholder = "••••••••"
 	pi.CharLimit = 64
+	pi.Prompt = "> "
 	pi.EchoMode = textinput.EchoPassword
 	pi.EchoCharacter = '•'
 	pi.Width = 40
+	pi.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	pi.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
 
 	ci := textinput.New()
-	ci.Placeholder = ""
+	ci.Placeholder = "482716"
+	ci.Prompt = "> "
 	ci.CharLimit = 6
 	ci.Width = 40
+	ci.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	ci.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
 
 	return landingModel{
 		tab:       tabCreate,
@@ -533,12 +559,19 @@ func (m landingModel) View() string {
 	// center button
 	btnRow := lipgloss.NewStyle().Width(outerW - 2).Align(lipgloss.Center).Render(btn)
 	rows = append(rows, "", btnRow)
+	// hint
+	hint := landHintStyle.Width(outerW - 4).Render("Tab / Click to move  •  Enter to submit  •  ← → switch tabs  •  Esc quit")
+	rows = append(rows, hint)
 
 	if m.errMsg != "" {
 		rows = append(rows, "", landErrorStyle.Render(m.errMsg))
 	}
 	if m.submitting {
-		rows = append(rows, landLabelStyle.Render("  creating…"))
+		msg := "  creating…"
+		if m.tab == tabJoin {
+			msg = "  joining…"
+		}
+		rows = append(rows, landLabelStyle.Render(msg))
 	}
 
 	formContent := strings.Join(rows, "\n")
@@ -547,8 +580,13 @@ func (m landingModel) View() string {
 	inner := lipgloss.JoinVertical(lipgloss.Left, tabsRow, formContent)
 	// outer container with + border — Width is content width (innerW)
 	outer := landOuterStyle.Width(outerW - 2).Render(inner)
+	// header above outer — more attractive
+	title := landTitleStyle.Render("◆ UPLINK ◆")
+	subtitle := landSubtitleStyle.Render("secure  •  ephemeral  •  p2p")
+	header := lipgloss.JoinVertical(lipgloss.Center, title, subtitle, "")
+	content := lipgloss.JoinVertical(lipgloss.Center, header, outer)
 	// center on screen
-	centered := lipgloss.NewStyle().Width(m.w).Height(m.h).Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(outer)
+	centered := lipgloss.NewStyle().Width(m.w).Height(m.h).Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(content)
 	return centered
 }
 
