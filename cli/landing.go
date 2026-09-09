@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -645,8 +644,6 @@ func (m *landingModel) submit() tea.Cmd {
 func (m *landingModel) doCreate(username, password string) tea.Cmd {
 	serverURL := m.serverURL
 	return func() tea.Msg {
-		// small delay for UX
-		time.Sleep(100 * time.Millisecond)
 		payload := map[string]any{"username": username, "duration": 600}
 		if password != "" {
 			payload["password"] = password
@@ -674,7 +671,6 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 	serverURL := m.serverURL
 	return func() tea.Msg {
-		time.Sleep(100 * time.Millisecond)
 		payload := map[string]any{"username": username}
 		if password != "" {
 			payload["password"] = password

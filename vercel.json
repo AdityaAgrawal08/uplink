@@ -1,0 +1,10 @@
+{
+  "regions": ["bom1"],
+  "functions": {
+    "src/app/api/v1/session/create/route.ts": { "maxDuration": 10 },
+    "src/app/api/v1/session/*/messages/route.ts": { "maxDuration": 10 },
+    "src/app/api/v1/session/*/join/route.ts": { "maxDuration": 10 },
+    "src/app/api/v1/session/*/heartbeat/route.ts": { "maxDuration": 5 },
+    "src/app/api/v1/session/*/files/route.ts": { "maxDuration": 5 }
+  }
+}

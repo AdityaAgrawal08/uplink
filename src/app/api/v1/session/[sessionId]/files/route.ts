@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { apiError } from "@/lib/api-utils";
 
@@ -13,12 +13,14 @@ export async function GET(
 
     const db = await getDb();
 
-    // 1. Mark stale ANNOUNCED files as UPLOAD_FAILED
+    // 1. Mark stale ANNOUNCED files as UPLOAD_FAILED — non-blocking
     const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000);
-    await db.collection("session_files").updateMany(
-      { sessionId, status: "ANNOUNCED", uploadedAt: { $lt: fiveMinAgo } },
-      { $set: { status: "UPLOAD_FAILED" } }
-    );
+    after(async () => {
+      await db.collection("session_files").updateMany(
+        { sessionId, status: "ANNOUNCED", uploadedAt: { $lt: fiveMinAgo } },
+        { $set: { status: "UPLOAD_FAILED" } }
+      ).catch(() => {});
+    });
 
     // 2. Build query — optional conversation scope filter.
     //    conv="general" → public files only (to is empty/absent)
@@ -39,18 +41,10 @@ export async function GET(
       fileQuery.to = conv;
     }
 
-    const files = await db
-      .collection("session_files")
-      .find(fileQuery)
-      .sort({ uploadedAt: 1 })
-      .toArray();
-
-    // 3. Fetch active participants with P2P discovery info
-    const participants = await db
-      .collection("session_participants")
-      .find({ sessionId, status: "ACTIVE" })
-      .project({ username: 1, peerId: 1, addrs: 1 })
-      .toArray();
+    const [files, participants] = await Promise.all([
+      db.collection("session_files").find(fileQuery).sort({ uploadedAt: 1 }).toArray(),
+      db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, peerId: 1, addrs: 1 }).toArray(),
+    ]);
 
     return NextResponse.json({
       files: files.map((f) => ({

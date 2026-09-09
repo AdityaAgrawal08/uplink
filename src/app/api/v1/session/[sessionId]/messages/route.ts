@@ -15,6 +15,9 @@ import {
   type SessionAliveDoc,
 } from "@/lib/sessionChat";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 10;
+
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const usernameRegex = USERNAME_RE;
 const BACKLOG_LIMIT = 50;
@@ -66,16 +69,17 @@ export async function POST(
 
     const db = await getDb();
 
-    // Per-user flood guard (Redis-backed; degrades to per-instance in mock
-    // mode). The limiter is abuse DEFENSE, never correctness: if the counter
-    // itself is unreachable we fail OPEN so chat delivery cannot 500.
+    // Per-user flood guard — non-blocking with 80ms timeout, fail-open
     let hits = 1;
     try {
       const rateKey = `chat:${sessionId}:${username}`;
-      hits = await redis.incr(rateKey);
-      if (hits === 1) await redis.expire(rateKey, RATE_WINDOW_SEC);
-    } catch (limiterErr) {
-      console.warn("chat rate-limiter unavailable; failing open:", limiterErr);
+      const timeout = new Promise<number>((_, rej) => setTimeout(() => rej(new Error("redis timeout")), 80));
+      hits = await Promise.race([redis.incr(rateKey), timeout]);
+      if (hits === 1) {
+        // expire fire-and-forget, don't block
+        redis.expire(rateKey, RATE_WINDOW_SEC).catch(() => {});
+      }
+    } catch {
       hits = 1;
     }
     if (hits > RATE_LIMIT) {
@@ -185,12 +189,12 @@ export async function GET(
         .toArray() as unknown as Promise<ChatDoc[]>;
 
     if (afterSeq !== null) {
-      maybeCleanup();
+      // cleanup after response, not before
+      after(() => maybeCleanup());
       let docs = await queryNew();
       for (;;) {
         if (docs.length > 0 || Date.now() >= deadline) break;
-        await new Promise((r) => setTimeout(r, 200));
-        // Surface room termination without waiting out the full hold.
+        await new Promise((r) => setTimeout(r, 50));
         const fresh = (await db
           .collection("sessions")
           .findOne({ sessionId }, { projection: { status: 1, expiresAt: 1 } })) as unknown as SessionAliveDoc | null;
@@ -209,22 +213,10 @@ export async function GET(
       });
     }
 
-    // No cursor → backlog: latest BACKLOG_LIMIT messages for the requested
-    // scope (whole visible stream by default; one exact thread with ?conv=).
-    const docs = await db
-      .collection("session_messages")
-      .find(baseFilter())
-      .sort({ seq: -1 })
-      .limit(BACKLOG_LIMIT)
-      .toArray() as unknown as ChatDoc[];
-
-    // Roster rides along with EVERY response so sidebars stay fresh without
-    // waiting for the next heartbeat tick (join/leave latency ≤ poll cadence).
-    const roster = await db
-      .collection("session_participants")
-      .find({ sessionId, status: "ACTIVE" })
-      .project({ username: 1, _id: 0 })
-      .toArray();
+    const [docs, roster] = await Promise.all([
+      db.collection("session_messages").find(baseFilter()).sort({ seq: -1 }).limit(BACKLOG_LIMIT).toArray() as Promise<ChatDoc[]>,
+      db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, _id: 0 }).toArray(),
+    ]);
 
     return NextResponse.json({
       messages: docs.reverse().map(toMessageDTO),
