@@ -99,11 +99,9 @@ func (c *chatScreen) openPicker() tea.Cmd {
 	c.palette.close() // command drawer hands the slot over
 	c.input.SetValue("")
 	c.input.Placeholder = ""
-	// Preserve any existing buffer from a previous picker session.
-	existingBuf := c.picker.buffered
-	existingInBuf := c.picker.inBuf
-	if existingInBuf == nil {
-		existingInBuf = map[string]bool{}
+	// Ensure persistent buffer maps exist.
+	if c.uploadBufSet == nil {
+		c.uploadBufSet = map[string]bool{}
 	}
 	c.picker = pickerState{
 		active:   true,
@@ -111,8 +109,8 @@ func (c *chatScreen) openPicker() tea.Cmd {
 		cwd:      home,
 		home:     home,
 		anchor:   -1,
-		buffered: existingBuf,
-		inBuf:    existingInBuf,
+		buffered: c.uploadBuf,
+		inBuf:    c.uploadBufSet,
 	}
 	c.loadPickerDir()
 	return nil
@@ -124,18 +122,16 @@ func (c *chatScreen) openFilesDrawer() tea.Cmd {
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
-	existingBuf := c.picker.buffered
-	existingInBuf := c.picker.inBuf
-	if existingInBuf == nil {
-		existingInBuf = map[string]bool{}
+	if c.uploadBufSet == nil {
+		c.uploadBufSet = map[string]bool{}
 	}
 	c.picker = pickerState{
 		active:   true,
 		mode:     modeFiles,
 		home:     ".",
 		anchor:   -1,
-		buffered: existingBuf,
-		inBuf:    existingInBuf,
+		buffered: c.uploadBuf,
+		inBuf:    c.uploadBufSet,
 		notice:   "loading shared files…",
 	}
 	return c.doFetchAllFiles()
@@ -147,20 +143,18 @@ func (c *chatScreen) openBufferReview() tea.Cmd {
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
+	if c.uploadBufSet == nil {
+		c.uploadBufSet = map[string]bool{}
+	}
 	c.picker = pickerState{
 		active:   true,
 		mode:     modeBuffer,
 		home:     ".",
 		anchor:   -1,
-		inBuf:    map[string]bool{},
-		buffered: c.picker.buffered, // preserve existing buffer
+		buffered: c.uploadBuf,
+		inBuf:    c.uploadBufSet,
 	}
-	// Rebuild inBuf from buffered list.
-	c.picker.inBuf = map[string]bool{}
-	for _, k := range c.picker.buffered {
-		c.picker.inBuf[k] = true
-	}
-	if len(c.picker.buffered) == 0 {
+	if len(c.uploadBuf) == 0 {
 		c.picker.notice = "buffer empty — use /upload to add files"
 	}
 	return nil
@@ -192,8 +186,11 @@ func (c *chatScreen) applyFilesList(files []sessionFile) {
 	c.picker.clampCursor()
 }
 
-// closePicker leaves browser mode; restore becomes the composer placeholder.
+// closePicker leaves browser mode; syncs buffer to persistent storage.
 func (c *chatScreen) closePicker(restore string) {
+	// Sync buffer back to persistent storage before clearing.
+	c.uploadBuf = c.picker.buffered
+	c.uploadBufSet = c.picker.inBuf
 	c.picker = pickerState{}
 	c.input.Placeholder = restore
 }
@@ -521,9 +518,40 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 	for _, abs := range c.picker.buffered {
 		jobs = append(jobs, uploadJob{Path: abs, To: toConv})
 	}
+	// Clear persistent buffer — files are being sent.
+	c.uploadBuf = nil
+	c.uploadBufSet = map[string]bool{}
 	c.closePicker(restore)
 	if len(jobs) == 0 {
 		return nil
+	}
+	return c.startUploads(jobs)
+}
+
+// sendBuffered sends all files currently in the persistent upload buffer.
+// Works from the command palette (/send) without needing the picker open.
+func (c *chatScreen) sendBuffered() tea.Cmd {
+	if len(c.uploadBuf) == 0 {
+		c.appendLine(tuiSystemStyle.Render("* buffer empty — use /upload to add files"))
+		return nil
+	}
+	jobs := make([]uploadJob, 0, len(c.uploadBuf))
+	var toConv string
+	if c.targetUser != "" {
+		toConv = conversationKey(c.me, c.targetUser)
+	}
+	for _, abs := range c.uploadBuf {
+		jobs = append(jobs, uploadJob{Path: abs, To: toConv})
+	}
+	// Clear the persistent buffer.
+	c.uploadBuf = nil
+	c.uploadBufSet = map[string]bool{}
+	// Also clear picker buffer if picker is open.
+	c.picker.buffered = nil
+	c.picker.inBuf = map[string]bool{}
+	if c.picker.isActive() {
+		restore := composerPlaceholder
+		c.closePicker(restore)
 	}
 	return c.startUploads(jobs)
 }
@@ -665,18 +693,31 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 			return true, nil
 		}
 		// modeBrowse: Enter buffers the file or opens the directory.
+		// If visual range is active, buffer the ENTIRE range, then clear it.
+		if p.anchor >= 0 && p.visual {
+			c.pickerToggleBuffer() // buffers the whole range
+			p.anchor = -1
+			p.visual = false
+			return true, nil
+		}
 		entry, key, _ := p.entryAt(p.cursor)
 		switch {
 		case !entry.dir:
-			c.pickerToggleBuffer() // buffer this file
+			c.pickerToggleBuffer() // buffer this single file
+			p.anchor = -1
+			p.visual = false
 			return true, nil
 		case key == parentDir(p.cwd):
+			p.anchor = -1
+			p.visual = false
 			c.pickerCd(key) // the ".." row
 		default:
+			p.anchor = -1
+			p.visual = false
 			c.pickerCd(key) // browse into the folder
 		}
 		return true, nil
-	case tea.KeyCtrlJ: // Ctrl+Enter (LF)
+	case tea.KeyCtrlJ: // Ctrl+Enter (LF — standard on most terminals)
 		// Ctrl+Enter: upload/download all buffered.
 		return true, c.pickerConfirm
 	case tea.KeyEsc:

@@ -378,6 +378,8 @@ type chatScreen struct {
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
 	picker       pickerState     // file-browser mode of that drawer (/upload)
+	uploadBuf    []string        // persistent upload buffer (survives picker close)
+	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
 	dlQ          dlState         // sequential shared-file download queue
 	filesSeen    map[string]bool // room files already announced to me
