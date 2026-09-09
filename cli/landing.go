@@ -45,10 +45,11 @@ var (
 				Align(lipgloss.Center)
 
 	landTabUnselectedStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("0")).
+				Background(lipgloss.Color("#3a3a3a")).
 				Foreground(lipgloss.Color("15")).
-				Align(lipgloss.Center).
-				Faint(false)
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("#555555")).
+				Align(lipgloss.Center)
 
 	landLabelStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("15")).
@@ -321,14 +322,21 @@ func (m landingModel) outerWidth() int {
 func (m landingModel) layout() landingLayout {
 	outerW := m.outerWidth()
 	labelW := 12
-	inputW := outerW - labelW - 6
-	if inputW < 20 {
-		inputW = 20
+	innerW := outerW - 2
+	inputW := 48
+	// cap to available space
+	maxInputW := innerW - labelW - 3
+	if maxInputW < 20 {
+		maxInputW = 20
 	}
+	if inputW > maxInputW {
+		inputW = maxInputW
+	}
+	tabOuterW := innerW / 2
 	return landingLayout{
 		outerW: outerW,
 		outerH: 16,
-		tabW:   outerW / 2,
+		tabW:   tabOuterW, // outer width per tab (including its border)
 		inputW: inputW,
 		labelW: labelW,
 		buttonW: 20,
@@ -457,18 +465,22 @@ func (m landingModel) View() string {
 	m.codeInput.Width = l.inputW
 	outerW := l.outerW
 
-	// tabs
+	// tabs - tabW is outer width per tab (including border), so content width = tabW-2
 	tabW := l.tabW
 	tabH := 3
+	tabContentW := tabW - 2
+	if tabContentW < 10 {
+		tabContentW = 10
+	}
 	createFocused := m.tab == tabCreate
 	joinFocused := m.tab == tabJoin
-	createStyle := landTabUnselectedStyle.Width(tabW).Height(tabH)
-	joinStyle := landTabUnselectedStyle.Width(tabW).Height(tabH)
+	createStyle := landTabUnselectedStyle.Width(tabContentW).Height(tabH-2).Padding(0, 1)
+	joinStyle := landTabUnselectedStyle.Width(tabContentW).Height(tabH-2).Padding(0, 1)
 	if createFocused {
-		createStyle = landTabSelectedStyle.Width(tabW).Height(tabH)
+		createStyle = landTabSelectedStyle.Width(tabContentW).Height(tabH-2).Padding(0, 1)
 	}
 	if joinFocused {
-		joinStyle = landTabSelectedStyle.Width(tabW).Height(tabH)
+		joinStyle = landTabSelectedStyle.Width(tabContentW).Height(tabH-2).Padding(0, 1)
 	}
 	createTab := createStyle.Render("CREATE")
 	joinTab := joinStyle.Render("JOIN")
@@ -533,8 +545,8 @@ func (m landingModel) View() string {
 	// formContent wrapped in outer
 	// combine tabs + form
 	inner := lipgloss.JoinVertical(lipgloss.Left, tabsRow, formContent)
-	// outer container with + border
-	outer := landOuterStyle.Width(outerW).Render(inner)
+	// outer container with + border — Width is content width (innerW)
+	outer := landOuterStyle.Width(outerW - 2).Render(inner)
 	// center on screen
 	centered := lipgloss.NewStyle().Width(m.w).Height(m.h).Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(outer)
 	return centered
