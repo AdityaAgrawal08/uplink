@@ -545,14 +545,18 @@ func (m landingModel) View() string {
 		rowCode := lipgloss.JoinHorizontal(lipgloss.Top, labelCode, " ", codeBox)
 		rows = append(rows, rowCode, "")
 	}
-	// button centered
+	// button centered — compact, hugs text
 	btnText := "CREATE"
 	if m.tab == tabJoin {
 		btnText = "JOIN"
 	}
-	btnStyle := landButtonBlurStyle.Width(l.buttonW).Height(3)
+	btnW := lipgloss.Width(btnText) + 4 // 2 padding each side
+	if btnW < 8 {
+		btnW = 8
+	}
+	btnStyle := landButtonBlurStyle.Width(btnW).Padding(0, 1)
 	if m.focus == focusSubmit {
-		btnStyle = landButtonSelectedStyle.Width(l.buttonW).Height(3)
+		btnStyle = landButtonSelectedStyle.Width(btnW).Padding(0, 1)
 	}
 	btn := btnStyle.Render(btnText)
 	// center button
