@@ -58,6 +58,25 @@ var (
 	tuiScrollbarThumbStyle = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("245")).
 					Background(lipgloss.Color("240"))
+
+	// WhatsApp-like bubble styles: own = green right, other = dark grey left.
+	tuiOwnBubbleStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("22")).
+				Foreground(lipgloss.Color("15")).
+				Padding(0, 1).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("22"))
+
+	tuiOtherBubbleStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("236")).
+				Foreground(lipgloss.Color("15")).
+				Padding(0, 1).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("236"))
+
+	tuiBubbleTimeStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("250")).
+				Faint(true)
 )
 
 // ---- layout constants --------------------------------------------------------
@@ -523,25 +542,72 @@ func (c *chatScreen) shouldRender(m chatMessage) bool {
 }
 
 func (c *chatScreen) renderLine(m chatMessage) string {
-	ts := tuiTimeStyle.Render("[--:--]")
+	// Timestamp - used for system lines and as bubble timestamp
+	tsPlain := "--:--"
 	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-		ts = tuiTimeStyle.Render("[" + t.Local().Format("15:04") + "]")
+		tsPlain = t.Local().Format("15:04")
 	}
+	ts := tuiTimeStyle.Render("[" + tsPlain + "]")
+	bubbleTs := tuiBubbleTimeStyle.Render(tsPlain)
 	if m.Kind == "system" {
 		if isOwnPresence(m.Text, c.me) {
 			return "" // never announce my own join/leave to me
 		}
 		return ts + " " + tuiSystemStyle.Render("* "+m.Text)
 	}
-	name := tuiNameStyle.Render(m.Username)
-	if m.Username == c.me {
-		name = tuiMeStyle.Render(name + " (you)")
+	isOwn := m.Username == c.me
+	textRendered := renderMarkdown(m.Text)
+
+	availWidth := c.vp.Width
+	if availWidth <= 0 {
+		availWidth = 60
 	}
-	line := ts + " " + name + ": " + renderMarkdown(m.Text)
-	if m.ConvID != generalConv && m.Username == c.me && c.targetUser != "" {
-		line += tuiTimeStyle.Render("  → " + c.targetUser)
+	maxBubbleW := int(float64(availWidth) * 0.62)
+	if maxBubbleW < 22 {
+		maxBubbleW = 22
 	}
-	return line
+	if maxBubbleW > availWidth-2 {
+		maxBubbleW = availWidth - 2
+	}
+
+	// Build bubble inner: for others show sender name on top line
+	var innerPlain string
+	if isOwn {
+		innerPlain = textRendered
+	} else {
+		nameLine := tuiNameStyle.Render(m.Username)
+		innerPlain = nameLine + "\n" + textRendered
+	}
+	innerWithTs := innerPlain + "  " + bubbleTs
+
+	// Compact hug: needed = content width + padding/border
+	needed := lipgloss.Width(innerPlain) + lipgloss.Width(tsPlain) + 6
+	if needed < 14 {
+		needed = 14
+	}
+	bubbleW := needed
+	if bubbleW > maxBubbleW {
+		bubbleW = maxBubbleW
+	}
+	bubbleInner := innerWithTs
+	contentW := lipgloss.Width(innerPlain)
+	if contentW > maxBubbleW-10 {
+		bubbleInner = innerPlain + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(tsPlain)-4)) + bubbleTs
+	}
+
+	var style lipgloss.Style
+	if isOwn {
+		style = tuiOwnBubbleStyle
+	} else {
+		style = tuiOtherBubbleStyle
+	}
+	bubble := style.Width(bubbleW).Render(bubbleInner)
+
+	if isOwn {
+		// Use lipgloss right-align so leading spaces survive viewport wrapping
+		return lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
+	}
+	return bubble
 }
 
 // addMessage records a confirmed server message and refreshes the view.
@@ -708,6 +774,9 @@ func (c *chatScreen) rebuildView() {
 		if hasCard && (!hasHist || cardBeforeHist) {
 			fd := cards[ci].ll.fileData
 			card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
+			if fd.username == c.me {
+				card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
+			}
 			c.lines = append(c.lines, card)
 			ci++
 		} else if hasHist {
@@ -1133,12 +1202,34 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
-	ts := tuiTimeStyle.Render("[" + time.Now().Format("15:04") + "]")
-	nameLabel := tuiMeStyle.Render(c.me + " (you)")
-	echo := ts + " " + nameLabel + ": " + renderMarkdown(text)
-	if c.targetUser != "" {
-		echo += tuiTimeStyle.Render("  → " + c.targetUser)
+	availWidth := c.vp.Width
+	if availWidth <= 0 {
+		availWidth = 60
 	}
+	textRendered := renderMarkdown(text)
+	tsPlain := time.Now().Format("15:04")
+	bubbleTs := tuiBubbleTimeStyle.Render(tsPlain)
+	maxBubbleW := int(float64(availWidth) * 0.62)
+	if maxBubbleW < 22 {
+		maxBubbleW = 22
+	}
+	if maxBubbleW > availWidth-2 {
+		maxBubbleW = availWidth - 2
+	}
+	needed := lipgloss.Width(textRendered) + lipgloss.Width(tsPlain) + 6
+	if needed < 14 {
+		needed = 14
+	}
+	bubbleW := needed
+	if bubbleW > maxBubbleW {
+		bubbleW = maxBubbleW
+	}
+	innerWithTs := textRendered + "  " + bubbleTs
+	if lipgloss.Width(textRendered) > maxBubbleW-10 {
+		innerWithTs = textRendered + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(tsPlain)-4)) + bubbleTs
+	}
+	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(innerWithTs)
+	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
 	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer}
 	target := peer
