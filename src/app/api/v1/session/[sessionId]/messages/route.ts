@@ -214,7 +214,7 @@ export async function GET(
     }
 
     const [docs, roster] = await Promise.all([
-      db.collection("session_messages").find(baseFilter()).sort({ seq: -1 }).limit(BACKLOG_LIMIT).toArray() as Promise<ChatDoc[]>,
+      db.collection("session_messages").find(baseFilter()).sort({ seq: -1 }).limit(BACKLOG_LIMIT).toArray() as unknown as Promise<ChatDoc[]>,
       db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, _id: 0 }).toArray(),
     ]);
 
