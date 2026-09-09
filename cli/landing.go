@@ -186,30 +186,41 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Type == tea.MouseLeft {
-			// tab bar at y=1 (inside outer border)
-			// outer border top is at row 0, tab row at 1
-			if msg.Y == 1 {
-				outerW := m.outerWidth()
-				tabW := outerW / 2
-				if msg.X < tabW {
+			l := m.layout()
+			outerW := l.outerW
+			outerH := 16
+			// outer is centered
+			outerLeft := (m.w - outerW) / 2
+			if outerLeft < 0 {
+				outerLeft = 0
+			}
+			outerTop := (m.h - outerH) / 2
+			if outerTop < 0 {
+				outerTop = 0
+			}
+			// header (title+subtitle) sits above outer, outerTop is outer border top
+			innerLeft := outerLeft + 1
+			innerTop := outerTop + 1
+			tabH := 3
+			// tab hit: inside inner, y in [innerTop, innerTop+tabH)
+			if msg.Y >= innerTop && msg.Y < innerTop+tabH {
+				tabW := l.tabW
+				if msg.X < innerLeft+tabW {
 					m.tab = tabCreate
 					if m.focus == focusCode {
 						m.focus = focusUser
 					}
 					m.syncFocus()
-				} else {
+				} else if msg.X < innerLeft+tabW*2 {
 					m.tab = tabJoin
 					m.syncFocus()
 				}
 				return m, nil
 			}
-			// inputs: approximate y positions
-			l := m.layout()
-			// y offsets inside outer: tabH(3) + 1 divider =4, then user row at 6, pass at 8, code at 10, button at 13
-			if m.hitInput(msg.X, msg.Y, l) {
+			if m.hitInputAbsolute(msg.X, msg.Y, l, outerLeft, outerTop) {
 				return m, nil
 			}
-			if m.hitButton(msg.X, msg.Y, l) {
+			if m.hitButtonAbsolute(msg.X, msg.Y, l, outerLeft, outerTop) {
 				return m, m.submit()
 			}
 		}
@@ -445,38 +456,72 @@ func (m *landingModel) syncFocus() {
 	}
 }
 
-func (m *landingModel) hitInput(x, y int, l landingLayout) bool {
-	left := l.labelW + 3
-	right := left + l.inputW + 2
-	if x < left || x > right {
+func (m *landingModel) hitInputAbsolute(x, y int, l landingLayout, outerLeft, outerTop int) bool {
+	innerLeft := outerLeft + 1
+	innerTop := outerTop + 1
+	innerW := l.outerW - 2
+	tabH := 3
+	// quick bounds: must be inside inner horizontally
+	if x < innerLeft || x >= innerLeft+innerW {
 		return false
 	}
-	if y == 5 {
+	// User row: innerTop+3 to +5
+	userTop := innerTop + tabH
+	if y >= userTop && y < userTop+3 {
 		m.focus = focusUser
 		m.syncFocus()
 		return true
 	}
-	if y == 7 {
+	// Pass row: userTop+4
+	passTop := userTop + 4
+	if y >= passTop && y < passTop+3 {
 		m.focus = focusPass
 		m.syncFocus()
 		return true
 	}
-	if m.tab == tabJoin && y == 9 {
-		m.focus = focusCode
-		m.syncFocus()
-		return true
+	// Code row only on JOIN
+	if m.tab == tabJoin {
+		codeTop := passTop + 4
+		if y >= codeTop && y < codeTop+3 {
+			m.focus = focusCode
+			m.syncFocus()
+			return true
+		}
 	}
 	return false
 }
 
-func (m *landingModel) hitButton(x, y int, l landingLayout) bool {
-	if y < 12 || y > 14 {
-		return false
+func (m *landingModel) hitButtonAbsolute(x, y int, l landingLayout, outerLeft, outerTop int) bool {
+	innerLeft := outerLeft + 1
+	innerTop := outerTop + 1
+	innerW := l.outerW - 2
+	tabH := 3
+	// button is centered below inputs
+	// User 3, blank1, Pass3, blank1, [Code3 blank1], button3
+	// Compute button top dynamically
+	userTop := innerTop + tabH
+	passTop := userTop + 4
+	buttonTop := passTop + 4
+	if m.tab == tabJoin {
+		buttonTop += 4 // code row + blank
 	}
-	center := l.outerW / 2
-	left := center - l.buttonW/2
-	right := left + l.buttonW
-	return x >= left && x <= right
+	// button height 3 (border), width ~12, centered
+	btnW := 12
+	if m.tab == tabCreate {
+		btnW = 12 // CREATE 6+4+2
+	} else {
+		btnW = 10 // JOIN 4+4+2
+	}
+	center := innerLeft + innerW/2
+	left := center - btnW/2
+	right := left + btnW
+	// allow slightly larger hit area
+	left -= 2
+	right += 2
+	if y >= buttonTop && y < buttonTop+3 && x >= left && x < right {
+		return true
+	}
+	return false
 }
 
 func (m landingModel) View() string {
