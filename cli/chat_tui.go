@@ -52,6 +52,12 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("62")).
 				Padding(0, 1)
+
+	tuiScrollbarStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("240"))
+	tuiScrollbarThumbStyle = lipgloss.NewStyle().
+					Foreground(lipgloss.Color("245")).
+					Background(lipgloss.Color("240"))
 )
 
 // ---- layout constants --------------------------------------------------------
@@ -410,10 +416,11 @@ const (
 
 // fileCardData holds metadata for rendering a file attachment card.
 type fileCardData struct {
-	filename string
-	username string
-	size     string // pre-formatted human size
-	time     string // formatted timestamp
+	filename  string
+	username  string
+	size      string // pre-formatted human size
+	time      string // formatted timestamp "15:04"
+	createdAt string // RFC3339 for chronological interleaving
 }
 
 // localLine is a UI-generated transcript row scoped to one conversation so
@@ -584,14 +591,51 @@ func (c *chatScreen) appendLocal(conv, text string) {
 
 // appendLocalFileCard adds a styled file attachment card to the transcript.
 func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, timestamp string) {
+	// Derive RFC3339 for interleaving; caller passes local "15:04" so we
+	// synthesize a full timestamp from now if not already RFC3339.
+	rfc := ""
+	if timestamp != "" {
+		if _, err := time.Parse(time.RFC3339, timestamp); err == nil {
+			rfc = timestamp
+		} else if t, err := time.Parse("15:04", timestamp); err == nil {
+			now := time.Now()
+			rfc = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, time.Local).Format(time.RFC3339)
+		} else {
+			rfc = time.Now().Format(time.RFC3339)
+		}
+	} else {
+		rfc = time.Now().Format(time.RFC3339)
+	}
 	c.localLines = append(c.localLines, localLine{
 		conv: conv,
 		kind: lineFileCard,
 		fileData: &fileCardData{
-			filename: filename,
-			username: username,
-			size:     sizeStr,
-			time:     timestamp,
+			filename:  filename,
+			username:  username,
+			size:      sizeStr,
+			time:      timestamp,
+			createdAt: rfc,
+		},
+	})
+	c.rebuildView()
+}
+
+// appendLocalFileCardWithRFC3339 is like appendLocalFileCard but accepts an
+// explicit RFC3339 timestamp (used for server-sourced file announcements).
+func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, filename, username, sizeStr, rfc3339 string) {
+	ts := ""
+	if t, err := time.Parse(time.RFC3339, rfc3339); err == nil {
+		ts = t.Local().Format("15:04")
+	}
+	c.localLines = append(c.localLines, localLine{
+		conv: conv,
+		kind: lineFileCard,
+		fileData: &fileCardData{
+			filename:  filename,
+			username:  username,
+			size:      sizeStr,
+			time:      ts,
+			createdAt: rfc3339,
 		},
 	})
 	c.rebuildView()
@@ -600,25 +644,82 @@ func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, time
 // rebuildView derives the painted transcript from raw history + local lines,
 // applying the CURRENT visibility filter. Entering/leaving private mode just
 // calls this — historical lines re-filter retroactively.
+// File cards are interleaved chronologically among history messages so they
+// behave like text messages; transient local lines (pending echo, progress)
+// stay pinned at the bottom.
 func (c *chatScreen) rebuildView() {
 	c.lines = c.lines[:0]
-	for _, m := range c.history {
-		if !c.shouldRender(m) {
+
+	// Partition local lines: file cards (to interleave) vs transient lines (pinned at bottom).
+	type cardEntry struct {
+		ll localLine
+		t  time.Time
+	}
+	var cards []cardEntry
+	var pinned []localLine
+	for _, ll := range c.localLines {
+		if ll.conv != c.activeConv() {
 			continue
 		}
-		c.lines = append(c.lines, c.renderLine(m))
+		if ll.kind == lineFileCard && ll.fileData != nil {
+			tt := time.Now()
+			if ll.fileData.createdAt != "" {
+				if p, err := time.Parse(time.RFC3339, ll.fileData.createdAt); err == nil {
+					tt = p
+				}
+			} else if ll.fileData.time != "" {
+				if p, err := time.Parse("15:04", ll.fileData.time); err == nil {
+					now := time.Now()
+					tt = time.Date(now.Year(), now.Month(), now.Day(), p.Hour(), p.Minute(), 0, 0, time.Local)
+				}
+			}
+			cards = append(cards, cardEntry{ll: ll, t: tt})
+		} else {
+			pinned = append(pinned, ll)
+		}
 	}
-	for _, ll := range c.localLines {
-		if ll.conv == c.activeConv() {
-			if ll.kind == lineFileCard && ll.fileData != nil {
-				// Render file attachment card with current viewport width.
-				fd := ll.fileData
-				card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
-				c.lines = append(c.lines, card)
+	sort.SliceStable(cards, func(i, j int) bool { return cards[i].t.Before(cards[j].t) })
+
+	// Collect visible history messages sorted by Seq (already chronological).
+	var visibleHistory []chatMessage
+	for _, m := range c.history {
+		if c.shouldRender(m) {
+			visibleHistory = append(visibleHistory, m)
+		}
+	}
+
+	// Merge history + file cards by timestamp.
+	hi, ci := 0, 0
+	for hi < len(visibleHistory) || ci < len(cards) {
+		var histTime time.Time
+		hasHist := hi < len(visibleHistory)
+		if hasHist {
+			if t, err := time.Parse(time.RFC3339, visibleHistory[hi].CreatedAt); err == nil {
+				histTime = t
 			} else {
-				c.lines = append(c.lines, ll.text)
+				// Fallback: treat missing timestamp as very old so cards sort after;
+				// but for our own messages CreatedAt is now set, so this rarely fires.
+				histTime = time.Time{}
 			}
 		}
+		hasCard := ci < len(cards)
+		// If history timestamp missing, keep history order and render hist first.
+		cardBeforeHist := hasCard && hasHist && !histTime.IsZero() && cards[ci].t.Before(histTime)
+		if hasCard && (!hasHist || cardBeforeHist) {
+			fd := cards[ci].ll.fileData
+			card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
+			c.lines = append(c.lines, card)
+			ci++
+		} else if hasHist {
+			c.lines = append(c.lines, c.renderLine(visibleHistory[hi]))
+			hi++
+		} else {
+			break
+		}
+	}
+	// Append transient pinned lines (pending echo, progress bars, errors) at bottom.
+	for _, ll := range pinned {
+		c.lines = append(c.lines, ll.text)
 	}
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
 		c.pending.lineIdx = len(c.lines) - 1 // pending echo is last local of its conv
@@ -629,18 +730,89 @@ func (c *chatScreen) rebuildView() {
 // refreshViewport re-serializes the transcript, hard-wrapping every line to
 // the current viewport width. lipgloss Width() wraps ANSI-aware, so styled
 // lines fold instead of being clipped by the viewport on narrow terminals.
+// It preserves the user's scroll position: only auto-scrolls if already at bottom.
 func (c *chatScreen) refreshViewport() {
 	w := c.vp.Width
 	if w <= 0 {
 		w = 40
 	}
+	atBottom := c.vp.AtBottom()
 	st := lipgloss.NewStyle().Width(w)
 	wrapped := make([]string, len(c.lines))
 	for i, ln := range c.lines {
 		wrapped[i] = st.Render(ln)
 	}
 	c.vp.SetContent(strings.Join(wrapped, "\n"))
-	c.vp.GotoBottom()
+	if atBottom {
+		c.vp.GotoBottom()
+	}
+}
+
+// scrollbarView renders a vertical scrollbar for the transcript viewport.
+// Height h includes the border interior rows. Uses ScrollPercent() to position
+// the thumb proportionally. Returns a single-column string of height h.
+func (c chatScreen) scrollbarView(h int) string {
+	if h <= 0 {
+		return ""
+	}
+	total := c.vp.TotalLineCount()
+	if total <= 0 {
+		total = len(c.lines)
+	}
+	visible := c.vp.Height
+	if visible <= 0 {
+		visible = h
+	}
+	// No scrolling needed: draw empty track.
+	if total <= visible {
+		rows := make([]string, h)
+		for i := range rows {
+			rows[i] = tuiScrollbarStyle.Render("│")
+		}
+		return strings.Join(rows, "\n")
+	}
+	// Reserve top/bottom arrows.
+	trackH := h
+	hasArrows := h >= 3
+	if hasArrows {
+		trackH = h - 2
+	}
+	thumbH := trackH * visible / total
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	if thumbH > trackH {
+		thumbH = trackH
+	}
+	pct := c.vp.ScrollPercent() // 0.0 - 1.0
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 1 {
+		pct = 1
+	}
+	thumbPos := int(float64(trackH-thumbH) * pct)
+	if thumbPos < 0 {
+		thumbPos = 0
+	}
+	if thumbPos+thumbH > trackH {
+		thumbPos = trackH - thumbH
+	}
+	var rows []string
+	if hasArrows {
+		rows = append(rows, tuiScrollbarStyle.Render("▲"))
+	}
+	for i := 0; i < trackH; i++ {
+		if i >= thumbPos && i < thumbPos+thumbH {
+			rows = append(rows, tuiScrollbarThumbStyle.Render("█"))
+		} else {
+			rows = append(rows, tuiScrollbarStyle.Render("│"))
+		}
+	}
+	if hasArrows {
+		rows = append(rows, tuiScrollbarStyle.Render("▼"))
+	}
+	return strings.Join(rows, "\n")
 }
 
 func (c chatScreen) headerView() string {
@@ -961,9 +1133,11 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
-	echo := tuiMeStyle.Render("[you →] " + renderMarkdown(text))
+	ts := tuiTimeStyle.Render("[" + time.Now().Format("15:04") + "]")
+	nameLabel := tuiMeStyle.Render(c.me + " (you)")
+	echo := ts + " " + nameLabel + ": " + renderMarkdown(text)
 	if c.targetUser != "" {
-		echo = tuiMeStyle.Render("[you → " + c.targetUser + "] " + text)
+		echo += tuiTimeStyle.Render("  → " + c.targetUser)
 	}
 	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer}
@@ -984,7 +1158,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.width, c.height = msg.Width, msg.Height
 		c.hoverPeer = "" // geometry changed; stale hover is meaningless
 		l := c.layoutFor()
-		c.vp.Width = l.vpWidth
+		// Reserve 1 column for scrollbar inside transcript.
+		vpW := l.vpWidth
+		if l.vpHeight > 0 && vpW > 10 {
+			vpW--
+		}
+		c.vp.Width = vpW
 		c.vp.Height = l.vpHeight
 		// Keep the composer inside its column: textinput pads/clips to Width.
 		if c.input.Width != l.vpWidth-4 {
@@ -1270,6 +1449,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		m := chatMessage{
 			Seq: msg.seq, Username: c.me, Kind: "chat",
 			Text: msg.text, To: to, ConvID: conv,
+			CreatedAt: time.Now().Format(time.RFC3339),
 		}
 		c.rendered[m.Seq] = true
 		known := false
@@ -1405,8 +1585,16 @@ func (c chatScreen) View() string {
 	l := c.layoutFor()
 
 	// Keep viewport dims in lockstep with the painted layout.
+	// Reserve 1 column for the scrollbar inside the transcript border.
 	vp := c.vp
-	vp.Width = l.vpWidth
+	scrollW := 1
+	innerW := l.vpWidth
+	if l.vpHeight > 0 && innerW > 10 {
+		vp.Width = innerW - scrollW
+	} else {
+		vp.Width = innerW
+		scrollW = 0
+	}
 	vp.Height = l.vpHeight
 
 	var body string
@@ -1416,9 +1604,21 @@ func (c chatScreen) View() string {
 		// omitting the block keeps the exact-row contract intact.
 		body = ""
 	case l.boxedTranscript:
-		body = tuiBorderStyle.Render(vp.View()) // exactly vpHeight+2 rows
+		if scrollW > 0 {
+			bar := c.scrollbarView(l.vpHeight)
+			// Viewport content + scrollbar joined, then bordered.
+			inner := lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
+			body = tuiBorderStyle.Render(inner)
+		} else {
+			body = tuiBorderStyle.Render(vp.View()) // exactly vpHeight+2 rows
+		}
 	default:
-		body = vp.View() // degraded: border dropped on tiny terminals
+		if scrollW > 0 {
+			bar := c.scrollbarView(l.vpHeight)
+			body = lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
+		} else {
+			body = vp.View() // degraded: border dropped on tiny terminals
+		}
 	}
 
 	if l.sidebarOn && body != "" {

@@ -121,14 +121,40 @@ func fileAttachmentCard(filename, username, sizeStr, timestamp string, width int
 	// Header line: icon + filename
 	header := cardIconStyle.Render(icon+" ") + cardHeaderStyle.Render(dispName)
 
-	// Meta line: EXT · SIZE
-	meta := cardMetaStyle.Render(fmt.Sprintf("%s · %s", label, sizeStr))
-
-	// Action: download indicator (right-aligned concept, placed on meta line)
+	// Meta line: EXT · SIZE with timestamp on the right
+	metaLeft := cardMetaStyle.Render(fmt.Sprintf("%s · %s", label, sizeStr))
+	var meta string
+	if timestamp != "" {
+		tsRender := cardTimeStyle.Render(timestamp)
+		// Attempt right-align timestamp within available width.
+		// Available inner width approx = width - 4 (border + padding).
+		avail := width - 4
+		if avail < 20 {
+			avail = 20
+		}
+		leftW := lipgloss.Width(metaLeft)
+		tsW := lipgloss.Width(tsRender)
+		gap := avail - leftW - tsW
+		if gap < 2 {
+			gap = 2
+		}
+		action := cardActionStyle.Render("↓ save")
+		// Second line: meta + timestamp/action on separate row for clarity
+		meta = fmt.Sprintf("%s%s%s", metaLeft, strings.Repeat(" ", gap), action)
+		// Build inner with timestamp on next line right-aligned.
+		inner := fmt.Sprintf("%s\n%s\n%s", header, meta, strings.Repeat(" ", avail-tsW)+tsRender)
+		return cardStyle.Render(inner)
+	}
 	action := cardActionStyle.Render("↓ save")
-
-	// Build the inner content.
-	inner := fmt.Sprintf("%s\n%s          %s", header, meta, action)
-
+	avail := width - 4
+	if avail < 20 {
+		avail = 20
+	}
+	leftW := lipgloss.Width(metaLeft)
+	tsGap := avail - leftW - lipgloss.Width(action)
+	if tsGap < 2 {
+		tsGap = 2
+	}
+	inner := fmt.Sprintf("%s\n%s%s%s", header, metaLeft, strings.Repeat(" ", tsGap), action)
 	return cardStyle.Render(inner)
 }

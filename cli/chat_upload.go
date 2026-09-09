@@ -270,11 +270,13 @@ func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 		if f.To != "" {
 			conv = f.To
 		}
-		ts := ""
-		if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
-			ts = t.Local().Format("15:04")
+		// Use helper that preserves RFC3339 for chronological interleaving.
+		if f.UploadedAt != "" {
+			c.appendLocalFileCardWithRFC3339(conv, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)
+		} else {
+			ts := time.Now().Format("15:04")
+			c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
 		}
-		c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
 	}
 }
 
@@ -309,15 +311,18 @@ func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 	}
 	if msg.err == nil {
 		// Replace progress line with a styled file attachment card.
-		ts := time.Now().Format("15:04")
+		now := time.Now()
+		ts := now.Format("15:04")
+		rfc := now.Format(time.RFC3339)
 		card := localLine{
 			conv: conv,
 			kind: lineFileCard,
 			fileData: &fileCardData{
-				filename: msg.display,
-				username: c.me,
-				size:     humanSize(msg.size),
-				time:     ts,
+				filename:  msg.display,
+				username:  c.me,
+				size:      humanSize(msg.size),
+				time:      ts,
+				createdAt: rfc,
 			},
 		}
 		if c.uploadQ.lineIdx >= 0 && c.uploadQ.lineIdx < len(c.localLines) &&
