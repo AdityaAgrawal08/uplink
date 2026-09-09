@@ -18,7 +18,7 @@ export async function POST(
 
     const text = await req.text();
     const body = text ? JSON.parse(text) : {};
-    const { filename, size, sha256 } = body;
+    const { filename, size, sha256, to } = body;
 
     if (!filename || typeof filename !== "string") {
       return apiError("Filename is required", 400);
@@ -29,6 +29,9 @@ export async function POST(
     if (!sha256 || typeof sha256 !== "string" || sha256.length !== 64) {
       return apiError("Valid SHA-256 hash is required", 400);
     }
+
+    // Optional: private conversation target. Empty/undefined = public (general).
+    const toUser = typeof to === "string" && to.trim() !== "" ? to.trim() : "";
 
     const db = await getDb();
 
@@ -46,7 +49,7 @@ export async function POST(
     const fileId = crypto.randomUUID();
     const shareId = generateShareId();
 
-    const fileDoc = {
+    const fileDoc: Record<string, unknown> = {
       sessionId,
       fileId,
       shareId,
@@ -57,6 +60,9 @@ export async function POST(
       uploadedAt: new Date(),
       status: "ANNOUNCED",
     };
+    if (toUser) {
+      fileDoc.to = toUser;
+    }
 
     await db.collection("session_files").insertOne(fileDoc);
 

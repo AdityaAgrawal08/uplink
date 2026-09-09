@@ -32,6 +32,7 @@ type dlState struct {
 	progCh  chan dlProgressMsg
 	name    string
 	lineIdx int
+	conv    string // conversation scope for the in-flight download
 }
 
 func (d *dlState) isActive() bool { return d.active }
@@ -78,6 +79,12 @@ func (c *chatClient) fetchDownloadURL(fileId string) (string, error) {
 
 func (c *chatScreen) startDownloads(jobs []dlJob) tea.Cmd {
 	c.dlQ.queue = append(c.dlQ.queue, jobs...)
+	// Set conversation scope from current context.
+	conv := generalConv
+	if c.targetUser != "" {
+		conv = conversationKey(c.me, c.targetUser)
+	}
+	c.dlQ.conv = conv
 	if c.dlQ.active {
 		return nil
 	}
@@ -100,7 +107,8 @@ func (c *chatScreen) startNextDownload() tea.Cmd {
 
 	c.dlQ.active = true
 	c.dlQ.name = job.Filename
-	c.paintDlLine(tuiDownloadRunStyle.Render(fmt.Sprintf("[↓] %s …", job.Filename)))
+	c.paintDlLine(tuiDownloadRunStyle.Render(
+		progressBar("Downloading…", 0, 0)), c.dlQ.conv)
 
 	run := func() tea.Msg {
 		defer close(progCh)
@@ -200,10 +208,13 @@ func runSessionDownload(ctx context.Context, client *chatClient, job dlJob, prog
 var tuiDownloadRunStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("39")) // blue while bytes arrive
 
-func (c *chatScreen) paintDlLine(text string) {
-	line := localLine{conv: generalConv, text: text}
+func (c *chatScreen) paintDlLine(text string, conv string) {
+	if conv == "" {
+		conv = generalConv
+	}
+	line := localLine{conv: conv, text: text}
 	if c.dlQ.lineIdx >= 0 && c.dlQ.lineIdx < len(c.localLines) &&
-		c.localLines[c.dlQ.lineIdx].conv == generalConv {
+		c.localLines[c.dlQ.lineIdx].conv == conv {
 		c.localLines[c.dlQ.lineIdx] = line
 	} else {
 		c.localLines = append(c.localLines, line)
@@ -215,13 +226,17 @@ func (c *chatScreen) paintDlLine(text string) {
 func (c *chatScreen) settleDownloadDone(msg dlDoneMsg) tea.Cmd {
 	c.dlQ.active = false
 	c.dlQ.cancel = nil
+	conv := c.dlQ.conv
+	if conv == "" {
+		conv = generalConv
+	}
 	dir, _ := downloadsDir()
 	if msg.err == nil {
 		c.paintDlLine(tuiSystemStyle.Render(
-			fmt.Sprintf("* saved %s → %s", msg.filename, dir)))
+			fmt.Sprintf("* saved %s → %s", msg.filename, dir)), conv)
 	} else {
 		c.paintDlLine(tuiErrStyle.Render(
-			fmt.Sprintf("✗ download failed: %s (%v)", msg.filename, msg.err)))
+			fmt.Sprintf("✗ download failed: %s (%v)", msg.filename, msg.err)), conv)
 	}
 	c.dlQ.lineIdx = -1
 	if len(c.dlQ.queue) > 0 {
@@ -235,9 +250,13 @@ func (c *chatScreen) cancelDownloads() {
 		c.dlQ.cancel()
 	}
 	name := c.dlQ.name
+	conv := c.dlQ.conv
+	if conv == "" {
+		conv = generalConv
+	}
 	c.dlQ.queue = nil
 	c.dlQ.active = false
 	c.dlQ.cancel = nil
-	c.paintDlLine(tuiSystemStyle.Render(fmt.Sprintf("* download cancelled: %s", name)))
+	c.paintDlLine(tuiSystemStyle.Render(fmt.Sprintf("* download cancelled: %s", name)), conv)
 	c.dlQ.lineIdx = -1
 }

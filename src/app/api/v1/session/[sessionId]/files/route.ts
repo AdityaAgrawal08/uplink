@@ -9,6 +9,7 @@ export async function GET(
   try {
     const { sessionId } = await props.params;
     const since = req.nextUrl.searchParams.get("since");
+    const conv = req.nextUrl.searchParams.get("conv");
 
     const db = await getDb();
 
@@ -19,13 +20,23 @@ export async function GET(
       { $set: { status: "UPLOAD_FAILED" } }
     );
 
-    // 2. Fetch session files
-    const fileQuery: { sessionId: string; uploadedAt?: { $gt: Date } } = { sessionId };
+    // 2. Build query — optional conversation scope filter.
+    //    conv="general" → public files only (to is empty/absent)
+    //    conv="a|b" → private thread files where to matches the pair key
+    //    conv omitted → all files (backward compat)
+    const fileQuery: Record<string, unknown> = { sessionId };
     if (since) {
       const sinceDate = new Date(since);
       if (!isNaN(sinceDate.getTime())) {
         fileQuery.uploadedAt = { $gt: sinceDate };
       }
+    }
+    if (conv === "general") {
+      // Public files: no `to` field, or `to` is empty
+      fileQuery.$or = [{ to: { $exists: false } }, { to: "" }];
+    } else if (conv && conv.includes("|")) {
+      // Private thread: files addressed to this pair
+      fileQuery.to = conv;
     }
 
     const files = await db
@@ -51,6 +62,7 @@ export async function GET(
         sha256: f.sha256,
         uploadedAt: f.uploadedAt.toISOString(),
         status: f.status,
+        to: (typeof f.to === "string" && f.to) || "",
       })),
       participants: participants.map((p) => ({
         username: p.username,

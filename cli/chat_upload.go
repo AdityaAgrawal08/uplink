@@ -40,10 +40,12 @@ const (
 )
 
 // uploadJob is one queued transfer. Path may be a directory (tarballed at
-// prepare time); Display is the name receivers will see.
+// prepare time); Display is the name receivers will see. To targets a
+// private conversation recipient (empty = public/general).
 type uploadJob struct {
 	Path    string
 	Display string
+	To      string
 }
 
 // uploadState lives on chatScreen and survives across jobs.
@@ -54,6 +56,7 @@ type uploadState struct {
 	progCh  chan uploadProgressMsg
 	name    string // display name of the in-flight job
 	lineIdx int    // transcript row of the in-flight echo (-1 = none)
+	conv    string // conversation scope for the in-flight job
 }
 
 func (u *uploadState) isActive() bool { return u.active }
@@ -112,7 +115,13 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 
 	c.uploadQ.active = true
 	c.uploadQ.name = display
-	c.paintUploadLine(tuiUploadRunStyle.Render(fmt.Sprintf("[↑] %s …", display)))
+	conv := generalConv
+	if job.To != "" {
+		conv = job.To
+	}
+	c.uploadQ.conv = conv
+	c.paintUploadLine(tuiUploadRunStyle.Render(
+		progressBar("Uploading…", 0, 0)), conv)
 
 	run := func() tea.Msg {
 		defer close(progCh)
@@ -146,9 +155,14 @@ type announceResponse struct {
 }
 
 // announceFile registers an intent-to-upload and mints {fileId, shareId}.
-func (c *chatClient) announceFile(filename string, size int64, shaHex string) (string, string, error) {
+// to is optional: non-empty targets a private conversation recipient.
+func (c *chatClient) announceFile(filename string, size int64, shaHex string, to string) (string, string, error) {
+	payload := map[string]any{"filename": filename, "size": size, "sha256": shaHex}
+	if to != "" {
+		payload["to"] = to
+	}
 	code, body, err := postJSON(c.endpoint("/announce"),
-		map[string]any{"filename": filename, "size": size, "sha256": shaHex},
+		payload,
 		c.authHeaders())
 	if err != nil {
 		return "", "", err
@@ -181,10 +195,17 @@ func (c *chatClient) completeUpload(fileId, shareId string) error {
 }
 
 // fetchFiles lists room files uploaded after `since` (RFC3339; "" = all).
-func (c *chatClient) fetchFiles(since string) ([]sessionFile, error) {
+func (c *chatClient) fetchFiles(since string, conv string) ([]sessionFile, error) {
 	url := c.endpoint("/files")
+	params := []string{}
 	if since != "" {
-		url += "?since=" + urlQueryEscape(since)
+		params = append(params, "since="+urlQueryEscape(since))
+	}
+	if conv != "" {
+		params = append(params, "conv="+urlQueryEscape(conv))
+	}
+	if len(params) > 0 {
+		url += "?" + strings.Join(params, "&")
 	}
 	code, body, err := getJSON(url, c.authHeaders())
 	if err != nil {
@@ -206,8 +227,9 @@ func (c *chatClient) fetchFiles(since string) ([]sessionFile, error) {
 func (c *chatScreen) doFetchFiles() tea.Cmd {
 	client := c.client
 	since := c.lastFilesAt
+	conv := c.activeConv()
 	return func() tea.Msg {
-		files, err := client.fetchFiles(since)
+		files, err := client.fetchFiles(since, conv)
 		return filesFetchedMsg{files: files, err: err}
 	}
 }
@@ -220,8 +242,9 @@ type filesListMsg struct {
 
 func (c *chatScreen) doFetchAllFiles() tea.Cmd {
 	client := c.client
+	conv := c.activeConv()
 	return func() tea.Msg {
-		files, err := client.fetchFiles("")
+		files, err := client.fetchFiles("", conv)
 		return filesListMsg{files: files, err: err}
 	}
 }
@@ -242,8 +265,18 @@ func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 		if f.Username == c.me {
 			continue // own uploads already painted by the engine
 		}
-		c.appendLocal(generalConv, tuiSystemStyle.Render(
-			fmt.Sprintf("* %s shared %s (%s)", f.Username, f.Filename, humanSize(f.Size))))
+		// Determine which conversation this file belongs to.
+		conv := generalConv
+		if f.To != "" {
+			conv = f.To
+		}
+		// Use helper that preserves RFC3339 for chronological interleaving.
+		if f.UploadedAt != "" {
+			c.appendLocalFileCardWithRFC3339(conv, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)
+		} else {
+			ts := time.Now().Format("15:04")
+			c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
+		}
 	}
 }
 
@@ -253,10 +286,13 @@ var tuiUploadRunStyle = lipgloss.NewStyle().
 	Foreground(lipgloss.Color("214")) // amber while bytes move
 
 // paintUploadLine replaces the in-flight echo row in place, or appends one.
-func (c *chatScreen) paintUploadLine(text string) {
-	line := localLine{conv: generalConv, text: text}
+func (c *chatScreen) paintUploadLine(text string, conv string) {
+	if conv == "" {
+		conv = generalConv
+	}
+	line := localLine{conv: conv, text: text, kind: lineText}
 	if c.uploadQ.lineIdx >= 0 && c.uploadQ.lineIdx < len(c.localLines) &&
-		c.localLines[c.uploadQ.lineIdx].conv == generalConv {
+		c.localLines[c.uploadQ.lineIdx].conv == conv {
 		c.localLines[c.uploadQ.lineIdx] = line
 	} else {
 		c.localLines = append(c.localLines, line)
@@ -269,12 +305,37 @@ func (c *chatScreen) paintUploadLine(text string) {
 func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 	c.uploadQ.active = false
 	c.uploadQ.cancel = nil
+	conv := c.uploadQ.conv
+	if conv == "" {
+		conv = generalConv
+	}
 	if msg.err == nil {
-		c.paintUploadLine(tuiSystemStyle.Render(
-			fmt.Sprintf("* you shared %s (%s)", msg.display, humanSize(msg.size))))
+		// Replace progress line with a styled file attachment card.
+		now := time.Now()
+		ts := now.Format("15:04")
+		rfc := now.Format(time.RFC3339)
+		card := localLine{
+			conv: conv,
+			kind: lineFileCard,
+			fileData: &fileCardData{
+				filename:  msg.display,
+				username:  c.me,
+				size:      humanSize(msg.size),
+				time:      ts,
+				createdAt: rfc,
+			},
+		}
+		if c.uploadQ.lineIdx >= 0 && c.uploadQ.lineIdx < len(c.localLines) &&
+			c.localLines[c.uploadQ.lineIdx].conv == conv {
+			c.localLines[c.uploadQ.lineIdx] = card
+		} else {
+			c.localLines = append(c.localLines, card)
+			c.uploadQ.lineIdx = len(c.localLines) - 1
+		}
+		c.rebuildView()
 	} else {
 		c.paintUploadLine(tuiErrStyle.Render(
-			fmt.Sprintf("✗ upload failed: %s (%v)", msg.display, msg.err)))
+			fmt.Sprintf("✗ upload failed: %s (%v)", msg.display, msg.err)), conv)
 	}
 	c.uploadQ.lineIdx = -1 // next job paints its own row
 	if len(c.uploadQ.queue) > 0 {
@@ -289,10 +350,14 @@ func (c *chatScreen) cancelUploads() {
 		c.uploadQ.cancel()
 	}
 	name := c.uploadQ.name
+	conv := c.uploadQ.conv
+	if conv == "" {
+		conv = generalConv
+	}
 	c.uploadQ.queue = nil
 	c.uploadQ.active = false
 	c.uploadQ.cancel = nil
-	c.paintUploadLine(tuiSystemStyle.Render(fmt.Sprintf("* upload cancelled: %s", name)))
+	c.paintUploadLine(tuiSystemStyle.Render(fmt.Sprintf("* upload cancelled: %s", name)), conv)
 	c.uploadQ.lineIdx = -1
 }
 
@@ -339,7 +404,7 @@ func runSessionUpload(ctx context.Context, client *chatClient, me string, job up
 	}
 
 	// 1. announce within the session
-	fileId, shareId, err := client.announceFile(display, info.Size(), sum)
+	fileId, shareId, err := client.announceFile(display, info.Size(), sum, job.To)
 	if err != nil {
 		return display, 0, fmt.Errorf("announce: %w", err)
 	}
