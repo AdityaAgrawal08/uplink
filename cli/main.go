@@ -28,6 +28,7 @@ import (
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/crc64"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/tarball"
 	"github.com/AdityaAgrawal08/uplink-delta/cli/wan"
+	tea "github.com/charmbracelet/bubbletea"
 	"golang.org/x/term"
 )
 
@@ -97,49 +98,70 @@ type ConfirmRequest struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
+	cfg := LoadConfig()
+
+	// single entry: `uplink` with no args launches the CREATE/JOIN TUI
+	if len(os.Args) == 1 {
+		serverURL := sanitizeServerUrl(cfg.Server)
+		m := newLandingModel(serverURL)
+		p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseAllMotion())
+		fm, err := p.Run()
+		if err != nil {
+			fmt.Printf("landing error: %v\n", err)
+			os.Exit(1)
+		}
+		if lm, ok := fm.(landingModel); ok && lm.result != nil {
+			r := lm.result
+			// transition directly into chat
+			runChat(serverURL, r.Key, r.Username, false)
+			return
+		}
+		return
 	}
 
-	cfg := LoadConfig()
 	subcommand := os.Args[1]
+	// help is explicit
+	if subcommand == "help" || subcommand == "--help" || subcommand == "-h" {
+		printUsage()
+		return
+	}
 
 	switch subcommand {
 	case "send":
 		handleSend(os.Args[2:])
 	case "receive":
 		handleReceive(os.Args[2:])
-	case "join":
-		cmdJoinChat(os.Args[2:], cfg)
 	case "create":
 		if len(os.Args) < 3 || os.Args[2] != "session" {
 			fmt.Println("✗ Unknown command. Did you mean: uplink create session ?")
 			os.Exit(1)
 		}
 		cmdCreateSession(os.Args[3:], cfg)
+	case "join":
+		cmdJoinChat(os.Args[2:], cfg)
 	case "config":
 		handleConfig(os.Args[2:])
 	case "version":
 		handleVersion()
 	case "update":
 		handleUpdate()
-	case "help", "--help", "-h":
-		printUsage()
 	default:
 		if strings.HasPrefix(subcommand, "-") {
 			fmt.Printf("✗ Error: Unknown option \"%s\"\n\n", subcommand)
 		} else {
 			fmt.Printf("✗ Error: Unknown command \"%s\"\n\n", subcommand)
 		}
-		fmt.Println("Run:\n  uplink --help\n\nto see all available commands.")
+		fmt.Println("Run:\n  uplink          (open CREATE/JOIN TUI)\n  uplink --help   (show help)")
 		os.Exit(1)
 	}
 }
 
 func printUsage() {
 	fmt.Println("Uplink CLI Client (v0.0.1)")
-	fmt.Println("Usage: uplink <command> [arguments] [flags]")
+	fmt.Println("Usage: uplink [command] [arguments] [flags]")
+	fmt.Println()
+	fmt.Println("  (no args)      Open CREATE / JOIN TUI")
+	fmt.Println("                 uplink")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  send        Upload a file or directory")
@@ -149,12 +171,6 @@ func printUsage() {
 	fmt.Println("  receive     Download a file or directory")
 	fmt.Println("              uplink receive 4827165038")
 	fmt.Println("              uplink receive https://uplink-delta-xi.vercel.app/share/...")
-	fmt.Println()
-	fmt.Println("  create session   Start a chat room and get a 6-digit key")
-	fmt.Println("                   uplink create session")
-	fmt.Println()
-	fmt.Println("  join <key>       Join a chat room with the 6-digit key")
-	fmt.Println("                   uplink join 482716")
 	fmt.Println()
 	fmt.Println("  config           Manage configuration (~/.uplink/config.json)")
 	fmt.Println("                   uplink config ls | get <key> | set <key> <val>")

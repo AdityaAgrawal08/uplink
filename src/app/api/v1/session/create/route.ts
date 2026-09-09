@@ -5,6 +5,9 @@ import { hashPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { BloomFilter } from "@/lib/bloom";
 
+export const dynamic = "force-dynamic";
+export const maxDuration = 10;
+
 // 6-digit numeric key (e.g. "042917") — the shareable chat room code.
 function generateSessionId(): string {
   return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
@@ -30,16 +33,20 @@ export async function POST(req: NextRequest) {
       return apiError("Duration must be between 60 and 3600 seconds", 400);
     }
 
-    // Ensure MongoDB indexes are initialized
-    await initIndexes();
+    // Indexes: non-blocking — don't stall request on cold start
+    initIndexes().catch(() => {});
     const db = await getDb();
 
-    // 2. Generate unique sessionId
+    // 2. Generate unique sessionId + hash password in parallel
+    const passwordHashPromise = password && typeof password === "string" && password.trim() !== ""
+      ? hashPassword(password)
+      : Promise.resolve(null);
+
     let sessionId = "";
     let attempts = 0;
     while (attempts < 10) {
       sessionId = generateSessionId();
-      const existing = await db.collection("sessions").findOne({ sessionId });
+      const existing = await db.collection("sessions").findOne({ sessionId }, { projection: { _id: 1 } });
       if (!existing) break;
       attempts++;
     }
@@ -51,11 +58,8 @@ export async function POST(req: NextRequest) {
     const bloom = new BloomFilter(256, 3);
     bloom.add(username);
 
-    // 4. Hash password if provided
-    let passwordHash = null;
-    if (password && typeof password === "string" && password.trim() !== "") {
-      passwordHash = await hashPassword(password);
-    }
+    // 4. Hash password (await parallel work)
+    const passwordHash = await passwordHashPromise;
 
     const now = new Date();
     const expiresAt = new Date(now.getTime() + durationNum * 1000);
@@ -79,8 +83,10 @@ export async function POST(req: NextRequest) {
       status: "ACTIVE",
     };
 
-    await db.collection("sessions").insertOne(sessionDoc);
-    await db.collection("session_participants").insertOne(participantDoc);
+    await Promise.all([
+      db.collection("sessions").insertOne(sessionDoc),
+      db.collection("session_participants").insertOne(participantDoc),
+    ]);
 
     return NextResponse.json({ sessionId }, { status: 201 });
   } catch (error) {
