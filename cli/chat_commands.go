@@ -25,6 +25,7 @@ type slashCommand struct {
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
+	{Name: "/upload-buffer", Desc: "review buffered files before sending"},
 	{Name: "/download", Desc: "fetch shared room files"},
 }
 
@@ -308,6 +309,8 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return nil
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
+	case "/upload-buffer":
+		return c.openBufferReview() // show buffered files for review
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
 	default:

@@ -56,6 +56,24 @@ var (
 
 // ---- layout constants --------------------------------------------------------
 
+// progressBar renders a text-based progress bar:
+//
+//	Uploading... [████████████████████] 100% (21.3 KB / 21.3 KB)
+func progressBar(label string, done, total int64) string {
+	if total <= 0 {
+		return fmt.Sprintf("%s …", label)
+	}
+	pct := int(100 * done / total)
+	const barWidth = 20
+	filled := barWidth * pct / 100
+	if filled > barWidth {
+		filled = barWidth
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+	return fmt.Sprintf("%s [%s] %d%% (%s / %s)",
+		label, bar, pct, humanSize(done), humanSize(total))
+}
+
 const (
 	rosterTotalWidth = 24 // DEFAULT sidebar outer width (density scales it)
 	rosterWidthInner = rosterTotalWidth - 2
@@ -380,11 +398,29 @@ type pendingSend struct {
 	to      string // recipient ("": broadcast) - needed to reconstruct on settle
 }
 
+// localLineKind distinguishes plain text lines from styled file attachment cards.
+type localLineKind int
+
+const (
+	lineText localLineKind = iota
+	lineFileCard
+)
+
+// fileCardData holds metadata for rendering a file attachment card.
+type fileCardData struct {
+	filename string
+	username string
+	size     string // pre-formatted human size
+	time     string // formatted timestamp
+}
+
 // localLine is a UI-generated transcript row scoped to one conversation so
 // mode switches never bleed it across views.
 type localLine struct {
-	conv string
-	text string
+	conv     string
+	text     string
+	kind     localLineKind
+	fileData *fileCardData // non-nil when kind == lineFileCard
 }
 
 // queuedLine remembers WHERE a typed line belonged when it was enqueued, so
@@ -540,7 +576,22 @@ func (c *chatScreen) appendLine(s string) {
 }
 
 func (c *chatScreen) appendLocal(conv, text string) {
-	c.localLines = append(c.localLines, localLine{conv: conv, text: text})
+	c.localLines = append(c.localLines, localLine{conv: conv, text: text, kind: lineText})
+	c.rebuildView()
+}
+
+// appendLocalFileCard adds a styled file attachment card to the transcript.
+func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, timestamp string) {
+	c.localLines = append(c.localLines, localLine{
+		conv: conv,
+		kind: lineFileCard,
+		fileData: &fileCardData{
+			filename: filename,
+			username: username,
+			size:     sizeStr,
+			time:     timestamp,
+		},
+	})
 	c.rebuildView()
 }
 
@@ -557,7 +608,14 @@ func (c *chatScreen) rebuildView() {
 	}
 	for _, ll := range c.localLines {
 		if ll.conv == c.activeConv() {
-			c.lines = append(c.lines, ll.text)
+			if ll.kind == lineFileCard && ll.fileData != nil {
+				// Render file attachment card with current viewport width.
+				fd := ll.fileData
+				card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
+				c.lines = append(c.lines, card)
+			} else {
+				c.lines = append(c.lines, ll.text)
+			}
 		}
 	}
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
@@ -1028,9 +1086,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case uploadProgressMsg:
 		if c.uploadQ.active && msg.total > 0 {
-			pct := 100 * msg.done / msg.total
 			c.paintUploadLine(tuiUploadRunStyle.Render(
-				fmt.Sprintf("[↑] %s %d%%", c.uploadQ.name, pct)), c.uploadQ.conv)
+				progressBar("Uploading…", msg.done, msg.total)), c.uploadQ.conv)
 		}
 		cmds = append(cmds, drainUploadProgressCmd(c.uploadQ.progCh))
 
@@ -1060,9 +1117,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dlProgressMsg:
 		if c.dlQ.active && msg.total > 0 {
-			pct := 100 * msg.done / msg.total
 			c.paintDlLine(tuiDownloadRunStyle.Render(
-				fmt.Sprintf("[↓] %s %d%%", c.dlQ.name, pct)), c.dlQ.conv)
+				progressBar("Downloading…", msg.done, msg.total)), c.dlQ.conv)
 		}
 		cmds = append(cmds, drainDlProgressCmd(c.dlQ.progCh))
 

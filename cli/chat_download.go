@@ -107,7 +107,8 @@ func (c *chatScreen) startNextDownload() tea.Cmd {
 
 	c.dlQ.active = true
 	c.dlQ.name = job.Filename
-	c.paintDlLine(tuiDownloadRunStyle.Render(fmt.Sprintf("[↓] %s …", job.Filename)), c.dlQ.conv)
+	c.paintDlLine(tuiDownloadRunStyle.Render(
+		progressBar("Downloading…", 0, 0)), c.dlQ.conv)
 
 	run := func() tea.Msg {
 		defer close(progCh)

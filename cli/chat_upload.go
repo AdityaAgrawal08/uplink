@@ -120,7 +120,8 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 		conv = job.To
 	}
 	c.uploadQ.conv = conv
-	c.paintUploadLine(tuiUploadRunStyle.Render(fmt.Sprintf("[↑] %s …", display)), conv)
+	c.paintUploadLine(tuiUploadRunStyle.Render(
+		progressBar("Uploading…", 0, 0)), conv)
 
 	run := func() tea.Msg {
 		defer close(progCh)
@@ -269,8 +270,11 @@ func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 		if f.To != "" {
 			conv = f.To
 		}
-		c.appendLocal(conv, tuiSystemStyle.Render(
-			fmt.Sprintf("* %s shared %s (%s)", f.Username, f.Filename, humanSize(f.Size))))
+		ts := ""
+		if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
+			ts = t.Local().Format("15:04")
+		}
+		c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
 	}
 }
 
@@ -284,7 +288,7 @@ func (c *chatScreen) paintUploadLine(text string, conv string) {
 	if conv == "" {
 		conv = generalConv
 	}
-	line := localLine{conv: conv, text: text}
+	line := localLine{conv: conv, text: text, kind: lineText}
 	if c.uploadQ.lineIdx >= 0 && c.uploadQ.lineIdx < len(c.localLines) &&
 		c.localLines[c.uploadQ.lineIdx].conv == conv {
 		c.localLines[c.uploadQ.lineIdx] = line
@@ -304,8 +308,26 @@ func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 		conv = generalConv
 	}
 	if msg.err == nil {
-		c.paintUploadLine(tuiSystemStyle.Render(
-			fmt.Sprintf("* you shared %s (%s)", msg.display, humanSize(msg.size))), conv)
+		// Replace progress line with a styled file attachment card.
+		ts := time.Now().Format("15:04")
+		card := localLine{
+			conv: conv,
+			kind: lineFileCard,
+			fileData: &fileCardData{
+				filename: msg.display,
+				username: c.me,
+				size:     humanSize(msg.size),
+				time:     ts,
+			},
+		}
+		if c.uploadQ.lineIdx >= 0 && c.uploadQ.lineIdx < len(c.localLines) &&
+			c.localLines[c.uploadQ.lineIdx].conv == conv {
+			c.localLines[c.uploadQ.lineIdx] = card
+		} else {
+			c.localLines = append(c.localLines, card)
+			c.uploadQ.lineIdx = len(c.localLines) - 1
+		}
+		c.rebuildView()
 	} else {
 		c.paintUploadLine(tuiErrStyle.Render(
 			fmt.Sprintf("✗ upload failed: %s (%v)", msg.display, msg.err)), conv)

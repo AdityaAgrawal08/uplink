@@ -232,8 +232,8 @@ func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	if len(sc.picker.buffered) != 1 {
 		t.Fatalf("Enter should buffer the file; got %d buffered", len(sc.picker.buffered))
 	}
-	// Ctrl+D triggers the upload pipeline.
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlD})
+	// Ctrl+Enter triggers the upload pipeline.
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlJ})
 	// Drain the batched cmds until the done message lands.
 	msgs := drainCmds(cmd)
 	var done *uploadDoneMsg
@@ -262,12 +262,12 @@ func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	// Success annotates the transcript in the room bucket.
 	found := false
 	for _, ll := range sc.localLines {
-		if strings.Contains(ll.text, "you shared payload.bin") {
+		if ll.kind == lineFileCard && ll.fileData != nil && ll.fileData.filename == "payload.bin" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("missing success line: %v", sc.localLines)
+		t.Fatalf("missing success card: %v", sc.localLines)
 	}
 }
 
@@ -352,10 +352,14 @@ func TestApplyRoomFilesAnnounces(t *testing.T) {
 	c.applyRoomFiles(files)
 	var lines []string
 	for _, ll := range c.localLines {
-		lines = append(lines, ll.text)
+		if ll.kind == lineFileCard && ll.fileData != nil {
+			lines = append(lines, ll.fileData.filename)
+		} else {
+			lines = append(lines, ll.text)
+		}
 	}
 	joined := strings.Join(lines, "|")
-	if !strings.Contains(joined, "alice shared report.pdf (2.3 MB)") {
+	if !strings.Contains(joined, "report.pdf") {
 		t.Fatalf("missing alice announcement: %v", lines)
 	}
 	if strings.Contains(joined, "mine.zip") || strings.Contains(joined, "again.pdf") {
@@ -551,11 +555,11 @@ func TestFilesDrawerBufferedMultiDownload(t *testing.T) {
 		{FileId: "id2", Filename: "two.txt", Size: 12, Status: "UPLOADED"},
 	})
 
-	// Buffer both rows via space, then ^D.
+	// Buffer both rows via space, then ^⏎ (Ctrl+Enter).
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyDown})
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlD})
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlJ})
 	sc = pump(sc, cmd)
 	for name, id := range map[string]string{"one.txt": "id1", "two.txt": "id2"} {
 		data, err := os.ReadFile(filepath.Join(tmpHome, "Downloads", name))
