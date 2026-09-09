@@ -131,6 +131,14 @@ func main() {
 		handleSend(os.Args[2:])
 	case "receive":
 		handleReceive(os.Args[2:])
+	case "create":
+		if len(os.Args) < 3 || os.Args[2] != "session" {
+			fmt.Println("✗ Unknown command. Did you mean: uplink create session ?")
+			os.Exit(1)
+		}
+		cmdCreateSession(os.Args[3:], cfg)
+	case "join":
+		cmdJoinChat(os.Args[2:], cfg)
 	case "config":
 		handleConfig(os.Args[2:])
 	case "version":
