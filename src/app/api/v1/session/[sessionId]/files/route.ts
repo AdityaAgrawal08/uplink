@@ -34,22 +34,13 @@ export async function GET(
       baseQuery.to = conv;
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let files: any[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let participants: any[] = [];
     if (since) {
       const sinceDate = new Date(since);
       if (!isNaN(sinceDate.getTime())) {
-        // New uploads + recently deleted (last 2 min) tombstones for already-seen seqs
-        const sinceQuery = {
-          ...baseQuery,
-          $or: [
-            { uploadedAt: { $gt: sinceDate } },
-            { status: "DELETED", deletedAt: { $gt: sinceDate } },
-          ],
-        };
-        // Need to handle conv $or merging: baseQuery already has $or for general, so merge correctly
-        // For general conv, baseQuery.$or is for to field, need to combine with uploadedAt/deletedAt $or
-        // Simplify: fetch both and merge
         const [newFiles, deletedFiles, parts] = await Promise.all([
           db.collection("session_files").find({ ...baseQuery, uploadedAt: { $gt: sinceDate } }).sort({ uploadedAt: 1 }).toArray(),
           db.collection("session_files").find({ ...baseQuery, status: "DELETED", deletedAt: { $gt: sinceDate } }).sort({ uploadedAt: 1 }).toArray(),
@@ -57,6 +48,7 @@ export async function GET(
         ]);
         // Merge and dedupe by fileId
         const seen = new Set<string>();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         files = [...newFiles, ...deletedFiles].filter((f: any) => {
           if (seen.has(f.fileId)) return false;
           seen.add(f.fileId);
@@ -77,6 +69,7 @@ export async function GET(
     }
 
     return NextResponse.json({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       files: files.map((f: any) => ({
         fileId: f.fileId,
         shareId: f.shareId,
@@ -90,6 +83,7 @@ export async function GET(
         deletedAt: f.deletedAt ? (f.deletedAt as Date).toISOString() : undefined,
         deletedBy: f.deletedBy || undefined,
       })),
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       participants: participants.map((p: any) => ({
         username: p.username,
         peerId: p.peerId || null,
