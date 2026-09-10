@@ -26,28 +26,58 @@ export async function GET(
     //    conv="general" → public files only (to is empty/absent)
     //    conv="a|b" → private thread files where to matches the pair key
     //    conv omitted → all files (backward compat)
-    const fileQuery: Record<string, unknown> = { sessionId };
+    //    For deleted tombstones, also return files where deletedAt > since
+    const baseQuery: Record<string, unknown> = { sessionId };
+    if (conv === "general") {
+      baseQuery.$or = [{ to: { $exists: false } }, { to: "" }];
+    } else if (conv && conv.includes("|")) {
+      baseQuery.to = conv;
+    }
+
+    let files: any[] = [];
+    let participants: any[] = [];
     if (since) {
       const sinceDate = new Date(since);
       if (!isNaN(sinceDate.getTime())) {
-        fileQuery.uploadedAt = { $gt: sinceDate };
+        // New uploads + recently deleted (last 2 min) tombstones for already-seen seqs
+        const sinceQuery = {
+          ...baseQuery,
+          $or: [
+            { uploadedAt: { $gt: sinceDate } },
+            { status: "DELETED", deletedAt: { $gt: sinceDate } },
+          ],
+        };
+        // Need to handle conv $or merging: baseQuery already has $or for general, so merge correctly
+        // For general conv, baseQuery.$or is for to field, need to combine with uploadedAt/deletedAt $or
+        // Simplify: fetch both and merge
+        const [newFiles, deletedFiles, parts] = await Promise.all([
+          db.collection("session_files").find({ ...baseQuery, uploadedAt: { $gt: sinceDate } }).sort({ uploadedAt: 1 }).toArray(),
+          db.collection("session_files").find({ ...baseQuery, status: "DELETED", deletedAt: { $gt: sinceDate } }).sort({ uploadedAt: 1 }).toArray(),
+          db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, peerId: 1, addrs: 1 }).toArray(),
+        ]);
+        // Merge and dedupe by fileId
+        const seen = new Set<string>();
+        files = [...newFiles, ...deletedFiles].filter((f: any) => {
+          if (seen.has(f.fileId)) return false;
+          seen.add(f.fileId);
+          return true;
+        });
+        participants = parts;
+      } else {
+        [files, participants] = await Promise.all([
+          db.collection("session_files").find(baseQuery).sort({ uploadedAt: 1 }).toArray(),
+          db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, peerId: 1, addrs: 1 }).toArray(),
+        ]);
       }
+    } else {
+      [files, participants] = await Promise.all([
+        db.collection("session_files").find(baseQuery).sort({ uploadedAt: 1 }).toArray(),
+        db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, peerId: 1, addrs: 1 }).toArray(),
+      ]);
     }
-    if (conv === "general") {
-      // Public files: no `to` field, or `to` is empty
-      fileQuery.$or = [{ to: { $exists: false } }, { to: "" }];
-    } else if (conv && conv.includes("|")) {
-      // Private thread: files addressed to this pair
-      fileQuery.to = conv;
-    }
-
-    const [files, participants] = await Promise.all([
-      db.collection("session_files").find(fileQuery).sort({ uploadedAt: 1 }).toArray(),
-      db.collection("session_participants").find({ sessionId, status: "ACTIVE" }).project({ username: 1, peerId: 1, addrs: 1 }).toArray(),
-    ]);
 
     return NextResponse.json({
-      files: files.map((f) => ({
+      files: files.map((f: any) => ({
         fileId: f.fileId,
         shareId: f.shareId,
         filename: f.filename,
@@ -57,8 +87,10 @@ export async function GET(
         uploadedAt: f.uploadedAt.toISOString(),
         status: f.status,
         to: (typeof f.to === "string" && f.to) || "",
+        deletedAt: f.deletedAt ? (f.deletedAt as Date).toISOString() : undefined,
+        deletedBy: f.deletedBy || undefined,
       })),
-      participants: participants.map((p) => ({
+      participants: participants.map((p: any) => ({
         username: p.username,
         peerId: p.peerId || null,
         addrs: p.addrs || [],

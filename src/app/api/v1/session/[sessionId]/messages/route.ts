@@ -188,19 +188,61 @@ export async function GET(
         .limit(POLL_LIMIT)
         .toArray() as unknown as Promise<ChatDoc[]>;
 
+    const queryDeleted = () => {
+      if (afterSeq === null) return Promise.resolve([] as unknown as ChatDoc[]);
+      // Recently deleted (last 2 minutes) tombstones for already-seen seqs
+      const since = new Date(Date.now() - 2 * 60 * 1000);
+      return db
+        .collection("session_messages")
+        .find({ ...baseFilter(), status: "DELETED", deletedAt: { $gt: since } })
+        .sort({ seq: 1 })
+        .limit(20)
+        .toArray() as unknown as Promise<ChatDoc[]>;
+    };
+
     if (afterSeq !== null) {
       // cleanup after response, not before
       after(() => maybeCleanup());
       let docs = await queryNew();
+      let deletedDocs: ChatDoc[] = [];
+      // Also check for recently deleted tombstones for already-seen seqs
+      try {
+        deletedDocs = await queryDeleted();
+      } catch {}
+      let merged = [...docs, ...deletedDocs].sort((a, b) => a.seq - b.seq);
+      // Dedupe by seq
+      const seen = new Set<number>();
+      merged = merged.filter((m) => {
+        if (seen.has(m.seq)) return false;
+        seen.add(m.seq);
+        return true;
+      });
       for (;;) {
-        if (docs.length > 0 || Date.now() >= deadline) break;
+        if (merged.length > 0 || Date.now() >= deadline) break;
         await new Promise((r) => setTimeout(r, 50));
         const fresh = (await db
           .collection("sessions")
           .findOne({ sessionId }, { projection: { status: 1, expiresAt: 1 } })) as unknown as SessionAliveDoc | null;
         if (!isSessionAlive(fresh)) break;
         docs = await queryNew();
+        try {
+          deletedDocs = await queryDeleted();
+        } catch {
+          deletedDocs = [];
+        }
+        merged = [...docs, ...deletedDocs].sort((a, b) => a.seq - b.seq);
+        const seen2 = new Set<number>();
+        merged = merged.filter((m) => {
+          if (seen2.has(m.seq)) return false;
+          seen2.add(m.seq);
+          return true;
+        });
+        if (merged.length > 0) {
+          docs = merged;
+          break;
+        }
       }
+      if (merged.length > 0) docs = merged;
       const roster = await db
         .collection("session_participants")
         .find({ sessionId, status: "ACTIVE" })

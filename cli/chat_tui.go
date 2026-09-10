@@ -670,6 +670,16 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 // addMessage records a confirmed server message and refreshes the view.
 func (c *chatScreen) addMessage(m chatMessage) {
 	if c.rendered[m.Seq] {
+		// If this is a tombstone update for an already-rendered seq, patch it
+		if m.Status == "DELETED" {
+			for i, h := range c.history {
+				if h.Seq == m.Seq {
+					c.history[i] = m
+					c.rebuildView()
+					return
+				}
+			}
+		}
 		return
 	}
 	c.rendered[m.Seq] = true
@@ -1502,11 +1512,21 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != "" {
 			c.picker.notice = msg.err
 		} else {
-			// Remove deleted entry from picker lists
+			now := time.Now().Format(time.RFC3339)
+			// Remove from picker and immediately show tombstone locally
 			if msg.kind == "msg" {
 				for i, m := range c.picker.deleteMsgs {
 					if m.Seq == msg.seq {
 						c.picker.deleteMsgs = append(c.picker.deleteMsgs[:i], c.picker.deleteMsgs[i+1:]...)
+						break
+					}
+				}
+				for i, h := range c.history {
+					if h.Seq == msg.seq {
+						c.history[i].Status = "DELETED"
+						c.history[i].DeletedAt = now
+						c.history[i].DeletedBy = c.me
+						c.history[i].Text = ""
 						break
 					}
 				}
@@ -1517,6 +1537,16 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						break
 					}
 				}
+				for i, ll := range c.localLines {
+					if ll.kind == lineFileCard && ll.fileData != nil && ll.fileData.fileId == msg.fileId {
+						c.localLines[i].fileData.deleted = true
+						c.localLines[i].fileData.deletedAt = now
+						if t, err := time.Parse(time.RFC3339, now); err == nil {
+							c.localLines[i].fileData.time = t.Local().Format("15:04")
+						}
+						break
+					}
+				}
 			}
 			if len(c.picker.deleteMsgs) == 0 && len(c.picker.deleteFiles) == 0 {
 				c.picker.notice = "no deletable items"
@@ -1524,7 +1554,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				c.picker.notice = msg.ok
 			}
 			c.picker.clampCursor()
-			// Trigger a poll to get tombstone
+			c.rebuildView()
+			// Also poll to propagate to other users
 			cmds = append(cmds, c.doPoll())
 			cmds = append(cmds, c.doFetchFiles())
 		}
