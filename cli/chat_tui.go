@@ -1495,6 +1495,40 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		c.applyFilesList(msg.files)
 
+	case deleteListMsg:
+		c.applyDeleteList(msg)
+
+	case deleteDoneMsg:
+		if msg.err != "" {
+			c.picker.notice = msg.err
+		} else {
+			// Remove deleted entry from picker lists
+			if msg.kind == "msg" {
+				for i, m := range c.picker.deleteMsgs {
+					if m.Seq == msg.seq {
+						c.picker.deleteMsgs = append(c.picker.deleteMsgs[:i], c.picker.deleteMsgs[i+1:]...)
+						break
+					}
+				}
+			} else {
+				for i, f := range c.picker.deleteFiles {
+					if f.FileId == msg.fileId {
+						c.picker.deleteFiles = append(c.picker.deleteFiles[:i], c.picker.deleteFiles[i+1:]...)
+						break
+					}
+				}
+			}
+			if len(c.picker.deleteMsgs) == 0 && len(c.picker.deleteFiles) == 0 {
+				c.picker.notice = "no deletable items"
+			} else {
+				c.picker.notice = msg.ok
+			}
+			c.picker.clampCursor()
+			// Trigger a poll to get tombstone
+			cmds = append(cmds, c.doPoll())
+			cmds = append(cmds, c.doFetchFiles())
+		}
+
 	case dlProgressMsg:
 		if c.dlQ.active && msg.total > 0 {
 			c.paintDlLine(tuiDownloadRunStyle.Render(

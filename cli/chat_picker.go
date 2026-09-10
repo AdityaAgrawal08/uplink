@@ -149,26 +149,37 @@ type deleteListMsg struct {
 	err   string
 }
 
+type deleteDoneMsg struct {
+	kind   string // "msg" or "file"
+	seq    int
+	fileId string
+	ok     string
+	err    string
+}
+
 // openDeletePicker shows own messages/files for deletion, 2 sections latest-first.
 func (c *chatScreen) openDeletePicker() tea.Cmd {
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
-	c.picker = pickerState{
-		active:   true,
-		mode:     modeDelete,
-		home:     ".",
-		anchor:   -1,
-		inBuf:    map[string]bool{},
-		notice:   "loading…",
-		loading:  true,
-		cursor:   0,
-		offset:   0,
-	}
-	// Build from current history immediately (own msgs), then fetch files
 	msgs := c.ownMessagesForDelete()
-	c.picker.deleteMsgs = msgs
-	// Kick async files fetch
+	c.picker = pickerState{
+		active:      true,
+		mode:        modeDelete,
+		home:        ".",
+		anchor:      -1,
+		inBuf:       map[string]bool{},
+		notice:      "loading files…",
+		loading:     true,
+		cursor:      0,
+		offset:      0,
+		deleteMsgs:  msgs,
+		deleteFiles: nil,
+	}
+	if len(msgs) == 0 {
+		c.picker.notice = "loading files…"
+	}
+	// Kick async files fetch (non-blocking for messages)
 	client := c.client
 	conv := c.activeConv()
 	return func() tea.Msg {
@@ -234,6 +245,33 @@ func (c *chatScreen) applyDeleteList(msg deleteListMsg) {
 		c.picker.notice = "no deletable items"
 	}
 	c.picker.clampCursor()
+}
+
+func (c *chatScreen) doDeleteAtCursor() tea.Cmd {
+	return func() tea.Msg {
+		p := &c.picker
+		if !p.isActive() || p.mode != modeDelete {
+			return deleteDoneMsg{err: "not in delete mode"}
+		}
+		total := len(p.deleteMsgs) + len(p.deleteFiles)
+		if p.cursor < 0 || p.cursor >= total {
+			return deleteDoneMsg{err: "nothing selected"}
+		}
+		if p.cursor < len(p.deleteMsgs) {
+			m := p.deleteMsgs[p.cursor]
+			err := c.client.deleteMessage(m.Seq)
+			if err != nil {
+				return deleteDoneMsg{err: err.Error()}
+			}
+			return deleteDoneMsg{kind: "msg", seq: m.Seq, ok: "deleted message"}
+		}
+		f := p.deleteFiles[p.cursor-len(p.deleteMsgs)]
+		err := c.client.deleteFile(f.FileId)
+		if err != nil {
+			return deleteDoneMsg{err: err.Error()}
+		}
+		return deleteDoneMsg{kind: "file", fileId: f.FileId, ok: "deleted file"}
+	}
 }
 
 // applyFilesList fills the drawer's listing; non-UPLOADED files never show.
@@ -419,6 +457,9 @@ func (p *pickerState) rowCount() int {
 	if p.mode == modeDetail {
 		return 0
 	}
+	if p.mode == modeDelete {
+		return len(p.deleteMsgs) + len(p.deleteFiles)
+	}
 	if p.mode == modeBuffer {
 		return len(p.buffered)
 	}
@@ -435,6 +476,22 @@ func (p *pickerState) rowCount() int {
 // entryAt maps a row index onto its target. key is the buffer identity:
 // absolute path (browse) or fileId (files). ok=false for the ".." row.
 func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) {
+	if p.mode == modeDelete {
+		total := len(p.deleteMsgs) + len(p.deleteFiles)
+		if row < 0 || row >= total {
+			return pickerEntry{}, "", false
+		}
+		if row < len(p.deleteMsgs) {
+			m := p.deleteMsgs[row]
+			preview := m.Text
+			if len(preview) > 28 {
+				preview = preview[:28] + "…"
+			}
+			return pickerEntry{name: preview, size: int64(m.Seq)}, fmt.Sprintf("msg:%d", m.Seq), true
+		}
+		f := p.deleteFiles[row-len(p.deleteMsgs)]
+		return pickerEntry{name: f.Filename, size: f.Size}, f.FileId, true
+	}
 	if p.mode == modeBuffer {
 		if row < 0 || row >= len(p.buffered) {
 			return pickerEntry{}, "", false
@@ -667,6 +724,25 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		return true, nil
 	}
 
+	// Delete mode: navigate own messages/files, Ctrl+D deletes for all.
+	if p.mode == modeDelete {
+		switch msg.Type {
+		case tea.KeyUp:
+			p.moveTo(p.cursor-1, false)
+			return true, nil
+		case tea.KeyDown:
+			p.moveTo(p.cursor+1, false)
+			return true, nil
+		case tea.KeyCtrlD:
+			return true, c.doDeleteAtCursor
+		case tea.KeyEsc:
+			restore := composerPlaceholder
+			c.closePicker(restore)
+			return true, nil
+		}
+		return true, nil
+	}
+
 	// Filter mode: capture keystrokes for the filter query.
 	if p.filtering {
 		switch {
@@ -868,6 +944,9 @@ func (c chatScreen) pickerView(maxW int) string {
 	if p.mode == modeBuffer {
 		return c.pickerBufferView(maxW, inner, pad)
 	}
+	if p.mode == modeDelete {
+		return c.pickerDeleteView(maxW, inner, pad)
+	}
 
 	var body []string
 	crumb := breadcrumb(p.cwd, p.home)
@@ -1024,6 +1103,87 @@ func (c chatScreen) pickerBufferView(maxW, inner int, pad func(string) string) s
 	body = append(body, tuiPaletteHintStyle.Render(
 		pad("↑↓ move · ctrl+d remove · ^⏎ send all · esc back")))
 
+	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
+	if lipgloss.Width(panel) > maxW {
+		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
+	}
+	return panel
+}
+
+func (c chatScreen) pickerDeleteView(maxW, inner int, pad func(string) string) string {
+	p := c.picker
+	var body []string
+	total := len(p.deleteMsgs) + len(p.deleteFiles)
+	body = append(body, tuiPickerCrumbStyle.Render(pad(fmt.Sprintf("delete — %d item%s", total, plural(total)))))
+	body = append(body, "")
+	if p.loading {
+		body = append(body, tuiPaletteHintStyle.Render(pad("· loading…")))
+	} else if p.notice != "" {
+		style := tuiDimStyle
+		if total == 0 {
+			style = tuiDimStyle
+		}
+		body = append(body, style.Render(pad("· "+p.notice)))
+	}
+	// Section: Messages
+	body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("— Messages — %d —", len(p.deleteMsgs)))))
+	if len(p.deleteMsgs) == 0 && !p.loading {
+		body = append(body, tuiDimStyle.Render(pad("  (none)")))
+	} else if len(p.deleteMsgs) == 0 && p.loading {
+		body = append(body, tuiDimStyle.Render(pad("  (loading…)")))
+	} else {
+		// Find visible window that includes cursor if in messages section
+		// For simplicity, use p.offset/cursor over combined list, but render per section
+		for i, m := range p.deleteMsgs {
+			row := i
+			// Determine if this row is visible
+			if row < p.offset || row >= p.offset+pickerMaxVisible {
+				continue
+			}
+			ts := ""
+			if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+				ts = t.Local().Format("15:04")
+			}
+			preview := m.Text
+			if len(preview) > 28 {
+				preview = preview[:28] + "…"
+			}
+			line := fmt.Sprintf("  %s %s", tuiPaletteMatchStyle.Render(preview), tuiDimStyle.Render(ts))
+			if row == p.cursor {
+				body = append(body, tuiPaletteSelStyle.Render(pad(line)))
+			} else {
+				body = append(body, pad(line))
+			}
+		}
+	}
+	// Section: Files
+	body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("— Files — %d —", len(p.deleteFiles)))))
+	if len(p.deleteFiles) == 0 && p.loading {
+		body = append(body, tuiDimStyle.Render(pad("  (loading…)")))
+	} else if len(p.deleteFiles) == 0 {
+		body = append(body, tuiDimStyle.Render(pad("  (none)")))
+	} else {
+		for i, f := range p.deleteFiles {
+			row := len(p.deleteMsgs) + i
+			if row < p.offset || row >= p.offset+pickerMaxVisible {
+				continue
+			}
+			ts := ""
+			if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
+				ts = t.Local().Format("15:04")
+			}
+			line := fmt.Sprintf("  %s %s", tuiPaletteMatchStyle.Render(f.Filename), tuiDimStyle.Render(ts))
+			if row == p.cursor {
+				body = append(body, tuiPaletteSelStyle.Render(pad(line)))
+			} else {
+				body = append(body, pad(line))
+			}
+		}
+	}
+	if more := p.rowCount() - p.offset - pickerMaxVisible; more > 0 {
+		body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("… +%d more", more))))
+	}
+	body = append(body, tuiPaletteHintStyle.Render(pad("↑↓ move · ctrl+d delete · esc close")))
 	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
 	if lipgloss.Width(panel) > maxW {
 		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)

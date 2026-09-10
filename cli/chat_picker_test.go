@@ -325,7 +325,7 @@ func TestUploadLocalGuards(t *testing.T) {
 	job := uploadJob{Path: big}
 	prog := make(chan uploadProgressMsg, 8) // left open; sends are select-defaulted
 	client := newChatClient(srv.URL, "123456", "bob")
-	if _, _, err := runSessionUpload(context.Background(), client, "bob", job, prog); err == nil {
+	if _, _, _, err := runSessionUpload(context.Background(), client, "bob", job, prog); err == nil {
 		t.Fatal("oversize upload must fail locally")
 	}
 	if hitServer {
@@ -334,7 +334,7 @@ func TestUploadLocalGuards(t *testing.T) {
 
 	empty := filepath.Join(t.TempDir(), "empty.txt")
 	os.WriteFile(empty, nil, 0o644)
-	if _, _, err := runSessionUpload(context.Background(), client, "bob", uploadJob{Path: empty}, prog); err == nil {
+	if _, _, _, err := runSessionUpload(context.Background(), client, "bob", uploadJob{Path: empty}, prog); err == nil {
 		t.Fatal("empty upload must fail locally")
 	}
 }
@@ -437,7 +437,7 @@ func newFilesDrawer(t *testing.T, files []sessionFile) chatScreen {
 // The /download listing shows only UPLOADED files, most recent first.
 func TestFilesDrawerSortsRecentFirst(t *testing.T) {
 	c := newPaletteScreen()
-	c, _ = typeKeys(c, "/d")
+	c, _ = typeKeys(c, "/download")
 	got, _ := step(c, tea.KeyMsg{Type: tea.KeyEnter})
 	if !got.picker.isActive() || got.picker.mode != modeFiles {
 		t.Fatal("/download must open the files drawer")
