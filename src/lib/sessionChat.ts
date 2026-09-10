@@ -76,6 +76,7 @@ export async function appendMessage(
     text,
     convId: to ? conversationKey(username, to) : GENERAL_CONV,
     createdAt: new Date(),
+    status: "ACTIVE",
   };
   if (to) doc.to = to;
   await db.collection("session_messages").insertOne(doc);
@@ -98,6 +99,9 @@ export interface ChatMessageDTO {
   createdAt: string;
   to?: string;
   convId: string;
+  status?: string;
+  deletedAt?: string;
+  deletedBy?: string;
 }
 
 export interface ChatDoc {
@@ -108,6 +112,9 @@ export interface ChatDoc {
   createdAt: Date;
   to?: string;
   convId?: string;
+  status?: string;
+  deletedAt?: Date;
+  deletedBy?: string;
 }
 
 export interface SessionAliveDoc {
@@ -123,6 +130,9 @@ export function toMessageDTO(m: {
   createdAt: Date;
   to?: string;
   convId?: string;
+  status?: string;
+  deletedAt?: Date;
+  deletedBy?: string;
 }): ChatMessageDTO {
   // Legacy docs (pre-convId) derive their bucket from `to`.
   const dto: ChatMessageDTO = {
@@ -134,5 +144,8 @@ export function toMessageDTO(m: {
     convId: resolveConvId(m),
   };
   if (m.to) dto.to = m.to;
+  if (m.status) (dto as any).status = m.status;
+  if (m.deletedAt) (dto as any).deletedAt = m.deletedAt.toISOString();
+  if (m.deletedBy) (dto as any).deletedBy = m.deletedBy;
   return dto;
 }

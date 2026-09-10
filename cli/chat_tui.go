@@ -435,11 +435,14 @@ const (
 
 // fileCardData holds metadata for rendering a file attachment card.
 type fileCardData struct {
+	fileId    string
 	filename  string
 	username  string
 	size      string // pre-formatted human size
 	time      string // formatted timestamp "15:04"
 	createdAt string // RFC3339 for chronological interleaving
+	deleted bool
+	deletedAt string // RFC3339
 }
 
 // localLine is a UI-generated transcript row scoped to one conversation so
@@ -542,6 +545,60 @@ func (c *chatScreen) shouldRender(m chatMessage) bool {
 }
 
 func (c *chatScreen) renderLine(m chatMessage) string {
+	// Deleted tombstone: show placeholder with deletedAt timestamp
+	if m.Status == "DELETED" {
+		delTsPlain := "--:--"
+		if m.DeletedAt != "" {
+			if t, err := time.Parse(time.RFC3339, m.DeletedAt); err == nil {
+				delTsPlain = t.Local().Format("15:04")
+			}
+		} else if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+			delTsPlain = t.Local().Format("15:04")
+		}
+		delTs := tuiBubbleTimeStyle.Render(delTsPlain)
+		isOwnDel := m.Username == c.me
+		var innerPlain string
+		if isOwnDel {
+			innerPlain = tuiDimStyle.Render("⊘ You deleted this message")
+		} else {
+			nameLine := tuiNameStyle.Render(m.Username)
+			innerPlain = nameLine + "\n" + tuiDimStyle.Render("⊘ This message was deleted")
+		}
+		availWidth := c.vp.Width
+		if availWidth <= 0 {
+			availWidth = 60
+		}
+		maxBubbleW := int(float64(availWidth) * 0.62)
+		if maxBubbleW < 22 {
+			maxBubbleW = 22
+		}
+		if maxBubbleW > availWidth-2 {
+			maxBubbleW = availWidth - 2
+		}
+		needed := lipgloss.Width(innerPlain) + lipgloss.Width(delTsPlain) + 6
+		if needed < 14 {
+			needed = 14
+		}
+		bubbleW := needed
+		if bubbleW > maxBubbleW {
+			bubbleW = maxBubbleW
+		}
+		bubbleInner := innerPlain + "  " + delTs
+		if lipgloss.Width(innerPlain) > maxBubbleW-10 {
+			bubbleInner = innerPlain + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(delTsPlain)-4)) + delTs
+		}
+		var style lipgloss.Style
+		if isOwnDel {
+			style = tuiOwnBubbleStyle
+		} else {
+			style = tuiOtherBubbleStyle
+		}
+		bubble := style.Width(bubbleW).Render(bubbleInner)
+		if isOwnDel {
+			return lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
+		}
+		return bubble
+	}
 	// Timestamp - used for system lines and as bubble timestamp
 	tsPlain := "--:--"
 	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
@@ -656,7 +713,7 @@ func (c *chatScreen) appendLocal(conv, text string) {
 }
 
 // appendLocalFileCard adds a styled file attachment card to the transcript.
-func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, timestamp string) {
+func (c *chatScreen) appendLocalFileCard(conv, fileId, filename, username, sizeStr, timestamp string) {
 	// Derive RFC3339 for interleaving; caller passes local "15:04" so we
 	// synthesize a full timestamp from now if not already RFC3339.
 	rfc := ""
@@ -676,6 +733,7 @@ func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, time
 		conv: conv,
 		kind: lineFileCard,
 		fileData: &fileCardData{
+			fileId:    fileId,
 			filename:  filename,
 			username:  username,
 			size:      sizeStr,
@@ -688,7 +746,7 @@ func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, time
 
 // appendLocalFileCardWithRFC3339 is like appendLocalFileCard but accepts an
 // explicit RFC3339 timestamp (used for server-sourced file announcements).
-func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, filename, username, sizeStr, rfc3339 string) {
+func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, fileId, filename, username, sizeStr, rfc3339 string) {
 	ts := ""
 	if t, err := time.Parse(time.RFC3339, rfc3339); err == nil {
 		ts = t.Local().Format("15:04")
@@ -697,6 +755,7 @@ func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, filename, username, si
 		conv: conv,
 		kind: lineFileCard,
 		fileData: &fileCardData{
+			fileId:    fileId,
 			filename:  filename,
 			username:  username,
 			size:      sizeStr,
@@ -773,9 +832,58 @@ func (c *chatScreen) rebuildView() {
 		cardBeforeHist := hasCard && hasHist && !histTime.IsZero() && cards[ci].t.Before(histTime)
 		if hasCard && (!hasHist || cardBeforeHist) {
 			fd := cards[ci].ll.fileData
-			card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
-			if fd.username == c.me {
-				card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
+			var card string
+			if fd.deleted {
+				// Deleted file tombstone
+				delTsPlain := fd.time
+				if fd.deletedAt != "" {
+					if t, err := time.Parse(time.RFC3339, fd.deletedAt); err == nil {
+						delTsPlain = t.Local().Format("15:04")
+					}
+				}
+				delTs := tuiBubbleTimeStyle.Render(delTsPlain)
+				isOwnDel := fd.username == c.me
+				var innerPlain string
+				if isOwnDel {
+					innerPlain = tuiDimStyle.Render("⊘ You deleted this file")
+				} else {
+					innerPlain = tuiDimStyle.Render("⊘ This file was deleted")
+				}
+				availWidth := c.vp.Width
+				if availWidth <= 0 {
+					availWidth = 60
+				}
+				maxBubbleW := int(float64(availWidth) * 0.62)
+				if maxBubbleW < 22 {
+					maxBubbleW = 22
+				}
+				if maxBubbleW > availWidth-2 {
+					maxBubbleW = availWidth - 2
+				}
+				needed := lipgloss.Width(innerPlain) + lipgloss.Width(delTsPlain) + 6
+				if needed < 14 {
+					needed = 14
+				}
+				bubbleW := needed
+				if bubbleW > maxBubbleW {
+					bubbleW = maxBubbleW
+				}
+				bubbleInner := innerPlain + "  " + delTs
+				var style lipgloss.Style
+				if isOwnDel {
+					style = tuiOwnBubbleStyle
+				} else {
+					style = tuiOtherBubbleStyle
+				}
+				card = style.Width(bubbleW).Render(bubbleInner)
+				if isOwnDel {
+					card = lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(card)
+				}
+			} else {
+				card = fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
+				if fd.username == c.me {
+					card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
+				}
 			}
 			c.lines = append(c.lines, card)
 			ci++

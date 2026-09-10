@@ -74,6 +74,7 @@ type uploadProgressMsg struct {
 type uploadDrainMsg struct{}
 
 type uploadDoneMsg struct {
+	fileId  string
 	display string
 	size    int64
 	err     error
@@ -125,8 +126,8 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 
 	run := func() tea.Msg {
 		defer close(progCh)
-		disp, size, err := runSessionUpload(ctx, client, me, job, progCh)
-		return uploadDoneMsg{display: disp, size: size, err: err}
+		disp, size, fid, err := runSessionUpload(ctx, client, me, job, progCh)
+		return uploadDoneMsg{fileId: fid, display: disp, size: size, err: err}
 	}
 
 	return tea.Batch(
@@ -249,11 +250,76 @@ func (c *chatScreen) doFetchAllFiles() tea.Cmd {
 	}
 }
 
-// applyRoomFiles paints unseen UPLOADED files as system announcements.
+// applyRoomFiles paints unseen UPLOADED files and tombstones for DELETED.
 func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 	for _, f := range files {
-		if f.Status != "UPLOADED" {
+		if f.Status != "UPLOADED" && f.Status != "DELETED" {
 			continue // ANNOUNCED/FAILED never announce
+		}
+		// For DELETED, update existing card to tombstone or create new one
+		if f.Status == "DELETED" {
+			// Update lastFilesAt using DeletedAt if newer
+			if f.DeletedAt != "" && f.DeletedAt > c.lastFilesAt {
+				c.lastFilesAt = f.DeletedAt
+			} else if f.UploadedAt > c.lastFilesAt {
+				c.lastFilesAt = f.UploadedAt
+			}
+			// Find existing card for this fileId
+			found := -1
+			for i, ll := range c.localLines {
+				if ll.kind == lineFileCard && ll.fileData != nil && ll.fileData.fileId == f.FileId {
+					found = i
+					break
+				}
+			}
+			if found >= 0 {
+				// Mark existing card as deleted
+				c.localLines[found].fileData.deleted = true
+				if f.DeletedAt != "" {
+					c.localLines[found].fileData.deletedAt = f.DeletedAt
+				} else {
+					c.localLines[found].fileData.deletedAt = time.Now().Format(time.RFC3339)
+				}
+				// Update time for display to deletedAt
+				if f.DeletedAt != "" {
+					if t, err := time.Parse(time.RFC3339, f.DeletedAt); err == nil {
+						c.localLines[found].fileData.time = t.Local().Format("15:04")
+					}
+				}
+				c.rebuildView()
+			} else {
+				// Never saw it before (e.g., joined after deletion) — still show tombstone at original position
+				conv := generalConv
+				if f.To != "" {
+					conv = f.To
+				}
+				// Create tombstone directly
+				delAt := f.DeletedAt
+				if delAt == "" {
+					delAt = time.Now().Format(time.RFC3339)
+				}
+				ts := ""
+				if t, err := time.Parse(time.RFC3339, delAt); err == nil {
+					ts = t.Local().Format("15:04")
+				}
+				c.localLines = append(c.localLines, localLine{
+					conv: conv,
+					kind: lineFileCard,
+					fileData: &fileCardData{
+						fileId:    f.FileId,
+						filename:  f.Filename,
+						username:  f.Username,
+						size:      humanSize(f.Size),
+						time:      ts,
+						createdAt: f.UploadedAt,
+						deleted: true,
+						deletedAt: delAt,
+					},
+				})
+				c.filesSeen[f.FileId] = true
+				c.rebuildView()
+			}
+			continue
 		}
 		if c.filesSeen[f.FileId] {
 			continue
@@ -272,10 +338,10 @@ func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 		}
 		// Use helper that preserves RFC3339 for chronological interleaving.
 		if f.UploadedAt != "" {
-			c.appendLocalFileCardWithRFC3339(conv, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)
+			c.appendLocalFileCardWithRFC3339(conv, f.FileId, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)
 		} else {
 			ts := time.Now().Format("15:04")
-			c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
+			c.appendLocalFileCard(conv, f.FileId, f.Filename, f.Username, humanSize(f.Size), ts)
 		}
 	}
 }
@@ -318,6 +384,7 @@ func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 			conv: conv,
 			kind: lineFileCard,
 			fileData: &fileCardData{
+				fileId:    msg.fileId,
 				filename:  msg.display,
 				username:  c.me,
 				size:      humanSize(msg.size),
@@ -365,13 +432,13 @@ func (c *chatScreen) cancelUploads() {
 
 // runSessionUpload executes the full announce->bytes->complete sequence for
 // one job. All failures return as errors; the caller annotates the transcript.
-func runSessionUpload(ctx context.Context, client *chatClient, me string, job uploadJob, prog chan<- uploadProgressMsg) (string, int64, error) {
+func runSessionUpload(ctx context.Context, client *chatClient, me string, job uploadJob, prog chan<- uploadProgressMsg) (string, int64, string, error) {
 	path := job.Path
 	display := filepath.Base(path)
 
 	info, err := os.Stat(path)
 	if err != nil {
-		return display, 0, fmt.Errorf("stat %s: %w", display, err)
+		return display, 0, "", fmt.Errorf("stat %s: %w", display, err)
 	}
 
 	var tmpTar string
@@ -379,47 +446,47 @@ func runSessionUpload(ctx context.Context, client *chatClient, me string, job up
 	if isDir {
 		tmpTar, err = tarballDir(path)
 		if err != nil {
-			return display, 0, fmt.Errorf("folder prep: %w", err)
+			return display, 0, "", fmt.Errorf("folder prep: %w", err)
 		}
 		defer os.Remove(tmpTar)
 		path = tmpTar
 		display = filepath.Base(path)
 		info, err = os.Stat(path)
 		if err != nil {
-			return display, 0, err
+			return display, 0, "", err
 		}
 	}
 
 	if info.Size() == 0 {
-		return display, 0, fmt.Errorf("%s is empty", display)
+		return display, 0, "", fmt.Errorf("%s is empty", display)
 	}
 	if info.Size() > uploadMaxBytes {
-		return display, 0, fmt.Errorf("%s is %s — v1 cap is %s",
+		return display, 0, "", fmt.Errorf("%s is %s — v1 cap is %s",
 			display, humanSize(info.Size()), humanSize(uploadMaxBytes))
 	}
 
 	sum, err := sha256File(ctx, path)
 	if err != nil {
-		return display, 0, fmt.Errorf("hash: %w", err)
+		return display, 0, "", fmt.Errorf("hash: %w", err)
 	}
 
 	// 1. announce within the session
 	fileId, shareId, err := client.announceFile(display, info.Size(), sum, job.To)
 	if err != nil {
-		return display, 0, fmt.Errorf("announce: %w", err)
+		return display, 0, "", fmt.Errorf("announce: %w", err)
 	}
 
 	// 2-4. bytes through the share pipeline under OUR shareId
 	err = putShareBytes(ctx, client.serverURL, path, display, info.Size(), sum, shareId, prog)
 	if err != nil {
-		return display, 0, err
+		return display, 0, fileId, err
 	}
 
 	// 5. flip session_files status to UPLOADED
 	if err := client.completeUpload(fileId, shareId); err != nil {
-		return display, 0, fmt.Errorf("complete: %w", err)
+		return display, 0, fileId, fmt.Errorf("complete: %w", err)
 	}
-	return display, info.Size(), nil
+	return display, info.Size(), fileId, nil
 }
 
 // sha256File streams the file through SHA-256 honouring cancellation.

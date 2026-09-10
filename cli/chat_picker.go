@@ -54,7 +54,7 @@ type pickerEntry struct {
 }
 
 // pickerMode selects what the drawer lists: the local file system (upload),
-// the room's shared files (download), a file detail view, or the buffer review.
+// the room's shared files (download), a file detail view, buffer review, or delete.
 type pickerMode int
 
 const (
@@ -62,6 +62,7 @@ const (
 	modeFiles
 	modeDetail    // detail window for download confirmation
 	modeBuffer    // buffer review: shows queued files, deselect with ctrl+d
+	modeDelete    // delete own messages/files, 2 sections
 )
 
 // pickerState is the browser mode of the drawer. All list math goes through
@@ -86,6 +87,10 @@ type pickerState struct {
 
 	// Detail window state (modeDetail).
 	detailFile *sessionFile // the file being inspected
+
+	// Delete mode state (modeDelete).
+	deleteMsgs  []chatMessage  // own messages, latest first
+	deleteFiles []sessionFile  // own files, latest first
 }
 
 func (p *pickerState) isActive() bool { return p.active }
@@ -137,13 +142,98 @@ func (c *chatScreen) openFilesDrawer() tea.Cmd {
 	return c.doFetchAllFiles()
 }
 
-// openDeletePicker is a stub for /delete — full implementation in next step.
+// deleteListMsg is the async result for /delete picker's data.
+type deleteListMsg struct {
+	msgs  []chatMessage
+	files []sessionFile
+	err   string
+}
+
+// openDeletePicker shows own messages/files for deletion, 2 sections latest-first.
 func (c *chatScreen) openDeletePicker() tea.Cmd {
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
-	// TODO: implement delete picker (modeDelete)
-	return nil
+	c.picker = pickerState{
+		active:   true,
+		mode:     modeDelete,
+		home:     ".",
+		anchor:   -1,
+		inBuf:    map[string]bool{},
+		notice:   "loading…",
+		loading:  true,
+		cursor:   0,
+		offset:   0,
+	}
+	// Build from current history immediately (own msgs), then fetch files
+	msgs := c.ownMessagesForDelete()
+	c.picker.deleteMsgs = msgs
+	// Kick async files fetch
+	client := c.client
+	conv := c.activeConv()
+	return func() tea.Msg {
+		files, err := client.fetchFiles("", conv)
+		if err != nil {
+			return deleteListMsg{msgs: msgs, err: err.Error()}
+		}
+		// Filter to own, not deleted, and latest first
+		var ownFiles []sessionFile
+		for _, f := range files {
+			if f.Username == c.me && f.Status == "UPLOADED" {
+				ownFiles = append(ownFiles, f)
+			}
+		}
+		sort.Slice(ownFiles, func(i, j int) bool {
+			return ownFiles[i].UploadedAt > ownFiles[j].UploadedAt
+		})
+		return deleteListMsg{msgs: msgs, files: ownFiles}
+	}
+}
+
+// ownMessagesForDelete returns own non-deleted messages in active conv, latest first.
+func (c *chatScreen) ownMessagesForDelete() []chatMessage {
+	var out []chatMessage
+	for _, m := range c.history {
+		if m.Username != c.me {
+			continue
+		}
+		if m.Status == "DELETED" {
+			continue
+		}
+		if !c.shouldRender(m) {
+			continue
+		}
+		if m.Kind == "system" {
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		// latest first: larger seq or newer CreatedAt
+		if out[i].Seq != out[j].Seq {
+			return out[i].Seq > out[j].Seq
+		}
+		return out[i].CreatedAt > out[j].CreatedAt
+	})
+	return out
+}
+
+func (c *chatScreen) applyDeleteList(msg deleteListMsg) {
+	if !c.picker.isActive() || c.picker.mode != modeDelete {
+		return
+	}
+	c.picker.loading = false
+	if msg.err != "" {
+		c.picker.notice = msg.err
+		return
+	}
+	c.picker.deleteMsgs = msg.msgs
+	c.picker.deleteFiles = msg.files
+	c.picker.notice = ""
+	if len(msg.msgs) == 0 && len(msg.files) == 0 {
+		c.picker.notice = "no deletable items"
+	}
+	c.picker.clampCursor()
 }
 
 // applyFilesList fills the drawer's listing; non-UPLOADED files never show.

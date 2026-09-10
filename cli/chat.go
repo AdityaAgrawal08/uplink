@@ -22,6 +22,9 @@ type chatMessage struct {
 	To        string `json:"to,omitempty"` // recipient of a 1:1 message
 	ConvID    string `json:"convId"`       // "general" or canonical "a|b"
 	CreatedAt string `json:"createdAt"`
+	Status    string `json:"status,omitempty"`
+	DeletedAt string `json:"deletedAt,omitempty"`
+	DeletedBy string `json:"deletedBy,omitempty"`
 }
 
 // conversationKey builds the canonical bucket id for a 1:1 thread.
@@ -55,6 +58,8 @@ type sessionFile struct {
 	Status     string `json:"status"`
 	UploadedAt string `json:"uploadedAt"`
 	To         string `json:"to"` // empty = public/general
+	DeletedAt string `json:"deletedAt,omitempty"`
+	DeletedBy string `json:"deletedBy,omitempty"`
 }
 
 type chatClient struct {
