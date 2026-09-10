@@ -21,6 +21,7 @@ export async function DELETE(
 
     const db = await getDb();
     const session = await db.collection("sessions").findOne({ sessionId });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!session || !isSessionAlive(session as any)) {
       return apiError("Session not found or has ended", 404);
     }
@@ -38,6 +39,7 @@ export async function DELETE(
     // Only sender can delete own messages, no admin override, no system messages
     if (msg.kind === "system") return apiError("Cannot delete system message", 403);
     if (msg.username !== username) return apiError("Only the sender can delete this message", 403);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if ((msg as any).status === "DELETED") return apiError("Message already deleted", 410);
 
     const now = new Date();

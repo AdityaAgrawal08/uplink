@@ -18,6 +18,7 @@ export async function DELETE(
 
     const db = await getDb();
     const session = await db.collection("sessions").findOne({ sessionId });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if (!session || !isSessionAlive(session as any)) {
       return apiError("Session not found or has ended", 404);
     }
@@ -32,6 +33,7 @@ export async function DELETE(
     const file = await db.collection("session_files").findOne({ sessionId, fileId });
     if (!file) return apiError("File not found", 404);
     if (file.username !== username) return apiError("Only the uploader can delete this file", 403);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     if ((file as any).status === "DELETED") return apiError("File already deleted", 410);
     if (file.status !== "UPLOADED") return apiError("File not in deletable state", 400);
 

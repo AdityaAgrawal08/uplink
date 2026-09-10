@@ -144,8 +144,11 @@ export function toMessageDTO(m: {
     convId: resolveConvId(m),
   };
   if (m.to) dto.to = m.to;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if (m.status) (dto as any).status = m.status;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if (m.deletedAt) (dto as any).deletedAt = m.deletedAt.toISOString();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   if (m.deletedBy) (dto as any).deletedBy = m.deletedBy;
   return dto;
 }
