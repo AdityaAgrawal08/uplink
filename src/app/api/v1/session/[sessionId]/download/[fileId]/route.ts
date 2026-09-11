@@ -12,18 +12,23 @@ export async function POST(
     const { sessionId, fileId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
 
+    // B28 FIX: Require authentication. Previously `if (username)` skipped
+    // the participant check when the header was absent, allowing anonymous
+    // download of any session file — including private ones.
+    if (!username) {
+      return apiError("X-Uplink-Username header is required", 400);
+    }
+
     const db = await getDb();
 
     // 0. Verify requester is an active session participant
-    if (username) {
-      const participant = await db.collection("session_participants").findOne({
-        sessionId,
-        username,
-        status: "ACTIVE",
-      });
-      if (!participant) {
-        return apiError("You are not an active participant in this session", 403);
-      }
+    const participant = await db.collection("session_participants").findOne({
+      sessionId,
+      username,
+      status: "ACTIVE",
+    });
+    if (!participant) {
+      return apiError("You are not an active participant in this session", 403);
     }
 
     // 1. Find file in session_files
@@ -39,7 +44,7 @@ export async function POST(
     // 1a. Private file access check: if file has a `to` field, only the
     //     sender (username) and the recipient (to) may download it.
     const fileTo = typeof sessionFile.to === "string" ? sessionFile.to : "";
-    if (fileTo && username) {
+    if (fileTo) {
       if (username !== sessionFile.username && username !== fileTo) {
         return apiError("You do not have access to this private file", 403);
       }

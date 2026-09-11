@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { apiError } from "@/lib/api-utils";
+import { GENERAL_CONV, isPairConv } from "@/lib/sessionChat";
 
 export async function GET(
   req: NextRequest,
@@ -8,6 +9,15 @@ export async function GET(
 ) {
   try {
     const { sessionId } = await props.params;
+    const username = req.headers.get("X-Uplink-Username") || "";
+    if (!username) return apiError("X-Uplink-Username header is required", 400);
+    // B28 FIX: Validate username format. It is interpolated into a $regex
+    // below; unvalidated input could inject regex metacharacters (ReDoS /
+    // unintended matches).
+    if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
+      return apiError("Invalid X-Uplink-Username", 400);
+    }
+
     const since = req.nextUrl.searchParams.get("since");
     const conv = req.nextUrl.searchParams.get("conv");
 
@@ -20,23 +30,53 @@ export async function GET(
       { $set: { status: "UPLOAD_FAILED" } }
     );
 
-    // 2. Build query — optional conversation scope filter.
-    //    conv="general" → public files only (to is empty/absent)
-    //    conv="a|b" → private thread files where to matches the pair key
-    //    conv omitted → all files (backward compat)
-    const fileQuery: Record<string, unknown> = { sessionId };
+    // 2. Build query.
+    //    B28 CRITICAL FIX: Always apply a visibility filter so a caller can
+    //    never see another user's private files. Previously, omitting `conv`
+    //    returned EVERY file in the room, leaking private threads.
+    //    Visibility: public files + files I sent privately + files sent to me.
+    //    Supports both legacy (`to` = raw username) and new (`convId`) docs.
+    const visibilityOr: Record<string, unknown>[] = [
+      { convId: GENERAL_CONV },
+      { convId: { $exists: false }, to: { $exists: false } },
+      { convId: { $exists: false }, to: "" },
+      { username },                                  // files I sent
+      { to: username },                              // legacy: files sent to me
+    ];
+    // Legacy pair-conv docs: convId == "a|b" where I am one of the two.
+    // handled below via convScope / the $expr-free approach of matching
+    // any convId containing my username as a token.
+    visibilityOr.push({ convId: { $regex: `(^|\\|)${username}(\\||$)` } });
+
+    const fileQuery: Record<string, unknown> = {
+      sessionId,
+      $or: visibilityOr,
+    };
+
     if (since) {
       const sinceDate = new Date(since);
       if (!isNaN(sinceDate.getTime())) {
         fileQuery.uploadedAt = { $gt: sinceDate };
       }
     }
-    if (conv === "general") {
-      // Public files: no `to` field, or `to` is empty
-      fileQuery.$or = [{ to: { $exists: false } }, { to: "" }];
-    } else if (conv && conv.includes("|")) {
-      // Private thread: files addressed to this pair
-      fileQuery.to = conv;
+
+    // 3. Optional conversation scope narrowing.
+    if (conv === GENERAL_CONV) {
+      // Public files only.
+      fileQuery.$and = [
+        { $or: [{ convId: GENERAL_CONV }, { convId: { $exists: false }, to: { $exists: false } }, { convId: { $exists: false }, to: "" }] },
+      ];
+      delete fileQuery.$or;
+    } else if (conv && isPairConv(conv)) {
+      const [u1, u2] = conv.split("|");
+      if (username !== u1 && username !== u2) {
+        return apiError("not a participant of this conversation", 403);
+      }
+      // Match new convId OR legacy raw `to` targeting either party.
+      delete fileQuery.$or;
+      fileQuery.$and = [
+        { $or: [{ convId: conv }, { to: u1 }, { to: u2 }] },
+      ];
     }
 
     const files = await db
@@ -45,7 +85,7 @@ export async function GET(
       .sort({ uploadedAt: 1 })
       .toArray();
 
-    // 3. Fetch active participants with P2P discovery info
+    // 4. Fetch active participants with P2P discovery info
     const participants = await db
       .collection("session_participants")
       .find({ sessionId, status: "ACTIVE" })
