@@ -18,15 +18,26 @@ export async function POST(
     const body = text ? JSON.parse(text) : {};
     const { peerId, addrs } = body;
 
+    // B30 FIX: Validate username format (it is used in queries and echoed
+    // into the roster). Also required before any DB work.
+    if (!/^[a-zA-Z0-9_]{3,20}$/.test(usernameHeader)) {
+      return apiError("Invalid X-Uplink-Username", 400);
+    }
+
     const db = await getDb();
 
-    // 1. Fetch Session to ensure it is ACTIVE
+    // 1. Fetch Session to ensure it is ACTIVE and not expired
     const session = await db.collection("sessions").findOne({ sessionId });
     if (!session) {
       return apiError("Session not found", 404);
     }
     if (session.status !== "ACTIVE") {
       return apiError("Session is not active", 410);
+    }
+    // B30 FIX: Also honor expiresAt. Previously a session past its expiry
+    // (but not yet swept by the cleanup worker) still accepted heartbeats.
+    if (session.expiresAt && new Date(session.expiresAt) <= new Date()) {
+      return apiError("Session has expired", 410);
     }
 
     const now = new Date();
@@ -48,22 +59,31 @@ export async function POST(
       updateFields.addrs = addrs;
     }
 
-    const result = await db.collection("session_participants").findOneAndUpdate(
-      { sessionId, username: usernameHeader },
+    // B30 FIX: Claim the LEFT→ACTIVE transition atomically. Only the request
+    // that actually flips the status may increment participantCount. The old
+    // code read `status` before the update and incremented afterwards, so
+    // two concurrent heartbeats could both observe LEFT and double-increment.
+    const revived = await db.collection("session_participants").findOneAndUpdate(
+      { sessionId, username: usernameHeader, status: "LEFT" },
       { $set: updateFields },
-      { returnDocument: "before" }
+      { returnDocument: "after" }
     );
 
-    if (!result) {
-      return apiError("Participant not found in session", 404);
-    }
-
-    // 3. Self-heal if uploader was marked LEFT
-    if (result.status === "LEFT") {
+    if (revived) {
+      // Exactly one caller wins this branch.
       await db.collection("sessions").updateOne(
         { sessionId },
         { $inc: { participantCount: 1 } }
       );
+    } else {
+      // Already ACTIVE (or missing) — plain heartbeat update.
+      const existing = await db.collection("session_participants").findOneAndUpdate(
+        { sessionId, username: usernameHeader },
+        { $set: updateFields }
+      );
+      if (!existing) {
+        return apiError("Participant not found in session", 404);
+      }
     }
 
     // 4. Live roster so clients can surface joins/leaves without extra calls

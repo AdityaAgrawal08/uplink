@@ -19,12 +19,6 @@ type wsClient struct {
 	closed bool
 }
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
-
 // wsConnect attempts a WebSocket upgrade. Returns nil if the server
 // doesn't support WebSocket (HTTP 404 or connection refused).
 func (c *chatClient) wsConnect() *wsClient {
@@ -57,11 +51,21 @@ func convertHTTPToWS(url string) string {
 
 // readLoop reads messages from the WebSocket and feeds them to the
 // chatClient callbacks. Runs until connection closes.
+//
+// B24 FIX: Distinguish a clean server-initiated close (going away / normal)
+// from an abnormal one, and report the latter through onTransientErr so the
+// UI can surface "connection lost" instead of silently freezing. The caller
+// (TUI) falls back to HTTP polling when this returns.
 func (ws *wsClient) readLoop(c *chatClient) {
 	defer ws.Close()
 	for {
 		_, data, err := ws.conn.ReadMessage()
 		if err != nil {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				if c.onTransientErr != nil {
+					c.onTransientErr(fmt.Errorf("websocket read failed: %w", err))
+				}
+			}
 			return
 		}
 		var poll chatPollResponse
@@ -108,8 +112,12 @@ func (ws *wsClient) heartbeat(c *chatClient) {
 }
 
 // send transmits a chat message over WebSocket.
+//
+// B24 FIX: Include the explicit `type:"chat"` discriminator. Previously the
+// payload was `{"text":...}` with no type, so a typed server protocol would
+// drop it as an unknown frame.
 func (ws *wsClient) send(text, to string) error {
-	payload := map[string]any{"text": text}
+	payload := map[string]any{"type": "chat", "text": text}
 	if to != "" {
 		payload["to"] = to
 	}
