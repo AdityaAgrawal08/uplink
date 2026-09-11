@@ -66,9 +66,6 @@ export async function POST(
       return apiError("Username already taken", 409);
     }
 
-    // 5. Add username to Bloom Filter
-    bloom.add(username);
-
     const now = new Date();
     const participantDoc = {
       sessionId,
@@ -78,8 +75,9 @@ export async function POST(
       status: "ACTIVE",
     };
 
-    // Use atomic transaction-like updates or safe updates
-    // In case of race conditions, unique index on { sessionId, username } will prevent duplicate insert
+    // B1 FIX: Insert participant FIRST, then update bloom filter only on success.
+    // Previously bloom.add() was called before insertOne(), causing bloom
+    // corruption (false positives) if the insert failed with duplicate key.
     try {
       await db.collection("session_participants").insertOne(participantDoc);
     } catch (dbErr) {
@@ -90,7 +88,13 @@ export async function POST(
       throw dbErr;
     }
 
-    // Update session document
+    // Bloom filter update only happens AFTER successful insert.
+    bloom.add(username);
+
+    // B5 FIX: Use $inc for participantCount to stay atomic with the actual
+    // insert. Previously the bloom filter was updated before the insert,
+    // and participantCount was incremented even if the insert later failed
+    // in edge cases.
     await db.collection("sessions").updateOne(
       { sessionId },
       {

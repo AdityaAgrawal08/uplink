@@ -32,6 +32,14 @@ export async function POST(
       return NextResponse.json({ ok: true, remaining: -1 });
     }
 
+    // B5 FIX: Atomically decrement participantCount to prevent drift.
+    // Previously leave never updated participantCount, causing it to
+    // accumulate over time and never decrease.
+    await db.collection("sessions").updateOne(
+      { sessionId },
+      { $inc: { participantCount: -1 } }
+    );
+
     await appendMessage(db, sessionId, "system", "system", `${username} left`);
 
     const remaining = await db.collection("session_participants").countDocuments({

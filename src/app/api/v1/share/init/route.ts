@@ -297,11 +297,25 @@ export async function POST(req: NextRequest) {
   } catch (error: unknown) {
     console.error("Error in POST /api/v1/share/init:", error);
     if (quotaReserved) {
-      try {
-        const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
-        await releaseUploadQuota(size, estimatedClassAOps);
-      } catch (refundErr) {
-        console.error("Failed to refund quota on init error:", refundErr);
+      // B3 FIX: Retry quota release up to 3 times with exponential backoff.
+      // Previously a single failure would leak quota permanently, eventually
+      // blocking all uploads when reservedBytes exceeds MAX_STORAGE_LIMIT.
+      const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
+      let released = false;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await releaseUploadQuota(size, estimatedClassAOps);
+          released = true;
+          break;
+        } catch (refundErr) {
+          console.error(`Quota release attempt ${attempt + 1}/3 failed:`, refundErr);
+          if (attempt < 2) {
+            await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+          }
+        }
+      }
+      if (!released) {
+        console.error(`CRITICAL: Quota release failed after 3 attempts for size=${size} ops=${estimatedClassAOps}. Manual recovery needed.`);
       }
     }
     const errMsg = error instanceof Error ? error.message : "Internal Server Error";

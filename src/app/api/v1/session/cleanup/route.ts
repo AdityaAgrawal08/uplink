@@ -47,21 +47,24 @@ export async function performSessionCleanup() {
         }
       }
 
-      // Update participantCount in sessions
-      let updatedParticipantCount = session.participantCount - leftCount;
-      if (updatedParticipantCount < 0) updatedParticipantCount = 0;
+      // B5 FIX: Recompute participantCount from actual ACTIVE count instead
+      // of arithmetic on potentially-stale document value. This prevents
+      // drift from race conditions between join/leave/cleanup.
+      const actualActiveCount = await db
+        .collection("session_participants")
+        .countDocuments({ sessionId, status: "ACTIVE" });
 
-      if (leftCount > 0) {
+      if (session.participantCount !== actualActiveCount) {
         await db.collection("sessions").updateOne(
           { sessionId },
-          { $set: { participantCount: updatedParticipantCount } }
+          { $set: { participantCount: actualActiveCount } }
         );
       }
 
       let expiresAt = new Date(session.expiresAt);
 
       // 3. If no active participants, schedule early expiry (min of current expiresAt and now + gracePeriod)
-      if (updatedParticipantCount === 0) {
+      if (actualActiveCount === 0) {
         const earlyExpiry = new Date(now.getTime() + gracePeriod);
         if (earlyExpiry < expiresAt) {
           expiresAt = earlyExpiry;
@@ -74,10 +77,12 @@ export async function performSessionCleanup() {
 
       // 4. Check if session has expired
       if (now > expiresAt) {
-        // Mark session as EXPIRED
+        // B4 FIX: Mark session as EXPIRED and set cleanupInitiated flag BEFORE
+        // deleting messages. This prevents the share cleanup worker from
+        // processing this session's shares while messages are being purged.
         await db.collection("sessions").updateOne(
           { sessionId },
-          { $set: { status: "EXPIRED" } }
+          { $set: { status: "EXPIRED", cleanupInitiated: true } }
         );
 
         // Fetch session files to expire underlying shares
@@ -113,7 +118,7 @@ export async function performSessionCleanup() {
         results.push({
           sessionId,
           expired: false,
-          activeParticipants: updatedParticipantCount,
+          activeParticipants: actualActiveCount,
         });
       }
     }
