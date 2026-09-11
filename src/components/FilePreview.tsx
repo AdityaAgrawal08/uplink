@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import QRCode from "qrcode";
 import SyntaxHighlighter from "./SyntaxHighlighter";
 
@@ -52,13 +52,6 @@ export default function FilePreview({ share }: Props) {
   const [copiedLink, setCopiedLink] = useState(false);
   const [copiedText, setCopiedText] = useState(false);
 
-  // B15 FIX: Use a ref to track the download URL to avoid the useCallback
-  // dependency cycle. The old code included `downloadUrl` (a state variable)
-  // in the useCallback deps, causing unnecessary re-creation on every
-  // state change and triggering the useEffect in a loop.
-  const downloadUrlRef = useRef(downloadUrl);
-  downloadUrlRef.current = downloadUrl;
-
   const previewType = getPreviewType(share.mimeType, share.filename);
   const fileExt = share.filename.split(".").pop()?.toLowerCase() || "txt";
 
@@ -74,10 +67,13 @@ export default function FilePreview({ share }: Props) {
     }
   }, []);
 
-  // B15 FIX: Use downloadUrlRef.current instead of downloadUrl in the
-  // dependency array to avoid unnecessary re-creation when the state changes.
-  const ensureDownloadUrl = useCallback(async () => {
-    if (downloadUrlRef.current) return downloadUrlRef.current;
+  // B15 FIX: `currentUrl` is passed as an argument instead of closing over
+  // the `downloadUrl` state. The old code listed `downloadUrl` in the dep
+  // array, so every state change recreated the callback and re-fired the
+  // auto-fetch effect below. Now the identity is stable ([share.shareId,
+  // password] only) and callers supply the latest value.
+  const ensureDownloadUrl = useCallback(async (currentUrl: string) => {
+    if (currentUrl) return currentUrl;
     try {
       const res = await fetch(`/api/v1/share/${share.shareId}/authorize-download`, {
         method: "POST",
@@ -96,7 +92,7 @@ export default function FilePreview({ share }: Props) {
   useEffect(() => {
     if (authorized && !downloadUrl && previewType !== "other" && previewType !== "text") {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      ensureDownloadUrl();
+      ensureDownloadUrl(downloadUrl);
     }
   }, [authorized, downloadUrl, previewType, ensureDownloadUrl]);
 
@@ -183,7 +179,7 @@ export default function FilePreview({ share }: Props) {
     }
 
     setLoading(true);
-    ensureDownloadUrl().then((url) => {
+    ensureDownloadUrl(downloadUrl).then((url) => {
       setLoading(false);
       if (url) {
         const a = document.createElement("a");

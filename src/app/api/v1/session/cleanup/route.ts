@@ -53,6 +53,7 @@ export async function performSessionCleanup() {
           leftCount++;
         }
       }
+      // leftCount feeds the per-session report below (staleRemoved).
 
       // B5 FIX: Recompute participantCount from actual ACTIVE count instead
       // of arithmetic on potentially-stale document value. This prevents
@@ -120,12 +121,14 @@ export async function performSessionCleanup() {
           sessionId,
           expired: true,
           filesCleaned: deleteFilesResult.deletedCount,
+          staleRemoved: leftCount,
         });
       } else {
         results.push({
           sessionId,
           expired: false,
           activeParticipants: actualActiveCount,
+          staleRemoved: leftCount,
         });
       }
       } catch (sessionErr) {
