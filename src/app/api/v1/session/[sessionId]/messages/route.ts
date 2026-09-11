@@ -187,9 +187,14 @@ export async function GET(
     if (afterSeq !== null) {
       maybeCleanup();
       let docs = await queryNew();
+      // B7 FIX: Use exponential backoff with jitter instead of fixed 200ms
+      // sleep. Under high concurrency the fixed interval causes a thundering
+      // herd where all poll requests wake simultaneously and hammer MongoDB.
+      let backoffMs = 50;
       for (;;) {
         if (docs.length > 0 || Date.now() >= deadline) break;
-        await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, backoffMs));
+        backoffMs = Math.min(backoffMs * 2, 500); // cap at 500ms
         // Surface room termination without waiting out the full hold.
         const fresh = (await db
           .collection("sessions")

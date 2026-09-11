@@ -23,7 +23,11 @@ export async function POST(req: NextRequest) {
 
   try {
     // Rate Limiting check
-    const clientIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    // B8 FIX: Split x-forwarded-for by comma and take the first entry
+    // (client's real IP). The header format is "client, proxy1, proxy2"
+    // and the leftmost is the original client.
+    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
     const ipHash = anonymizeIp(clientIp);
     const rateLimitKey = `rate:init:${ipHash}`;
     const attempts = await redis.incr(rateLimitKey);

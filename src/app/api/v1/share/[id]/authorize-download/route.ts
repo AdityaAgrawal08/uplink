@@ -26,7 +26,9 @@ export async function POST(
     const body = await req.json().catch(() => ({}));
     const { password, preview } = body;
 
-    const clientIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    // B8 FIX: Split x-forwarded-for by comma and take the first entry.
+    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
     const ipHash = anonymizeIp(clientIp);
 
     const db = await getDb();

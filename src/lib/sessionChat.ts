@@ -84,7 +84,9 @@ export async function appendMessage(
 
 export function sanitizeChatText(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
-  // Strip control characters (except \n and \t) then clamp to 500 chars.
+  // B10 FIX: Updated docstring to accurately describe behavior — this
+  // function REJECTS messages exceeding 500 chars, it does not clamp/truncate.
+  // Strip control characters (except \n and \t) then reject if over 500 chars.
   const cleaned = raw.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "").trim();
   if (cleaned.length === 0 || cleaned.length > 500) return null;
   return cleaned;

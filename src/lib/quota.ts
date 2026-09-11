@@ -320,8 +320,9 @@ export async function recordDeleteQuota(fileSize: number): Promise<void> {
   const db = await getDb();
   
   const state = await getQuotaState();
-  const newSize = Math.max(0, state.storageBytes - fileSize);
-  const sizeDiff = state.storageBytes - newSize;
+  // B11 FIX: Simplify — Math.max(0, ...) was dead code since fileSize is
+  // validated upstream to be positive and storageBytes >= fileSize by design.
+  const sizeDiff = Math.min(fileSize, state.storageBytes);
 
   const res = await db.collection<QuotaDoc>("quotas").findOneAndUpdate(
     { _id: "r2_quota" },

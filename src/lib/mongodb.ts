@@ -47,10 +47,19 @@ interface QuotaDocument {
 }
 
 let indexesPromise: Promise<void> | null = null;
+// B12 FIX: Track last failure time to prevent rapid retry loops.
+let lastIndexFailureAt = 0;
+const INDEX_RETRY_COOLDOWN_MS = 30_000; // 30 seconds between retry attempts
 
 // Helper to initialize indexes
 export function initIndexes(): Promise<void> {
   if (indexesPromise) return indexesPromise;
+
+  // B12 FIX: Enforce cooldown after failures to avoid hammering MongoDB
+  // when indexes consistently fail (e.g., auth issues, network partitions).
+  if (lastIndexFailureAt > 0 && Date.now() - lastIndexFailureAt < INDEX_RETRY_COOLDOWN_MS) {
+    return Promise.resolve();
+  }
 
   indexesPromise = (async () => {
     const db = await getDb();
@@ -117,6 +126,7 @@ export function initIndexes(): Promise<void> {
 
   indexesPromise.catch((error) => {
     console.error("Failed to initialize MongoDB indexes:", error);
+    lastIndexFailureAt = Date.now();
     indexesPromise = null;
   });
 
