@@ -1,14 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
+import { isMockStorage } from "@/lib/r2";
 
 export async function GET(req: NextRequest) {
   try {
+    // B35 FIX: only serve this dev-only filesystem shim when mock storage is
+    // active, so it is never an open local file-read endpoint in production.
+    if (!isMockStorage()) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
     const { searchParams } = new URL(req.url);
     const key = searchParams.get("key");
     const preview = searchParams.get("preview") === "true";
-    const filename = searchParams.get("filename") || "file";
+    const rawFilename = searchParams.get("filename") || "file";
     const mimeType = searchParams.get("mimeType") || "application/octet-stream";
+
+    // B35 FIX: sanitize the filename before interpolating it into
+    // Content-Disposition. A crafted quote or CR/LF would otherwise corrupt
+    // (or inject) response headers.
+    const filename = rawFilename.replace(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 200) || "file";
 
     if (!key) {
       return NextResponse.json({ error: "Missing key" }, { status: 400 });
