@@ -30,10 +30,18 @@ describe("sanitizeChatText", () => {
     expect(sanitizeChatText("  padded  ")).toBe("padded");
   });
 
-  it("clamps to 500 chars after cleaning", () => {
+  it("rejects messages over 500 chars after cleaning (B10: rejects, does not clamp)", () => {
     const ok = "x".repeat(500);
     expect(sanitizeChatText(ok)).toHaveLength(500);
     expect(sanitizeChatText(ok + "y")).toBeNull(); // over-limit rejected, not truncated
+  });
+
+  // B18: Newlines are intentionally preserved to support multi-line messages.
+  // This test pins that decision so a future "single-line only" change is
+  // explicit and deliberate.
+  it("preserves newlines for multi-line messages (B18 design decision)", () => {
+    expect(sanitizeChatText("line one\nline two")).toBe("line one\nline two");
+    expect(sanitizeChatText("a\n\nb")).toBe("a\n\nb");
   });
 
   it("unicode survives", () => {

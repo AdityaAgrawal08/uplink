@@ -295,6 +295,13 @@ export async function completeMultipartUpload(
     }
   }
 
+  // B2 FIX: isMockStorage() covers both the null-client case and the
+  // FORCE_MOCK_STORAGE flag. Guard the real path explicitly so TypeScript
+  // can narrow s3Client to non-null.
+  if (!s3Client) {
+    return { error: "S3 client not initialized" };
+  }
+
   try {
     const command = new CompleteMultipartUploadCommand({
       Bucket: getBucketName(),

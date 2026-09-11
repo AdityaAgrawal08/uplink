@@ -128,6 +128,23 @@ export async function logQuotaEvent(type: QuotaEvent["type"], message: string): 
   try {
     const db = await getDb();
     console.log(`[Quota Event] [${type}] ${message}`);
+
+    // B22 FIX: Archive old events to a separate collection before truncating.
+    // Previously the $slice:-50 silently discarded older events, losing
+    // historical data needed for capacity planning and incident analysis.
+    const doc = await db.collection<QuotaDoc>("quotas").findOne(
+      { _id: "r2_quota" },
+      { projection: { quotaEvents: 1 } }
+    );
+    if (doc && doc.quotaEvents && doc.quotaEvents.length >= 50) {
+      const archivedEvents = doc.quotaEvents.slice(0, -49); // keep newest 49
+      if (archivedEvents.length > 0) {
+        await db.collection("quota_events_archive").insertMany(
+          archivedEvents.map(e => ({ ...e, archivedAt: new Date() }))
+        );
+      }
+    }
+
     await db.collection<QuotaDoc>("quotas").updateOne(
       { _id: "r2_quota" },
       {

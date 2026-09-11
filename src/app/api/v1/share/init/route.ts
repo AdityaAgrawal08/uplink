@@ -204,33 +204,13 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Generate a unique 10-digit numeric code
-    let downloadCode = "";
-    let isCodeUnique = false;
-    let codeAttempts = 0;
-    while (!isCodeUnique && codeAttempts < 10) {
-      if (codeAttempts > 0) {
-        await new Promise(r => setTimeout(r, 50)); // minimal backoff
-      }
-      downloadCode = "";
-      for (let i = 0; i < 10; i++) {
-        downloadCode += crypto.randomInt(0, 10).toString();
-      }
-      const existingCode = await db.collection("shares").findOne({ downloadCode });
-      if (!existingCode) {
-        isCodeUnique = true;
-      }
-      codeAttempts++;
-    }
-
-    if (!isCodeUnique) {
-      return apiError("Unique download code generation failed due to collision limits", 500);
-    }
-
     // 5. Database Insert (Share & Upload Session)
-    const shareDoc = {
+    // B20 FIX: The old check-then-insert was a TOCTOU race — two concurrent
+    // requests could both pass the findOne uniqueness check, then the second
+    // insertOne would throw duplicate-key (11000) and return a 500. Now the
+    // insert is retried with a freshly generated code on collision.
+    const shareBase = {
       shareId,
-      downloadCode,
       filename,
       storageFilename,
       size,
@@ -271,7 +251,33 @@ export async function POST(req: NextRequest) {
       partsCount: isMultipart ? Number(partsCount) : 1,
     };
 
-    await db.collection("shares").insertOne(shareDoc);
+    let shareInserted = false;
+    let codeAttempts = 0;
+    let downloadCode = "";
+    while (!shareInserted && codeAttempts < 20) {
+      downloadCode = "";
+      for (let i = 0; i < 10; i++) {
+        downloadCode += crypto.randomInt(0, 10).toString();
+      }
+      try {
+        await db.collection("shares").insertOne({ ...shareBase, downloadCode });
+        shareInserted = true;
+      } catch (dbErr) {
+        const err = dbErr as { code?: number };
+        if (err.code === 11000) {
+          // Duplicate downloadCode (or shareId) — retry with a new code.
+          codeAttempts++;
+          await new Promise(r => setTimeout(r, 50));
+          continue;
+        }
+        throw dbErr;
+      }
+    }
+
+    if (!shareInserted) {
+      return apiError("Unique download code generation failed due to collision limits", 500);
+    }
+
     await db.collection("upload_sessions").insertOne(uploadSessionDoc);
 
     const responseData = {

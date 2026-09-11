@@ -18,9 +18,13 @@ export async function performSessionCleanup() {
     const gracePeriod = 120 * 1000; // 120 seconds grace period
 
     // 1. Find all ACTIVE sessions
+    // B27 FIX: Limit to 50 sessions per invocation to prevent the cleanup
+    // worker from running indefinitely under heavy load. Unprocessed
+    // sessions will be caught by the next cleanup sweep.
     const activeSessions = await db
       .collection("sessions")
       .find({ status: "ACTIVE" })
+      .limit(50)
       .toArray();
 
     const results = [];
