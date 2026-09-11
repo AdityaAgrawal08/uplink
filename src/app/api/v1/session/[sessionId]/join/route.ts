@@ -103,7 +103,13 @@ export async function POST(
       }
     );
 
-    await appendMessage(db, sessionId, "system", "system", `${username} joined`);
+    // B45 FIX: the join already succeeded — a transient transcript failure
+    // must not turn it into a 500 (the client would retry into a 409).
+    try {
+      await appendMessage(db, sessionId, "system", "system", `${username} joined`);
+    } catch (msgErr) {
+      console.warn("join succeeded but system message failed:", msgErr);
+    }
 
     // Fetch active participants to return
     const activeParticipants = await db

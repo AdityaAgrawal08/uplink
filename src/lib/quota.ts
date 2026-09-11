@@ -241,14 +241,19 @@ export async function commitUploadQuota(fileSize: number): Promise<void> {
   }
 
   const db = await getDb();
+  // B48 FIX: pipeline update clamps reservedBytes at 0. A double-commit
+  // (concurrent confirms racing past the idempotency check) previously
+  // drove reservedBytes negative and double-counted storageBytes.
   const res = await db.collection<QuotaDoc>("quotas").findOneAndUpdate(
     { _id: "r2_quota" },
-    {
-      $inc: {
-        storageBytes: fileSize,
-        reservedBytes: -fileSize,
+    [
+      {
+        $set: {
+          storageBytes: { $add: ["$storageBytes", fileSize] },
+          reservedBytes: { $max: [0, { $subtract: ["$reservedBytes", fileSize] }] },
+        },
       },
-    },
+    ] as unknown as import("mongodb").UpdateFilter<QuotaDoc>,
     { returnDocument: "after" }
   );
 

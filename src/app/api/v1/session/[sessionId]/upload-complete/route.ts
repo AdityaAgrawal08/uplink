@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
+import { checkObjectExists } from "@/lib/r2";
 import { apiError } from "@/lib/api-utils";
 
 export async function POST(
@@ -37,6 +38,22 @@ export async function POST(
 
     if (file.username !== usernameHeader) {
       return apiError("You do not have permission to modify this file status", 403);
+    }
+
+    // B46 FIX: verify the bytes actually landed before advertising the file
+    // as UPLOADED. Previously a client could announce + complete without
+    // ever PUTting, creating phantom file cards whose downloads 404 at R2.
+    // Idempotent: an already-UPLOADED file re-verifies cheaply via HEAD.
+    const share = await db.collection("shares").findOne(
+      { shareId },
+      { projection: { objectKey: 1 } }
+    );
+    if (!share) {
+      return apiError("Associated share metadata not found", 404);
+    }
+    const objDetails = await checkObjectExists(share.objectKey as string);
+    if (!objDetails.exists) {
+      return apiError("Uploaded file was not found in object storage", 404);
     }
 
     // 2. Update status to UPLOADED

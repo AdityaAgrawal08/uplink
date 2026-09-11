@@ -187,6 +187,10 @@ export async function GET(
     if (afterSeq !== null) {
       maybeCleanup();
       let docs = await queryNew();
+      // B43 FIX: track the latest liveness observation so the `ended` flag
+      // reflects a termination that happened DURING the hold, not just the
+      // snapshot from before it.
+      let lastAlive = alive;
       // B7 FIX: Use exponential backoff with jitter instead of fixed 200ms
       // sleep. Under high concurrency the fixed interval causes a thundering
       // herd where all poll requests wake simultaneously and hammer MongoDB.
@@ -199,7 +203,8 @@ export async function GET(
         const fresh = (await db
           .collection("sessions")
           .findOne({ sessionId }, { projection: { status: 1, expiresAt: 1 } })) as unknown as SessionAliveDoc | null;
-        if (!isSessionAlive(fresh)) break;
+        lastAlive = isSessionAlive(fresh);
+        if (!lastAlive) break;
         docs = await queryNew();
       }
       const roster = await db
@@ -210,7 +215,7 @@ export async function GET(
       return NextResponse.json({
         messages: docs.map(toMessageDTO),
         activeUsers: roster.map((r) => r.username).sort(),
-        ended: !alive,
+        ended: !lastAlive,
       });
     }
 
