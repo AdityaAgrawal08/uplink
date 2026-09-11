@@ -3,7 +3,7 @@ import crypto from "crypto";
 import { getDb } from "@/lib/mongodb";
 import { generateShareId } from "@/lib/crypto";
 import { apiError } from "@/lib/api-utils";
-import { conversationKey } from "@/lib/sessionChat";
+import { conversationKey, isPairConv } from "@/lib/sessionChat";
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 const MAX_FILENAME_LEN = 255;
@@ -18,6 +18,9 @@ export async function POST(
 
     if (!usernameHeader) {
       return apiError("X-Uplink-Username header is required", 400);
+    }
+    if (!USERNAME_RE.test(usernameHeader)) {
+      return apiError("Invalid X-Uplink-Username", 400);
     }
 
     const text = await req.text();
@@ -39,15 +42,28 @@ export async function POST(
       return apiError("Valid SHA-256 hash is required", 400);
     }
 
-    // Optional: private conversation target. Empty/undefined = public (general).
-    const toUser = typeof to === "string" && to.trim() !== "" ? to.trim() : "";
-    // B28 FIX: Validate the recipient username format and reject self-targeting.
-    if (toUser) {
-      if (!USERNAME_RE.test(toUser)) {
-        return apiError("to must be a valid username", 400);
-      }
-      if (toUser === usernameHeader) {
-        return apiError("cannot target a private file to yourself", 400);
+    // Optional private target. Callers may pass EITHER a raw recipient
+    // username ("bob") OR a canonical conversation key ("alice|bob") — the
+    // Go CLI uses the latter. Normalize to: raw recipient + canonical convId.
+    const rawTo = typeof to === "string" ? to.trim() : "";
+    let toUser = "";
+    let convId = "general";
+    if (rawTo) {
+      if (isPairConv(rawTo)) {
+        const [u1, u2] = rawTo.split("|");
+        if (usernameHeader !== u1 && usernameHeader !== u2) {
+          return apiError("not a participant of this conversation", 403);
+        }
+        toUser = usernameHeader === u1 ? u2 : u1;
+        convId = rawTo;
+      } else if (USERNAME_RE.test(rawTo)) {
+        if (rawTo === usernameHeader) {
+          return apiError("cannot target a private file to yourself", 400);
+        }
+        toUser = rawTo;
+        convId = conversationKey(usernameHeader, rawTo);
+      } else {
+        return apiError("to must be a valid username or conversation key", 400);
       }
     }
 
@@ -89,17 +105,13 @@ export async function POST(
       sha256,
       uploadedAt: new Date(),
       status: "ANNOUNCED",
+      // B28 CRITICAL FIX: always store the canonical conversation bucket so
+      // the files route can filter reliably. `to` holds the raw recipient so
+      // the download access check can compare against usernames.
+      convId,
     };
     if (toUser) {
-      // B28 CRITICAL FIX: Store BOTH the raw recipient (`to`) and the
-      // canonical conversation key (`convId`). Previously only the raw
-      // recipient was stored, so the files route (which filters by the
-      // canonical "a|b" pair key) never matched — private files were
-      // unroutable and leaked to everyone when conv was omitted.
       fileDoc.to = toUser;
-      fileDoc.convId = conversationKey(usernameHeader, toUser);
-    } else {
-      fileDoc.convId = "general";
     }
 
     await db.collection("session_files").insertOne(fileDoc);

@@ -54,7 +54,21 @@ type sessionFile struct {
 	Size       int64  `json:"size"`
 	Status     string `json:"status"`
 	UploadedAt string `json:"uploadedAt"`
-	To         string `json:"to"` // empty = public/general
+	To         string `json:"to"`     // raw recipient username; empty = public/general
+	ConvID     string `json:"convId"` // canonical conversation bucket ("general" or "a|b")
+}
+
+// fileConv returns the canonical conversation bucket for a server file.
+// Prefers the server-provided convId; falls back to deriving it from the
+// sender/recipient, then to the general room.
+func fileConv(f sessionFile) string {
+	if f.ConvID != "" {
+		return f.ConvID
+	}
+	if f.To != "" {
+		return conversationKey(f.Username, f.To)
+	}
+	return generalConv
 }
 
 type chatClient struct {

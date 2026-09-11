@@ -265,11 +265,11 @@ func (c *chatScreen) applyRoomFiles(files []sessionFile) {
 		if f.Username == c.me {
 			continue // own uploads already painted by the engine
 		}
-		// Determine which conversation this file belongs to.
-		conv := generalConv
-		if f.To != "" {
-			conv = f.To
-		}
+		// Determine which conversation this file belongs to. Prefer the
+		// server-provided canonical convId; derive it from sender/recipient
+		// otherwise. (The old code used the raw `to`, which made private
+		// file cards land in a bucket that never matched activeConv().)
+		conv := fileConv(f)
 		// Use helper that preserves RFC3339 for chronological interleaving.
 		if f.UploadedAt != "" {
 			c.appendLocalFileCardWithRFC3339(conv, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)

@@ -3,6 +3,7 @@ import { getDb } from "@/lib/mongodb";
 import { getPresignedDownloadUrl } from "@/lib/r2";
 import { apiError } from "@/lib/api-utils";
 import { consumeClassBQuota } from "@/lib/quota";
+import { isPairConv } from "@/lib/sessionChat";
 
 export async function POST(
   req: NextRequest,
@@ -41,11 +42,17 @@ export async function POST(
       return apiError("File upload is not complete", 400);
     }
 
-    // 1a. Private file access check: if file has a `to` field, only the
-    //     sender (username) and the recipient (to) may download it.
+    // 1a. Private file access check. `to` may be a raw recipient username
+    //     (new docs) or a canonical pair key "a|b" (legacy CLI docs). Only
+    //     the sender and the recipient(s) may download.
     const fileTo = typeof sessionFile.to === "string" ? sessionFile.to : "";
-    if (fileTo) {
-      if (username !== sessionFile.username && username !== fileTo) {
+    const fileConvId = typeof sessionFile.convId === "string" ? sessionFile.convId : "";
+    if (fileTo || (fileConvId && fileConvId !== "general")) {
+      const pair = isPairConv(fileConvId) ? fileConvId : (isPairConv(fileTo) ? fileTo : "");
+      const allowed = username === sessionFile.username
+        || username === fileTo
+        || (pair !== "" && (pair.split("|")[0] === username || pair.split("|")[1] === username));
+      if (!allowed) {
         return apiError("You do not have access to this private file", 403);
       }
     }

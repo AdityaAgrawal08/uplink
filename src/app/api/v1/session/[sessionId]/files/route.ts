@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getDb } from "@/lib/mongodb";
 import { apiError } from "@/lib/api-utils";
-import { GENERAL_CONV, isPairConv } from "@/lib/sessionChat";
+import { GENERAL_CONV, isPairConv, conversationKey } from "@/lib/sessionChat";
 
 export async function GET(
   req: NextRequest,
@@ -42,11 +42,11 @@ export async function GET(
       { convId: { $exists: false }, to: "" },
       { username },                                  // files I sent
       { to: username },                              // legacy: files sent to me
+      // Legacy pair-key docs: convId exists and contains me as a token.
+      { convId: { $regex: `(^|\\|)${username}(\\||$)` } },
+      // Legacy pair-key docs stored in `to` ("a|b") where I am a token.
+      { convId: { $exists: false }, to: { $regex: `(^|\\|)${username}(\\||$)` } },
     ];
-    // Legacy pair-conv docs: convId == "a|b" where I am one of the two.
-    // handled below via convScope / the $expr-free approach of matching
-    // any convId containing my username as a token.
-    visibilityOr.push({ convId: { $regex: `(^|\\|)${username}(\\||$)` } });
 
     const fileQuery: Record<string, unknown> = {
       sessionId,
@@ -72,10 +72,11 @@ export async function GET(
       if (username !== u1 && username !== u2) {
         return apiError("not a participant of this conversation", 403);
       }
-      // Match new convId OR legacy raw `to` targeting either party.
+      // Match canonical convId OR legacy pair-key `to` OR legacy raw
+      // recipient `to` for either party.
       delete fileQuery.$or;
       fileQuery.$and = [
-        { $or: [{ convId: conv }, { to: u1 }, { to: u2 }] },
+        { $or: [{ convId: conv }, { to: conv }, { to: u1 }, { to: u2 }] },
       ];
     }
 
@@ -93,17 +94,28 @@ export async function GET(
       .toArray();
 
     return NextResponse.json({
-      files: files.map((f) => ({
-        fileId: f.fileId,
-        shareId: f.shareId,
-        filename: f.filename,
-        username: f.username,
-        size: f.size,
-        sha256: f.sha256,
-        uploadedAt: f.uploadedAt.toISOString(),
-        status: f.status,
-        to: (typeof f.to === "string" && f.to) || "",
-      })),
+      files: files.map((f) => {
+        // Resolve the canonical conversation bucket so clients don't have to
+        // re-derive it (and to bridge legacy docs).
+        const rawTo = typeof f.to === "string" ? f.to : "";
+        const convId = typeof f.convId === "string" && f.convId
+          ? f.convId
+          : rawTo
+            ? (isPairConv(rawTo) ? rawTo : conversationKey(f.username as string, rawTo))
+            : GENERAL_CONV;
+        return {
+          fileId: f.fileId,
+          shareId: f.shareId,
+          filename: f.filename,
+          username: f.username,
+          size: f.size,
+          sha256: f.sha256,
+          uploadedAt: f.uploadedAt.toISOString(),
+          status: f.status,
+          to: rawTo,
+          convId,
+        };
+      }),
       participants: participants.map((p) => ({
         username: p.username,
         peerId: p.peerId || null,
