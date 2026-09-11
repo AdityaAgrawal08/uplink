@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -22,6 +23,9 @@ type chatMessage struct {
 	To        string `json:"to,omitempty"` // recipient of a 1:1 message
 	ConvID    string `json:"convId"`       // "general" or canonical "a|b"
 	CreatedAt string `json:"createdAt"`
+	Status    string `json:"status,omitempty"`
+	DeletedAt string `json:"deletedAt,omitempty"`
+	DeletedBy string `json:"deletedBy,omitempty"`
 }
 
 // conversationKey builds the canonical bucket id for a 1:1 thread.
@@ -55,6 +59,8 @@ type sessionFile struct {
 	Status     string `json:"status"`
 	UploadedAt string `json:"uploadedAt"`
 	To         string `json:"to"` // empty = public/general
+	DeletedAt string `json:"deletedAt,omitempty"`
+	DeletedBy string `json:"deletedBy,omitempty"`
 }
 
 type chatClient struct {
@@ -239,6 +245,56 @@ func (c *chatClient) beatOnce() (hb heartbeatResponse, err error) {
 	}
 	c.applyRoster(hb.ActiveUsers)
 	return hb, nil
+}
+
+func (c *chatClient) deleteMessage(seq int) error {
+	code, body, err := deleteJSON(c.endpoint(fmt.Sprintf("/messages/%d", seq)), c.authHeaders())
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		var e struct{ Error string `json:"error"`}
+		_ = json.Unmarshal(body, &e)
+		if e.Error != "" {
+			return fmt.Errorf("%s (%d) %s", e.Error, code, string(body))
+		}
+		return fmt.Errorf("delete failed %d %s", code, string(body))
+	}
+	return nil
+}
+
+func (c *chatClient) deleteFile(fileId string) error {
+	code, body, err := deleteJSON(c.endpoint(fmt.Sprintf("/files/%s", fileId)), c.authHeaders())
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		var e struct{ Error string `json:"error"`}
+		_ = json.Unmarshal(body, &e)
+		if e.Error != "" {
+			return fmt.Errorf("%s (%d) %s", e.Error, code, string(body))
+		}
+		return fmt.Errorf("delete failed %d %s", code, string(body))
+	}
+	return nil
+}
+
+func deleteJSON(url string, headers map[string]string) (int, []byte, error) {
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, err
 }
 
 func (c *chatClient) leave() {

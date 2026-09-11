@@ -25,9 +25,8 @@ type slashCommand struct {
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
-	{Name: "/upload-review", Desc: "review buffered files before sending"},
-	{Name: "/send", Desc: "send all buffered files now"},
 	{Name: "/download", Desc: "fetch shared room files"},
+	{Name: "/delete", Desc: "delete your messages and files"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -310,10 +309,8 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return nil
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
-	case "/upload-review":
-		return c.openBufferReview() // show buffered files for review
-	case "/send":
-		return c.sendBuffered() // send all buffered files now
+	case "/delete":
+		return c.openDeletePicker() // show own messages/files for deletion
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
 	default:
