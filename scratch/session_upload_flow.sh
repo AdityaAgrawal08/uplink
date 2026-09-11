@@ -56,7 +56,8 @@ code -X POST "$SERVER/api/v1/session/$SID/upload-complete" \
 
 echo "=== S-U4: since= watermark strictly-new semantics ==="
 # Capture file #1's uploadedAt as the watermark, then push a second file.
-UPAT=$(code "$SERVER/api/v1/session/$SID/files" > /dev/null; python3 -c "import json;d=json.load(open('$BODY'));print([f['uploadedAt'] for f in d.get('files',[]) if f['fileId']=='$FILEID'][0])")
+# (Auth header required since the private-file privacy fix.)
+UPAT=$(code "$SERVER/api/v1/session/$SID/files" -H 'X-Uplink-Username: ul_alice' > /dev/null; python3 -c "import json;d=json.load(open('$BODY'));print([f['uploadedAt'] for f in d.get('files',[]) if f['fileId']=='$FILEID'][0])")
 printf 'second payload %s\n' "$(date +%s)" > "$FIXTURE"
 SIZE=$(wc -c < "$FIXTURE" | tr -d ' ')
 HASH=$(sha256sum "$FIXTURE" | cut -d' ' -f1)
@@ -75,7 +76,7 @@ code -X POST "$SERVER/api/v1/session/$SID/upload-complete" \
      -d "{\"fileId\":\"$FILEID2\",\"shareId\":\"$SHAREID2\"}" > /dev/null
 
 # since=<uploadedAt of #1> must return #2 and NOT #1 again.
-ST=$(code "$SERVER/api/v1/session/$SID/files?since=$UPAT")
+ST=$(code "$SERVER/api/v1/session/$SID/files?since=$UPAT" -H 'X-Uplink-Username: ul_bob')
 SEEN2=$(python3 -c "import json;d=json.load(open('$BODY'));print(sum(1 for f in d.get('files',[]) if f['fileId']=='$FILEID2'))")
 RESEEN1=$(python3 -c "import json;d=json.load(open('$BODY'));print(sum(1 for f in d.get('files',[]) if f['fileId']=='$FILEID'))")
 if [ "$SEEN2" = "1" ] && [ "$RESEEN1" = "0" ]; then ok "watermark strictly-new only"

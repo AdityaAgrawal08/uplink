@@ -67,7 +67,9 @@ ST=$(code -X POST "$SERVER/api/v1/session/$SID/heartbeat" \
 [ "$ST" = "200" ] && ok "heartbeat" || bad "status=$ST"
 
 echo "=== S-C7: files listing ==="
-ST=$(code "$SERVER/api/v1/session/$SID/files")
+# S-C7 requires auth since the private-file privacy fix: the files endpoint
+# mandates X-Uplink-Username and applies a per-user visibility filter.
+ST=$(code "$SERVER/api/v1/session/$SID/files" -H 'X-Uplink-Username: ci_alice')
 HAS_FILE=$(FILEID="$FILEID" BODY="$BODY" python3 -c 'import json,os;d=json.load(open(os.environ["BODY"]));fid=os.environ["FILEID"];print(any(f.get("fileId")==fid for f in d.get("files",[])))' 2>/dev/null)
 if [ "$ST" = "200" ] && [ "$HAS_FILE" = "True" ]; then ok "file listed"; else bad "files status=$ST body=$(head -c 160 "$BODY")"; fi
 
