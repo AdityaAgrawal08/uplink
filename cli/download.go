@@ -5,11 +5,27 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
+
+// B54 FIX: downloads must not hang forever on a stalled server. A full
+// Client.Timeout would also kill slow-but-healthy large transfers, so bound
+// only the header phase (connect/TLS/first-byte) and stream the body.
+var downloadHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
 
 func readPartialMetadata(sha256Path string) (int64, string, error) {
 	data, err := os.ReadFile(sha256Path)
@@ -70,13 +86,20 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 		_ = os.Remove(metadataFile)
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
+	// B53 FIX: handle the request-construction error. The old `req, _ := ...`
+	// ignored it, so a malformed URL meant a nil-pointer panic on the next
+	// line instead of an error return.
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("download request: %w", err)
+	}
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// B54 FIX: bounded client (see downloadHTTPClient) instead of a
+	// timeout-less one that could hang forever.
+	resp, err := downloadHTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("download start: %w", err)
 	}

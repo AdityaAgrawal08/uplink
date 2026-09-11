@@ -1373,7 +1373,9 @@ func handleReceive(args []string) {
 			printer.Print(written)
 		})
 	} else {
-		downloadResp, err := http.Get(authData.DownloadUrl)
+		// B54 FIX: same bounded client for the non-resumable fallback path,
+		// which previously used timeout-less http.Get.
+		downloadResp, err := downloadHTTPClient.Get(authData.DownloadUrl)
 		if err != nil {
 			fmt.Printf("✗ Error: Downloading file failed: %v\n", err)
 			os.Exit(1)
