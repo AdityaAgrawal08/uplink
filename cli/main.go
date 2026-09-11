@@ -481,7 +481,12 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			return "", "", "", 0, fmt.Errorf("E2EE encryption stream: %w", err)
 		}
 		filePath = tempEncFile.Name()
-		fileInfo, _ = os.Stat(filePath)
+		// B55 FIX: check the stat error. The old `fileInfo, _ = os.Stat`
+		// left fileInfo nil on failure, panicking at fileInfo.Size() below.
+		fileInfo, err = os.Stat(filePath)
+		if err != nil {
+			return "", "", "", 0, fmt.Errorf("E2EE temp file stat: %w", err)
+		}
 	}
 
 	file, err := os.Open(filePath)

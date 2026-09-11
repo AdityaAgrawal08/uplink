@@ -478,8 +478,16 @@ func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound)
 		return
 	}
 
+	// B56 FIX: never trust a client-supplied message ID. An empty MsgId
+	// would break chunk correlation for every receiver; generate one
+	// server-side when absent.
+	msgId := in.MsgId
+	if msgId == "" {
+		msgId = genId()
+	}
+
 	msg := ChatMessage{
-		MsgId:       in.MsgId,
+		MsgId:       msgId,
 		Username:    conn.Username,
 		Kind:        "file",
 		Filename:    in.Filename,
