@@ -2,6 +2,12 @@ import { getDb } from "@/lib/mongodb";
 import FilePreview from "@/components/FilePreview";
 import { notFound } from "next/navigation";
 
+// B14 FIX: This page reads live share state (status/expiry) from MongoDB.
+// Without an explicit directive the Next.js full-route cache could serve a
+// stale shell for a share that has since expired or been revoked. Force
+// per-request rendering.
+export const dynamic = "force-dynamic";
+
 export default async function SharePage(props: { params: Promise<{ id: string }> }) {
   const { id } = await props.params;
   const db = await getDb();
@@ -11,7 +17,10 @@ export default async function SharePage(props: { params: Promise<{ id: string }>
     status: "ACTIVE",
   });
 
-  if (!share) {
+  // B14 FIX: honor expiresAt. The API routes reject expired shares, but this
+  // page only filtered on status — a share past its expiry but not yet swept
+  // would still render a download UI.
+  if (!share || (share.expiresAt && new Date(share.expiresAt) < new Date())) {
     notFound();
   }
 
