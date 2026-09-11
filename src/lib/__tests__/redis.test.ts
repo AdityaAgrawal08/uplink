@@ -64,4 +64,26 @@ describe("MockRedis", () => {
     }
     expect(await r.incr("rl")).toBe(21); // caller compares > LIMIT
   });
+
+  // B13: Document that SET without EX/PX clears TTL (matches real Redis).
+  // This is the correct behavior but can surprise callers who expect TTL
+  // preservation across re-sets.
+  it("set without expiry clears prior TTL (matches real Redis SET behavior)", async () => {
+    await r.set("k", "v1", { ex: 3600 });
+    const itemBefore = r["store"].get("k");
+    expect(itemBefore?.expiry).not.toBeNull();
+
+    // Overwrite without EX — TTL should be lost.
+    await r.set("k", "v2");
+    const itemAfter = r["store"].get("k");
+    expect(itemAfter?.expiry).toBeNull();
+    expect(await r.get("k")).toBe("v2");
+
+    // incr after set-without-TTL should also have no TTL.
+    await r.incr("counter");
+    await r.expire("counter", 60);
+    await r.set("counter", "999"); // overwrite clears TTL
+    const counterItem = r["store"].get("counter");
+    expect(counterItem?.expiry).toBeNull();
+  });
 });
