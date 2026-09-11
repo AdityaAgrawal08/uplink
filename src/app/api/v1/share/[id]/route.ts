@@ -25,6 +25,10 @@ export async function GET(
           createdAt: 1,
           expiresAt: 1,
           status: 1,
+          // B32 FIX: these two are returned in the response but were missing
+          // from the projection, so they always came back undefined.
+          downloadsCount: 1,
+          downloadLimit: 1,
         },
       }
     );

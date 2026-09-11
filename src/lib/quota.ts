@@ -274,7 +274,7 @@ export async function releaseUploadQuota(fileSize: number, estimatedClassAOps: n
   }
 
   const db = await getDb();
-  
+
   // Guard decrements below 0
   const state = await getQuotaState();
   const refundSize = Math.min(fileSize, state.reservedBytes);
@@ -301,6 +301,31 @@ export async function releaseUploadQuota(fileSize: number, estimatedClassAOps: n
       );
     }
   }
+}
+
+// releaseUploadQuotaWithRetry wraps releaseUploadQuota with bounded retries.
+// B3 FIX: every caller that refunds a reservation on an error path should use
+// this so a transient Mongo failure cannot permanently leak reserved quota.
+export async function releaseUploadQuotaWithRetry(
+  fileSize: number,
+  estimatedClassAOps: number,
+  attempts = 3
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await releaseUploadQuota(fileSize, estimatedClassAOps);
+      return true;
+    } catch (err) {
+      console.error(`Quota release attempt ${attempt + 1}/${attempts} failed:`, err);
+      if (attempt < attempts - 1) {
+        await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+      }
+    }
+  }
+  console.error(
+    `CRITICAL: Quota release failed after ${attempts} attempts (size=${fileSize}, ops=${estimatedClassAOps}). Manual recovery needed.`
+  );
+  return false;
 }
 
 // Atomically check and consume 1 Class B operation quota for reads

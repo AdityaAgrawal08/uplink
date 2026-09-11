@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { getDb } from "@/lib/mongodb";
 import { deleteObject } from "@/lib/r2";
-import { recordDeleteQuota, releaseUploadQuota } from "@/lib/quota";
+import { recordDeleteQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
 import { validateAdminAuth } from "@/lib/auth";
 import { apiError } from "@/lib/api-utils";
 
@@ -120,7 +120,7 @@ export async function performCleanup() {
           // If it was unconfirmed, release the reservation
           const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
           const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
-          await releaseUploadQuota(share.size, estimatedOps);
+          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         } else {
           // If it was committed, decrement active storage bytes and record delete op
           await recordDeleteQuota(share.size);
@@ -150,7 +150,7 @@ export async function performCleanup() {
         if (originalStatus === "CREATED") {
           const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
           const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
-          await releaseUploadQuota(share.size, estimatedOps);
+          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         }
 
         results.push({ shareId: share.shareId, status: "DELETE_FAILED" });
