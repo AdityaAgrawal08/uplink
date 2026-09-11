@@ -29,7 +29,10 @@ export async function performSessionCleanup() {
 
     const results = [];
 
+    // B52 FIX: isolate per-session failures so one corrupt session document
+    // cannot abort the sweep for every remaining session.
     for (const session of activeSessions) {
+      try {
       const sessionId = session.sessionId;
 
       // 2. Query participants who are ACTIVE
@@ -124,6 +127,10 @@ export async function performSessionCleanup() {
           expired: false,
           activeParticipants: actualActiveCount,
         });
+      }
+      } catch (sessionErr) {
+        console.error(`Session cleanup failed for ${session.sessionId}, continuing sweep:`, sessionErr);
+        results.push({ sessionId: session.sessionId, expired: false, error: "CLEANUP_ERROR" });
       }
     }
 

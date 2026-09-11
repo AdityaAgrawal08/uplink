@@ -160,6 +160,12 @@ func uniquePath(dir, name string) string {
 }
 
 // runSessionDownload fetches one file into ~/Downloads.
+//
+// B49 FIX: stream into a `.part` temp file and rename on success, removing
+// the temp on failure. Previously a failed/cancelled download left a corrupt
+// partial file at the destination, and a retry minted " (1)" duplicates.
+// B50 FIX: sanitize the server-provided filename with filepath.Base so a
+// malicious `../../evil` name cannot escape ~/Downloads.
 func runSessionDownload(ctx context.Context, client *chatClient, job dlJob, prog chan<- dlProgressMsg) error {
 	url, err := client.fetchDownloadURL(job.FileId)
 	if err != nil {
@@ -169,7 +175,12 @@ func runSessionDownload(ctx context.Context, client *chatClient, job dlJob, prog
 	if err != nil {
 		return err
 	}
-	dest := uniquePath(dir, job.Filename)
+	safeName := filepath.Base(job.Filename)
+	if safeName == "" || safeName == "." || safeName == "/" {
+		safeName = "file"
+	}
+	dest := uniquePath(dir, safeName)
+	tmp := dest + ".part"
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -185,22 +196,36 @@ func runSessionDownload(ctx context.Context, client *chatClient, job dlJob, prog
 		return fmt.Errorf("status %d: %s", resp.StatusCode, truncateStringPlain(string(body), 120))
 	}
 
-	f, err := os.Create(dest)
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
 	pr := &progressReader{r: resp.Body, total: job.Size, onProg: func(done, total int64) {
 		select {
 		case prog <- dlProgressMsg{done: done, total: total}:
 		default:
 		}
 	}}
-	if _, err := io.Copy(f, pr); err != nil {
-		return fmt.Errorf("write: %w", err)
+	_, copyErr := io.Copy(f, pr)
+	syncErr := f.Sync()
+	closeErr := f.Close()
+	if copyErr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write: %w", copyErr)
 	}
-	return f.Sync()
+	if syncErr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("sync: %w", syncErr)
+	}
+	if closeErr != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("close: %w", closeErr)
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
 }
 
 // ---- transcript paint ------------------------------------------------------------------

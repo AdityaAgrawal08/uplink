@@ -17,6 +17,10 @@ import (
 
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
 
+// B25 FIX: shared HTTP client for all JSON API calls so keep-alive
+// connections are reused across polls, heartbeats, and sends.
+var sharedHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 const chatUsernameHint = "3-20 chars, letters/digits/underscore"
 
 type sessionCreateResponse struct {
@@ -67,8 +71,10 @@ func postJSON(url string, payload any, headers map[string]string) (int, []byte, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// B25 FIX: reuse a shared client so keep-alive connections are pooled.
+	// Previously every call allocated a new http.Client (new pool, new
+	// dials), defeating HTTP keep-alive on every poll/heartbeat.
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -85,8 +91,8 @@ func getJSON(url string, headers map[string]string) (int, []byte, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// B25 FIX: shared client (see postJSON).
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}

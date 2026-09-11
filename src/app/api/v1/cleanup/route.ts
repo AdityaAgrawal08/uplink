@@ -93,67 +93,74 @@ export async function performCleanup() {
     const results = [];
 
     // 3. Process deletions
+    // B51 FIX: isolate per-share failures so one bad share (R2 error, quota
+    // DB error) cannot abort the sweep for every remaining share.
     for (const share of lockedShares) {
-      const originalStatus = share.originalStatus || "ACTIVE";
+      try {
+        const originalStatus = share.originalStatus || "ACTIVE";
 
-      const deleteSuccess = await deleteObject(share.objectKey);
-      
-      if (deleteSuccess) {
-        // Deletion succeeded: Update status to DELETED
-        await db.collection("shares").updateOne(
-          { shareId: share.shareId },
-          {
-            $set: {
-              status: "DELETED",
-              cleanupLockedUntil: null,
-              cleanupWorkerId: null,
-            },
-            $unset: {
-              downloadCode: "",
-              originalStatus: "",
-            },
+        const deleteSuccess = await deleteObject(share.objectKey);
+        
+        if (deleteSuccess) {
+          // Deletion succeeded: Update status to DELETED
+          await db.collection("shares").updateOne(
+            { shareId: share.shareId },
+            {
+              $set: {
+                status: "DELETED",
+                cleanupLockedUntil: null,
+                cleanupWorkerId: null,
+              },
+              $unset: {
+                downloadCode: "",
+                originalStatus: "",
+              },
+            }
+          );
+
+          // Adjust quota system metrics based on original status
+          if (originalStatus === "CREATED") {
+            // If it was unconfirmed, release the reservation
+            const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
+            const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
+            await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          } else {
+            // If it was committed, decrement active storage bytes and record delete op
+            await recordDeleteQuota(share.size);
           }
-        );
 
-        // Adjust quota system metrics based on original status
-        if (originalStatus === "CREATED") {
-          // If it was unconfirmed, release the reservation
-          const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
-          const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
-          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          results.push({ shareId: share.shareId, status: "DELETED" });
         } else {
-          // If it was committed, decrement active storage bytes and record delete op
-          await recordDeleteQuota(share.size);
-        }
+          // Deletion failed: Transition to DELETE_FAILED and release lock
+          await db.collection("shares").updateOne(
+            { shareId: share.shareId },
+            {
+              $set: {
+                status: "DELETE_FAILED",
+                cleanupLockedUntil: null,
+                cleanupWorkerId: null,
+                lastErrorCode: "R2_DELETE_FAILED",
+                lastErrorMessage: "Failed to delete file from R2 object storage",
+              },
+              $unset: {
+                downloadCode: "",
+              },
+            }
+          );
 
-        results.push({ shareId: share.shareId, status: "DELETED" });
-      } else {
-        // Deletion failed: Transition to DELETE_FAILED and release lock
-        await db.collection("shares").updateOne(
-          { shareId: share.shareId },
-          {
-            $set: {
-              status: "DELETE_FAILED",
-              cleanupLockedUntil: null,
-              cleanupWorkerId: null,
-              lastErrorCode: "R2_DELETE_FAILED",
-              lastErrorMessage: "Failed to delete file from R2 object storage",
-            },
-            $unset: {
-              downloadCode: "",
-            },
+          // If the unconfirmed upload expired and R2 deletion failed, we still release the reservation
+          // so storage is not leaked.
+          if (originalStatus === "CREATED") {
+            const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
+            const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
+            await releaseUploadQuotaWithRetry(share.size, estimatedOps);
           }
-        );
 
-        // If the unconfirmed upload expired and R2 deletion failed, we still release the reservation
-        // so storage is not leaked.
-        if (originalStatus === "CREATED") {
-          const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
-          const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
-          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          results.push({ shareId: share.shareId, status: "DELETE_FAILED" });
         }
-
-        results.push({ shareId: share.shareId, status: "DELETE_FAILED" });
+      } catch (shareErr) {
+        console.error(`Cleanup failed for share ${share.shareId}, continuing sweep:`, shareErr);
+        results.push({ shareId: share.shareId, status: "CLEANUP_ERROR" });
       }
     }
 
