@@ -411,7 +411,7 @@ func (s *Server) handleChat(session *Session, conn *Connection, in *Inbound) {
 	// Rate limit: max messages per second per user.
 	key := session.Id + ":" + conn.Username
 	if !s.limiter.Allow(key) {
-		_ = conn.Conn.WriteJSON(Outbound{
+		safeSend(conn, Outbound{
 			Type:    msgTypeError,
 			Message: "slow down — rate limited",
 		})
@@ -453,7 +453,7 @@ func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound)
 		return
 	}
 	if in.Size > s.cfg.MaxFileSize {
-		_ = conn.Conn.WriteJSON(Outbound{
+		safeSend(conn, Outbound{
 			Type:    msgTypeError,
 			Message: "file exceeds maximum size limit",
 		})
@@ -539,13 +539,26 @@ func (s *Server) handleDelete(session *Session, conn *Connection, in *Inbound) {
 
 func (s *Server) handleHeartbeat(session *Session, conn *Connection) {
 	conn.LastBeat = time.Now()
-	_ = conn.Conn.WriteJSON(Outbound{
+	safeSend(conn, Outbound{
 		Type:  "heartbeat-ack",
 		Users: session.ActiveUsernames(),
 	})
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+// safeSend sends a JSON message through the connection's send channel.
+// Non-blocking: drops the message if the channel is full (slow consumer).
+func safeSend(conn *Connection, msg Outbound) {
+	data, err := jsonMarshal(msg)
+	if err != nil {
+		return
+	}
+	select {
+	case conn.Send <- data:
+	default:
+	}
+}
 
 func (s *Server) getSession(id string) *Session {
 	s.mu.RLock()
