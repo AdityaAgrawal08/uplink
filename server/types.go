@@ -24,6 +24,7 @@ const (
 const (
 	msgTypeWelcome = "welcome"
 	msgTypeUsers   = "users"
+	msgTypeKeys    = "keys"
 	msgTypeSystem  = "system"
 	msgTypeEnded   = "ended"
 	msgTypeError   = "error"
@@ -64,6 +65,9 @@ type Outbound struct {
 	SessionPubKey  string `json:"sessionPublicKey,omitempty"`
 	Users          []string `json:"users,omitempty"`
 
+	// keys (E2E public-key distribution)
+	Keys []UserKey `json:"keys,omitempty"`
+
 	// chat / file / delete
 	MsgId      string `json:"msgId,omitempty"`
 	Username   string `json:"username,omitempty"`
@@ -88,6 +92,13 @@ type Outbound struct {
 	DeleteMsgId string `json:"deleteMsgId,omitempty"`
 }
 
+// UserKey is one participant's X25519 public key, distributed to peers so
+// they can derive shared E2E encryption keys.
+type UserKey struct {
+	Username  string `json:"username"`
+	PublicKey string `json:"publicKey"`
+}
+
 // ChatMessage is a single transcript entry held in the ring buffer.
 type ChatMessage struct {
 	MsgId     string    `json:"msgId"`
@@ -98,7 +109,7 @@ type ChatMessage struct {
 	Filename  string    `json:"filename,omitempty"`
 	Size      int64     `json:"size,omitempty"`
 	SHA256    string    `json:"sha256,omitempty"`
-	TotalChunks int    `json:"totalChunks,omitempty"`
+	TotalChunks int     `json:"totalChunks,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 }
 
@@ -155,8 +166,8 @@ type Connection struct {
 	Send       chan []byte
 	LastBeat   time.Time
 	SendMu     sync.Mutex
-	ServerPubKey []byte // X25519 public key distributed to this client
-	ClientPubKey []byte // X25519 public key sent by this client
+	ServerPubKey string // X25519 public key distributed to this client
+	ClientPubKey string // X25519 public key sent by this client
 }
 
 // ─── Session (one per chat room) ───────────────────────────────────────────

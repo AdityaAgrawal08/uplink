@@ -2,7 +2,9 @@ package main
 
 import (
 	"crypto/rand"
-	"encoding/hex"
+	"crypto/subtle"
+	"encoding/base64"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -220,7 +222,11 @@ func (s *Server) handleLeaveHTTP(w http.ResponseWriter, r *http.Request, session
 		jsonError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	s.removeUser(session, username)
+	// HTTP leave: look up the live connection for this username (if any).
+	session.Mu.RLock()
+	conn := session.Users[username]
+	session.Mu.RUnlock()
+	s.removeUser(session, conn)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -302,7 +308,7 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request, session
 	s.readPump(session, conn)
 
 	// When readPump returns, the client disconnected.
-	s.removeUser(session, username)
+	s.removeUser(session, conn)
 	session.SendSystem(username + " left")
 	session.Broadcast(Outbound{
 		Type:  msgTypeUsers,
@@ -395,11 +401,23 @@ func (s *Server) writePump(session *Session, conn *Connection) {
 
 func (s *Server) handleJoin(session *Session, conn *Connection, in *Inbound) {
 	// Client sends its public key after receiving the welcome.
-	if in.ClientPubKey != "" {
-		conn.ClientPubKey = []byte(in.ClientPubKey)
-		// Broadcast updated keys to all users.
-		s.broadcastUserKeys(session)
+	key := strings.TrimSpace(in.ClientPubKey)
+	if key == "" {
+		return
 	}
+	// Validate: must be base64 that decodes to a 32-byte X25519 public key.
+	raw, err := base64.RawStdEncoding.DecodeString(key)
+	if err != nil || len(raw) != 32 {
+		safeSend(conn, Outbound{
+			Type:    msgTypeError,
+			Message: "invalid clientPublicKey (expected base64-encoded 32-byte X25519 key)",
+		})
+		return
+	}
+	conn.ClientPubKey = key
+	// Distribute the updated key set to everyone so peers can derive shared
+	// secrets. (Previously this was a no-op stub, so E2E was never wired up.)
+	s.broadcastUserKeys(session)
 }
 
 func (s *Server) handleChat(session *Session, conn *Connection, in *Inbound) {
@@ -566,12 +584,19 @@ func (s *Server) getSession(id string) *Session {
 	return s.sessions[id]
 }
 
-func (s *Server) removeUser(session *Session, username string) {
+func (s *Server) removeUser(session *Session, conn *Connection) {
+	if conn == nil {
+		return
+	}
 	session.Mu.Lock()
-	if c, ok := session.Users[username]; ok {
-		close(c.Send)
-		_ = c.Conn.Close()
-		delete(session.Users, username)
+	// B37 FIX: only remove the map entry if it is still THIS connection.
+	// After a reconnect the same username maps to a new Connection; the old
+	// connection's readPump returning would otherwise evict the live one.
+	cur, ok := session.Users[conn.Username]
+	if ok && cur == conn {
+		close(conn.Send)
+		_ = conn.Conn.Close()
+		delete(session.Users, conn.Username)
 	}
 	empty := len(session.Users) == 0
 	session.Mu.Unlock()
@@ -595,14 +620,17 @@ func (s *Server) removeUser(session *Session, username string) {
 
 func (s *Server) broadcastUserKeys(session *Session) {
 	session.Mu.RLock()
-	defer session.Mu.RUnlock()
+	keys := make([]UserKey, 0, len(session.Users))
 	for _, c := range session.Users {
-		if c.ClientPubKey != nil {
-			// Each user gets a message with all other users' public keys.
-			// For v1, we just broadcast a "key-refresh" event; clients
-			// re-derive shared keys from the roster.
+		if c.ClientPubKey != "" {
+			keys = append(keys, UserKey{Username: c.Username, PublicKey: c.ClientPubKey})
 		}
 	}
+	session.Mu.RUnlock()
+	if len(keys) == 0 {
+		return
+	}
+	session.Broadcast(Outbound{Type: msgTypeKeys, Keys: keys}, "")
 }
 
 // cleanerLoop periodically sweeps expired sessions.
@@ -628,27 +656,33 @@ func (s *Server) cleanerLoop() {
 	}
 }
 
-// hashPassword hashes a password with argon2id.
+// hashPassword hashes a password with argon2id using a per-password random
+// salt, encoded as $argon2id$v=19$m=16384,t=3,p=1$<salt-b64>$<hash-b64>.
 func hashPassword(password string) string {
-	// Use a fixed salt for simplicity; production should use per-password random salt.
-	salt := []byte("uplink-ws-salt-v1")
+	salt := make([]byte, 16)
+	if _, err := rand.Read(salt); err != nil {
+		return ""
+	}
 	hash := argon2.IDKey([]byte(password), salt, 3, 16*1024, 1, 32)
-	return "$argon2id$v=19$m=16384,t=3,p=1$" + string(salt) + "$" + hexEncode(hash)
+	return fmt.Sprintf("$argon2id$v=19$m=16384,t=3,p=1$%s$%s",
+		base64.RawStdEncoding.EncodeToString(salt),
+		base64.RawStdEncoding.EncodeToString(hash))
 }
 
 func verifyPassword(password, hash string) bool {
-	// For v1, we compare against the stored hash.
-	// The format is: $argon2id$v=19$m=16384,t=3,p=1$<salt>$<hash>
+	// Format: $argon2id$v=19$m=16384,t=3,p=1$<salt-b64>$<hash-b64>
 	parts := strings.SplitN(hash, "$", 6)
 	if len(parts) != 6 {
 		return false
 	}
-	salt := []byte(parts[4])
-	expected := parts[5]
-	computed := hexEncode(argon2.IDKey([]byte(password), salt, 3, 16*1024, 1, 32))
-	return expected == computed
-}
-
-func hexEncode(b []byte) string {
-	return strings.ToLower(hex.EncodeToString(b))
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return false
+	}
+	expected, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil {
+		return false
+	}
+	computed := argon2.IDKey([]byte(password), salt, 3, 16*1024, 1, 32)
+	return subtle.ConstantTimeCompare(computed, expected) == 1
 }
