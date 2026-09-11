@@ -18,6 +18,17 @@ export async function POST(
     const body = text ? JSON.parse(text) : {};
     const { peerId, addrs } = body;
 
+    // B41 FIX: validate P2P discovery fields before persisting. Previously
+    // any JSON type was written straight into the participant document.
+    if (peerId !== undefined && (typeof peerId !== "string" || peerId.length > 256)) {
+      return apiError("peerId must be a string of at most 256 characters", 400);
+    }
+    if (addrs !== undefined) {
+      if (!Array.isArray(addrs) || addrs.length > 32 || !addrs.every(a => typeof a === "string" && a.length <= 512)) {
+        return apiError("addrs must be an array of at most 32 strings (each at most 512 chars)", 400);
+      }
+    }
+
     // B30 FIX: Validate username format (it is used in queries and echoed
     // into the roster). Also required before any DB work.
     if (!/^[a-zA-Z0-9_]{3,20}$/.test(usernameHeader)) {

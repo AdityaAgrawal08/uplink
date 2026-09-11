@@ -112,6 +112,24 @@ export async function POST(
         return apiError("Invalid parts list structure. Each part must contain a valid partNumber and etag.", 400);
       }
 
+      // B40 FIX: bound the parts array and require unique part numbers.
+      // init caps partsCount at 100, but confirm accepted an unbounded array;
+      // duplicates would also duplicate bytes in mock-mode assembly.
+      if (parts.length === 0 || parts.length > 100) {
+        const estimatedOps = uploadSession.partsCount + 2;
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        return apiError("Parts list must contain between 1 and 100 entries", 400);
+      }
+      const seenParts = new Set<number>();
+      for (const p of parts) {
+        if (seenParts.has(p.partNumber)) {
+          const estimatedOps = uploadSession.partsCount + 2;
+          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          return apiError(`Duplicate partNumber in parts list: ${p.partNumber}`, 400);
+        }
+        seenParts.add(p.partNumber);
+      }
+
       // Assemble chunks in R2/S3 or mock storage
       const completionResult = await completeMultipartUpload(
         share.objectKey,
@@ -229,6 +247,22 @@ export async function POST(
     );
 
     if (!updateShareResult) {
+      // B39 FIX: distinguish a lost race (share went ACTIVE via a concurrent
+      // confirm) from a genuine conflict. The old code unconditionally
+      // released quota here, so a concurrent double-confirm drove
+      // reservedBytes negative and corrupted the quota ledger.
+      const current = await db.collection("shares").findOne(
+        { shareId: share.shareId },
+        { projection: { status: 1, downloadCode: 1 } }
+      );
+      if (current && current.status === "ACTIVE") {
+        return NextResponse.json({
+          message: "Upload already confirmed",
+          shareId: share.shareId,
+          downloadCode: current.downloadCode || null,
+          status: current.status,
+        });
+      }
       const estimatedOps = uploadSession.isMultipart ? uploadSession.partsCount + 2 : 1;
       await releaseUploadQuotaWithRetry(share.size, estimatedOps);
       return apiError("Conflict updating share status", 409);

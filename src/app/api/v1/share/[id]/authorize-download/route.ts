@@ -54,20 +54,10 @@ export async function POST(
       }
     }
 
-    // 2. Class B Operation Quota check (Milestone 5)
-    try {
-      const classBApproved = await consumeClassBQuota();
-      if (!classBApproved) {
-        return apiError("Service is temporarily unavailable due to operations quota limit exhaustion.", 503);
-      }
-    } catch (quotaErr) {
-      console.error("Fail-closed: Class B quota check error:", quotaErr);
-      return apiError("Service is temporarily unavailable due to system quota validation failure.", 503);
-    }
-
     const now = new Date();
 
-    // Check expiration
+    // 2. Expiry and status check (before password verification so dead links
+    //    fail fast without burning a password attempt).
     if (new Date(share.expiresAt) < now || share.status === "EXPIRED") {
       if (share.status !== "EXPIRED" && share.status !== "DELETED" && share.status !== "PENDING_DELETE") {
         await db.collection("shares").updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
@@ -79,7 +69,9 @@ export async function POST(
       return apiError(`This share link is not active (${share.status})`, 400);
     }
 
-    // 3. Password Verification
+    // 3. Password Verification (before any quota spend: failed guesses must
+    //    not burn Class B operations — otherwise an attacker can exhaust the
+    //    daily R2 budget with wrong passwords).
     if (share.passwordHash) {
       if (!password) {
         return NextResponse.json(
@@ -138,7 +130,20 @@ export async function POST(
       }
     }
 
-    // 5. Generate Presigned GET URL
+    // 5. Class B Operation Quota check — placed AFTER auth, expiry, and
+    //    limit checks so failed guesses, dead links, and exhausted shares
+    //    never spend R2 operations budget (B38).
+    try {
+      const classBApproved = await consumeClassBQuota();
+      if (!classBApproved) {
+        return apiError("Service is temporarily unavailable due to operations quota limit exhaustion.", 503);
+      }
+    } catch (quotaErr) {
+      console.error("Fail-closed: Class B quota check error:", quotaErr);
+      return apiError("Service is temporarily unavailable due to system quota validation failure.", 503);
+    }
+
+    // 6. Generate Presigned GET URL
     const downloadUrlExpiry = 3600; // 1h expiry for download link
     const downloadUrl = await getPresignedDownloadUrl(
       share.objectKey,
