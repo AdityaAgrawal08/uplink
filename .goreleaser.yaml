@@ -15,9 +15,6 @@ builds:
     binary: uplink
     goos: [linux, windows, darwin]
     goarch: [amd64, arm64]
-    ignore:
-      - goos: windows
-        goarch: arm64  # covered by amd64 emulation; re-enable on demand
     ldflags:
       - -s -w
       - -X main.version={{.Version}}
@@ -39,17 +36,12 @@ checksum:
   name_template: checksums.txt
   algorithm: sha256
 
-signs:
-  - artifacts: checksum
-    args:
-      - "--batch"
-      - "--local-user"
-      - "{{ .Env.GPG_FINGERPRINT }}"
-      - "--output"
-      - "${signature}"
-      - "--detach-sign"
-      - "${artifact}"
-    stdin: "{{ .Env.GPG_PASSPHRASE }}"
+# NOTE: GPG signing (signs:) and package-manager taps (brews:, scoops:)
+# are intentionally absent: they need secrets and tap repos that don't
+# exist yet. Add them when ready — install.sh, install.ps1, and
+# `uplink update` all verify checksums.txt, which this file publishes.
+# Homebrew/Scoop users can still install via the one-link scripts until
+# the taps land.
 
 changelog:
   sort: asc
@@ -57,19 +49,3 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
-
-brews:
-  - name: uplink
-    homepage: https://github.com/AdityaAgrawal08/uplink-delta
-    description: Ephemeral E2E-encrypted terminal chat and file sharing
-    repository:
-      owner: AdityaAgrawal08
-      name: homebrew-uplink
-
-scoops:
-  - repository:
-      owner: AdityaAgrawal08
-      name: scoop-uplink
-    homepage: https://github.com/AdityaAgrawal08/uplink-delta
-    description: Ephemeral E2E-encrypted terminal chat and file sharing
-    license: MIT

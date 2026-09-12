@@ -45,7 +45,16 @@ if [ -z "${EXPECTED}" ]; then
   echo "Error: no checksum entry for ${ASSET_NAME} — aborting." >&2
   exit 1
 fi
-ACTUAL="$(sha256sum "${TEMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)"
+ACTUAL=""
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "${TEMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)"
+elif command -v shasum >/dev/null 2>&1; then
+  # macOS ships shasum, not sha256sum.
+  ACTUAL="$(shasum -a 256 "${TEMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)"
+else
+  echo "Error: need sha256sum or shasum to verify the download — aborting." >&2
+  exit 1
+fi
 if [ "${ACTUAL}" != "${EXPECTED}" ]; then
   echo "Error: checksum mismatch — aborting (do not run this binary)." >&2
   exit 1

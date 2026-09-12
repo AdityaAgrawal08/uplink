@@ -1,4 +1,3 @@
-<#pragma warning disable
 # Uplink installer for Windows (PowerShell 5.1+).
 # Usage: irm https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"

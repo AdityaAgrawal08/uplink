@@ -1,6 +1,9 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -170,20 +173,30 @@ func handleUpdate() {
 	}
 	fmt.Println("✓ Checksum verified.")
 
+	// Release assets are archives (tar.gz, .zip on Windows) — extract the
+	// binary first. Installing the archive itself was an old bug that left
+	// a non-executable tarball on the user's PATH.
+	binPath, err := extractReleaseAsset(tmpFile.Name())
+	if err != nil {
+		fmt.Printf("✗ %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(binPath)
+
 	// Determine install path
 	selfPath, err := exec.LookPath("uplink")
 	if err != nil {
 		selfPath = filepath.Join(".", "uplink")
 	}
 
-	if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
+	if err := os.Chmod(binPath, 0755); err != nil {
 		fmt.Printf("✗ Cannot make binary executable: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := os.Rename(tmpFile.Name(), selfPath); err != nil {
+	if err := os.Rename(binPath, selfPath); err != nil {
 		// Try copy if rename fails (cross-device)
-		in, err := os.Open(tmpFile.Name())
+		in, err := os.Open(binPath)
 		if err != nil {
 			fmt.Printf("✗ Cannot read new binary: %v\n", err)
 			os.Exit(1)
@@ -199,8 +212,93 @@ func handleUpdate() {
 			fmt.Printf("✗ Install failed: %v\n", err)
 			os.Exit(1)
 		}
-		os.Remove(tmpFile.Name())
+		os.Remove(binPath)
 	}
 
 	fmt.Printf("✓ Updated to v%s (%s)\n", latestTag, selfPath)
+}
+
+// extractReleaseAsset unpacks a downloaded release archive and returns the
+// path of the extracted uplink binary (in a fresh temp file). Zip-slip
+// hardened: entries are flattened to their base name and only uplink*
+// entries are accepted; decompression is capped to blunt bombs.
+func extractReleaseAsset(archivePath string) (string, error) {
+	out, err := os.CreateTemp("", "uplink-bin-*")
+	if err != nil {
+		return "", fmt.Errorf("temp file creation failed: %w", err)
+	}
+	outPath := out.Name()
+	if runtime.GOOS == "windows" {
+		out.Close()
+		os.Remove(outPath)
+		return extractZipAsset(archivePath)
+	}
+	defer out.Close()
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		os.Remove(outPath)
+		return "", err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(io.LimitReader(f, 300<<20))
+	if err != nil {
+		os.Remove(outPath)
+		return "", fmt.Errorf("not a gzip archive: %w", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			os.Remove(outPath)
+			return "", fmt.Errorf("tar read failed: %w", err)
+		}
+		name := filepath.Base(hdr.Name)
+		if !strings.HasPrefix(name, "uplink") || !hdr.FileInfo().Mode().IsRegular() {
+			continue
+		}
+		if _, err := io.CopyN(out, tr, 300<<20); err != nil && err != io.EOF {
+			os.Remove(outPath)
+			return "", fmt.Errorf("extract failed: %w", err)
+		}
+		return outPath, nil
+	}
+	os.Remove(outPath)
+	return "", fmt.Errorf("no uplink binary found in archive")
+}
+
+func extractZipAsset(archivePath string) (string, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return "", fmt.Errorf("not a zip archive: %w", err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if !strings.HasPrefix(name, "uplink") || f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		out, err := os.CreateTemp("", "uplink-bin-*.exe")
+		if err != nil {
+			rc.Close()
+			return "", err
+		}
+		_, copyErr := io.CopyN(out, io.LimitReader(rc, 300<<20), 300<<20)
+		rc.Close()
+		out.Close()
+		if copyErr != nil && copyErr != io.EOF {
+			os.Remove(out.Name())
+			return "", fmt.Errorf("extract failed: %w", copyErr)
+		}
+		return out.Name(), nil
+	}
+	return "", fmt.Errorf("no uplink binary found in archive")
 }

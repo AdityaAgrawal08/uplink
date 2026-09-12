@@ -1,5 +1,11 @@
 name: Release
 
+# Single source of truth for release artifacts is .goreleaser.yaml: it
+# emits the exact asset names install.sh / install.ps1 expect
+# (uplink-<os>-<arch>.tar.gz, .zip on Windows), plus the checksums.txt
+# both installers and `uplink update` verify before installing. The old
+# hand-rolled matrix is gone: it published tarballs for Windows (the
+# installer expects .zip) and no checksums at all (installers refuse).
 on:
   push:
     tags:
@@ -9,69 +15,25 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build Binaries
+  release:
+    name: GoReleaser
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - os: linux
-            arch: amd64
-          - os: linux
-            arch: arm64
-          - os: darwin
-            arch: amd64
-          - os: darwin
-            arch: arm64
-          - os: windows
-            arch: amd64
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set Up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: cli/go.mod
 
-      - name: Build Binary
-        run: |
-          cd cli
-          ext=""
-          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
-          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} CGO_ENABLED=0 \
-            go build -o "uplink${ext}" -trimpath -ldflags="-s -w"
-
-      - name: Archive Binary
-        run: |
-          cd cli
-          ext=""
-          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
-          tar -czf ../uplink-${{ matrix.os }}-${{ matrix.arch }}.tar.gz "uplink${ext}"
-
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
         with:
-          name: uplink-${{ matrix.os }}-${{ matrix.arch }}
-          path: uplink-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
-
-  release:
-    name: Create Release
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Download Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*.tar.gz
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
