@@ -4,8 +4,9 @@ name: CI
 # cross-platform CLI builds, and a full end-to-end integration matrix
 # (real MongoDB service container + mock R2 storage) covering every
 # feature surface: share send/receive, folders, E2EE, multipart,
-# idempotency, negative contracts, and collaborative sessions
-# (auto-skipped on branches without session routes).
+# idempotency, negative contracts, and the signaling plane + two-client
+# P2P chat (session routes are signaling-only; chat content never flows
+# over HTTP).
 
 on:
   push:
@@ -161,9 +162,6 @@ jobs:
 
       - name: Two-client chat E2E (cross-delivery, roster, end-propagation)
         run: SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh
-
-      - name: Session /upload flow (watermark, visibility, byte-identity)
-        run: SERVER=http://localhost:3000 ./scratch/session_upload_flow.sh
 
       - name: API contract probes
         # NOTE: deliberately NO /share/init calls here — the init rate limiter

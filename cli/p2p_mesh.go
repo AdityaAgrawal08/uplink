@@ -106,11 +106,15 @@ func (m *mesh) ensurePeer(username string) {
 func (m *mesh) send(peer string, raw []byte) error {
 	m.mu.Lock()
 	mp, ok := m.peers[peer]
+	var dc *webrtc.DataChannel
+	if ok {
+		dc = mp.dc
+	}
 	m.mu.Unlock()
-	if !ok || mp.dc == nil {
+	if !ok || dc == nil {
 		return fmt.Errorf("no open channel to %s", peer)
 	}
-	return mp.dc.Send(raw)
+	return dc.Send(raw)
 }
 
 // deliver routes a drained offer/answer note to the setup goroutine for
@@ -173,12 +177,31 @@ func (m *mesh) dropPeer(username string) {
 func (m *mesh) closePeer(mp *meshPeer) {
 	// Closing the PC wakes a blocked setupPeer via the connection-state
 	// callback; no separate done channel (single ownership, no double-close).
-	if mp.dc != nil {
-		_ = mp.dc.Close()
+	// Fields are copied under lock: writers (setup goroutine, Pion threads)
+	// and readers (close paths) otherwise race.
+	m.mu.Lock()
+	dc, pc := mp.dc, mp.pc
+	m.mu.Unlock()
+	if dc != nil {
+		_ = dc.Close()
 	}
-	if mp.pc != nil {
-		_ = mp.pc.Close()
+	if pc != nil {
+		_ = pc.Close()
 	}
+}
+
+// setPC stores the PeerConnection under lock.
+func (m *mesh) setPC(mp *meshPeer, pc *webrtc.PeerConnection) {
+	m.mu.Lock()
+	mp.pc = pc
+	m.mu.Unlock()
+}
+
+// setDC stores the data channel under lock (wired from Pion threads).
+func (m *mesh) setDC(mp *meshPeer, dc *webrtc.DataChannel) {
+	m.mu.Lock()
+	mp.dc = dc
+	m.mu.Unlock()
 }
 
 func (m *mesh) close() {
@@ -241,7 +264,7 @@ func (m *mesh) setupPeer(mp *meshPeer) {
 		m.failPeer(peer)
 		return
 	}
-	mp.pc = pc
+	m.setPC(mp, pc)
 
 	// Any terminal connection state fails this attempt; the engine may
 	// re-ensure (fresh PC + fresh Noise handshake).
@@ -258,7 +281,7 @@ func (m *mesh) setupPeer(mp *meshPeer) {
 	})
 
 	wireChannel := func(dc *webrtc.DataChannel) {
-		mp.dc = dc
+		m.setDC(mp, dc)
 		dc.OnOpen(func() {
 			if m.cb.onPeerUp != nil {
 				m.cb.onPeerUp(peer)
