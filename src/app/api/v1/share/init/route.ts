@@ -311,8 +311,7 @@ export async function POST(req: NextRequest) {
       const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
       await releaseUploadQuotaWithRetry(size, estimatedClassAOps);
     }
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   } finally {
     if (redisIdempotencyKey && !success) {
       await redis.del(redisIdempotencyKey).catch(err => console.error("Failed to clean up idempotency key on error:", err));

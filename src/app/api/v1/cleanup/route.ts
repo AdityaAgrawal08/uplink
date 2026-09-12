@@ -182,7 +182,6 @@ export async function performCleanup() {
     });
   } catch (error: unknown) {
     console.error("Cleanup job error:", error);
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }

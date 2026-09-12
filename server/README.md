@@ -1,5 +1,16 @@
 # Uplink WebSocket Server
 
+> **STATUS: SHELVED.** This relay was built for E2E chat with zero storage,
+> but it needs a persistent host (long-lived processes) and the project
+> deploys on Vercel serverless only, which cannot run it. The production
+> architecture is now: Vercel signaling plane (`src/app/api/v1/session/*`,
+> `src/lib/rooms.ts`) + WebRTC P2P data plane in the CLI (`cli/p2p_*.go`).
+> Keep this directory as the documented fallback: if an always-on host
+> (VPS/Fly/Railway) ever becomes available, this relay slots back in as an
+> optional always-on relay/fallback. Known gaps if revived: session
+> password via query param (move to header), no max-sessions cap, no
+> per-IP connection cap (see branch history for the audit).
+
 Standalone Go WebSocket server for real-time chat sessions. Replaces HTTP long-polling with persistent bidirectional connections.
 
 ## Architecture

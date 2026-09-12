@@ -202,7 +202,6 @@ export async function POST(
     });
   } catch (error: unknown) {
     console.error("Error in POST /api/v1/share/[id]/authorize-download:", error);
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }

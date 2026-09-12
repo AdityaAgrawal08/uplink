@@ -85,7 +85,7 @@ export async function POST(
     const text = await getObjectText(share.objectKey);
     return NextResponse.json({ text: text.slice(0, 100000) });
   } catch (err: unknown) {
-    const errMsg = err instanceof Error ? err.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    console.error("Error in POST /api/v1/share/[id]/preview-text:", err);
+    return apiError("Internal server error", 500);
   }
 }

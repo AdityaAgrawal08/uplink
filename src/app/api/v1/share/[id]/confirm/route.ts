@@ -319,7 +319,6 @@ export async function POST(
         console.error("Failed to refund quota on confirm crash:", refundErr);
       }
     }
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }
