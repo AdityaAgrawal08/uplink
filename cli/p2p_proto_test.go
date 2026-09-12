@@ -37,7 +37,7 @@ func TestDecodeFrameRejects(t *testing.T) {
 }
 
 func TestFrameTypesAccepted(t *testing.T) {
-	for _, ft := range []string{frameChat, frameAck, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping} {
+	for _, ft := range []string{frameChat, frameAck, frameFile, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping} {
 		f := newFrame(ft, "m", "a", "")
 		raw, _ := encodeFrame(f)
 		if _, err := decodeFrame(raw); err != nil {

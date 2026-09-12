@@ -1,8 +1,6 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
 	"strings"
 	"testing"
 )
@@ -45,7 +43,7 @@ func TestThreadViewIsolatedFromRoom(t *testing.T) {
 	c.addMessage(chatMessage{Seq: 3, Username: "p1", Kind: "system", Text: "p3 joined", ConvID: generalConv})
 
 	cmd := c.enterPrivate("p2")
-	_ = cmd // backlog fetch may be nil (fetchedConvs pre-seeded by helper)
+	_ = cmd // always nil now (no server history to fetch)
 
 	got := strings.Join(c.lines, "\n")
 	if strings.Contains(got, "room noise") || strings.Contains(got, "p3 joined") {
@@ -108,45 +106,20 @@ func TestPendingEchoLivesInItsConversation(t *testing.T) {
 	}
 }
 
-// Lazy deep-fetch fires exactly once per thread and carries ?conv=.
-func TestEnterPrivateFetchesThreadOnce(t *testing.T) {
-	var queries []string
-	srv := newFakeChatServer(t, nil)
-	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("conv") != "" {
-			queries = append(queries, r.URL.Query().Get("conv"))
-			fmt.Fprintf(w, `{"messages":[{"seq":50,"username":"alice","kind":"chat","text":"old","convId":%q}],"activeUsers":[],"ended":false}`, convOf("me", "alice"))
-			return
-		}
-		fmt.Fprint(w, `{"messages":[],"activeUsers":[],"ended":false}`)
-	})
-	defer srv.Close()
-
+// Threads open instantly: there is no server history to fetch, so
+// enterPrivate must never schedule a fetch command.
+func TestEnterPrivateSwitchesInstantly(t *testing.T) {
 	c := newFilterScreen("me", "")
 	c.vp = *viewportPtr(60, 20)
-	c.client = newChatClient(srv.URL, "123456", "me")
 
-	first := c.enterPrivate("alice")
-	if first == nil {
-		t.Fatal("first open must schedule thread fetch")
-	}
-	msg := first() // perform the wire call
-	nm, _ := c.Update(msg)
-	*c = nm.(chatScreen) // Update returns the mutated copy (Elm-style)
 	if cmd := c.enterPrivate("alice"); cmd != nil {
-		t.Fatal("second open must NOT refetch")
+		t.Fatal("thread open must not schedule any fetch (no server history)")
 	}
-	if len(queries) != 1 || queries[0] != convOf("me", "alice") {
-		t.Fatalf("fetch queries = %v", queries)
+	if c.targetUser != "alice" {
+		t.Fatalf("targetUser = %q", c.targetUser)
 	}
-	found := false
-	for _, m := range c.history {
-		if m.Text == "old" && m.ConvID == convOf("me", "alice") {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("deep-fetched history not stored")
+	if cmd := c.enterPrivate("alice"); cmd != nil {
+		t.Fatal("re-open must also be fetch-free")
 	}
 }
 

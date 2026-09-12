@@ -29,7 +29,13 @@ const (
 	frameFileMeta     = "file-meta"
 	frameFileChunk    = "file-chunk"
 	frameFileComplete = "file-complete"
-	frameTyping       = "typing"
+	// frameFile is a whole file in one frame, used ONLY on the inbox
+	// fallback path. Rationale: the inbox keys boxes by msgId, so the
+	// streaming meta/chunk/complete frames (which share one msgId) would
+	// overwrite each other server-side. One file = one box = no collision.
+	// Size-capped (see fallbackFileMax); larger files need the direct line.
+	frameFile   = "file"
+	frameTyping = "typing"
 )
 
 // Max plaintext bytes per file chunk (encrypted individually so receivers
@@ -68,7 +74,7 @@ func decodeFrame(raw []byte) (frame, error) {
 		return f, fmt.Errorf("unsupported protocol version %d", f.V)
 	}
 	switch f.Type {
-	case frameChat, frameAck, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping:
+	case frameChat, frameAck, frameFile, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping:
 		return f, nil
 	default:
 		return f, fmt.Errorf("unknown frame type %q", f.Type)

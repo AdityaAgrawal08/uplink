@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -181,6 +182,50 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 		lastDMAt:   map[string]time.Time{},
 		input:      ti,
 	}
+}
+
+// wireTestEngine attaches a live signal client + engine (backed by srv, a
+// fake signaling server) to a bare screen, joins me and every peer, and
+// seeds the engine roster. Returns peer pubkeys keyed by username for
+// assertions that need them.
+func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string, peers ...string) map[string]string {
+	t.Helper()
+	id, err := generateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := &signalClient{serverURL: srv.URL, me: me}
+	// First user creates the room; if it already exists (shared server),
+	// fall back to joining it.
+	if sid, err := sig.createRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); err == nil {
+		sig.key = sid
+	} else if _, jerr := sig.joinRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); jerr != nil {
+		t.Fatalf("create/join %s: %v / %v", me, err, jerr)
+	} else {
+		sig.key = "123456"
+	}
+	pubkeys := map[string]string{}
+	for _, p := range peers {
+		pid, err := generateIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pk := base64.StdEncoding.EncodeToString(pid.publicKey())
+		psig := &signalClient{serverURL: srv.URL, key: "123456", me: p}
+		if _, err := psig.joinRoom(p, pk, ""); err != nil {
+			t.Fatalf("join %s: %v", p, err)
+		}
+		pubkeys[p] = pk
+	}
+	c.sig = sig
+	c.eng = newEngine(me, id, sig, engineCallbacks{})
+	c.netCh = make(chan tea.Msg, 256)
+	roster := []rosterMember{}
+	for u, pk := range pubkeys {
+		roster = append(roster, rosterMember{Username: u, Pubkey: pk, Online: true})
+	}
+	c.eng.setRoster(roster)
+	return pubkeys
 }
 
 // Visibility is now purely conversational; see chat_conv_test.go for the
@@ -497,8 +542,10 @@ func maxLineWidth(s string) int {
 
 // ---------------------------------------------------------------------------
 // Wire-level send integration: Update(Enter) must produce a command whose
-// invocation performs the HTTP POST. Regression for the silent-send bug where
-// the optimistic echo painted but no request ever left the process.
+// invocation performs the inbox deposit. Regression for the silent-send bug
+// where the optimistic echo painted but no request ever left the process.
+// Bodies are sealed E2E boxes (opaque by design); assertions count deposits
+// and check routing fields, never plaintext.
 // ---------------------------------------------------------------------------
 
 func newFakeChatServer(t *testing.T, got *[][]byte) *httptest.Server {
@@ -517,14 +564,20 @@ func newFakeChatServer(t *testing.T, got *[][]byte) *httptest.Server {
 	}))
 }
 
+func inboxDeposits(fs *fakeSignalServer, user string) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return len(fs.boxes["123456/"+user])
+}
+
 func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter, Runes: []rune{}})
@@ -547,8 +600,8 @@ func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
 	if !ok {
 		t.Fatalf("send cmd yielded %T; want sendDoneMsg", msg)
 	}
-	if len(received) != 1 || !strings.Contains(string(received[0]), "hello") {
-		t.Fatalf("wire payload wrong: %v", received)
+	if inboxDeposits(fs, "alice") != 1 {
+		t.Fatal("broadcast must deposit exactly one box for the single peer")
 	}
 
 	// Feed the confirmation back through Update; echo must resolve.
@@ -570,13 +623,13 @@ func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
 }
 
 func TestOutboxPromotionGoesOverWire(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	scr := m.(chatScreen)
 
@@ -626,12 +679,9 @@ func TestOutboxPromotionGoesOverWire(t *testing.T) {
 	if promo3 != nil {
 		t.Fatal("spurious promotion after last message")
 	}
-	if len(received) != 3 {
-		t.Fatalf("wire saw %d posts; want 3 (%v)", len(received), received)
-	}
-	for i, want := range []string{"one", "two", "three"} {
-		if !strings.Contains(string(received[i]), want) {
-			t.Errorf("post %d = %q; want %q", i, received[i], want)
-		}
+	// Three sends → three inbox boxes for the peer. Payloads are sealed
+	// boxes (opaque); counting deposits proves the pipeline drained.
+	if inboxDeposits(fs, "alice") != 3 {
+		t.Fatalf("wire saw %d deposits; want 3", inboxDeposits(fs, "alice"))
 	}
 }

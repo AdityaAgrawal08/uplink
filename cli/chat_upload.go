@@ -1,18 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"mime"
-	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/AdityaAgrawal08/uplink-delta/cli/pkg/tarball"
@@ -22,13 +14,10 @@ import (
 
 // ---- session file upload engine ----------------------------------------------
 //
-// Wires the picker's buffered paths into the server's session-file contract:
-//
-//	announce {filename,size,sha256} -> {fileId,shareId}
-//	share/init (with that shareId)  -> presigned PUT url
-//	PUT bytes                       -> storage
-//	share/{id}/confirm              -> share goes live
-//	session upload-complete         -> status flips to UPLOADED
+// Wires the picker's buffered paths into the P2P engine: folders are
+// tarballed client-side, then bytes stream E2E-encrypted over the direct
+// line (or the inbox fallback for small files). No server storage at any
+// step — the old announce/init/PUT/confirm chain is gone.
 //
 // Jobs run strictly sequentially (one in-flight transfer) so progress lines
 // stay readable and the wire sees one file at a time. Folders are tarballed
@@ -79,12 +68,6 @@ type uploadDoneMsg struct {
 	err     error
 }
 
-// filesFetchedMsg lands after each room-files poll.
-type filesFetchedMsg struct {
-	files []sessionFile
-	err   error
-}
-
 // ---- queue control ---------------------------------------------------------------
 
 // startUploads enqueues jobs and kicks the first transfer.
@@ -109,23 +92,20 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 
 	progCh := make(chan uploadProgressMsg, 32)
 	c.uploadQ.progCh = progCh
-	client := c.client
-	me := c.me
 	display := filepath.Base(job.Path)
 
 	c.uploadQ.active = true
 	c.uploadQ.name = display
-	conv := generalConv
-	if job.To != "" {
-		conv = job.To
-	}
+	// job.To is a raw recipient username ("" = room broadcast); the card
+	// paints into the matching conversation bucket.
+	conv := convFor(c.me, job.To)
 	c.uploadQ.conv = conv
 	c.paintUploadLine(tuiUploadRunStyle.Render(
 		progressBar("Uploading…", 0, 0)), conv)
 
 	run := func() tea.Msg {
 		defer close(progCh)
-		disp, size, err := runSessionUpload(ctx, client, me, job, progCh)
+		disp, size, err := runSessionUpload(ctx, c.eng, job, progCh)
 		return uploadDoneMsg{display: disp, size: size, err: err}
 	}
 
@@ -144,139 +124,6 @@ func drainUploadProgressCmd(ch <-chan uploadProgressMsg) tea.Cmd {
 			return uploadDrainMsg{}
 		}
 		return msg
-	}
-}
-
-// ---- session-file HTTP client ----------------------------------------------------
-
-type announceResponse struct {
-	FileId  string `json:"fileId"`
-	ShareId string `json:"shareId"`
-}
-
-// announceFile registers an intent-to-upload and mints {fileId, shareId}.
-// to is optional: non-empty targets a private conversation recipient.
-func (c *chatClient) announceFile(filename string, size int64, shaHex string, to string) (string, string, error) {
-	payload := map[string]any{"filename": filename, "size": size, "sha256": shaHex}
-	if to != "" {
-		payload["to"] = to
-	}
-	code, body, err := postJSON(c.endpoint("/announce"),
-		payload,
-		c.authHeaders())
-	if err != nil {
-		return "", "", err
-	}
-	if code != 201 && code != 200 {
-		return "", "", fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
-	}
-	var r announceResponse
-	if err := json.Unmarshal(body, &r); err != nil {
-		return "", "", err
-	}
-	if r.FileId == "" || r.ShareId == "" {
-		return "", "", fmt.Errorf("server returned empty ids")
-	}
-	return r.FileId, r.ShareId, nil
-}
-
-// completeUpload flips the announced file to UPLOADED after bytes land.
-func (c *chatClient) completeUpload(fileId, shareId string) error {
-	code, body, err := postJSON(c.endpoint("/upload-complete"),
-		map[string]any{"fileId": fileId, "shareId": shareId},
-		c.authHeaders())
-	if err != nil {
-		return err
-	}
-	if code != 200 {
-		return fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
-	}
-	return nil
-}
-
-// fetchFiles lists room files uploaded after `since` (RFC3339; "" = all).
-func (c *chatClient) fetchFiles(since string, conv string) ([]sessionFile, error) {
-	url := c.endpoint("/files")
-	params := []string{}
-	if since != "" {
-		params = append(params, "since="+urlQueryEscape(since))
-	}
-	if conv != "" {
-		params = append(params, "conv="+urlQueryEscape(conv))
-	}
-	if len(params) > 0 {
-		url += "?" + strings.Join(params, "&")
-	}
-	code, body, err := getJSON(url, c.authHeaders())
-	if err != nil {
-		return nil, err
-	}
-	if code != 200 {
-		return nil, fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
-	}
-	var r struct {
-		Files []sessionFile `json:"files"`
-	}
-	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
-	}
-	return r.Files, nil
-}
-
-// doFetchFiles polls the room file list (receiver side).
-func (c *chatScreen) doFetchFiles() tea.Cmd {
-	client := c.client
-	since := c.lastFilesAt
-	conv := c.activeConv()
-	return func() tea.Msg {
-		files, err := client.fetchFiles(since, conv)
-		return filesFetchedMsg{files: files, err: err}
-	}
-}
-
-// filesListMsg fills the /download drawer (full listing, no watermark).
-type filesListMsg struct {
-	files []sessionFile
-	err   error
-}
-
-func (c *chatScreen) doFetchAllFiles() tea.Cmd {
-	client := c.client
-	conv := c.activeConv()
-	return func() tea.Msg {
-		files, err := client.fetchFiles("", conv)
-		return filesListMsg{files: files, err: err}
-	}
-}
-
-// applyRoomFiles paints unseen UPLOADED files as system announcements.
-func (c *chatScreen) applyRoomFiles(files []sessionFile) {
-	for _, f := range files {
-		if f.Status != "UPLOADED" {
-			continue // ANNOUNCED/FAILED never announce
-		}
-		if c.filesSeen[f.FileId] {
-			continue
-		}
-		c.filesSeen[f.FileId] = true
-		if f.UploadedAt > c.lastFilesAt {
-			c.lastFilesAt = f.UploadedAt
-		}
-		if f.Username == c.me {
-			continue // own uploads already painted by the engine
-		}
-		// Determine which conversation this file belongs to. Prefer the
-		// server-provided canonical convId; derive it from sender/recipient
-		// otherwise. (The old code used the raw `to`, which made private
-		// file cards land in a bucket that never matched activeConv().)
-		conv := fileConv(f)
-		// Use helper that preserves RFC3339 for chronological interleaving.
-		if f.UploadedAt != "" {
-			c.appendLocalFileCardWithRFC3339(conv, f.Filename, f.Username, humanSize(f.Size), f.UploadedAt)
-		} else {
-			ts := time.Now().Format("15:04")
-			c.appendLocalFileCard(conv, f.Filename, f.Username, humanSize(f.Size), ts)
-		}
 	}
 }
 
@@ -363,9 +210,11 @@ func (c *chatScreen) cancelUploads() {
 
 // ---- per-job pipeline -------------------------------------------------------------
 
-// runSessionUpload executes the full announce->bytes->complete sequence for
-// one job. All failures return as errors; the caller annotates the transcript.
-func runSessionUpload(ctx context.Context, client *chatClient, me string, job uploadJob, prog chan<- uploadProgressMsg) (string, int64, error) {
+// runSessionUpload prepares one job (tarballing directories, enforcing caps)
+// and hands the bytes to the engine, which streams them E2E-encrypted over
+// the direct line (or the inbox fallback for small files). All failures
+// return as errors; the caller annotates the transcript.
+func runSessionUpload(ctx context.Context, eng *engine, job uploadJob, prog chan<- uploadProgressMsg) (string, int64, error) {
 	path := job.Path
 	display := filepath.Base(path)
 
@@ -398,57 +247,15 @@ func runSessionUpload(ctx context.Context, client *chatClient, me string, job up
 			display, humanSize(info.Size()), humanSize(uploadMaxBytes))
 	}
 
-	sum, err := sha256File(ctx, path)
-	if err != nil {
-		return display, 0, fmt.Errorf("hash: %w", err)
+	select {
+	case <-ctx.Done():
+		return display, 0, ctx.Err()
+	default:
 	}
 
-	// 1. announce within the session
-	fileId, shareId, err := client.announceFile(display, info.Size(), sum, job.To)
-	if err != nil {
-		return display, 0, fmt.Errorf("announce: %w", err)
-	}
-
-	// 2-4. bytes through the share pipeline under OUR shareId
-	err = putShareBytes(ctx, client.serverURL, path, display, info.Size(), sum, shareId, prog)
-	if err != nil {
-		return display, 0, err
-	}
-
-	// 5. flip session_files status to UPLOADED
-	if err := client.completeUpload(fileId, shareId); err != nil {
-		return display, 0, fmt.Errorf("complete: %w", err)
-	}
-	return display, info.Size(), nil
-}
-
-// sha256File streams the file through SHA-256 honouring cancellation.
-func sha256File(ctx context.Context, path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	h := sha256.New()
-	buf := make([]byte, 256<<10)
-	for {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-		n, rerr := f.Read(buf)
-		if n > 0 {
-			h.Write(buf[:n])
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return "", rerr
-		}
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	// job.To is a raw recipient username ("" = broadcast); the engine
+	// encrypts for exactly that audience.
+	return eng.sendFile(job.To, path, display, prog)
 }
 
 // tarballDir packs dir into a temp <name>.tar.gz preserving the full
@@ -470,117 +277,4 @@ func tarballDir(dir string) (string, error) {
 		return "", err
 	}
 	return out, nil
-}
-
-// putShareBytes runs share/init (reusing our announced shareId), PUTs the
-// single-part payload, then confirms the share. Session v1 caps sizes below
-// the multipart threshold so exactly one PUT happens here.
-func putShareBytes(ctx context.Context, serverURL, path, display string, size int64, sumHex, shareId string, prog chan<- uploadProgressMsg) error {
-	mimeType := mimeByExt(path)
-
-	initReq := InitRequest{
-		Filename:  display,
-		Size:      size,
-		MimeType:  mimeType,
-		HashValue: sumHex,
-		ShareId:   shareId,
-	}
-	jsonBytes, err := json.Marshal(initReq)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, "POST", serverURL+"/api/v1/share/init", bytes.NewReader(jsonBytes))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("init: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("init: status %d: %s", resp.StatusCode, truncateStringPlain(string(body), 120))
-	}
-	var initResp InitResponse
-	if err := json.NewDecoder(resp.Body).Decode(&initResp); err != nil {
-		return fmt.Errorf("init decode: %w", err)
-	}
-	if initResp.UploadUrl == "" {
-		return fmt.Errorf("init returned no single-part URL")
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	putReq, err := http.NewRequestWithContext(ctx, "PUT", initResp.UploadUrl, &progressReader{r: f, total: size, onProg: func(done, total int64) {
-		select {
-		case prog <- uploadProgressMsg{done: done, total: total}:
-		default:
-		}
-	}})
-	if err != nil {
-		return err
-	}
-	putReq.ContentLength = size
-	putReq.Header.Set("Content-Type", mimeType)
-	putResp, err := http.DefaultClient.Do(putReq)
-	if err != nil {
-		return fmt.Errorf("upload: %w", err)
-	}
-	defer putResp.Body.Close()
-	if putResp.StatusCode != 200 && putResp.StatusCode != 204 {
-		body, _ := io.ReadAll(putResp.Body)
-		return fmt.Errorf("upload: status %d: %s", putResp.StatusCode, truncateStringPlain(string(body), 120))
-	}
-
-	confirmURL := fmt.Sprintf("%s/api/v1/share/%s/confirm", serverURL, shareId)
-	conf, err := http.NewRequestWithContext(ctx, "POST", confirmURL, bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return err
-	}
-	conf.Header.Set("Content-Type", "application/json")
-	confResp, err := http.DefaultClient.Do(conf)
-	if err != nil {
-		return fmt.Errorf("confirm: %w", err)
-	}
-	defer confResp.Body.Close()
-	if confResp.StatusCode != 200 {
-		body, _ := io.ReadAll(confResp.Body)
-		return fmt.Errorf("confirm: status %d: %s", confResp.StatusCode, truncateStringPlain(string(body), 120))
-	}
-	return nil
-}
-
-// progressReader reports cumulative bytes through onProg (throttled to
-// ~every 512KB or at EOF). Callbacks must not block; senders use select.
-type progressReader struct {
-	r        io.Reader
-	total    int64
-	n        int64
-	lastEmit int64
-	onProg   func(done, total int64)
-}
-
-func (p *progressReader) Read(buf []byte) (int, error) {
-	n, err := p.r.Read(buf)
-	p.n += int64(n)
-	if p.n-p.lastEmit >= 512<<10 || err == io.EOF {
-		p.lastEmit = p.n
-		if p.onProg != nil {
-			p.onProg(p.n, p.total)
-		}
-	}
-	return n, err
-}
-
-func mimeByExt(path string) string {
-	if t := mime.TypeByExtension(strings.ToLower(filepath.Ext(path))); t != "" {
-		return t
-	}
-	return "application/octet-stream"
 }

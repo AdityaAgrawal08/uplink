@@ -11,14 +11,14 @@ import (
 )
 
 type engineProbe struct {
-	mu       sync.Mutex
-	chats    []engineChat
-	files    []engineFile
-	ready    map[string]string // peer -> safety code
-	lost     []string
-	chatCh   chan engineChat
-	readyCh  chan string
-	fileCh   chan engineFile
+	mu      sync.Mutex
+	chats   []engineChat
+	files   []engineFile
+	ready   map[string]string // peer -> safety code
+	lost    []string
+	chatCh  chan engineChat
+	readyCh chan string
+	fileCh  chan engineFile
 }
 
 func newEngineProbe() *engineProbe {
@@ -206,5 +206,34 @@ func TestEngineEndToEnd(t *testing.T) {
 	got = waitChat(t, pb, "hello over fallback")
 	if got.From != "alice" {
 		t.Fatalf("wrong fallback envelope: %+v", got)
+	}
+}
+
+// A file too big for one box with no live peer must fail fast with an
+// actionable error — never silently wedge or spray oversized boxes.
+func TestEngineBigFileFallbackRefused(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", base64.StdEncoding.EncodeToString(ida.publicKey()), ""); err != nil {
+		t.Fatal(err)
+	}
+	pa := newEngineProbe()
+	ea := newEngineWithStun("alice", ida, sigA, pa.callbacks(), []string{})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{{Username: "bob", Pubkey: pubB, Online: true}})
+
+	big := make([]byte, fallbackFileMax+1)
+	src := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(src, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ea.sendFile("bob", src, "big.bin", nil); err == nil {
+		t.Fatal("oversize fallback file must fail fast")
 	}
 }

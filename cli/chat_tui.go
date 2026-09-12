@@ -345,57 +345,50 @@ func truncateStringPlain(s string, n int) string {
 
 // ---- messages --------------------------------------------------------------
 
-type pollTickMsg struct{}
-type beatTickMsg struct{}
-type backlogMsg struct {
-	msgs []chatMessage
-	err  error
+// The engine pushes network events from its own goroutines; they arrive here
+// through netCh (see drainNetCmd) because bubbletea Update must stay on the
+// main loop. Buffer is generous; drops are safe (inbox redelivers unacked,
+// P2P is already reliably delivered — a dropped paint is just a missed row).
+type netChatMsg struct{ chat engineChat }
+type netFileMsg struct{ file engineFile }
+type netFileErrMsg struct {
+	msgId, from, reason string
 }
-type pollDoneMsg struct {
-	newMsgs []chatMessage
-	users   []string // authoritative roster snapshot at poll time
-	ended   bool
-	err     error
+type netReadyMsg struct {
+	user, code string
 }
-type beatDoneMsg struct {
-	users []string
+type netLostMsg struct{ user string }
+type netErrMsg struct{ err error }
+type rosterTickMsg struct{}
+
+type sendDoneMsg struct {
+	text  string
+	to    string // empty for broadcasts
+	seq   int    // local display sequence (server keeps no transcript)
+	msgId string // E2E message identity (ACKs/dedup)
+	code  int
 	err   error
 }
-
-type wsConnectedMsg struct {
-	ws *wsClient
-}
-type sendDoneMsg struct {
-	text string
-	to   string // empty for broadcasts
-	seq  int
-	code int
-	err  error
-}
 type leaveDoneMsg struct{}
-type convBacklogMsg struct {
-	conv string
-	msgs []chatMessage
-	err  error
-}
 
 // ---- model -----------------------------------------------------------------
 
 type chatScreen struct {
-	client       *chatClient
+	sig          *signalClient
+	eng          *engine
 	key          string
 	me           string
-	persist      bool
 	width        int
 	height       int
-	history      []chatMessage        // every confirmed server message (deduped by seq)
-	localLines   []localLine          // echoes & notes not backed by server docs
-	fetchedConvs map[string]bool      // threads already deep-fetched this session
+	history      []chatMessage        // live transcript (deduped by local seq)
+	localLines   []localLine          // echoes & notes
+	netCh        chan tea.Msg         // engine -> Update bridge (non-blocking)
+	nextSeq      int                  // local display sequence counter
 	hoverPeer    string               // sidebar row under the mouse ("" = none)
 	unread       map[string]int       // peer -> unread DM count (cleared on open)
 	lastDMAt     map[string]time.Time // peer -> newest incoming DM (recency sort)
 	lines        []string             // DERIVED paint buffer: rebuildView() owns it
-	rendered     map[int]bool         // server seqs already rendered
+	rendered     map[int]bool         // local seqs already rendered
 	pending      *pendingSend         // single in-flight send (nil = idle)
 	outbox       []queuedLine         // queued sends waiting for the in-flight one
 	users        []string
@@ -406,14 +399,9 @@ type chatScreen struct {
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
-	dlQ          dlState         // sequential shared-file download queue
-	filesSeen    map[string]bool // room files already announced to me
-	lastFilesAt  string          // newest uploadedAt fed into /files?since=
-	ws           *wsClient       // WebSocket connection (nil = using long-poll)
+	received     []receivedFile  // files arrived this session (for /download)
 	status       string
 	targetUser   string // private-chat peer; "" = general room
-	beatFailures int
-	pollFailures int
 }
 
 // pendingSend tracks the optimistic echo line for the in-flight send so the
@@ -471,7 +459,17 @@ func (c *chatScreen) activeConv() string {
 // composerPlaceholder doubles as the restore text whenever a drawer closes.
 const composerPlaceholder = "Type a message…  ·  / commands  ·  tab picks a peer"
 
-func newChatScreen(serverURL, key, me string) chatScreen {
+// receivedFile is one file that arrived this session (P2P or fallback).
+// There is no server-side file index anymore; /download lists these.
+type receivedFile struct {
+	filename string
+	from     string
+	size     int64
+	path     string
+	at       time.Time
+}
+
+func newChatScreen(serverURL, key, me string, id *identityKey) chatScreen {
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
 	ti.Focus()
@@ -479,18 +477,37 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
+	netCh := make(chan tea.Msg, 256)
+	sig := &signalClient{serverURL: serverURL, key: key, me: me}
+	// Engine callbacks only ever push into netCh (never touch the screen:
+	// they run on network goroutines). The drain command below feeds them
+	// into Update on the main loop.
+	push := func(m tea.Msg) {
+		select {
+		case netCh <- m:
+		default:
+		}
+	}
+	eng := newEngine(me, id, sig, engineCallbacks{
+		onChat:      func(c engineChat) { push(netChatMsg{chat: c}) },
+		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
+		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
+		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
+		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
+		onError:     func(err error) { push(netErrMsg{err: err}) },
+	})
 	return chatScreen{
-		client:       newChatClient(serverURL, key, me),
-		key:          key,
-		me:           me,
-		vp:           vp,
-		input:        ti,
-		rendered:     map[int]bool{},
-		unread:       map[string]int{},
-		lastDMAt:     map[string]time.Time{},
-		fetchedConvs: map[string]bool{generalConv: true},
-		filesSeen:    map[string]bool{},
-		outbox:       nil,
+		sig:        sig,
+		eng:        eng,
+		key:        key,
+		me:         me,
+		vp:         vp,
+		input:      ti,
+		netCh:      netCh,
+		rendered:   map[int]bool{},
+		unread:     map[string]int{},
+		lastDMAt:   map[string]time.Time{},
+		outbox:     nil,
 	}
 }
 
@@ -528,6 +545,16 @@ func orderedUsers(users []string, me string, lastDMAt map[string]time.Time) []st
 // a bare strings.Contains would produce.
 func isOwnPresence(systemText, me string) bool {
 	return systemText == me+" joined" || systemText == me+" left"
+}
+
+// convFor resolves the conversation bucket for a message or file traveling
+// from->to (empty to = room broadcast). Canonical pair keys make direction
+// irrelevant: alice->bob and bob->alice land in the same thread.
+func convFor(from, to string) string {
+	if to == "" {
+		return generalConv
+	}
+	return conversationKey(from, to)
 }
 
 // shouldRender decides visibility BEFORE any styling. The rule is strictly
@@ -1033,125 +1060,75 @@ func (c chatScreen) sidebarInnerWidth() int {
 
 // ---- async commands --------------------------------------------------------
 
-func schedulePoll(backoff time.Duration) tea.Cmd {
-	if backoff > 0 {
-		return tea.Tick(backoff, func(time.Time) tea.Msg { return pollTickMsg{} })
-	}
-	return func() tea.Msg { return pollTickMsg{} }
+func scheduleRoster() tea.Cmd {
+	return tea.Tick(5*time.Second, func(time.Time) tea.Msg { return rosterTickMsg{} })
 }
 
-func scheduleBeat() tea.Cmd {
-	return tea.Tick(15*time.Second, func(time.Time) tea.Msg { return beatTickMsg{} })
-}
-
-func (c chatScreen) doPoll() tea.Cmd {
-	client := c.client
+// drainNetCmd relays ONE engine event per Update cycle; Update reschedules
+// until the channel is empty (same pattern as the progress drains).
+func (c chatScreen) drainNetCmd() tea.Cmd {
 	return func() tea.Msg {
-		newMsgs, ended, err := client.pollOnce()
-		return pollDoneMsg{newMsgs: newMsgs, users: client.users, ended: ended, err: err}
-	}
-}
-
-func (c chatScreen) doBeat() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		hb, err := client.beatOnce()
-		return beatDoneMsg{users: hb.ActiveUsers, err: err}
-	}
-}
-
-func (c chatScreen) doSend(text, to string) tea.Cmd {
-	client := c.client
-	ws := c.ws
-	return func() tea.Msg {
-		if ws != nil {
-			if err := ws.send(text, to); err == nil {
-				return sendDoneMsg{text: text, to: to, code: 200}
-			}
-			// WS send failed — fall back to HTTP
+		select {
+		case m := <-c.netCh:
+			return m
+		default:
+			return nil
 		}
-		code, msg, err := client.sendMessage(text, to)
-		return sendDoneMsg{text: text, to: msg.To, seq: msg.Seq, code: code, err: err}
+	}
+}
+
+func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
+	return func() tea.Msg {
+		// engine.sendChat is synchronous: P2P encrypt+send, or inbox seal+
+		// deposit. Map failures onto the legacy settle codes.
+		msgId, err := c.eng.sendChat(to, text)
+		if err == nil {
+			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201}
+		}
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "429"):
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err}
+		case strings.Contains(msg, "404"),
+			strings.Contains(msg, "gone"),
+			strings.Contains(msg, "not in session"),
+			strings.Contains(msg, "Session not found"):
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err}
+		default:
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 500, err: err}
+		}
 	}
 }
 
 func (c chatScreen) doLeave() tea.Cmd {
-	client := c.client
-	ws := c.ws
 	return func() tea.Msg {
-		if ws != nil {
-			ws.Close()
-		}
-		client.leave()
+		c.eng.stop()
+		_, _, _ = postJSON(c.sig.endpoint("/leave"), map[string]any{}, c.sig.headers())
 		return leaveDoneMsg{}
-	}
-}
-
-func (c chatScreen) fetchBacklogCmd() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		msgs, err := client.fetchBacklog()
-		return backlogMsg{msgs: msgs, err: err}
-	}
-}
-
-// doConvFetch deep-fetches one conversation's latest page from the server.
-func (c chatScreen) doConvFetch(conv string) tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		msgs, err := client.fetchConvBacklog(conv)
-		return convBacklogMsg{conv: conv, msgs: msgs, err: err}
 	}
 }
 
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	// Try WebSocket first; fall back to long-polling if unavailable.
-	return tea.Batch(c.fetchBacklogCmd(), c.tryWS(), c.doBeat(), c.doFetchFiles(), scheduleBeat())
-}
-
-// tryWS attempts a WebSocket upgrade. On success it starts the readLoop
-// and heartbeat goroutines and returns nil (no polling needed). On
-// failure it returns the initial long-poll schedule.
-func (c chatScreen) tryWS() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		ws := client.wsConnect()
-		if ws == nil {
-			return schedulePoll(0)() // fallback: start HTTP long-polling
-		}
-		// WebSocket connected — stash it and start background goroutines.
-		// We can't mutate chatScreen from a Cmd goroutine, so we return
-		// a special message that Update handles.
-		go ws.readLoop(client)
-		go ws.heartbeat(client)
-		return wsConnectedMsg{ws: ws}
-	}
+	// No backlog (the server keeps no transcript), no WS upgrade, no beat
+	// tick (the engine owns heartbeats): just drain engine events and
+	// refresh the sidebar roster on a slow tick.
+	return tea.Batch(c.drainNetCmd(), scheduleRoster())
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// enterPrivate switches to a 1:1 thread. History older than the mixed
-// backlog window is deep-fetched lazily the first time the thread opens.
-// Returns nil or the backlog command - caller MUST schedule it.
+// enterPrivate switches to a 1:1 thread. There is no server history to
+// deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
 	c.palette.close()      // stale "/" query must not survive a mode switch
 	delete(c.unread, user) // opening the thread clears its badge
-	conv := conversationKey(c.me, user)
 	c.rebuildView()
-	if c.fetchedConvs == nil {
-		c.fetchedConvs = map[string]bool{}
-	}
-	var fetchCmd tea.Cmd
-	if !c.fetchedConvs[conv] {
-		c.fetchedConvs[conv] = true // ask once regardless of outcome
-		fetchCmd = c.doConvFetch(conv)
-	}
-	return fetchCmd
+	return nil
 }
 
 // exitPrivate returns to the common room; returns a system line or "".
@@ -1236,8 +1213,10 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	if target == "" && c.pending.conv == generalConv {
 		target = ""
 	}
+	c.nextSeq++
+	seq := c.nextSeq
 	c.rebuildView()
-	return c.doSend(text, target)
+	return c.doSend(text, target, seq)
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1262,98 +1241,97 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		c.refreshViewport() // re-wrap transcript to the new width
 
-	case backlogMsg:
-		if msg.err != nil {
-			c.status = "failed to load history: " + msg.err.Error()
-			break
+	case rosterTickMsg:
+		// Sidebar freshness from the engine's heartbeat roster (the engine
+		// owns the 15s beat; this only renders).
+		roster := c.eng.peers()
+		users := onlineNames(roster, c.me)
+		c.users = users
+		live := map[string]bool{c.me: true}
+		for _, u := range users {
+			live[u] = true
 		}
-		for _, m := range msg.msgs {
-			c.addMessage(m)
+		for peer := range c.unread {
+			if !live[peer] {
+				delete(c.unread, peer)
+			}
 		}
+		for peer := range c.lastDMAt {
+			if !live[peer] {
+				delete(c.lastDMAt, peer)
+			}
+		}
+		if c.hoverPeer != "" && !live[c.hoverPeer] {
+			c.hoverPeer = ""
+		}
+		cmds = append(cmds, scheduleRoster())
 
-	case pollTickMsg:
-		if c.ws == nil {
-			cmds = append(cmds, c.doPoll())
+	case netChatMsg:
+		m := msg.chat
+		cm := chatMessage{
+			Seq: c.nextSeq, MsgId: m.MsgId, Username: m.From, Kind: "chat",
+			Text: m.Text, To: m.To,
+			ConvID:    convFor(m.From, m.To),
+			CreatedAt: time.Now().Format(time.RFC3339),
 		}
+		c.nextSeq++
+		// Delivery receipt back to the sender (best-effort; inbox
+		// redelivery covers loss, dedup covers repeats).
+		sender, msgId := m.From, m.MsgId
+		cmds = append(cmds, func() tea.Msg {
+			_ = c.eng.sendAck(sender, msgId)
+			return nil
+		})
+		c.handleNewMessage(cm)
+		cmds = append(cmds, c.drainNetCmd())
 
-	case pollDoneMsg:
-		if msg.ended {
-			reason := "Session has ended"
-			if msg.err != nil {
-				reason = msg.err.Error()
+	case netFileMsg:
+		f := msg.file
+		c.received = append(c.received, receivedFile{
+			filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
+		})
+		conv := convFor(f.From, f.To)
+		ts := time.Now()
+		c.localLines = append(c.localLines, localLine{
+			conv: conv,
+			kind: lineFileCard,
+			fileData: &fileCardData{
+				filename:  f.Filename,
+				username:  f.From,
+				size:      humanSize(f.Size),
+				time:      ts.Format("15:04"),
+				createdAt: ts.Format(time.RFC3339),
+			},
+		})
+		// Bump unread if it landed in a background thread.
+		if conv != c.activeConv() && conv != generalConv {
+			if peer := peerOf(c.me, conv); peer != "" {
+				c.unread[peer]++
+				c.lastDMAt[peer] = ts
 			}
-			c.appendLine(tuiSystemStyle.Render("* " + reason))
-			cmds = append(cmds, c.doLeave(), tea.Quit)
-			return c, tea.Batch(cmds...)
 		}
-		if msg.err != nil {
-			c.pollFailures++
-			c.status = fmt.Sprintf("reconnecting… (%d)", c.pollFailures)
-			cmds = append(cmds, schedulePoll(time.Duration(400*c.pollFailures)*time.Millisecond))
-			return c, tea.Batch(cmds...)
-		}
-		if c.pollFailures > 0 {
-			c.pollFailures = 0
-			c.status = ""
-		}
-		if msg.users != nil {
-			c.users = msg.users // join/leave freshness without waiting for heartbeat
-		}
-		for _, m := range msg.newMsgs {
-			c.handleNewMessage(m)
-		}
-		cmds = append(cmds, schedulePoll(0))
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
 
-	case beatTickMsg:
-		cmds = append(cmds, c.doBeat())
+	case netFileErrMsg:
+		c.appendLine(tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		cmds = append(cmds, c.drainNetCmd())
 
-	case beatDoneMsg:
-		if msg.err != nil {
-			c.beatFailures++
-			if c.beatFailures >= 3 {
-				c.status = "connection lost… retrying"
-			}
-		} else {
-			c.beatFailures = 0
-			if c.status == "connection lost… retrying" {
-				c.status = ""
-			}
-			// Authoritative snapshot — INCLUDING shrinking to empty.
-			c.users = msg.users
-			live := map[string]bool{c.me: true}
-			for _, u := range msg.users {
-				live[u] = true
-			}
-			for peer := range c.unread {
-				if !live[peer] {
-					delete(c.unread, peer)
-				}
-			}
-			for peer := range c.lastDMAt {
-				if !live[peer] {
-					delete(c.lastDMAt, peer)
-				}
-			}
-			if c.hoverPeer != "" && !live[c.hoverPeer] {
-				c.hoverPeer = ""
-			}
-		}
-		cmds = append(cmds, scheduleBeat(), c.doFetchFiles()) // roster + room files
+	case netReadyMsg:
+		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("🔒 encrypted channel to %s (safety %s)", msg.user, msg.code)))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netLostMsg:
+		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("* lost direct line to %s (fallback relay active)", msg.user)))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netErrMsg:
+		c.appendLine(tuiErrStyle.Render("* " + msg.err.Error()))
+		cmds = append(cmds, c.drainNetCmd())
 
 	case sendDoneMsg:
 		if nc := c.settleSend(msg); nc != nil {
 			cmds = append(cmds, nc)
-		}
-
-	case wsConnectedMsg:
-		c.ws = msg.ws
-		c.status = "connected (websocket)"
-
-	case convBacklogMsg:
-		if msg.err == nil {
-			for _, m := range msg.msgs {
-				c.addMessage(m) // seq-deduped; pre-window history lands here
-			}
 		}
 
 	case uploadProgressMsg:
@@ -1370,37 +1348,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if nc := c.settleUploadDone(msg); nc != nil {
 			cmds = append(cmds, nc)
 		}
-		cmds = append(cmds, c.doFetchFiles()) // instant self-feedback
-
-	case filesFetchedMsg:
-		if msg.err == nil {
-			c.applyRoomFiles(msg.files)
-		}
-
-	case filesListMsg:
-		if msg.err != nil {
-			if c.picker.isActive() && c.picker.mode == modeFiles {
-				c.picker.loading = false
-				c.picker.notice = truncateStringPlain(msg.err.Error(), 40)
-			}
-			break
-		}
-		c.applyFilesList(msg.files)
-
-	case dlProgressMsg:
-		if c.dlQ.active && msg.total > 0 {
-			c.paintDlLine(tuiDownloadRunStyle.Render(
-				progressBar("Downloading…", msg.done, msg.total)), c.dlQ.conv)
-		}
-		cmds = append(cmds, drainDlProgressCmd(c.dlQ.progCh))
-
-	case dlDrainMsg:
-		// channel closed; the done msg lands separately
-
-	case dlDoneMsg:
-		if nc := c.settleDownloadDone(msg); nc != nil {
-			cmds = append(cmds, nc)
-		}
+		// Own uploads paint their card in settleUploadDone; peers receive
+		// the file over the wire. No server round-trip exists anymore.
 
 	case leaveDoneMsg:
 		return c, tea.Quit
@@ -1426,14 +1375,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break // unknown keys do nothing in browser mode
 		}
-		// Esc during a transfer cancels it before anything else sees the key.
-		if msg.Type == tea.KeyEsc && (c.uploadQ.isActive() || c.dlQ.isActive()) {
-			if c.uploadQ.isActive() {
-				c.cancelUploads()
-			}
-			if c.dlQ.isActive() {
-				c.cancelDownloads()
-			}
+		// Esc during an upload cancels it before anything else sees the key.
+		// (Downloads no longer exist as a transfer: files arrive complete.)
+		if msg.Type == tea.KeyEsc && c.uploadQ.isActive() {
+			c.cancelUploads()
 			break
 		}
 		// "/" command drawer eats navigation + selection keys while open.
@@ -1538,7 +1483,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			conv = conversationKey(c.me, to)
 		}
 		m := chatMessage{
-			Seq: msg.seq, Username: c.me, Kind: "chat",
+			Seq: msg.seq, MsgId: msg.msgId, Username: c.me, Kind: "chat",
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
@@ -1765,17 +1710,40 @@ func (c chatScreen) View() string {
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).
-func runChatTUI(serverURL, key, me string, persist bool) {
-	scr := newChatScreen(serverURL, key, me)
-	scr.persist = persist
+func runChatTUI(serverURL, key, me string, id *identityKey) {
+	scr := newChatScreen(serverURL, key, me, id)
+	// Seed the roster synchronously so the sidebar isn't empty on paint;
+	// the engine beat loop keeps it fresh, rosterTickMsg renders it.
+	if roster, err := scr.sig.heartbeat("", nil); err == nil {
+		scr.eng.setRoster(roster)
+		scr.users = onlineNames(roster, me)
+	}
+	scr.eng.start()
 	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
 	}
-	if persist {
-		_ = saveHistory(key, scr.history)
-	}
-	scr.client.leave()
+	scr.eng.stop()
+	_, _, _ = postJSON(scr.sig.endpoint("/leave"), map[string]any{}, scr.sig.headers())
 	fmt.Printf("\nYou left session %s.\n", key)
+}
+
+// onlineNames extracts online usernames (sidebar order = sorted).
+func onlineNames(roster []rosterMember, me string) []string {
+	var out []string
+	for _, m := range roster {
+		if m.Online {
+			out = append(out, m.Username)
+		}
+	}
+	sort.Strings(out)
+	// keep me first for orderedUsers parity
+	names := []string{me}
+	for _, u := range out {
+		if u != me {
+			names = append(names, u)
+		}
+	}
+	return names
 }

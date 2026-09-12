@@ -29,10 +29,12 @@ const (
 	engineSignalEvery = 2 * time.Second
 	engineInboxEvery  = 5 * time.Second
 	engineBeatEvery   = 15 * time.Second
-	inboxBoxKind      = "p2p"
-	// fallbackFileMax caps files sent via inbox (serverless request limits;
-	// larger files need the direct line).
-	fallbackFileMax = 1 << 20 // 1 MB
+	inboxBoxKind = "p2p"
+	// fallbackFileMax caps single-box files on the inbox path. Math: the
+	// server caps box payloads at 256KB; base64 inflates raw bytes 4/3 plus
+	// JSON overhead, so ~160KB raw fits with margin. Larger files need the
+	// direct line (P2P streams in 64KB chunks with no total cap).
+	fallbackFileMax = 160 * 1024
 	assemblyTTL     = 15 * time.Minute
 )
 
@@ -41,8 +43,8 @@ type engineChat struct {
 }
 
 type engineFile struct {
-	MsgId, From, Filename, Path string
-	Size                        int64
+	MsgId, From, To, Filename, Path string
+	Size                            int64
 }
 
 type engineCallbacks struct {
@@ -76,6 +78,7 @@ type engine struct {
 	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
+	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 }
@@ -129,6 +132,16 @@ func loadOrCreateIdentity() (*identityKey, error) {
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = os.WriteFile(path, id.priv.Bytes(), 0o600)
 	return id, nil
+}
+
+// peers returns a snapshot of the last known roster for UI rendering.
+// Presence freshness is maintained by the beat loop; this never blocks.
+func (e *engine) peers() []rosterMember {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]rosterMember, len(e.presence))
+	copy(out, e.presence)
+	return out
 }
 
 // ─── lifecycle ──────────────────────────────────────────────────────────────
@@ -227,6 +240,9 @@ func (e *engine) beatOnce() {
 	if err != nil {
 		return // transient; next tick retries
 	}
+	e.mu.Lock()
+	e.presence = roster
+	e.mu.Unlock()
 	e.setRoster(roster)
 }
 
@@ -482,7 +498,7 @@ func (e *engine) dispatch(f frame) {
 		if e.cb.onTyping != nil {
 			e.cb.onTyping(f.From, f.To, f.Active)
 		}
-	case frameFileMeta, frameFileChunk, frameFileComplete:
+	case frameFileMeta, frameFileChunk, frameFileComplete, frameFile:
 		e.onFileFrame(f)
 	}
 }
@@ -491,8 +507,12 @@ func (e *engine) dispatch(f frame) {
 
 // sendFrame routes one frame: Noise transport when live, pairwise box via
 // inbox otherwise. Broadcast (to=="") fans out per peer; returns nil if at
-// least one path succeeded.
+// least one path succeeded. Typing is live-only: stale typing indicators
+// delivered minutes later from an inbox would be wrong, so they drop.
 func (e *engine) sendFrame(to string, f frame) error {
+	if f.Type == frameTyping && !e.peerLive(to) {
+		return nil
+	}
 	raw, err := encodeFrame(f)
 	if err != nil {
 		return err
@@ -583,15 +603,64 @@ func (e *engine) sendFile(to, path, display string, prog chan<- uploadProgressMs
 	}
 	sum := sha256.Sum256(data)
 	sumHex := hex.EncodeToString(sum[:])
-	chunks := splitChunks(data)
 	id, err := newMsgId()
 	if err != nil {
 		return "", 0, err
 	}
-	// Fallback path caps total size (serverless request limits).
-	if !e.peerLive(to) && int64(len(data)) > fallbackFileMax {
+	// Streaming (meta/chunks/complete sharing one msgId) requires the live
+	// path for every recipient: inbox boxes key by msgId and would collide.
+	// When anyone is unreachable, small files go as ONE self-contained box
+	// and larger ones fail fast with an actionable error.
+	if e.allLive(to) {
+		_, _, serr := e.sendFileStream(to, id, display, data, sumHex, prog)
+		if serr != nil {
+			return "", 0, serr
+		}
+		return display, int64(len(data)), nil
+	}
+	if int64(len(data)) > fallbackFileMax {
 		return "", 0, fmt.Errorf("peer unreachable for large file (%s) — wait for a direct connection", humanSize(int64(len(data))))
 	}
+	whole := newFrame(frameFile, id, e.me, to)
+	whole.Filename = display
+	whole.Size = int64(len(data))
+	whole.SHA256 = sumHex
+	whole.Data = base64.StdEncoding.EncodeToString(data)
+	if err := e.sendFrame(to, whole); err != nil {
+		return "", 0, err
+	}
+	if prog != nil {
+		select {
+		case prog <- uploadProgressMsg{done: int64(len(data)), total: int64(len(data))}:
+		default:
+		}
+	}
+	return display, int64(len(data)), nil
+}
+
+// allLive reports whether every recipient currently has a live E2E channel
+// (DM: the one peer; broadcast: the whole roster).
+func (e *engine) allLive(to string) bool {
+	if to != "" {
+		return e.peerLive(to)
+	}
+	e.mu.Lock()
+	peers := make([]string, 0, len(e.roster))
+	for u := range e.roster {
+		peers = append(peers, u)
+	}
+	e.mu.Unlock()
+	for _, u := range peers {
+		if !e.peerLive(u) {
+			return false
+		}
+	}
+	return true
+}
+
+// sendFileStream streams meta/chunks/complete down the live path.
+func (e *engine) sendFileStream(to, id, display string, data []byte, sumHex string, prog chan<- uploadProgressMsg) (string, int64, error) {
+	chunks := splitChunks(data)
 	meta := newFrame(frameFileMeta, id, e.me, to)
 	meta.Filename = display
 	meta.Size = int64(len(data))
@@ -632,6 +701,15 @@ func (e *engine) peerLive(to string) bool {
 }
 
 func (e *engine) onFileFrame(f frame) {
+	// Single-box files (inbox path) skip reassembly entirely.
+	if f.Type == frameFile {
+		blob, err := base64.StdEncoding.DecodeString(f.Data)
+		if err != nil || int64(len(blob)) != f.Size || f.Size <= 0 || f.Size > fallbackFileMax {
+			return // corrupt or absurd: drop (fail closed)
+		}
+		e.saveVerifiedFile(f.MsgId, f.From, f.To, f.Filename, f.Size, f.SHA256, blob)
+		return
+	}
 	e.sweepAssemblies()
 	e.mu.Lock()
 	a, ok := e.files[f.MsgId]
@@ -681,21 +759,28 @@ func (e *engine) onFileFrame(f frame) {
 	if !complete {
 		return
 	}
+	e.saveVerifiedFile(meta.MsgId, meta.From, meta.To, meta.Filename, meta.Size, meta.SHA256, blob)
+}
+
+// saveVerifiedFile checks the SHA-256 fingerprint and atomically saves the
+// blob to ~/Downloads, then reports it. Shared by streamed and single-box
+// receives; integrity failure discards, never displays.
+func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, shaHex string, blob []byte) {
 	sum := sha256.Sum256(blob)
-	if hex.EncodeToString(sum[:]) != meta.SHA256 {
+	if hex.EncodeToString(sum[:]) != shaHex {
 		if e.cb.onFileErr != nil {
-			e.cb.onFileErr(meta.MsgId, meta.From, "SHA-256 mismatch — file discarded")
+			e.cb.onFileErr(msgId, from, "SHA-256 mismatch — file discarded")
 		}
 		return
 	}
 	dir, err := downloadsDir()
 	if err != nil {
 		if e.cb.onFileErr != nil {
-			e.cb.onFileErr(meta.MsgId, meta.From, err.Error())
+			e.cb.onFileErr(msgId, from, err.Error())
 		}
 		return
 	}
-	safe := filepath.Base(meta.Filename)
+	safe := filepath.Base(filename)
 	if safe == "" || safe == "." {
 		safe = "file"
 	}
@@ -703,19 +788,19 @@ func (e *engine) onFileFrame(f frame) {
 	tmp := dest + ".part"
 	if err := os.WriteFile(tmp, blob, 0o644); err != nil {
 		if e.cb.onFileErr != nil {
-			e.cb.onFileErr(meta.MsgId, meta.From, err.Error())
+			e.cb.onFileErr(msgId, from, err.Error())
 		}
 		return
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		os.Remove(tmp)
 		if e.cb.onFileErr != nil {
-			e.cb.onFileErr(meta.MsgId, meta.From, err.Error())
+			e.cb.onFileErr(msgId, from, err.Error())
 		}
 		return
 	}
 	if e.cb.onFile != nil {
-		e.cb.onFile(engineFile{MsgId: meta.MsgId, From: meta.From, Filename: meta.Filename, Path: dest, Size: meta.Size})
+		e.cb.onFile(engineFile{MsgId: msgId, From: from, To: to, Filename: filename, Path: dest, Size: size})
 	}
 }
 

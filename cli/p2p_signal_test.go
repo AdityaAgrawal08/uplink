@@ -48,7 +48,7 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Pubkey   string `json:"pubkey"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		if len(body.Username) < 3 || body.Pubkey == "" {
+		if len(body.Username) < 1 || body.Pubkey == "" {
 			f.write(w, 400, map[string]string{"error": "bad input"})
 			return
 		}

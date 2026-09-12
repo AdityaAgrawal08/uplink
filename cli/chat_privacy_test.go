@@ -1,11 +1,9 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
+	"encoding/base64"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -87,17 +85,18 @@ func TestPendingEchoSurvivesModeSwitch(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Regression: sends from private view must carry the recipient over the wire
+// Regression: sends from private view must target the peer over the wire.
+// The deposit lands in alice's inbox (payload opaque: sealed box).
 // ---------------------------------------------------------------------------
 
 func TestSendTargetsCurrentPeer(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice")
 	var m tea.Model = c
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
@@ -120,84 +119,68 @@ func TestSendTargetsCurrentPeer(t *testing.T) {
 	sd := cmd().(sendDoneMsg)
 	_ = sd
 
-	if len(received) != 1 {
-		t.Fatalf("wire posts = %d", len(received))
-	}
-	body := string(received[0])
-	if !strings.Contains(body, `"to":"alice"`) {
-		t.Errorf("payload missing private recipient: %s", body)
+	if inboxDeposits(fs, "alice") != 1 {
+		t.Fatal("private send must deposit exactly one box for alice")
 	}
 }
 
-// Common-room sends must NOT carry a recipient.
+// Common-room sends fan out per peer (one sealed box each). There is no
+// single broadcast envelope anymore; assert every peer got exactly one.
 func TestCommonRoomSendsBroadcast(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice", "carol")
 	dispatch := c.submitLine("hello everyone")
 	if dispatch == nil {
 		t.Fatal("broadcast dispatch produced no command")
 	}
-	sd := dispatch().(sendDoneMsg) // performs the POST
+	sd := dispatch().(sendDoneMsg) // performs the deposits
 	c.settleSend(sd)
 
-	if len(received) != 1 {
-		t.Fatalf("posts=%d", len(received))
-	}
-	if strings.Contains(string(received[0]), `"to"`) {
-		t.Errorf("broadcast leaked a recipient field: %s", received[0])
+	if inboxDeposits(fs, "alice") != 1 || inboxDeposits(fs, "carol") != 1 {
+		t.Fatal("broadcast must fan out one box per peer")
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Regression: roster freshness rides on polls, not just 15s heartbeats
+// Regression: roster freshness rides on heartbeats, shrinking included
 // ---------------------------------------------------------------------------
 
 func TestPollAdoptsRosterImmediately(t *testing.T) {
-	var mu sync.Mutex
-	users := []string{"bob"}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		u := users
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		quoted := make([]string, len(u))
-		for i, n := range u {
-			quoted[i] = fmt.Sprintf("%q", n)
-		}
-		fmt.Fprintf(w, `{"messages":[],"activeUsers":[%s],"ended":false}`, strings.Join(quoted, ","))
-	}))
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob")
 
-	// A peer joins server-side between polls.
-	mu.Lock()
-	users = []string{"bob", "alice"}
-	mu.Unlock()
-
-	_, ended, err := c.client.pollOnce()
-	if err != nil || ended {
-		t.Fatalf("poll failed: ended=%v err=%v", ended, err)
+	// A peer joins server-side between beats.
+	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	if _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+		t.Fatal(err)
 	}
-	if len(c.client.users) != 2 {
-		t.Fatalf("roster after poll = %v; want [bob alice]", c.client.users)
+
+	c.eng.beatOnce()
+	m, _ := c.Update(rosterTickMsg{})
+	*c = m.(chatScreen)
+	if len(c.users) != 2 {
+		t.Fatalf("roster after beat = %v; want [bob alice]", c.users)
 	}
 
 	// Everyone else leaves — roster must SHRINK too (no ghost users).
-	mu.Lock()
-	users = []string{"bob"}
-	mu.Unlock()
-	if _, _, err := c.client.pollOnce(); err != nil {
+	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	if err := leaver.leaveRoom(); err != nil {
 		t.Fatal(err)
 	}
-	if len(c.client.users) != 1 {
-		t.Fatalf("roster shrink failed: %v", c.client.users)
+	c.eng.beatOnce()
+	m, _ = c.Update(rosterTickMsg{})
+	*c = m.(chatScreen)
+	if len(c.users) != 1 {
+		t.Fatalf("roster shrink failed: %v", c.users)
 	}
 }
