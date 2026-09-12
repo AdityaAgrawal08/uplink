@@ -17,9 +17,14 @@ export async function POST(
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
-    const { peerId, addrs } = parsed.body;
+    const { peerId, addrs } = parsed.body as { peerId?: unknown; addrs?: unknown };
 
-    const roster = await heartbeat(sessionId, usernameHeader, { peerId, addrs });
+    // Rooms.heartbeat() validates both fields (400 on garbage), so the
+    // narrow-down cast here is safe.
+    const roster = await heartbeat(sessionId, usernameHeader, {
+      peerId: peerId as string | undefined,
+      addrs: addrs as string[] | undefined,
+    });
     const activeUsers = roster.filter((m) => m.online).map((m) => m.username);
     return NextResponse.json({ ok: true, activeUsers, roster });
   } catch (error) {

@@ -58,9 +58,18 @@ export async function POST(req: NextRequest) {
       downloadLimit,
       checksumCrc64nvme,
       isEncrypted,
-    } = body;
-    size = Number(body.size);
-    partsCount = Number(body.partsCount) || 0;
+    } = body as {
+      filename?: unknown;
+      mimeType?: unknown;
+      hashValue?: unknown;
+      password?: unknown;
+      expiresInSeconds?: unknown;
+      downloadLimit?: unknown;
+      checksumCrc64nvme?: unknown;
+      isEncrypted?: unknown;
+    };
+    size = Number(body.size as unknown);
+    partsCount = Number(body.partsCount as unknown) || 0;
 
     // 1. Basic Validations
     if (!filename || typeof filename !== "string") {
@@ -172,7 +181,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 4. Share ID and Key construction
-    const shareId = body.shareId || generateShareId();
+    const shareId = (typeof body.shareId === "string" && body.shareId) || generateShareId();
     const storageFilename = sanitizeFilename(filename);
     const date = new Date();
     const year = date.getUTCFullYear();
@@ -204,7 +213,7 @@ export async function POST(req: NextRequest) {
       uploadUrl = await getPresignedUploadUrl(
         objectKey,
         uploadUrlExpiry,
-        mimeType || "application/octet-stream",
+        (mimeType as string | undefined) || "application/octet-stream",
         hashValue
       );
     }
