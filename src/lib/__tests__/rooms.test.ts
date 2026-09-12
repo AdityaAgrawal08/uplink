@@ -125,4 +125,15 @@ describe("rooms signaling plane", () => {
     expect(e.status).toBe(429);
     expect(e.message).toBe("slow");
   });
+
+  it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
+    const username = `u_${Math.random().toString(36).slice(2, 10)}`;
+    const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");
+    const { getRoomMeta } = await import("../rooms");
+    const meta = await getRoomMeta(sessionId);
+    expect(meta?.passwordHash).toBe("argon2id-fake-hash");
+    const open = await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, null);
+    const openMeta = await getRoomMeta(open.sessionId);
+    expect(openMeta?.passwordHash).toBeNull();
+  });
 });

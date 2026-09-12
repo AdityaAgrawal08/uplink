@@ -138,11 +138,19 @@ export async function roomExists(code: string): Promise<boolean> {
 
 export async function getRoomMeta(code: string): Promise<{ passwordHash: string | null; createdAt: string } | null> {
   const meta = await redis.hgetall(roomKey(code));
-  if (!meta) return null;
-  return {
-    passwordHash: meta.passwordHash || null,
-    createdAt: meta.createdAt || "",
-  };
+  if (!meta || typeof meta.meta !== "string") return null;
+  // BUGFIX: room metadata lives under the single "meta" field (written by
+  // createRoom); reading passwordHash/createdAt as top-level fields always
+  // yielded null, silently disabling room passwords.
+  try {
+    const parsed = JSON.parse(meta.meta) as { passwordHash?: unknown; createdAt?: unknown };
+    return {
+      passwordHash: typeof parsed.passwordHash === "string" ? parsed.passwordHash : null,
+      createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+    };
+  } catch {
+    return null;
+  }
 }
 
 export async function checkCreateLimit(ipHash: string): Promise<void> {
