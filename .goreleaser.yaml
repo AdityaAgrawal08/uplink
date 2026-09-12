@@ -1,0 +1,75 @@
+# GoReleaser: one config builds, signs, and publishes everything the
+# install link needs — per-OS/arch binaries, checksums.txt (verified by
+# install.sh / install.ps1), and Homebrew/Scoop manifests.
+version: 2
+
+project_name: uplink
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: uplink-cli
+    main: ./cli
+    binary: uplink
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+    ignore:
+      - goos: windows
+        goarch: arm64  # covered by amd64 emulation; re-enable on demand
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: uplink-archives
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: []
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+signs:
+  - artifacts: checksum
+    args:
+      - "--batch"
+      - "--local-user"
+      - "{{ .Env.GPG_FINGERPRINT }}"
+      - "--output"
+      - "${signature}"
+      - "--detach-sign"
+      - "${artifact}"
+    stdin: "{{ .Env.GPG_PASSPHRASE }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+brews:
+  - name: uplink
+    homepage: https://github.com/AdityaAgrawal08/uplink-delta
+    description: Ephemeral E2E-encrypted terminal chat and file sharing
+    repository:
+      owner: AdityaAgrawal08
+      name: homebrew-uplink
+
+scoops:
+  - repository:
+      owner: AdityaAgrawal08
+      name: scoop-uplink
+    homepage: https://github.com/AdityaAgrawal08/uplink-delta
+    description: Ephemeral E2E-encrypted terminal chat and file sharing
+    license: MIT

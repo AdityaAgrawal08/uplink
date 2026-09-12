@@ -36,6 +36,22 @@ trap CLEANUP EXIT
 echo "Downloading ${DOWNLOAD_URL}..."
 curl -sSL -o "${TEMP_DIR}/${ASSET_NAME}" "${DOWNLOAD_URL}"
 
+# Verify checksum against the published checksums.txt (fail closed: a
+# missing or mismatched checksum aborts before anything executes).
+echo "Verifying checksum..."
+CHECKSUM_URL="https://github.com/${REPO}/releases/latest/download/checksums.txt"
+EXPECTED=$(curl -sSL "${CHECKSUM_URL}" | awk -v asset="${ASSET_NAME}" '$2 == asset {print $1}')
+if [ -z "${EXPECTED}" ]; then
+  echo "Error: no checksum entry for ${ASSET_NAME} — aborting." >&2
+  exit 1
+fi
+ACTUAL="$(sha256sum "${TEMP_DIR}/${ASSET_NAME}" | cut -d' ' -f1)"
+if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+  echo "Error: checksum mismatch — aborting (do not run this binary)." >&2
+  exit 1
+fi
+echo "Checksum OK."
+
 # Extract and install
 echo "Extracting binary..."
 tar -xzf "${TEMP_DIR}/${ASSET_NAME}" -C "${TEMP_DIR}"
