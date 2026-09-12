@@ -91,9 +91,9 @@ func newMsgId() (string, error) {
 // racing duplicate paths) surfaces each message exactly once. Oldest entries
 // evict past capacity — matches Telegram's bounded-recent-IDs pattern.
 type seenSet struct {
-	mu   sync.Mutex
-	cap  int
-	ids  map[string]struct{}
+	mu    sync.Mutex
+	cap   int
+	ids   map[string]struct{}
 	order []string
 }
 
@@ -101,7 +101,7 @@ func newSeenSet(capacity int) *seenSet {
 	return &seenSet{cap: capacity, ids: make(map[string]struct{})}
 }
 
-//seen reports whether id was already observed. First observation records it.
+// seen reports whether id was already observed. First observation records it.
 func (s *seenSet) seen(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
