@@ -36,19 +36,19 @@ const generalConv = "general"
 
 // runChat picks the rendering mode: full-screen TUI by default, plain lines
 // when stdout isn't a terminal or UPLINK_CHAT_PLAIN=1 (tests/CI/pipes).
-func runChat(serverURL, key, me string, id *identityKey) {
+func runChat(serverURL, key, me string, id *identityKey, password string) {
 	if os.Getenv("UPLINK_CHAT_PLAIN") == "1" || !term.IsTerminal(int(os.Stdin.Fd())) {
-		runChatPlain(serverURL, key, me, id)
+		runChatPlain(serverURL, key, me, id, password)
 		return
 	}
-	runChatTUI(serverURL, key, me, id)
+	runChatTUI(serverURL, key, me, id, password)
 }
 
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
 // There is no backlog (the server keeps no transcript) and no local history:
 // the room is live from the moment you join.
-func runChatPlain(serverURL, key, me string, id *identityKey) {
+func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	eng := newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
@@ -70,6 +70,7 @@ func runChatPlain(serverURL, key, me string, id *identityKey) {
 			fmt.Printf("* %v\n", err)
 		},
 	})
+	eng.joinPassword = password // enables engine self-rejoin after prune
 
 	// Seed the roster synchronously so the welcome line is accurate; the
 	// engine's beat loop keeps it fresh from here on.

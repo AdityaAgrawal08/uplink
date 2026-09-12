@@ -174,13 +174,16 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 	ti.Focus()
 	ti.CharLimit = 500
 	return &chatScreen{
-		me:         me,
-		targetUser: target,
-		users:      users,
-		rendered:   map[int]bool{},
-		unread:     map[string]int{},
-		lastDMAt:   map[string]time.Time{},
-		input:      ti,
+		me:          me,
+		targetUser:  target,
+		users:       users,
+		rendered:    map[int]bool{},
+		renderCache: map[int]string{},
+		tsCache:     map[int]time.Time{},
+		wrapCache:   map[string]string{},
+		unread:      map[string]int{},
+		lastDMAt:    map[string]time.Time{},
+		input:       ti,
 	}
 }
 
@@ -685,3 +688,102 @@ func TestOutboxPromotionGoesOverWire(t *testing.T) {
 		t.Fatalf("wire saw %d deposits; want 3", inboxDeposits(fs, "alice"))
 	}
 }
+
+// History and received-files stay bounded in marathon sessions.
+func TestTranscriptBounds(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	// Pre-fill directly (bypassing per-add rebuilds) then trigger ONE trim.
+	for i := 0; i < maxHistory+100; i++ {
+		c.history = append(c.history, chatMessage{Seq: i, Username: "alice", Kind: "chat", Text: "x", ConvID: generalConv})
+		c.rendered[i] = true
+	}
+	c.addMessage(chatMessage{Seq: maxHistory + 100, Username: "alice", Kind: "chat", Text: "y", ConvID: generalConv})
+	if len(c.history) != maxHistory {
+		t.Fatalf("history = %d; want cap %d", len(c.history), maxHistory)
+	}
+	if len(c.rendered) != maxHistory {
+		t.Fatalf("rendered = %d; want cap %d", len(c.rendered), maxHistory)
+	}
+	// Oldest fell off; newest retained.
+	if c.history[0].Seq != 101 || c.history[len(c.history)-1].Seq != maxHistory+100 {
+		t.Fatal("trim kept the wrong window")
+	}
+}
+
+// Render caches must hold: a few hundred live adds stay fast. This fails if
+// cache invalidation ever regresses (e.g. clearing every rebuild), which
+// once made this suite take 8+ minutes.
+func TestRebuildStaysFast(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(120, 30)
+	start := time.Now()
+	for i := 0; i < 300; i++ {
+		c.addMessage(chatMessage{Seq: i, Username: "alice", Kind: "chat", Text: "hello world test message", ConvID: generalConv})
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("300 adds took %v; render caches likely broken", elapsed)
+	}
+}
+
+func TestReceivedFilesBound(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	sc := m.(chatScreen)
+	for i := 0; i < maxReceivedFiles+10; i++ {
+		nm, _ := sc.Update(netFileMsg{file: engineFile{MsgId: "m", From: "alice", Filename: "f.txt", Size: 1, Path: "/tmp/f"}})
+		sc = nm.(chatScreen)
+	}
+	if len(sc.received) != maxReceivedFiles {
+		t.Fatalf("received = %d; want cap %d", len(sc.received), maxReceivedFiles)
+	}
+}
+
+// The engine->Update bridge must be self-perpetuating: a one-shot drain
+// would strand all later engine traffic in netCh forever (the TUI would go
+// deaf while plain mode kept working — exactly the failure this guards).
+// Proof obligation: EVERY pump outcome re-arms the next pump cycle.
+func TestDrainPumpSelfPerpetuating(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.netCh = make(chan tea.Msg, 4)
+
+	// Empty channel: pump yields netIdleMsg promptly (bounded wait).
+	got := c.drainNetCmd()()
+	if _, ok := got.(netIdleMsg); !ok {
+		t.Fatalf("idle pump yielded %T; want netIdleMsg", got)
+	}
+
+	// Queued event: pump delivers it.
+	c.netCh <- netChatMsg{chat: engineChat{MsgId: "m", From: "a", Text: "hi"}}
+	got = c.drainNetCmd()()
+	if _, ok := got.(netChatMsg); !ok {
+		t.Fatalf("pump yielded %T; want netChatMsg", got)
+	}
+
+	// Every pump outcome, fed through Update, must schedule the next cycle.
+	// (netChatMsg also schedules its ACK closure; Batch is non-nil either way.)
+	for _, msg := range []tea.Msg{
+		netIdleMsg{},
+		netChatMsg{chat: engineChat{MsgId: "m2", From: "a", Text: "x"}},
+		netFileMsg{file: engineFile{MsgId: "f1", From: "a", Filename: "x", Size: 1, Path: "/tmp/x"}},
+		netFileErrMsg{msgId: "f", from: "a", reason: "r"},
+		netReadyMsg{user: "a", code: "c"},
+		netLostMsg{user: "a"},
+		netErrMsg{err: errTestSink},
+	} {
+		if _, cmd := c.Update(msg); cmd == nil {
+			t.Fatalf("Update(%T) did not re-arm the pump", msg)
+		}
+	}
+}
+
+var errTestSink = errTestSinkNew()
+
+func errTestSinkNew() error {
+	return errTestSinkVal{}
+}
+
+type errTestSinkVal struct{}
+
+func (errTestSinkVal) Error() string { return "sink" }

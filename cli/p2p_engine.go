@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -75,10 +76,14 @@ type engine struct {
 	roster    map[string][]byte // username -> static pubkey
 	noise     map[string]*peerSession
 	hs        map[string]*peerSession // handshakes in progress
+	hsAt      map[string]time.Time   // handshake start times (stuck-hs expiry)
 	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
 	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
+	// joinPassword lets the engine rejoin by itself after being pruned for
+	// missed heartbeats (e.g. laptop sleep). Memory-only, never logged.
+	joinPassword string
 	// lastRosterAt stamps the freshest roster snapshot. Sends refresh it
 	// on demand when stale (rosterFreshTTL), so a join is never missed
 	// for longer than this — without putting a Redis read on every send.
@@ -107,6 +112,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		roster:    map[string][]byte{},
 		noise:     map[string]*peerSession{},
 		hs:        map[string]*peerSession{},
+		hsAt:      map[string]time.Time{},
 		seen:      newSeenSet(2000),
 		files:     map[string]*fileAssembly{},
 		announced: map[string]bool{},
@@ -225,6 +231,15 @@ func (e *engine) dropNoise(peer string) {
 	e.mu.Lock()
 	delete(e.noise, peer)
 	delete(e.hs, peer)
+	delete(e.hsAt, peer)
+	e.mu.Unlock()
+}
+
+// trackHs records a handshake start for stuck-handshake expiry.
+func (e *engine) trackHs(peer string, ps *peerSession) {
+	e.mu.Lock()
+	e.hs[peer] = ps
+	e.hsAt[peer] = time.Now()
 	e.mu.Unlock()
 }
 
@@ -248,12 +263,69 @@ func (e *engine) beatLoop() {
 func (e *engine) beatOnce() {
 	roster, err := e.sig.heartbeat("", nil)
 	if err != nil {
-		return // transient; next tick retries
+		// Pruned while asleep (missed beats): rejoin with the same identity
+		// instead of rotting at 403 forever. A 409 here means someone took
+		// our name meanwhile — surface it, don't loop.
+		if isNotMember(err) {
+			if _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
+				e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
+				return
+			}
+			roster, err = e.sig.heartbeat("", nil)
+			if err != nil {
+				return
+			}
+		} else {
+			return // transient; next tick retries
+		}
 	}
 	e.mu.Lock()
 	e.presence = roster
 	e.mu.Unlock()
 	e.setRoster(roster)
+	e.reconcilePeers(roster)
+}
+
+// isNotMember reports the server's "you are not in this session" rejection.
+func isNotMember(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "403")
+}
+
+// stuckHsTTL bounds a handshake with no progress. Past it the attempt is
+// torn down and retried fresh (signal notes can be lost to TTL expiry,
+// leaving an otherwise-healthy peer pair stalled forever).
+const stuckHsTTL = 60 * time.Second
+
+// reconcilePeers closes the retry gap: failed mesh setups leave no trace
+// (failPeer removes the entry) and stuck handshakes leave only an hs entry,
+// so without this a transient failure would strand a peer until the roster
+// itself changed. In-flight setups and fresh handshakes are left alone.
+func (e *engine) reconcilePeers(roster []rosterMember) {
+	now := time.Now()
+	for _, m := range roster {
+		if m.Username == "" || m.Username == e.me {
+			continue
+		}
+		e.mu.Lock()
+		_, live := e.noise[m.Username]
+		_, hs := e.hs[m.Username]
+		started := e.hsAt[m.Username]
+		e.mu.Unlock()
+		if live {
+			continue
+		}
+		if hs {
+			if now.Sub(started) < stuckHsTTL {
+				continue // handshake in progress; leave it alone
+			}
+			// stuck: full restart (fresh PC + fresh Noise = fresh nonces)
+			e.mesh.dropPeer(m.Username)
+			e.dropNoise(m.Username)
+		} else if e.mesh.hasPeer(m.Username) {
+			continue // mesh setup in flight; leave it alone
+		}
+		e.mesh.ensurePeer(m.Username)
+	}
 }
 
 // ─── signaling poll (the ONLY signal drain) ────────────────────────────────
@@ -306,9 +378,7 @@ func (e *engine) onMeshUp(peer string) {
 			e.emitErr(err)
 			return
 		}
-		e.mu.Lock()
-		e.hs[peer] = ps
-		e.mu.Unlock()
+		e.trackHs(peer, ps)
 		if err := e.sig.signalSend(peer, noiseSig1, base64.StdEncoding.EncodeToString(m1)); err != nil {
 			e.emitErr(err)
 		}
@@ -330,9 +400,7 @@ func (e *engine) onHandshakeNote(n signalNote) {
 		if err != nil {
 			return
 		}
-		e.mu.Lock()
-		e.hs[n.From] = ps
-		e.mu.Unlock()
+		e.trackHs(n.From, ps)
 		m2, err := ps.stepNoise(raw)
 		if err != nil || m2 == nil {
 			e.dropNoise(n.From)
@@ -389,6 +457,7 @@ func (e *engine) verifyReady(peer string, ps *peerSession) {
 	}
 	e.noise[peer] = ps
 	delete(e.hs, peer)
+	delete(e.hsAt, peer)
 	announced := e.announced[peer]
 	if !announced {
 		e.announced[peer] = true
@@ -588,6 +657,9 @@ func (e *engine) sendOne(peer string, f frame, raw []byte) error {
 }
 
 func (e *engine) sendChat(to, text string) (string, error) {
+	if text == "" {
+		return "", fmt.Errorf("empty message")
+	}
 	id, err := newMsgId()
 	if err != nil {
 		return "", err

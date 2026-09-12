@@ -160,6 +160,15 @@ func (m *mesh) queueFor(peer string) chan signalNote {
 	return q
 }
 
+// hasPeer reports whether a peer has a live setup entry (in flight or up).
+// The engine uses it to avoid churning setups that are still working.
+func (m *mesh) hasPeer(username string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.peers[username]
+	return ok
+}
+
 // dropPeer tears down a peer (leave, ban, or re-setup).
 func (m *mesh) dropPeer(username string) {
 	m.mu.Lock()

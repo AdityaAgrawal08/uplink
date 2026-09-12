@@ -138,7 +138,7 @@ func cmdCreateSession(args []string, cfg *Config) {
 
 	// The creator is already a participant server-side — drop them straight
 	// into the room so their username isn't stranded without a UI.
-	runChat(serverURL, sid, username, id)
+	runChat(serverURL, sid, username, id, password)
 }
 
 // cmdJoinChat handles: uplink join <key> — resolves to the interactive chat.
@@ -209,5 +209,5 @@ func cmdJoinChat(args []string, cfg *Config) {
 		}
 	}
 
-	runChat(serverURL, key, username, id)
+	runChat(serverURL, key, username, id, password)
 }

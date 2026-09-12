@@ -237,3 +237,63 @@ func TestEngineBigFileFallbackRefused(t *testing.T) {
 		t.Fatal("oversize fallback file must fail fast")
 	}
 }
+
+// Empty text never reaches the wire (TUI guards too; defense in depth).
+func TestEngineSendChatRejectsEmpty(t *testing.T) {
+	ida, _ := generateIdentity()
+	e := newEngine("alice", ida, &signalClient{}, engineCallbacks{})
+	defer e.stop()
+	if _, err := e.sendChat("bob", ""); err == nil {
+		t.Fatal("empty text must fail")
+	}
+	if _, err := e.sendChat("", ""); err == nil {
+		t.Fatal("empty broadcast must fail")
+	}
+}
+
+// Pruned while asleep (missed beats): the next beat rejoins automatically
+// with the same identity instead of rotting at 403 forever.
+func TestEngineAutoRejoinAfterPrune(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Bob stays behind so the room survives alice's prune.
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	pa := newEngineProbe()
+	ea := newEngineWithStun("alice", ida, sigA, pa.callbacks(), []string{})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+
+	// Simulate a prune: someone (or the sweeper) drops alice server-side.
+	kicker := &signalClient{serverURL: srv.URL, me: "alice", key: sigA.key}
+	if err := kicker.leaveRoom(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next beat must rejoin transparently.
+	ea.beatOnce()
+	roster, err := sigA.heartbeat("", nil)
+	if err != nil {
+		t.Fatalf("still out after rejoin: %v", err)
+	}
+	found := false
+	for _, m := range roster {
+		if m.Username == "alice" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("engine did not rejoin after prune")
+	}
+}
