@@ -79,9 +79,18 @@ type engine struct {
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
 	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
+	// lastRosterAt stamps the freshest roster snapshot. Sends refresh it
+	// on demand when stale (rosterFreshTTL), so a join is never missed
+	// for longer than this — without putting a Redis read on every send.
+	lastRosterAt time.Time
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
+
+// rosterFreshTTL bounds how stale the send path's roster may be. The 15s
+// beat loop keeps it fresh in the background; this only fires a synchronous
+// refresh when a send would otherwise address a stale world.
+const rosterFreshTTL = 5 * time.Second
 
 func newEngine(me string, id *identityKey, sig *signalClient, cb engineCallbacks) *engine {
 	return newEngineWithStun(me, id, sig, cb, nil)
@@ -177,6 +186,7 @@ func (e *engine) stopped() bool {
 // opens setup for newcomers, tears down the departed.
 func (e *engine) setRoster(members []rosterMember) {
 	e.mu.Lock()
+	e.lastRosterAt = time.Now()
 	next := map[string][]byte{}
 	for _, m := range members {
 		if m.Username == "" || m.Username == e.me {
@@ -461,7 +471,11 @@ func (e *engine) inboxOnce() {
 		senderKey, known := e.roster[b.From]
 		e.mu.Unlock()
 		if !known {
-			ack = append(ack, b.MsgId) // sender gone: purge to avoid inbox clog
+			// Sender not in MY roster snapshot (typically it is stale and
+			// a beat refresh is pending). Leave the box UNACKED so a later
+			// poll — after the roster refreshes — can still deliver it.
+			// Purging here ate legitimate mail whenever rosters lagged.
+			// Stragglers are bounded by the 1h server TTL + per-user cap.
 			continue
 		}
 		pt, err := openBox(e.id, senderKey, b.Payload)
@@ -526,6 +540,12 @@ func (e *engine) sendFrame(to string, f frame) error {
 		peers = append(peers, u)
 	}
 	e.mu.Unlock()
+	if len(peers) == 0 {
+		// Fail loudly, not silently: a broadcast with no known recipients
+		// (typically a roster not yet refreshed after a join) must surface
+		// instead of returning success having sent nothing.
+		return fmt.Errorf("no recipients in roster yet — retry in a few seconds")
+	}
 	var firstErr error
 	sent := 0
 	for _, u := range peers {
@@ -572,12 +592,31 @@ func (e *engine) sendChat(to, text string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	e.ensureFreshRoster()
 	f := newFrame(frameChat, id, e.me, to)
 	f.Data = text
 	if err := e.sendFrame(to, f); err != nil {
 		return "", err
 	}
 	return id, nil
+}
+
+// ensureFreshRoster refreshes the roster synchronously when the snapshot is
+// older than rosterFreshTTL. Sends then never address a world older than a
+// few seconds, while the hot path (fresh cache) costs nothing extra.
+// Failures keep the stale snapshot (fail-open for sends).
+func (e *engine) ensureFreshRoster() {
+	e.mu.Lock()
+	stale := time.Since(e.lastRosterAt) > rosterFreshTTL
+	e.mu.Unlock()
+	if !stale {
+		return
+	}
+	roster, err := e.sig.heartbeat("", nil)
+	if err != nil {
+		return
+	}
+	e.setRoster(roster)
 }
 
 func (e *engine) sendAck(to, msgId string) error {
@@ -607,6 +646,7 @@ func (e *engine) sendFile(to, path, display string, prog chan<- uploadProgressMs
 	if err != nil {
 		return "", 0, err
 	}
+	e.ensureFreshRoster()
 	// Streaming (meta/chunks/complete sharing one msgId) requires the live
 	// path for every recipient: inbox boxes key by msgId and would collide.
 	// When anyone is unreachable, small files go as ONE self-contained box
