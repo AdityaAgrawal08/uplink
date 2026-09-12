@@ -54,35 +54,35 @@ type pickerEntry struct {
 }
 
 // pickerMode selects what the drawer lists: the local file system (upload),
-// the room's shared files (download), a file detail view, or the buffer review.
+// the room's shared files (download), a file detail view, buffer review, or delete.
 type pickerMode int
 
 const (
 	modeBrowse pickerMode = iota
 	modeFiles
-	modeDetail    // detail window for download confirmation
-	modeBuffer    // buffer review: shows queued files, deselect with ctrl+d
+	modeDetail // detail window for download confirmation
+	modeBuffer // buffer review: shows queued files, deselect with ctrl+d
 )
 
 // pickerState is the browser mode of the drawer. All list math goes through
 // pure helpers so navigation rules are unit-testable without a filesystem.
 type pickerState struct {
-	active   bool
-	mode     pickerMode
-	cwd      string // absolute current directory (modeBrowse)
-	home     string // $HOME, for ~/ breadcrumb abbreviation
-	entries  []pickerEntry
-	files    []receivedFile // modeFiles listing (received this session), most recent first
-	loading  bool          // modeFiles: unused (listing is synchronous); kept for shape parity
-	cursor   int
-	offset   int      // first visible row in the scroll window
-	anchor   int      // range anchor (-1 = no active range)
-	visual   bool     // `v` visual mode: plain moves extend the range
-	buffered []string // ordered keys: absolute paths OR fileIds
-	inBuf    map[string]bool
-	notice   string // transient error line ("" = none)
-	filter   string // substring filter (active when filtering=true)
-	filtering bool  // true while the user is typing a filter query
+	active    bool
+	mode      pickerMode
+	cwd       string // absolute current directory (modeBrowse)
+	home      string // $HOME, for ~/ breadcrumb abbreviation
+	entries   []pickerEntry
+	files     []receivedFile // modeFiles listing (received this session), most recent first
+	loading   bool           // modeFiles: unused (listing is synchronous); kept for shape parity
+	cursor    int
+	offset    int      // first visible row in the scroll window
+	anchor    int      // range anchor (-1 = no active range)
+	visual    bool     // `v` visual mode: plain moves extend the range
+	buffered  []string // ordered keys: absolute local paths
+	inBuf     map[string]bool
+	notice    string // transient error line ("" = none)
+	filter    string // substring filter (active when filtering=true)
+	filtering bool   // true while the user is typing a filter query
 
 	// Detail window state (modeDetail).
 	detailFile *receivedFile // the file being inspected
@@ -346,7 +346,7 @@ func (p *pickerState) rowCount() int {
 }
 
 // entryAt maps a row index onto its target. key is the buffer identity:
-// absolute path (browse) or fileId (files). ok=false for the ".." row.
+// absolute path (browse) or save path (files). ok=false for the ".." row.
 func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) {
 	if p.mode == modeBuffer {
 		if row < 0 || row >= len(p.buffered) {
@@ -483,7 +483,7 @@ func (c *chatScreen) pickerBufferFolder() {
 }
 
 // pickerConfirm hands the buffered set to the active engine and closes:
-// browse mode uploads buffered paths; files mode downloads buffered fileIds.
+// browse mode uploads buffered paths; files mode is read-only (no buffering).
 func (c *chatScreen) pickerConfirm() tea.Cmd {
 	restore := composerPlaceholder
 	if c.picker.mode == modeFiles {

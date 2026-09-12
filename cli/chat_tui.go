@@ -721,58 +721,6 @@ func (c *chatScreen) appendLocal(conv, text string) {
 	c.rebuildView()
 }
 
-// appendLocalFileCard adds a styled file attachment card to the transcript.
-func (c *chatScreen) appendLocalFileCard(conv, filename, username, sizeStr, timestamp string) {
-	// Derive RFC3339 for interleaving; caller passes local "15:04" so we
-	// synthesize a full timestamp from now if not already RFC3339.
-	rfc := ""
-	if timestamp != "" {
-		if _, err := time.Parse(time.RFC3339, timestamp); err == nil {
-			rfc = timestamp
-		} else if t, err := time.Parse("15:04", timestamp); err == nil {
-			now := time.Now()
-			rfc = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, time.Local).Format(time.RFC3339)
-		} else {
-			rfc = time.Now().Format(time.RFC3339)
-		}
-	} else {
-		rfc = time.Now().Format(time.RFC3339)
-	}
-	c.localLines = append(c.localLines, localLine{
-		conv: conv,
-		kind: lineFileCard,
-		fileData: &fileCardData{
-			filename:  filename,
-			username:  username,
-			size:      sizeStr,
-			time:      timestamp,
-			createdAt: rfc,
-		},
-	})
-	c.rebuildView()
-}
-
-// appendLocalFileCardWithRFC3339 is like appendLocalFileCard but accepts an
-// explicit RFC3339 timestamp (used for server-sourced file announcements).
-func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, filename, username, sizeStr, rfc3339 string) {
-	ts := ""
-	if t, err := time.Parse(time.RFC3339, rfc3339); err == nil {
-		ts = t.Local().Format("15:04")
-	}
-	c.localLines = append(c.localLines, localLine{
-		conv: conv,
-		kind: lineFileCard,
-		fileData: &fileCardData{
-			filename:  filename,
-			username:  username,
-			size:      sizeStr,
-			time:      ts,
-			createdAt: rfc3339,
-		},
-	})
-	c.rebuildView()
-}
-
 // rebuildView derives the painted transcript from raw history + local lines,
 // applying the CURRENT visibility filter. Entering/leaving private mode just
 // calls this — historical lines re-filter retroactively.

@@ -17,12 +17,24 @@ function getClientPromise(): Promise<MongoClient> {
     };
 
     if (!globalWithMongo._mongoClientPromise) {
-      client = new MongoClient(mongoUri);
+      client = new MongoClient(mongoUri, {
+        maxPoolSize: 20,
+        minPoolSize: 5,
+        maxIdleTimeMS: 30000,
+        serverSelectionTimeoutMS: 3000,
+        socketTimeoutMS: 10000,
+      });
       globalWithMongo._mongoClientPromise = client.connect();
     }
     clientPromise = globalWithMongo._mongoClientPromise;
   } else {
-    client = new MongoClient(mongoUri);
+    client = new MongoClient(mongoUri, {
+      maxPoolSize: 20,
+      minPoolSize: 5,
+      maxIdleTimeMS: 30000,
+      serverSelectionTimeoutMS: 3000,
+      socketTimeoutMS: 10000,
+    });
     clientPromise = client.connect();
   }
 

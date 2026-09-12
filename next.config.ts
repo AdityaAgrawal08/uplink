@@ -28,6 +28,14 @@ const nextConfig: NextConfig = {
   async headers() {
     return [
       {
+        source: "/api/(.*)",
+        headers: [
+          { key: "Cache-Control", value: "private, no-store, no-cache, must-revalidate" },
+          { key: "CDN-Cache-Control", value: "no-store" },
+          { key: "Vercel-CDN-Cache-Control", value: "no-store" },
+        ],
+      },
+      {
         source: "/(.*)",
         headers: [
           { key: "Content-Security-Policy", value: csp },

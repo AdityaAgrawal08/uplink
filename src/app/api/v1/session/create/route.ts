@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { hashPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
+
+export const dynamic = "force-dynamic";
+export const maxDuration = 10;
 import {
   RoomError,
   createRoom,

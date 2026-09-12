@@ -209,7 +209,9 @@ class LazyRedisClient implements IRedisClient {
     const redisUrl = process.env.UPSTASH_REDIS_REST_URL;
     const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN;
 
-    if (redisUrl && redisToken && !this.isFallbackToMock) {
+    const isPlaceholder = (v?: string) => !v || /placeholder|example|_here|xxxx/i.test(v) || v.includes("bad port");
+
+    if (redisUrl && redisToken && !isPlaceholder(redisUrl) && !isPlaceholder(redisToken) && !this.isFallbackToMock) {
       this.client = new Redis({
         url: redisUrl,
         token: redisToken,
@@ -217,6 +219,10 @@ class LazyRedisClient implements IRedisClient {
     } else {
       if (this.isFallbackToMock) {
         console.warn("Upstash Redis connection failed or unreachable. Falling back to local in-memory MockRedis.");
+      } else if (!redisUrl || !redisToken || isPlaceholder(redisUrl) || isPlaceholder(redisToken)) {
+        // silent fallback for local/dev without credentials
+        this.client = new MockRedis();
+        return this.client;
       } else {
         console.log("Upstash Redis credentials missing. Using local in-memory MockRedis.");
       }

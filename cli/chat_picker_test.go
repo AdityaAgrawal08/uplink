@@ -383,7 +383,7 @@ func newFilesDrawer(t *testing.T, files []receivedFile) chatScreen {
 // The /download listing shows received files, most recent first.
 func TestFilesDrawerSortsRecentFirst(t *testing.T) {
 	c := newPaletteScreen()
-	c, _ = typeKeys(c, "/d")
+	c, _ = typeKeys(c, "/download")
 	got, _ := step(c, tea.KeyMsg{Type: tea.KeyEnter})
 	if !got.picker.isActive() || got.picker.mode != modeFiles {
 		t.Fatal("/download must open the files drawer")
