@@ -2,9 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
 import { crc64nvmeBase64 } from "@/lib/crc64";
+import { isMockStorage } from "@/lib/r2";
 
 export async function PUT(req: NextRequest) {
   try {
+    // B35 FIX: only serve this dev-only filesystem shim when mock storage is
+    // active. Otherwise it is an open local file-write endpoint on the host.
+    if (!isMockStorage()) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
+
     const { searchParams } = new URL(req.url);
     const key = searchParams.get("key");
     const sha256 = searchParams.get("sha256") || "";

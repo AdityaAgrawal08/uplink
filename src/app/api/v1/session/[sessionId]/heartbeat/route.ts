@@ -1,84 +1,35 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getDb } from "@/lib/mongodb";
-import { apiError } from "@/lib/api-utils";
+import { apiError, parseJsonBody } from "@/lib/api-utils";
+import { validateSignalingEnv } from "@/lib/env";
+import { RoomError, heartbeat } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     const { sessionId } = await props.params;
     const usernameHeader = req.headers.get("X-Uplink-Username");
-
     if (!usernameHeader) {
       return apiError("X-Uplink-Username header is required", 400);
     }
 
-    const text = await req.text();
-    const body = text ? JSON.parse(text) : {};
-    const { peerId, addrs } = body;
+    const parsed = await parseJsonBody(req);
+    if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
+    const { peerId, addrs } = parsed.body as { peerId?: unknown; addrs?: unknown };
 
-    const db = await getDb();
-
-    // 1. Fetch Session to ensure it is ACTIVE
-    const session = await db.collection("sessions").findOne({ sessionId });
-    if (!session) {
-      return apiError("Session not found", 404);
-    }
-    if (session.status !== "ACTIVE") {
-      return apiError("Session is not active", 410);
-    }
-
-    const now = new Date();
-
-    // 2. Update participant heartbeat
-    const updateFields: {
-      lastHeartbeat: Date;
-      status: string;
-      peerId?: string;
-      addrs?: string[];
-    } = {
-      lastHeartbeat: now,
-      status: "ACTIVE",
-    };
-    if (peerId !== undefined) {
-      updateFields.peerId = peerId;
-    }
-    if (addrs !== undefined) {
-      updateFields.addrs = addrs;
-    }
-
-    const result = await db.collection("session_participants").findOneAndUpdate(
-      { sessionId, username: usernameHeader },
-      { $set: updateFields },
-      { returnDocument: "before" }
-    );
-
-    if (!result) {
-      return apiError("Participant not found in session", 404);
-    }
-
-    // 3. Self-heal if uploader was marked LEFT
-    if (result.status === "LEFT") {
-      await db.collection("sessions").updateOne(
-        { sessionId },
-        { $inc: { participantCount: 1 } }
-      );
-    }
-
-    // 4. Live roster so clients can surface joins/leaves without extra calls
-    const activeUsers = (
-      await db
-        .collection("session_participants")
-        .find({ sessionId, status: "ACTIVE" })
-        .project({ username: 1, _id: 0 })
-        .toArray()
-    ).map((u) => u.username);
-
-    return NextResponse.json({ ok: true, activeUsers });
+    // Rooms.heartbeat() validates both fields (400 on garbage), so the
+    // narrow-down cast here is safe.
+    const roster = await heartbeat(sessionId, usernameHeader, {
+      peerId: peerId as string | undefined,
+      addrs: addrs as string[] | undefined,
+    });
+    const activeUsers = roster.filter((m) => m.online).map((m) => m.username);
+    return NextResponse.json({ ok: true, activeUsers, roster });
   } catch (error) {
+    if (error instanceof RoomError) return apiError(error.message, error.status);
     console.error("Error in POST /api/v1/session/heartbeat:", error);
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }

@@ -64,4 +64,59 @@ describe("MockRedis", () => {
     }
     expect(await r.incr("rl")).toBe(21); // caller compares > LIMIT
   });
+
+  // B13: Document that SET without EX/PX clears TTL (matches real Redis).
+  // This is the correct behavior but can surprise callers who expect TTL
+  // preservation across re-sets.
+  it("set without expiry clears prior TTL (matches real Redis SET behavior)", async () => {
+    await r.set("k", "v1", { ex: 3600 });
+    const itemBefore = r["store"].get("k");
+    expect(itemBefore?.expiry).not.toBeNull();
+
+    // Overwrite without EX — TTL should be lost.
+    await r.set("k", "v2");
+    const itemAfter = r["store"].get("k");
+    expect(itemAfter?.expiry).toBeNull();
+    expect(await r.get("k")).toBe("v2");
+
+    // incr after set-without-TTL should also have no TTL.
+    await r.incr("counter");
+    await r.expire("counter", 60);
+    await r.set("counter", "999"); // overwrite clears TTL
+    const counterItem = r["store"].get("counter");
+    expect(counterItem?.expiry).toBeNull();
+  });
+
+  it("hsetnx claims a field exactly once (atomic username-claim contract)", async () => {
+    expect(await r.hsetnx("room:m", "alice", "{}")).toBe(1);
+    expect(await r.hsetnx("room:m", "alice", "{}")).toBe(0);
+    expect(await r.hsetnx("room:m", "bob", "{}")).toBe(1);
+    expect(await r.hlen("room:m")).toBe(2);
+    expect(await r.hgetall("room:m")).toEqual({ alice: "{}", bob: "{}" });
+    expect(await r.hdel("room:m", "alice")).toBe(1);
+    expect(await r.hdel("room:m", "alice")).toBe(0);
+    expect(await r.hgetall("room:m")).toEqual({ bob: "{}" });
+  });
+
+  it("lists behave as FIFO queues with trim", async () => {
+    expect(await r.lrange("q", 0, -1)).toEqual([]);
+    await r.rpush("q", "a", "b", "c");
+    expect(await r.llen("q")).toBe(3);
+    expect(await r.lrange("q", 0, -1)).toEqual(["a", "b", "c"]);
+    expect(await r.lrange("q", 1, 2)).toEqual(["b", "c"]);
+    await r.ltrim("q", 1, -1);
+    expect(await r.lrange("q", 0, -1)).toEqual(["b", "c"]);
+  });
+
+  it("expire applies to hashes and lists, del clears all types", async () => {
+    await r.hset("h", "f", "v");
+    await r.rpush("l", "x");
+    expect(await r.expire("h", 3600)).toBe(1);
+    expect(await r.expire("l", 3600)).toBe(1);
+    expect(await r.expire("missing", 60)).toBe(0);
+    expect(await r.del("h")).toBe(1);
+    expect(await r.hgetall("h")).toBeNull();
+    expect(await r.del("l")).toBe(1);
+    expect(await r.llen("l")).toBe(0);
+  });
 });

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -178,15 +179,27 @@ func stripANSI(s string) string {
 }
 
 func TestBeatPrunesDepartedPeers(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
 	c := newFilterScreen("me", "", "me")
+	wireTestEngine(t, c, srv, "me", "alice")
 	now := time.Now()
 	c.unread = map[string]int{"ghost": 4}
 	c.lastDMAt = map[string]time.Time{"ghost": now}
 
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	scr := m.(chatScreen)
-	nm, _ := scr.Update(beatDoneMsg{users: []string{"me", "alice"}})
+	// Pull the heartbeat roster (me+alice on the fake server): ghost never
+	// existed server-side, so the tick must prune ghost entries.
+	scr.eng.beatOnce()
+	nm, _ := scr.Update(rosterTickMsg{})
 	got := nm.(chatScreen)
+
+	if len(got.users) != 2 {
+		t.Fatalf("roster = %v; want [me alice]", got.users)
+	}
 
 	if _, ok := got.unread["ghost"]; ok {
 		t.Error("unread entry for departed peer not pruned")

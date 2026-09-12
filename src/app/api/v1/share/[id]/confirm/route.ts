@@ -5,7 +5,7 @@ import path from "path";
 import { getDb } from "@/lib/mongodb";
 import { checkObjectExists, completeMultipartUpload, s3Client, calculateS3ObjectHash } from "@/lib/r2";
 import { anonymizeIp } from "@/lib/crypto";
-import { commitUploadQuota, releaseUploadQuota } from "@/lib/quota";
+import { commitUploadQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
 import { apiError } from "@/lib/api-utils";
 
 interface ShareData {
@@ -81,7 +81,7 @@ export async function POST(
         .collection("upload_sessions")
         .updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
       const estimatedOps = uploadSession.isMultipart ? uploadSession.partsCount + 2 : 1;
-      await releaseUploadQuota(share.size, estimatedOps);
+      await releaseUploadQuotaWithRetry(share.size, estimatedOps);
       return apiError("Upload session has expired", 410);
     }
 
@@ -92,7 +92,7 @@ export async function POST(
     if (uploadSession.isMultipart) {
       if (!parts || !Array.isArray(parts)) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuota(share.size, estimatedOps);
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         return apiError("Parts list is required to complete multipart upload", 400);
       }
 
@@ -108,8 +108,26 @@ export async function POST(
       );
       if (!isValid) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuota(share.size, estimatedOps);
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         return apiError("Invalid parts list structure. Each part must contain a valid partNumber and etag.", 400);
+      }
+
+      // B40 FIX: bound the parts array and require unique part numbers.
+      // init caps partsCount at 100, but confirm accepted an unbounded array;
+      // duplicates would also duplicate bytes in mock-mode assembly.
+      if (parts.length === 0 || parts.length > 100) {
+        const estimatedOps = uploadSession.partsCount + 2;
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        return apiError("Parts list must contain between 1 and 100 entries", 400);
+      }
+      const seenParts = new Set<number>();
+      for (const p of parts) {
+        if (seenParts.has(p.partNumber)) {
+          const estimatedOps = uploadSession.partsCount + 2;
+          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          return apiError(`Duplicate partNumber in parts list: ${p.partNumber}`, 400);
+        }
+        seenParts.add(p.partNumber);
       }
 
       // Assemble chunks in R2/S3 or mock storage
@@ -121,7 +139,7 @@ export async function POST(
 
       if (completionResult.error) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuota(share.size, estimatedOps);
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         return apiError(`Failed to complete multipart assembly: ${completionResult.error}`, 400);
       }
 
@@ -131,7 +149,7 @@ export async function POST(
       const objDetails = await checkObjectExists(share.objectKey);
       if (!objDetails.exists) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuota(share.size, estimatedOps);
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
         return apiError("Uploaded file was not found in object storage after assembly", 404);
       }
 
@@ -156,12 +174,12 @@ export async function POST(
       // Single-part HEAD check
       const objDetails = await checkObjectExists(share.objectKey);
       if (!objDetails.exists) {
-        await releaseUploadQuota(share.size, 1);
+        await releaseUploadQuotaWithRetry(share.size, 1);
         return apiError("Uploaded file was not found in object storage", 404);
       }
 
       if (objDetails.size <= 0) {
-        await releaseUploadQuota(share.size, 1);
+        await releaseUploadQuotaWithRetry(share.size, 1);
         return apiError("Uploaded file cannot be empty (0 bytes)", 400);
       }
 
@@ -206,7 +224,7 @@ export async function POST(
         await db
           .collection("upload_sessions")
           .updateOne({ shareId: id }, { $set: { status: "VERIFY_FAILED" } });
-        await releaseUploadQuota(share.size, 1);
+        await releaseUploadQuotaWithRetry(share.size, 1);
         return apiError("Integrity check failed: uploaded file SHA-256 does not match client expectation", 412);
       }
     }
@@ -229,8 +247,24 @@ export async function POST(
     );
 
     if (!updateShareResult) {
+      // B39 FIX: distinguish a lost race (share went ACTIVE via a concurrent
+      // confirm) from a genuine conflict. The old code unconditionally
+      // released quota here, so a concurrent double-confirm drove
+      // reservedBytes negative and corrupted the quota ledger.
+      const current = await db.collection("shares").findOne(
+        { shareId: share.shareId },
+        { projection: { status: 1, downloadCode: 1 } }
+      );
+      if (current && current.status === "ACTIVE") {
+        return NextResponse.json({
+          message: "Upload already confirmed",
+          shareId: share.shareId,
+          downloadCode: current.downloadCode || null,
+          status: current.status,
+        });
+      }
       const estimatedOps = uploadSession.isMultipart ? uploadSession.partsCount + 2 : 1;
-      await releaseUploadQuota(share.size, estimatedOps);
+      await releaseUploadQuotaWithRetry(share.size, estimatedOps);
       return apiError("Conflict updating share status", 409);
     }
 
@@ -243,7 +277,9 @@ export async function POST(
     quotaCommitted = true;
 
     // 5. Structured Diagnostics Logging
-    const clientIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    // B8 FIX: take the leftmost entry of x-forwarded-for (the real client).
+    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
     const ipHash = anonymizeIp(clientIp);
     const userAgent = req.headers.get("user-agent") || "Unknown";
 
@@ -278,12 +314,11 @@ export async function POST(
     if (!quotaCommitted && share) {
       try {
         const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
-        await releaseUploadQuota(share.size, estimatedOps);
+        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
       } catch (refundErr) {
         console.error("Failed to refund quota on confirm crash:", refundErr);
       }
     }
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }

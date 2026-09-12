@@ -1,8 +1,14 @@
 package main
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -13,11 +19,67 @@ import (
 	"time"
 )
 
-// version is set via ldflags at build time: go build -ldflags "-X main.version=1.2.3"
+// version/commit/date are set via ldflags at build time (see .goreleaser.yaml):
+// go build -ldflags "-X main.version=1.2.3 -X main.commit=abc -X main.date=2026-01-01"
 var version = "0.0.1"
+var commit = "dev"
+var date = "unknown"
 
 func handleVersion() {
-	fmt.Printf("uplink %s (%s/%s)\n", version, runtime.GOOS, runtime.GOARCH)
+	fmt.Printf("uplink %s (%s/%s) commit %s built %s\n", version, runtime.GOOS, runtime.GOARCH, commit, date)
+}
+
+// githubRelease mirrors the subset of the GitHub releases API we need.
+type githubRelease struct {
+	TagName string `json:"tag_name"`
+	Assets  []struct {
+		Name               string `json:"name"`
+		BrowserDownloadURL string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+// verifyReleaseChecksum downloads checksums.txt from the same release and
+// compares the downloaded asset's SHA-256. hasher already consumed the
+// downloaded bytes. Missing/mismatched checksums fail closed.
+func verifyReleaseChecksum(client *http.Client, release githubRelease, assetName string, hasher hash.Hash) error {
+	var checksumURL string
+	for _, a := range release.Assets {
+		if a.Name == "checksums.txt" {
+			checksumURL = a.BrowserDownloadURL
+			break
+		}
+	}
+	if checksumURL == "" {
+		return fmt.Errorf("release has no checksums.txt — refusing to install")
+	}
+	resp, err := client.Get(checksumURL)
+	if err != nil {
+		return fmt.Errorf("checksum download failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("checksum download returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("checksum read failed: %w", err)
+	}
+	var expected string
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == assetName {
+			expected = fields[0]
+			break
+		}
+	}
+	if expected == "" {
+		return fmt.Errorf("no checksum entry for %s — refusing to install", assetName)
+	}
+	actual := hex.EncodeToString(hasher.Sum(nil))
+	if !strings.EqualFold(actual, expected) {
+		return fmt.Errorf("checksum mismatch — refusing to install (do not run this binary)")
+	}
+	return nil
 }
 
 func handleUpdate() {
@@ -47,13 +109,7 @@ func handleUpdate() {
 		os.Exit(1)
 	}
 
-	var release struct {
-		TagName string `json:"tag_name"`
-		Assets  []struct {
-			Name               string `json:"name"`
-			BrowserDownloadURL string `json:"browser_download_url"`
-		} `json:"assets"`
-	}
+	var release githubRelease
 	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
 		fmt.Printf("✗ Failed to parse response: %v\n", err)
 		os.Exit(1)
@@ -104,11 +160,28 @@ func handleUpdate() {
 		os.Exit(1)
 	}
 
-	if _, err := io.Copy(tmpFile, dlResp.Body); err != nil {
+	hasher := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmpFile, hasher), dlResp.Body); err != nil {
 		fmt.Printf("✗ Download interrupted: %v\n", err)
 		os.Exit(1)
 	}
 	tmpFile.Close()
+
+	if err := verifyReleaseChecksum(client, release, filepath.Base(downloadURL), hasher); err != nil {
+		fmt.Printf("✗ %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("✓ Checksum verified.")
+
+	// Release assets are archives (tar.gz, .zip on Windows) — extract the
+	// binary first. Installing the archive itself was an old bug that left
+	// a non-executable tarball on the user's PATH.
+	binPath, err := extractReleaseAsset(tmpFile.Name())
+	if err != nil {
+		fmt.Printf("✗ %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(binPath)
 
 	// Determine install path
 	selfPath, err := exec.LookPath("uplink")
@@ -116,14 +189,14 @@ func handleUpdate() {
 		selfPath = filepath.Join(".", "uplink")
 	}
 
-	if err := os.Chmod(tmpFile.Name(), 0755); err != nil {
+	if err := os.Chmod(binPath, 0755); err != nil {
 		fmt.Printf("✗ Cannot make binary executable: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := os.Rename(tmpFile.Name(), selfPath); err != nil {
+	if err := os.Rename(binPath, selfPath); err != nil {
 		// Try copy if rename fails (cross-device)
-		in, err := os.Open(tmpFile.Name())
+		in, err := os.Open(binPath)
 		if err != nil {
 			fmt.Printf("✗ Cannot read new binary: %v\n", err)
 			os.Exit(1)
@@ -139,8 +212,93 @@ func handleUpdate() {
 			fmt.Printf("✗ Install failed: %v\n", err)
 			os.Exit(1)
 		}
-		os.Remove(tmpFile.Name())
+		os.Remove(binPath)
 	}
 
 	fmt.Printf("✓ Updated to v%s (%s)\n", latestTag, selfPath)
+}
+
+// extractReleaseAsset unpacks a downloaded release archive and returns the
+// path of the extracted uplink binary (in a fresh temp file). Zip-slip
+// hardened: entries are flattened to their base name and only uplink*
+// entries are accepted; decompression is capped to blunt bombs.
+func extractReleaseAsset(archivePath string) (string, error) {
+	out, err := os.CreateTemp("", "uplink-bin-*")
+	if err != nil {
+		return "", fmt.Errorf("temp file creation failed: %w", err)
+	}
+	outPath := out.Name()
+	if runtime.GOOS == "windows" {
+		out.Close()
+		os.Remove(outPath)
+		return extractZipAsset(archivePath)
+	}
+	defer out.Close()
+
+	f, err := os.Open(archivePath)
+	if err != nil {
+		os.Remove(outPath)
+		return "", err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(io.LimitReader(f, 300<<20))
+	if err != nil {
+		os.Remove(outPath)
+		return "", fmt.Errorf("not a gzip archive: %w", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			os.Remove(outPath)
+			return "", fmt.Errorf("tar read failed: %w", err)
+		}
+		name := filepath.Base(hdr.Name)
+		if !strings.HasPrefix(name, "uplink") || !hdr.FileInfo().Mode().IsRegular() {
+			continue
+		}
+		if _, err := io.CopyN(out, tr, 300<<20); err != nil && err != io.EOF {
+			os.Remove(outPath)
+			return "", fmt.Errorf("extract failed: %w", err)
+		}
+		return outPath, nil
+	}
+	os.Remove(outPath)
+	return "", fmt.Errorf("no uplink binary found in archive")
+}
+
+func extractZipAsset(archivePath string) (string, error) {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return "", fmt.Errorf("not a zip archive: %w", err)
+	}
+	defer zr.Close()
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if !strings.HasPrefix(name, "uplink") || f.FileInfo().IsDir() {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", err
+		}
+		out, err := os.CreateTemp("", "uplink-bin-*.exe")
+		if err != nil {
+			rc.Close()
+			return "", err
+		}
+		_, copyErr := io.CopyN(out, io.LimitReader(rc, 300<<20), 300<<20)
+		rc.Close()
+		out.Close()
+		if copyErr != nil && copyErr != io.EOF {
+			os.Remove(out.Name())
+			return "", fmt.Errorf("extract failed: %w", copyErr)
+		}
+		return out.Name(), nil
+	}
+	return "", fmt.Errorf("no uplink binary found in archive")
 }

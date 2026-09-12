@@ -1,0 +1,19 @@
+services:
+  ws-server:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - UPLINK_MAX_USERS=50
+      - UPLINK_MSG_BUF=100
+      - UPLINK_SESSION_TTL=30m
+      - UPLINK_HB_TIMEOUT=45s
+      - UPLINK_RATE_LIMIT=20
+      - UPLINK_MAX_FILE_MB=256
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3

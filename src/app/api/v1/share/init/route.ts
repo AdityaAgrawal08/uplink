@@ -10,7 +10,7 @@ import {
   hashPassword,
   anonymizeIp,
 } from "@/lib/crypto";
-import { reserveUploadQuota, releaseUploadQuota } from "@/lib/quota";
+import { reserveUploadQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
 import { apiError } from "@/lib/api-utils";
 
 export async function POST(req: NextRequest) {
@@ -23,7 +23,11 @@ export async function POST(req: NextRequest) {
 
   try {
     // Rate Limiting check
-    const clientIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    // B8 FIX: Split x-forwarded-for by comma and take the first entry
+    // (client's real IP). The header format is "client, proxy1, proxy2"
+    // and the leftmost is the original client.
+    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
     const ipHash = anonymizeIp(clientIp);
     const rateLimitKey = `rate:init:${ipHash}`;
     const attempts = await redis.incr(rateLimitKey);
@@ -38,7 +42,12 @@ export async function POST(req: NextRequest) {
     if (text.length > 1024 * 100) { // 100 KB max for init metadata
       return apiError("Request body too large", 413);
     }
-    const body = text ? JSON.parse(text) : {};
+    let body: Record<string, unknown>;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      return apiError("Request body must be valid JSON", 400);
+    }
 
     const {
       filename,
@@ -49,9 +58,18 @@ export async function POST(req: NextRequest) {
       downloadLimit,
       checksumCrc64nvme,
       isEncrypted,
-    } = body;
-    size = Number(body.size);
-    partsCount = Number(body.partsCount) || 0;
+    } = body as {
+      filename?: unknown;
+      mimeType?: unknown;
+      hashValue?: unknown;
+      password?: unknown;
+      expiresInSeconds?: unknown;
+      downloadLimit?: unknown;
+      checksumCrc64nvme?: unknown;
+      isEncrypted?: unknown;
+    };
+    size = Number(body.size as unknown);
+    partsCount = Number(body.partsCount as unknown) || 0;
 
     // 1. Basic Validations
     if (!filename || typeof filename !== "string") {
@@ -163,7 +181,7 @@ export async function POST(req: NextRequest) {
     }
 
     // 4. Share ID and Key construction
-    const shareId = body.shareId || generateShareId();
+    const shareId = (typeof body.shareId === "string" && body.shareId) || generateShareId();
     const storageFilename = sanitizeFilename(filename);
     const date = new Date();
     const year = date.getUTCFullYear();
@@ -195,38 +213,18 @@ export async function POST(req: NextRequest) {
       uploadUrl = await getPresignedUploadUrl(
         objectKey,
         uploadUrlExpiry,
-        mimeType || "application/octet-stream",
+        (mimeType as string | undefined) || "application/octet-stream",
         hashValue
       );
     }
 
-    // Generate a unique 10-digit numeric code
-    let downloadCode = "";
-    let isCodeUnique = false;
-    let codeAttempts = 0;
-    while (!isCodeUnique && codeAttempts < 10) {
-      if (codeAttempts > 0) {
-        await new Promise(r => setTimeout(r, 50)); // minimal backoff
-      }
-      downloadCode = "";
-      for (let i = 0; i < 10; i++) {
-        downloadCode += crypto.randomInt(0, 10).toString();
-      }
-      const existingCode = await db.collection("shares").findOne({ downloadCode });
-      if (!existingCode) {
-        isCodeUnique = true;
-      }
-      codeAttempts++;
-    }
-
-    if (!isCodeUnique) {
-      return apiError("Unique download code generation failed due to collision limits", 500);
-    }
-
     // 5. Database Insert (Share & Upload Session)
-    const shareDoc = {
+    // B20 FIX: The old check-then-insert was a TOCTOU race — two concurrent
+    // requests could both pass the findOne uniqueness check, then the second
+    // insertOne would throw duplicate-key (11000) and return a 500. Now the
+    // insert is retried with a freshly generated code on collision.
+    const shareBase = {
       shareId,
-      downloadCode,
       filename,
       storageFilename,
       size,
@@ -267,7 +265,33 @@ export async function POST(req: NextRequest) {
       partsCount: isMultipart ? Number(partsCount) : 1,
     };
 
-    await db.collection("shares").insertOne(shareDoc);
+    let shareInserted = false;
+    let codeAttempts = 0;
+    let downloadCode = "";
+    while (!shareInserted && codeAttempts < 20) {
+      downloadCode = "";
+      for (let i = 0; i < 10; i++) {
+        downloadCode += crypto.randomInt(0, 10).toString();
+      }
+      try {
+        await db.collection("shares").insertOne({ ...shareBase, downloadCode });
+        shareInserted = true;
+      } catch (dbErr) {
+        const err = dbErr as { code?: number };
+        if (err.code === 11000) {
+          // Duplicate downloadCode (or shareId) — retry with a new code.
+          codeAttempts++;
+          await new Promise(r => setTimeout(r, 50));
+          continue;
+        }
+        throw dbErr;
+      }
+    }
+
+    if (!shareInserted) {
+      return apiError("Unique download code generation failed due to collision limits", 500);
+    }
+
     await db.collection("upload_sessions").insertOne(uploadSessionDoc);
 
     const responseData = {
@@ -297,15 +321,11 @@ export async function POST(req: NextRequest) {
   } catch (error: unknown) {
     console.error("Error in POST /api/v1/share/init:", error);
     if (quotaReserved) {
-      try {
-        const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
-        await releaseUploadQuota(size, estimatedClassAOps);
-      } catch (refundErr) {
-        console.error("Failed to refund quota on init error:", refundErr);
-      }
+      // B3 FIX: Retry quota release so a transient failure cannot leak quota.
+      const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
+      await releaseUploadQuotaWithRetry(size, estimatedClassAOps);
     }
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   } finally {
     if (redisIdempotencyKey && !success) {
       await redis.del(redisIdempotencyKey).catch(err => console.error("Failed to clean up idempotency key on error:", err));

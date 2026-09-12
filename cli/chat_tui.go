@@ -56,8 +56,8 @@ var (
 	tuiScrollbarStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("240"))
 	tuiScrollbarThumbStyle = lipgloss.NewStyle().
-					Foreground(lipgloss.Color("245")).
-					Background(lipgloss.Color("240"))
+				Foreground(lipgloss.Color("245")).
+				Background(lipgloss.Color("240"))
 
 	// WhatsApp-like bubble styles: own = green right, other = dark grey left.
 	tuiOwnBubbleStyle = lipgloss.NewStyle().
@@ -345,59 +345,68 @@ func truncateStringPlain(s string, n int) string {
 
 // ---- messages --------------------------------------------------------------
 
-type pollTickMsg struct{}
-type beatTickMsg struct{}
-type backlogMsg struct {
-	msgs []chatMessage
-	err  error
+// The engine pushes network events from its own goroutines; they arrive here
+// through netCh (see drainNetCmd) because bubbletea Update must stay on the
+// main loop. Buffer is generous; drops are safe (inbox redelivers unacked,
+// P2P is already reliably delivered — a dropped paint is just a missed row).
+type netChatMsg struct{ chat engineChat }
+type netFileMsg struct{ file engineFile }
+type netFileErrMsg struct {
+	msgId, from, reason string
 }
-type pollDoneMsg struct {
-	newMsgs []chatMessage
-	users   []string // authoritative roster snapshot at poll time
-	ended   bool
-	err     error
+type netReadyMsg struct {
+	user, code string
 }
-type beatDoneMsg struct {
-	users []string
+type netLostMsg struct{ user string }
+type netErrMsg struct{ err error }
+type rosterTickMsg struct{}
+
+// netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
+// a network event or one of these, and both handlers re-arm the pump, so
+// exactly one pump goroutine exists at all times.
+type netIdleMsg struct{}
+
+type sendDoneMsg struct {
+	text  string
+	to    string // empty for broadcasts
+	seq   int    // local display sequence (server keeps no transcript)
+	msgId string // E2E message identity (ACKs/dedup)
+	code  int
 	err   error
 }
-
-type wsConnectedMsg struct {
-	ws *wsClient
-}
-type sendDoneMsg struct {
-	text string
-	to   string // empty for broadcasts
-	seq  int
-	code int
-	err  error
-}
 type leaveDoneMsg struct{}
-type convBacklogMsg struct {
-	conv string
-	msgs []chatMessage
-	err  error
-}
 
 // ---- model -----------------------------------------------------------------
 
 type chatScreen struct {
-	client       *chatClient
-	key          string
-	me           string
-	persist      bool
-	width        int
-	height       int
-	history      []chatMessage        // every confirmed server message (deduped by seq)
-	localLines   []localLine          // echoes & notes not backed by server docs
-	fetchedConvs map[string]bool      // threads already deep-fetched this session
-	hoverPeer    string               // sidebar row under the mouse ("" = none)
-	unread       map[string]int       // peer -> unread DM count (cleared on open)
-	lastDMAt     map[string]time.Time // peer -> newest incoming DM (recency sort)
-	lines        []string             // DERIVED paint buffer: rebuildView() owns it
-	rendered     map[int]bool         // server seqs already rendered
-	pending      *pendingSend         // single in-flight send (nil = idle)
-	outbox       []queuedLine         // queued sends waiting for the in-flight one
+	sig        *signalClient
+	eng        *engine
+	key        string
+	me         string
+	width      int
+	height     int
+	history    []chatMessage        // live transcript (deduped by local seq)
+	localLines []localLine          // echoes & notes
+	netCh      chan tea.Msg         // engine -> Update bridge (non-blocking)
+	nextSeq    int                  // local display sequence counter
+	hoverPeer  string               // sidebar row under the mouse ("" = none)
+	unread     map[string]int       // peer -> unread DM count (cleared on open)
+	lastDMAt   map[string]time.Time // peer -> newest incoming DM (recency sort)
+	lines      []string             // DERIVED paint buffer: rebuildView() owns it
+	rendered   map[int]bool         // local seqs already rendered
+	// Render caches (perf): renderCache memoizes per-message bubbles,
+	// tsCache memoizes parsed timestamps, wrapCache memoizes width-wrapped
+	// lines by content. All three are keyed independent of position and are
+	// dropped wholesale whenever vp.Width changes (the only input besides
+	// message content). Without them every new message re-renders and
+	// re-measures the entire transcript (grapheme segmentation dominates
+	// profiles) — O(n) per message, ~90ms at 5000 lines.
+	renderCache  map[int]string
+	tsCache      map[int]time.Time
+	wrapCache    map[string]string
+	cacheWidth   int
+	pending      *pendingSend // single in-flight send (nil = idle)
+	outbox       []queuedLine // queued sends waiting for the in-flight one
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -406,14 +415,9 @@ type chatScreen struct {
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
-	dlQ          dlState         // sequential shared-file download queue
-	filesSeen    map[string]bool // room files already announced to me
-	lastFilesAt  string          // newest uploadedAt fed into /files?since=
-	ws           *wsClient       // WebSocket connection (nil = using long-poll)
+	received     []receivedFile  // files arrived this session (for /download)
 	status       string
 	targetUser   string // private-chat peer; "" = general room
-	beatFailures int
-	pollFailures int
 }
 
 // pendingSend tracks the optimistic echo line for the in-flight send so the
@@ -435,14 +439,11 @@ const (
 
 // fileCardData holds metadata for rendering a file attachment card.
 type fileCardData struct {
-	fileId    string
 	filename  string
 	username  string
 	size      string // pre-formatted human size
 	time      string // formatted timestamp "15:04"
 	createdAt string // RFC3339 for chronological interleaving
-	deleted bool
-	deletedAt string // RFC3339
 }
 
 // localLine is a UI-generated transcript row scoped to one conversation so
@@ -474,7 +475,25 @@ func (c *chatScreen) activeConv() string {
 // composerPlaceholder doubles as the restore text whenever a drawer closes.
 const composerPlaceholder = "Type a message…  ·  / commands  ·  tab picks a peer"
 
-func newChatScreen(serverURL, key, me string) chatScreen {
+// receivedFile is one file that arrived this session (P2P or fallback).
+// There is no server-side file index anymore; /download lists these.
+type receivedFile struct {
+	filename string
+	from     string
+	size     int64
+	path     string
+	at       time.Time
+}
+
+// maxReceivedFiles bounds the /download drawer source in marathon sessions
+// (oldest fall off; the files themselves stay saved on disk).
+const maxReceivedFiles = 200
+
+// maxHistory bounds the in-memory transcript for the same reason (oldest
+// scrollback falls off first).
+const maxHistory = 5000
+
+func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
 	ti.Focus()
@@ -482,18 +501,41 @@ func newChatScreen(serverURL, key, me string) chatScreen {
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
+	netCh := make(chan tea.Msg, 256)
+	sig := &signalClient{serverURL: serverURL, key: key, me: me}
+	// Engine callbacks only ever push into netCh (never touch the screen:
+	// they run on network goroutines). The drain command below feeds them
+	// into Update on the main loop.
+	push := func(m tea.Msg) {
+		select {
+		case netCh <- m:
+		default:
+		}
+	}
+	eng := newEngine(me, id, sig, engineCallbacks{
+		onChat:      func(c engineChat) { push(netChatMsg{chat: c}) },
+		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
+		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
+		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
+		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
+		onError:     func(err error) { push(netErrMsg{err: err}) },
+	})
+	eng.joinPassword = password // enables engine self-rejoin after prune
 	return chatScreen{
-		client:       newChatClient(serverURL, key, me),
-		key:          key,
-		me:           me,
-		vp:           vp,
-		input:        ti,
-		rendered:     map[int]bool{},
-		unread:       map[string]int{},
-		lastDMAt:     map[string]time.Time{},
-		fetchedConvs: map[string]bool{generalConv: true},
-		filesSeen:    map[string]bool{},
-		outbox:       nil,
+		sig:         sig,
+		eng:         eng,
+		key:         key,
+		me:          me,
+		vp:          vp,
+		input:       ti,
+		netCh:       netCh,
+		rendered:    map[int]bool{},
+		renderCache: map[int]string{},
+		tsCache:     map[int]time.Time{},
+		wrapCache:   map[string]string{},
+		unread:      map[string]int{},
+		lastDMAt:    map[string]time.Time{},
+		outbox:      nil,
 	}
 }
 
@@ -533,6 +575,16 @@ func isOwnPresence(systemText, me string) bool {
 	return systemText == me+" joined" || systemText == me+" left"
 }
 
+// convFor resolves the conversation bucket for a message or file traveling
+// from->to (empty to = room broadcast). Canonical pair keys make direction
+// irrelevant: alice->bob and bob->alice land in the same thread.
+func convFor(from, to string) string {
+	if to == "" {
+		return generalConv
+	}
+	return conversationKey(from, to)
+}
+
 // shouldRender decides visibility BEFORE any styling. The rule is strictly
 // conversational: a row paints only if it belongs to the ACTIVE bucket.
 // General view therefore NEVER shows DM lines (they live exclusively in their
@@ -545,60 +597,6 @@ func (c *chatScreen) shouldRender(m chatMessage) bool {
 }
 
 func (c *chatScreen) renderLine(m chatMessage) string {
-	// Deleted tombstone: show placeholder with deletedAt timestamp
-	if m.Status == "DELETED" {
-		delTsPlain := "--:--"
-		if m.DeletedAt != "" {
-			if t, err := time.Parse(time.RFC3339, m.DeletedAt); err == nil {
-				delTsPlain = t.Local().Format("15:04")
-			}
-		} else if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-			delTsPlain = t.Local().Format("15:04")
-		}
-		delTs := tuiBubbleTimeStyle.Render(delTsPlain)
-		isOwnDel := m.Username == c.me
-		var innerPlain string
-		if isOwnDel {
-			innerPlain = tuiDimStyle.Render("⊘ You deleted this message")
-		} else {
-			nameLine := tuiNameStyle.Render(m.Username)
-			innerPlain = nameLine + "\n" + tuiDimStyle.Render("⊘ This message was deleted")
-		}
-		availWidth := c.vp.Width
-		if availWidth <= 0 {
-			availWidth = 60
-		}
-		maxBubbleW := int(float64(availWidth) * 0.62)
-		if maxBubbleW < 22 {
-			maxBubbleW = 22
-		}
-		if maxBubbleW > availWidth-2 {
-			maxBubbleW = availWidth - 2
-		}
-		needed := lipgloss.Width(innerPlain) + lipgloss.Width(delTsPlain) + 6
-		if needed < 14 {
-			needed = 14
-		}
-		bubbleW := needed
-		if bubbleW > maxBubbleW {
-			bubbleW = maxBubbleW
-		}
-		bubbleInner := innerPlain + "  " + delTs
-		if lipgloss.Width(innerPlain) > maxBubbleW-10 {
-			bubbleInner = innerPlain + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(delTsPlain)-4)) + delTs
-		}
-		var style lipgloss.Style
-		if isOwnDel {
-			style = tuiOwnBubbleStyle
-		} else {
-			style = tuiOtherBubbleStyle
-		}
-		bubble := style.Width(bubbleW).Render(bubbleInner)
-		if isOwnDel {
-			return lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
-		}
-		return bubble
-	}
 	// Timestamp - used for system lines and as bubble timestamp
 	tsPlain := "--:--"
 	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
@@ -670,16 +668,6 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 // addMessage records a confirmed server message and refreshes the view.
 func (c *chatScreen) addMessage(m chatMessage) {
 	if c.rendered[m.Seq] {
-		// If this is a tombstone update for an already-rendered seq, patch it
-		if m.Status == "DELETED" {
-			for i, h := range c.history {
-				if h.Seq == m.Seq {
-					c.history[i] = m
-					c.rebuildView()
-					return
-				}
-			}
-		}
 		return
 	}
 	c.rendered[m.Seq] = true
@@ -699,6 +687,17 @@ func (c *chatScreen) addMessage(m chatMessage) {
 		}
 	}
 	c.history = append(c.history, m)
+	// Bound the transcript: marathon sessions must not grow it without
+	// limit. Oldest scrollback falls off first (rendered flags for dropped
+	// seqs go with them); rendering is unaffected.
+	if len(c.history) > maxHistory {
+		for _, dropped := range c.history[:len(c.history)-maxHistory] {
+			delete(c.rendered, dropped.Seq)
+			delete(c.renderCache, dropped.Seq)
+			delete(c.tsCache, dropped.Seq)
+		}
+		c.history = append([]chatMessage(nil), c.history[len(c.history)-maxHistory:]...)
+	}
 	c.rebuildView()
 }
 
@@ -722,68 +721,62 @@ func (c *chatScreen) appendLocal(conv, text string) {
 	c.rebuildView()
 }
 
-// appendLocalFileCard adds a styled file attachment card to the transcript.
-func (c *chatScreen) appendLocalFileCard(conv, fileId, filename, username, sizeStr, timestamp string) {
-	// Derive RFC3339 for interleaving; caller passes local "15:04" so we
-	// synthesize a full timestamp from now if not already RFC3339.
-	rfc := ""
-	if timestamp != "" {
-		if _, err := time.Parse(time.RFC3339, timestamp); err == nil {
-			rfc = timestamp
-		} else if t, err := time.Parse("15:04", timestamp); err == nil {
-			now := time.Now()
-			rfc = time.Date(now.Year(), now.Month(), now.Day(), t.Hour(), t.Minute(), 0, 0, time.Local).Format(time.RFC3339)
-		} else {
-			rfc = time.Now().Format(time.RFC3339)
-		}
-	} else {
-		rfc = time.Now().Format(time.RFC3339)
-	}
-	c.localLines = append(c.localLines, localLine{
-		conv: conv,
-		kind: lineFileCard,
-		fileData: &fileCardData{
-			fileId:    fileId,
-			filename:  filename,
-			username:  username,
-			size:      sizeStr,
-			time:      timestamp,
-			createdAt: rfc,
-		},
-	})
-	c.rebuildView()
-}
-
-// appendLocalFileCardWithRFC3339 is like appendLocalFileCard but accepts an
-// explicit RFC3339 timestamp (used for server-sourced file announcements).
-func (c *chatScreen) appendLocalFileCardWithRFC3339(conv, fileId, filename, username, sizeStr, rfc3339 string) {
-	ts := ""
-	if t, err := time.Parse(time.RFC3339, rfc3339); err == nil {
-		ts = t.Local().Format("15:04")
-	}
-	c.localLines = append(c.localLines, localLine{
-		conv: conv,
-		kind: lineFileCard,
-		fileData: &fileCardData{
-			fileId:    fileId,
-			filename:  filename,
-			username:  username,
-			size:      sizeStr,
-			time:      ts,
-			createdAt: rfc3339,
-		},
-	})
-	c.rebuildView()
-}
-
 // rebuildView derives the painted transcript from raw history + local lines,
 // applying the CURRENT visibility filter. Entering/leaving private mode just
 // calls this — historical lines re-filter retroactively.
 // File cards are interleaved chronologically among history messages so they
 // behave like text messages; transient local lines (pending echo, progress)
 // stay pinned at the bottom.
+// cacheForWidth drops all render caches when the viewport width changed.
+// Rendered output depends only on (message content, width), so caches stay
+// valid across rebuilds at a stable width no matter how history grows.
+func (c *chatScreen) cacheForWidth(w int) {
+	if c.renderCache == nil {
+		c.renderCache = map[int]string{}
+	}
+	if c.tsCache == nil {
+		c.tsCache = map[int]time.Time{}
+	}
+	if c.wrapCache == nil {
+		c.wrapCache = map[string]string{}
+	}
+	if c.cacheWidth != w {
+		c.renderCache = map[int]string{}
+		c.tsCache = map[int]time.Time{}
+		c.wrapCache = map[string]string{}
+		c.cacheWidth = w
+	}
+}
+
+// renderedLine returns the cached bubble for a history message, rendering
+// and memoizing on miss.
+func (c *chatScreen) renderedLine(m chatMessage) string {
+	if s, ok := c.renderCache[m.Seq]; ok {
+		return s
+	}
+	s := c.renderLine(m)
+	c.renderCache[m.Seq] = s
+	return s
+}
+
+// messageTime returns the cached parsed timestamp for a history message.
+func (c *chatScreen) messageTime(m chatMessage) time.Time {
+	if t, ok := c.tsCache[m.Seq]; ok {
+		return t
+	}
+	var t time.Time
+	if parsed, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
+		t = parsed
+	}
+	// Fallback matches the old inline behavior: missing timestamps sort as
+	// very old (cards after). Cached either way — parse once per message.
+	c.tsCache[m.Seq] = t
+	return t
+}
+
 func (c *chatScreen) rebuildView() {
 	c.lines = c.lines[:0]
+	c.cacheForWidth(c.vp.Width)
 
 	// Partition local lines: file cards (to interleave) vs transient lines (pinned at bottom).
 	type cardEntry struct {
@@ -823,82 +816,27 @@ func (c *chatScreen) rebuildView() {
 		}
 	}
 
-	// Merge history + file cards by timestamp.
+	// Merge history + file cards by timestamp (parsed timestamps cached).
 	hi, ci := 0, 0
 	for hi < len(visibleHistory) || ci < len(cards) {
 		var histTime time.Time
 		hasHist := hi < len(visibleHistory)
 		if hasHist {
-			if t, err := time.Parse(time.RFC3339, visibleHistory[hi].CreatedAt); err == nil {
-				histTime = t
-			} else {
-				// Fallback: treat missing timestamp as very old so cards sort after;
-				// but for our own messages CreatedAt is now set, so this rarely fires.
-				histTime = time.Time{}
-			}
+			histTime = c.messageTime(visibleHistory[hi])
 		}
 		hasCard := ci < len(cards)
 		// If history timestamp missing, keep history order and render hist first.
 		cardBeforeHist := hasCard && hasHist && !histTime.IsZero() && cards[ci].t.Before(histTime)
 		if hasCard && (!hasHist || cardBeforeHist) {
 			fd := cards[ci].ll.fileData
-			var card string
-			if fd.deleted {
-				// Deleted file tombstone
-				delTsPlain := fd.time
-				if fd.deletedAt != "" {
-					if t, err := time.Parse(time.RFC3339, fd.deletedAt); err == nil {
-						delTsPlain = t.Local().Format("15:04")
-					}
-				}
-				delTs := tuiBubbleTimeStyle.Render(delTsPlain)
-				isOwnDel := fd.username == c.me
-				var innerPlain string
-				if isOwnDel {
-					innerPlain = tuiDimStyle.Render("⊘ You deleted this file")
-				} else {
-					innerPlain = tuiDimStyle.Render("⊘ This file was deleted")
-				}
-				availWidth := c.vp.Width
-				if availWidth <= 0 {
-					availWidth = 60
-				}
-				maxBubbleW := int(float64(availWidth) * 0.62)
-				if maxBubbleW < 22 {
-					maxBubbleW = 22
-				}
-				if maxBubbleW > availWidth-2 {
-					maxBubbleW = availWidth - 2
-				}
-				needed := lipgloss.Width(innerPlain) + lipgloss.Width(delTsPlain) + 6
-				if needed < 14 {
-					needed = 14
-				}
-				bubbleW := needed
-				if bubbleW > maxBubbleW {
-					bubbleW = maxBubbleW
-				}
-				bubbleInner := innerPlain + "  " + delTs
-				var style lipgloss.Style
-				if isOwnDel {
-					style = tuiOwnBubbleStyle
-				} else {
-					style = tuiOtherBubbleStyle
-				}
-				card = style.Width(bubbleW).Render(bubbleInner)
-				if isOwnDel {
-					card = lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(card)
-				}
-			} else {
-				card = fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
-				if fd.username == c.me {
-					card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
-				}
+			card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
+			if fd.username == c.me {
+				card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
 			}
 			c.lines = append(c.lines, card)
 			ci++
 		} else if hasHist {
-			c.lines = append(c.lines, c.renderLine(visibleHistory[hi]))
+			c.lines = append(c.lines, c.renderedLine(visibleHistory[hi]))
 			hi++
 		} else {
 			break
@@ -919,6 +857,10 @@ func (c *chatScreen) rebuildView() {
 // lines fold instead of being clipped by the viewport on narrow terminals.
 // It preserves the user's scroll position: only auto-scrolls if already at bottom.
 func (c *chatScreen) refreshViewport() {
+	// Validate caches against the RAW width (same key rebuildView uses);
+	// the mapped fallback below is style-only. Mismatched keys here once
+	// caused every rebuild to clear the caches — zero benefit.
+	c.cacheForWidth(c.vp.Width)
 	w := c.vp.Width
 	if w <= 0 {
 		w = 40
@@ -927,7 +869,21 @@ func (c *chatScreen) refreshViewport() {
 	st := lipgloss.NewStyle().Width(w)
 	wrapped := make([]string, len(c.lines))
 	for i, ln := range c.lines {
-		wrapped[i] = st.Render(ln)
+		// Unchanged lines re-wrap identically: memoize by content. Only new
+		// or edited rows pay the grapheme-segmentation cost per rebuild.
+		if prev, ok := c.wrapCache[ln]; ok {
+			wrapped[i] = prev
+			continue
+		}
+		r := st.Render(ln)
+		// Bound the cache: content-keyed entries outlive their rows, so
+		// cap at ~2x history. Oldest eviction is approximate but safe
+		// (a miss just re-renders).
+		if len(c.wrapCache) > 2*(len(c.history)+len(c.localLines)+64) {
+			clear(c.wrapCache)
+		}
+		c.wrapCache[ln] = r
+		wrapped[i] = r
 	}
 	c.vp.SetContent(strings.Join(wrapped, "\n"))
 	if atBottom {
@@ -1151,125 +1107,78 @@ func (c chatScreen) sidebarInnerWidth() int {
 
 // ---- async commands --------------------------------------------------------
 
-func schedulePoll(backoff time.Duration) tea.Cmd {
-	if backoff > 0 {
-		return tea.Tick(backoff, func(time.Time) tea.Msg { return pollTickMsg{} })
-	}
-	return func() tea.Msg { return pollTickMsg{} }
+func scheduleRoster() tea.Cmd {
+	return tea.Tick(5*time.Second, func(time.Time) tea.Msg { return rosterTickMsg{} })
 }
 
-func scheduleBeat() tea.Cmd {
-	return tea.Tick(15*time.Second, func(time.Time) tea.Msg { return beatTickMsg{} })
-}
-
-func (c chatScreen) doPoll() tea.Cmd {
-	client := c.client
+// drainNetCmd is a self-perpetuating event pump: it waits briefly for the
+// next engine event and yields either it or netIdleMsg, and BOTH handlers
+// re-arm the pump — so exactly one pump goroutine exists at all times and
+// engine traffic always reaches Update within ~100ms. (A one-shot drain
+// would strand later events in netCh forever: nothing else schedules it.)
+func (c chatScreen) drainNetCmd() tea.Cmd {
 	return func() tea.Msg {
-		newMsgs, ended, err := client.pollOnce()
-		return pollDoneMsg{newMsgs: newMsgs, users: client.users, ended: ended, err: err}
-	}
-}
-
-func (c chatScreen) doBeat() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		hb, err := client.beatOnce()
-		return beatDoneMsg{users: hb.ActiveUsers, err: err}
-	}
-}
-
-func (c chatScreen) doSend(text, to string) tea.Cmd {
-	client := c.client
-	ws := c.ws
-	return func() tea.Msg {
-		if ws != nil {
-			if err := ws.send(text, to); err == nil {
-				return sendDoneMsg{text: text, to: to, code: 200}
-			}
-			// WS send failed — fall back to HTTP
+		select {
+		case m := <-c.netCh:
+			return m
+		case <-time.After(100 * time.Millisecond):
+			return netIdleMsg{}
 		}
-		code, msg, err := client.sendMessage(text, to)
-		return sendDoneMsg{text: text, to: msg.To, seq: msg.Seq, code: code, err: err}
+	}
+}
+
+func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
+	return func() tea.Msg {
+		// engine.sendChat is synchronous: P2P encrypt+send, or inbox seal+
+		// deposit. Map failures onto the legacy settle codes.
+		msgId, err := c.eng.sendChat(to, text)
+		if err == nil {
+			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201}
+		}
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "429"):
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err}
+		case strings.Contains(msg, "404"),
+			strings.Contains(msg, "gone"),
+			strings.Contains(msg, "not in session"),
+			strings.Contains(msg, "Session not found"):
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err}
+		default:
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 500, err: err}
+		}
 	}
 }
 
 func (c chatScreen) doLeave() tea.Cmd {
-	client := c.client
-	ws := c.ws
 	return func() tea.Msg {
-		if ws != nil {
-			ws.Close()
-		}
-		client.leave()
+		c.eng.stop()
+		_, _, _ = postJSON(c.sig.endpoint("/leave"), map[string]any{}, c.sig.headers())
 		return leaveDoneMsg{}
-	}
-}
-
-func (c chatScreen) fetchBacklogCmd() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		msgs, err := client.fetchBacklog()
-		return backlogMsg{msgs: msgs, err: err}
-	}
-}
-
-// doConvFetch deep-fetches one conversation's latest page from the server.
-func (c chatScreen) doConvFetch(conv string) tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		msgs, err := client.fetchConvBacklog(conv)
-		return convBacklogMsg{conv: conv, msgs: msgs, err: err}
 	}
 }
 
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
-	// Try WebSocket first; fall back to long-polling if unavailable.
-	return tea.Batch(c.fetchBacklogCmd(), c.tryWS(), c.doBeat(), c.doFetchFiles(), scheduleBeat())
-}
-
-// tryWS attempts a WebSocket upgrade. On success it starts the readLoop
-// and heartbeat goroutines and returns nil (no polling needed). On
-// failure it returns the initial long-poll schedule.
-func (c chatScreen) tryWS() tea.Cmd {
-	client := c.client
-	return func() tea.Msg {
-		ws := client.wsConnect()
-		if ws == nil {
-			return schedulePoll(0)() // fallback: start HTTP long-polling
-		}
-		// WebSocket connected — stash it and start background goroutines.
-		// We can't mutate chatScreen from a Cmd goroutine, so we return
-		// a special message that Update handles.
-		go ws.readLoop(client)
-		go ws.heartbeat(client)
-		return wsConnectedMsg{ws: ws}
-	}
+	// No backlog (the server keeps no transcript), no WS upgrade, no beat
+	// tick (the engine owns heartbeats): just drain engine events and
+	// refresh the sidebar roster on a slow tick.
+	return tea.Batch(c.drainNetCmd(), scheduleRoster())
 }
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// enterPrivate switches to a 1:1 thread. History older than the mixed
-// backlog window is deep-fetched lazily the first time the thread opens.
-// Returns nil or the backlog command - caller MUST schedule it.
+// enterPrivate switches to a 1:1 thread. There is no server history to
+// deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
 	c.palette.close()      // stale "/" query must not survive a mode switch
 	delete(c.unread, user) // opening the thread clears its badge
-	conv := conversationKey(c.me, user)
 	c.rebuildView()
-	if c.fetchedConvs == nil {
-		c.fetchedConvs = map[string]bool{}
-	}
-	var fetchCmd tea.Cmd
-	if !c.fetchedConvs[conv] {
-		c.fetchedConvs[conv] = true // ask once regardless of outcome
-		fetchCmd = c.doConvFetch(conv)
-	}
-	return fetchCmd
+	return nil
 }
 
 // exitPrivate returns to the common room; returns a system line or "".
@@ -1354,8 +1263,10 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	if target == "" && c.pending.conv == generalConv {
 		target = ""
 	}
+	c.nextSeq++
+	seq := c.nextSeq
 	c.rebuildView()
-	return c.doSend(text, target)
+	return c.doSend(text, target, seq)
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -1380,98 +1291,109 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		c.refreshViewport() // re-wrap transcript to the new width
 
-	case backlogMsg:
-		if msg.err != nil {
-			c.status = "failed to load history: " + msg.err.Error()
-			break
+	case rosterTickMsg:
+		// Sidebar freshness from the engine's heartbeat roster (the engine
+		// owns the 15s beat; this only renders).
+		roster := c.eng.peers()
+		users := onlineNames(roster, c.me)
+		c.users = users
+		live := map[string]bool{c.me: true}
+		for _, u := range users {
+			live[u] = true
 		}
-		for _, m := range msg.msgs {
-			c.addMessage(m)
+		for peer := range c.unread {
+			if !live[peer] {
+				delete(c.unread, peer)
+			}
 		}
+		for peer := range c.lastDMAt {
+			if !live[peer] {
+				delete(c.lastDMAt, peer)
+			}
+		}
+		if c.hoverPeer != "" && !live[c.hoverPeer] {
+			c.hoverPeer = ""
+		}
+		cmds = append(cmds, scheduleRoster())
 
-	case pollTickMsg:
-		if c.ws == nil {
-			cmds = append(cmds, c.doPoll())
+	case netChatMsg:
+		m := msg.chat
+		cm := chatMessage{
+			Seq: c.nextSeq, MsgId: m.MsgId, Username: m.From, Kind: "chat",
+			Text: m.Text, To: m.To,
+			ConvID:    convFor(m.From, m.To),
+			CreatedAt: time.Now().Format(time.RFC3339),
 		}
+		c.nextSeq++
+		// Delivery receipt back to the sender (best-effort; inbox
+		// redelivery covers loss, dedup covers repeats).
+		sender, msgId := m.From, m.MsgId
+		cmds = append(cmds, func() tea.Msg {
+			_ = c.eng.sendAck(sender, msgId)
+			return nil
+		})
+		c.handleNewMessage(cm)
+		cmds = append(cmds, c.drainNetCmd())
 
-	case pollDoneMsg:
-		if msg.ended {
-			reason := "Session has ended"
-			if msg.err != nil {
-				reason = msg.err.Error()
+	case netFileMsg:
+		f := msg.file
+		// Peer-controlled filename: sanitize before it touches the
+		// transcript, the drawer, or the filesystem-adjacent path display.
+		f.Filename = sanitizeDisplay(f.Filename)
+		c.received = append(c.received, receivedFile{
+			filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
+		})
+		// Bound the drawer source: marathon sessions must not grow it
+		// without limit (oldest fall off; files stay saved on disk).
+		if len(c.received) > maxReceivedFiles {
+			c.received = append([]receivedFile(nil), c.received[len(c.received)-maxReceivedFiles:]...)
+		}
+		conv := convFor(f.From, f.To)
+		ts := time.Now()
+		c.localLines = append(c.localLines, localLine{
+			conv: conv,
+			kind: lineFileCard,
+			fileData: &fileCardData{
+				filename:  f.Filename,
+				username:  f.From,
+				size:      humanSize(f.Size),
+				time:      ts.Format("15:04"),
+				createdAt: ts.Format(time.RFC3339),
+			},
+		})
+		// Bump unread if it landed in a background thread.
+		if conv != c.activeConv() && conv != generalConv {
+			if peer := peerOf(c.me, conv); peer != "" {
+				c.unread[peer]++
+				c.lastDMAt[peer] = ts
 			}
-			c.appendLine(tuiSystemStyle.Render("* " + reason))
-			cmds = append(cmds, c.doLeave(), tea.Quit)
-			return c, tea.Batch(cmds...)
 		}
-		if msg.err != nil {
-			c.pollFailures++
-			c.status = fmt.Sprintf("reconnecting… (%d)", c.pollFailures)
-			cmds = append(cmds, schedulePoll(time.Duration(400*c.pollFailures)*time.Millisecond))
-			return c, tea.Batch(cmds...)
-		}
-		if c.pollFailures > 0 {
-			c.pollFailures = 0
-			c.status = ""
-		}
-		if msg.users != nil {
-			c.users = msg.users // join/leave freshness without waiting for heartbeat
-		}
-		for _, m := range msg.newMsgs {
-			c.handleNewMessage(m)
-		}
-		cmds = append(cmds, schedulePoll(0))
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
 
-	case beatTickMsg:
-		cmds = append(cmds, c.doBeat())
+	case netFileErrMsg:
+		c.appendLine(tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		cmds = append(cmds, c.drainNetCmd())
 
-	case beatDoneMsg:
-		if msg.err != nil {
-			c.beatFailures++
-			if c.beatFailures >= 3 {
-				c.status = "connection lost… retrying"
-			}
-		} else {
-			c.beatFailures = 0
-			if c.status == "connection lost… retrying" {
-				c.status = ""
-			}
-			// Authoritative snapshot — INCLUDING shrinking to empty.
-			c.users = msg.users
-			live := map[string]bool{c.me: true}
-			for _, u := range msg.users {
-				live[u] = true
-			}
-			for peer := range c.unread {
-				if !live[peer] {
-					delete(c.unread, peer)
-				}
-			}
-			for peer := range c.lastDMAt {
-				if !live[peer] {
-					delete(c.lastDMAt, peer)
-				}
-			}
-			if c.hoverPeer != "" && !live[c.hoverPeer] {
-				c.hoverPeer = ""
-			}
-		}
-		cmds = append(cmds, scheduleBeat(), c.doFetchFiles()) // roster + room files
+	case netReadyMsg:
+		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("🔒 encrypted channel to %s (safety %s)", msg.user, msg.code)))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netLostMsg:
+		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("* lost direct line to %s (fallback relay active)", msg.user)))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netErrMsg:
+		c.appendLine(tuiErrStyle.Render("* " + msg.err.Error()))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netIdleMsg:
+		// Pump heartbeat: nothing arrived, keep waiting.
+		cmds = append(cmds, c.drainNetCmd())
 
 	case sendDoneMsg:
 		if nc := c.settleSend(msg); nc != nil {
 			cmds = append(cmds, nc)
-		}
-
-	case wsConnectedMsg:
-		c.ws = msg.ws
-		c.status = "connected (websocket)"
-
-	case convBacklogMsg:
-		if msg.err == nil {
-			for _, m := range msg.msgs {
-				c.addMessage(m) // seq-deduped; pre-window history lands here
-			}
 		}
 
 	case uploadProgressMsg:
@@ -1488,92 +1410,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if nc := c.settleUploadDone(msg); nc != nil {
 			cmds = append(cmds, nc)
 		}
-		cmds = append(cmds, c.doFetchFiles()) // instant self-feedback
-
-	case filesFetchedMsg:
-		if msg.err == nil {
-			c.applyRoomFiles(msg.files)
-		}
-
-	case filesListMsg:
-		if msg.err != nil {
-			if c.picker.isActive() && c.picker.mode == modeFiles {
-				c.picker.loading = false
-				c.picker.notice = truncateStringPlain(msg.err.Error(), 40)
-			}
-			break
-		}
-		c.applyFilesList(msg.files)
-
-	case deleteListMsg:
-		c.applyDeleteList(msg)
-
-	case deleteDoneMsg:
-		if msg.err != "" {
-			c.picker.notice = msg.err
-		} else {
-			now := time.Now().Format(time.RFC3339)
-			// Remove from picker and immediately show tombstone locally
-			if msg.kind == "msg" {
-				for i, m := range c.picker.deleteMsgs {
-					if m.Seq == msg.seq {
-						c.picker.deleteMsgs = append(c.picker.deleteMsgs[:i], c.picker.deleteMsgs[i+1:]...)
-						break
-					}
-				}
-				for i, h := range c.history {
-					if h.Seq == msg.seq {
-						c.history[i].Status = "DELETED"
-						c.history[i].DeletedAt = now
-						c.history[i].DeletedBy = c.me
-						c.history[i].Text = ""
-						break
-					}
-				}
-			} else {
-				for i, f := range c.picker.deleteFiles {
-					if f.FileId == msg.fileId {
-						c.picker.deleteFiles = append(c.picker.deleteFiles[:i], c.picker.deleteFiles[i+1:]...)
-						break
-					}
-				}
-				for i, ll := range c.localLines {
-					if ll.kind == lineFileCard && ll.fileData != nil && ll.fileData.fileId == msg.fileId {
-						c.localLines[i].fileData.deleted = true
-						c.localLines[i].fileData.deletedAt = now
-						if t, err := time.Parse(time.RFC3339, now); err == nil {
-							c.localLines[i].fileData.time = t.Local().Format("15:04")
-						}
-						break
-					}
-				}
-			}
-			if len(c.picker.deleteMsgs) == 0 && len(c.picker.deleteFiles) == 0 {
-				c.picker.notice = "no deletable items"
-			} else {
-				c.picker.notice = msg.ok
-			}
-			c.picker.clampCursor()
-			c.rebuildView()
-			// Also poll to propagate to other users
-			cmds = append(cmds, c.doPoll())
-			cmds = append(cmds, c.doFetchFiles())
-		}
-
-	case dlProgressMsg:
-		if c.dlQ.active && msg.total > 0 {
-			c.paintDlLine(tuiDownloadRunStyle.Render(
-				progressBar("Downloading…", msg.done, msg.total)), c.dlQ.conv)
-		}
-		cmds = append(cmds, drainDlProgressCmd(c.dlQ.progCh))
-
-	case dlDrainMsg:
-		// channel closed; the done msg lands separately
-
-	case dlDoneMsg:
-		if nc := c.settleDownloadDone(msg); nc != nil {
-			cmds = append(cmds, nc)
-		}
+		// Own uploads paint their card in settleUploadDone; peers receive
+		// the file over the wire. No server round-trip exists anymore.
 
 	case leaveDoneMsg:
 		return c, tea.Quit
@@ -1599,14 +1437,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			break // unknown keys do nothing in browser mode
 		}
-		// Esc during a transfer cancels it before anything else sees the key.
-		if msg.Type == tea.KeyEsc && (c.uploadQ.isActive() || c.dlQ.isActive()) {
-			if c.uploadQ.isActive() {
-				c.cancelUploads()
-			}
-			if c.dlQ.isActive() {
-				c.cancelDownloads()
-			}
+		// Esc during an upload cancels it before anything else sees the key.
+		// (Downloads no longer exist as a transfer: files arrive complete.)
+		if msg.Type == tea.KeyEsc && c.uploadQ.isActive() {
+			c.cancelUploads()
 			break
 		}
 		// "/" command drawer eats navigation + selection keys while open.
@@ -1711,7 +1545,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			conv = conversationKey(c.me, to)
 		}
 		m := chatMessage{
-			Seq: msg.seq, Username: c.me, Kind: "chat",
+			Seq: msg.seq, MsgId: msg.msgId, Username: c.me, Kind: "chat",
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
@@ -1938,17 +1772,40 @@ func (c chatScreen) View() string {
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).
-func runChatTUI(serverURL, key, me string, persist bool) {
-	scr := newChatScreen(serverURL, key, me)
-	scr.persist = persist
+func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
+	scr := newChatScreen(serverURL, key, me, id, password)
+	// Seed the roster synchronously so the sidebar isn't empty on paint;
+	// the engine beat loop keeps it fresh, rosterTickMsg renders it.
+	if roster, err := scr.sig.heartbeat("", nil); err == nil {
+		scr.eng.setRoster(roster)
+		scr.users = onlineNames(roster, me)
+	}
+	scr.eng.start()
 	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
 	}
-	if persist {
-		_ = saveHistory(key, scr.history)
-	}
-	scr.client.leave()
+	scr.eng.stop()
+	_, _, _ = postJSON(scr.sig.endpoint("/leave"), map[string]any{}, scr.sig.headers())
 	fmt.Printf("\nYou left session %s.\n", key)
+}
+
+// onlineNames extracts online usernames (sidebar order = sorted).
+func onlineNames(roster []rosterMember, me string) []string {
+	var out []string
+	for _, m := range roster {
+		if m.Online {
+			out = append(out, m.Username)
+		}
+	}
+	sort.Strings(out)
+	// keep me first for orderedUsers parity
+	names := []string{me}
+	for _, u := range out {
+		if u != me {
+			names = append(names, u)
+		}
+	}
+	return names
 }

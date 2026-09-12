@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"regexp"
 	"strings"
@@ -710,7 +711,17 @@ func (m *landingModel) submit() tea.Cmd {
 func (m *landingModel) doCreate(username, password string) tea.Cmd {
 	serverURL := m.serverURL
 	return func() tea.Msg {
-		payload := map[string]any{"username": username, "duration": 600}
+		// Signaling requires the device identity pubkey (peers E2E-encrypt
+		// to the roster-advertised key; rooms carry no duration — they live
+		// till empty).
+		id, err := loadOrCreateIdentity()
+		if err != nil {
+			return landingDoneMsg{err: "device identity unavailable: " + err.Error()}
+		}
+		payload := map[string]any{
+			"username": username,
+			"pubkey":   base64.StdEncoding.EncodeToString(id.publicKey()),
+		}
 		if password != "" {
 			payload["password"] = password
 		}
@@ -726,7 +737,9 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 			}
 			return landingDoneMsg{err: e.Error}
 		}
-		var r sessionCreateResponse
+		var r struct {
+			SessionID string `json:"sessionId"`
+		}
 		if err := jsonDecode(body, &r); err != nil || r.SessionID == "" {
 			return landingDoneMsg{err: "unexpected server response"}
 		}
@@ -737,7 +750,14 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 	serverURL := m.serverURL
 	return func() tea.Msg {
-		payload := map[string]any{"username": username}
+		id, err := loadOrCreateIdentity()
+		if err != nil {
+			return landingDoneMsg{err: "device identity unavailable: " + err.Error()}
+		}
+		payload := map[string]any{
+			"username": username,
+			"pubkey":   base64.StdEncoding.EncodeToString(id.publicKey()),
+		}
 		if password != "" {
 			payload["password"] = password
 		}
@@ -751,14 +771,13 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 		var e struct{ Error string `json:"error"`}
 		_ = jsonDecode(body, &e)
 		switch c {
-		case 403:
-			return landingDoneMsg{err: "incorrect password"}
+		case 401:
+			return landingDoneMsg{err: "password required or incorrect"}
 		case 409:
 			return landingDoneMsg{err: "'" + username + "' already in this session"}
-		case 410:
-			return landingDoneMsg{err: "session has ended"}
 		case 404:
-			return landingDoneMsg{err: "session not found"}
+			// Rooms vanish when emptied — there is no other terminal state.
+			return landingDoneMsg{err: "session not found (rooms vanish when emptied)"}
 		default:
 			if e.Error == "" {
 				e.Error = string(body)

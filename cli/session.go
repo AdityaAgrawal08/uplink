@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -17,16 +18,11 @@ import (
 
 var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
 
+// B25 FIX: shared HTTP client for all JSON API calls so keep-alive
+// connections are reused across polls, heartbeats, and sends.
+var sharedHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 const chatUsernameHint = "3-20 chars, letters/digits/underscore"
-
-type sessionCreateResponse struct {
-	SessionID string `json:"sessionId"`
-}
-
-type sessionJoinResponse struct {
-	SessionID    string   `json:"sessionId"`
-	Participants []string `json:"participants"`
-}
 
 // promptLine asks until non-empty; trims spaces and surrounding quotes.
 func promptLine(reader *bufio.Reader, label string) string {
@@ -67,8 +63,10 @@ func postJSON(url string, payload any, headers map[string]string) (int, []byte, 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// B25 FIX: reuse a shared client so keep-alive connections are pooled.
+	// Previously every call allocated a new http.Client (new pool, new
+	// dials), defeating HTTP keep-alive on every poll/heartbeat.
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -85,8 +83,8 @@ func getJSON(url string, headers map[string]string) (int, []byte, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	// B25 FIX: shared client (see postJSON).
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -100,7 +98,6 @@ func cmdCreateSession(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("create session", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
 	passwordFlag := fs.String("password", "", "Password-protect this session")
-	persistFlag := fs.Bool("persist", false, "Save chat history to ~/.uplink/history/ on exit")
 	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
@@ -118,41 +115,30 @@ func cmdCreateSession(args []string, cfg *Config) {
 		}
 	}
 
-	payload := map[string]any{"username": username, "duration": 600}
-	if password != "" {
-		payload["password"] = password
-	}
-
-	code, body, err := postJSON(serverURL+"/api/v1/session/create", payload, nil)
+	// Device identity: the public half is advertised in the roster so peers
+	// can E2E-encrypt; rooms carry no duration (they live till empty).
+	id, err := loadOrCreateIdentity()
 	if err != nil {
-		fmt.Printf("✗ Could not reach server: %v\n", err)
+		fmt.Printf("✗ Could not load device identity: %v\n", err)
 		os.Exit(1)
 	}
-	if code != 201 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(body, &e)
-		fmt.Printf("✗ Session creation failed (%d): %s\n", code, e.Error)
-		os.Exit(1)
-	}
-
-	var created sessionCreateResponse
-	if err := json.Unmarshal(body, &created); err != nil || created.SessionID == "" {
-		fmt.Println("✗ Unexpected server response.")
+	sc := &signalClient{serverURL: serverURL, me: username}
+	sid, err := sc.createRoom(username, base64.StdEncoding.EncodeToString(id.publicKey()), password)
+	if err != nil {
+		fmt.Printf("✗ Session creation failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	fmt.Println("\n✓ Session created")
 	fmt.Println("\n  ┌─────────────────────────────────────┐")
-	fmt.Printf("  │  KEY: %-29s │\n", created.SessionID)
-	fmt.Printf("  │  Share it: uplink join %-12s │\n", created.SessionID)
+	fmt.Printf("  │  KEY: %-29s │\n", sid)
+	fmt.Printf("  │  Share it: uplink join %-12s │\n", sid)
 	fmt.Println("  └─────────────────────────────────────┘")
 	fmt.Printf("\nYou are '%s'. Connecting to your room… (/exit to leave)\n", username)
 
 	// The creator is already a participant server-side — drop them straight
 	// into the room so their username isn't stranded without a UI.
-	runChat(serverURL, created.SessionID, username, *persistFlag)
+	runChat(serverURL, sid, username, id, password)
 }
 
 // cmdJoinChat handles: uplink join <key> — resolves to the interactive chat.
@@ -160,7 +146,6 @@ func cmdJoinChat(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	serverFlag := fs.String("server", cfg.Server, "Server base URL")
 	passwordFlag := fs.String("password", "", "Session password")
-	persistFlag := fs.Bool("persist", false, "Save chat history to ~/.uplink/history/ on exit")
 	if err := fs.Parse(normalizeFlagOrder(args, map[string]bool{"server": true, "password": true})); err != nil {
 		os.Exit(1)
 	}
@@ -180,29 +165,26 @@ func cmdJoinChat(args []string, cfg *Config) {
 	}
 
 	password := *passwordFlag
+	id, err := loadOrCreateIdentity()
+	if err != nil {
+		fmt.Printf("✗ Could not load device identity: %v\n", err)
+		os.Exit(1)
+	}
+	pubkey := base64.StdEncoding.EncodeToString(id.publicKey())
 
-	// Unique-username loop — server rejects duplicates with 409.
+	// Unique-username loop — server rejects duplicates with 409, missing
+	// passwords with 401, and gone rooms with 404 (rooms die on empty).
 	var username string
 	for {
 		username = promptChatUsername(reader)
-		payload := map[string]any{"username": username}
-		if password != "" {
-			payload["password"] = password
-		}
-		code, body, err := postJSON(serverURL+"/api/v1/session/"+key+"/join", payload, nil)
-		if err != nil {
-			fmt.Printf("✗ Could not reach server: %v\n", err)
-			os.Exit(1)
-		}
-		if code == 200 {
+		sc := &signalClient{serverURL: serverURL, me: username, key: key}
+		_, err := sc.joinRoom(username, pubkey, password)
+		if err == nil {
 			break
 		}
-		var e struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(body, &e)
-		switch code {
-		case 403:
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "status 401"):
 			if password == "" {
 				fmt.Print("This session is password-protected. Enter password: ")
 				pwdBytes, perr := reader.ReadString('\n')
@@ -216,16 +198,16 @@ func cmdJoinChat(args []string, cfg *Config) {
 			fmt.Println("✗ Incorrect password.")
 			password = ""
 			continue
-		case 409:
+		case strings.Contains(msg, "status 409"):
 			fmt.Printf("'%s' is already in this session — choose another.\n", username)
-		case 410:
-			fmt.Println("✗ This session has ended.")
+		case strings.Contains(msg, "status 404"):
+			fmt.Println("✗ This session does not exist (rooms vanish when emptied).")
 			os.Exit(1)
 		default:
-			fmt.Printf("✗ Join failed (%d): %s\n", code, e.Error)
+			fmt.Printf("✗ Join failed: %s\n", msg)
 			os.Exit(1)
 		}
 	}
 
-	runChat(serverURL, key, username, *persistFlag)
+	runChat(serverURL, key, username, id, password)
 }

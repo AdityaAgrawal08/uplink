@@ -59,10 +59,19 @@ interface QuotaDocument {
 }
 
 let indexesPromise: Promise<void> | null = null;
+// B12 FIX: Track last failure time to prevent rapid retry loops.
+let lastIndexFailureAt = 0;
+const INDEX_RETRY_COOLDOWN_MS = 30_000; // 30 seconds between retry attempts
 
 // Helper to initialize indexes
 export function initIndexes(): Promise<void> {
   if (indexesPromise) return indexesPromise;
+
+  // B12 FIX: Enforce cooldown after failures to avoid hammering MongoDB
+  // when indexes consistently fail (e.g., auth issues, network partitions).
+  if (lastIndexFailureAt > 0 && Date.now() - lastIndexFailureAt < INDEX_RETRY_COOLDOWN_MS) {
+    return Promise.resolve();
+  }
 
   indexesPromise = (async () => {
     const db = await getDb();
@@ -79,16 +88,10 @@ export function initIndexes(): Promise<void> {
     // Unique sparse index for short downloadCode
     await db.collection("shares").createIndex({ downloadCode: 1 }, { unique: true, sparse: true });
 
-    // Session-based sharing indexes
-    await db.collection("sessions").createIndex({ sessionId: 1 }, { unique: true });
-    await db.collection("session_participants").createIndex({ sessionId: 1, username: 1 }, { unique: true });
-    await db.collection("session_files").createIndex({ sessionId: 1, fileId: 1 }, { unique: true });
-    await db.collection("session_files").createIndex({ sessionId: 1, filename: 1 });
-
-    // Chat transcript indexes (ordered delivery per room, per-conversation)
-    await db.collection("session_messages").createIndex({ sessionId: 1, seq: 1 });
-    await db.collection("session_messages").createIndex({ sessionId: 1, convId: 1, seq: 1 });
-    await db.collection("session_messages").createIndex({ createdAt: 1 });
+    // NOTE: chat sessions live in Redis now (see src/lib/rooms.ts). The old
+    // sessions/session_participants/session_files/session_messages
+    // collections are no longer written; their indexes are intentionally
+    // not created here.
 
     // Initialize quota tracking document if not present
     const quotaDoc = await db.collection<QuotaDocument>("quotas").findOne({ _id: "r2_quota" });
@@ -129,6 +132,7 @@ export function initIndexes(): Promise<void> {
 
   indexesPromise.catch((error) => {
     console.error("Failed to initialize MongoDB indexes:", error);
+    lastIndexFailureAt = Date.now();
     indexesPromise = null;
   });
 

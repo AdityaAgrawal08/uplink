@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,9 +18,10 @@ import (
 // dotfiles included. A selection buffer accumulates paths across directories;
 // Ctrl+Enter hands them all to the upload engine, Esc discards.
 //
-// Selecting "/download" opens a search-driven file picker with a detail window
-// for confirming downloads. In private conversations, the detail window is
-// skipped (only one file from one uploader).
+// Selecting "/download" opens a read-only browser of files received this
+// session (newest first) with a detail window showing sender, size, and
+// save location. Files arrive complete over the wire — nothing left to
+// download, so the drawer never mutates anything.
 
 const pickerMaxVisible = 8 // entry rows painted before scrolling
 const pickerMaxTrayRows = 3
@@ -60,37 +60,32 @@ type pickerMode int
 const (
 	modeBrowse pickerMode = iota
 	modeFiles
-	modeDetail    // detail window for download confirmation
-	modeBuffer    // buffer review: shows queued files, deselect with ctrl+d
-	modeDelete    // delete own messages/files, 2 sections
+	modeDetail // detail window for download confirmation
+	modeBuffer // buffer review: shows queued files, deselect with ctrl+d
 )
 
 // pickerState is the browser mode of the drawer. All list math goes through
 // pure helpers so navigation rules are unit-testable without a filesystem.
 type pickerState struct {
-	active   bool
-	mode     pickerMode
-	cwd      string // absolute current directory (modeBrowse)
-	home     string // $HOME, for ~/ breadcrumb abbreviation
-	entries  []pickerEntry
-	files    []sessionFile // modeFiles listing, most recent first
-	loading  bool          // modeFiles: waiting on the /files response
-	cursor   int
-	offset   int      // first visible row in the scroll window
-	anchor   int      // range anchor (-1 = no active range)
-	visual   bool     // `v` visual mode: plain moves extend the range
-	buffered []string // ordered keys: absolute paths OR fileIds
-	inBuf    map[string]bool
-	notice   string // transient error line ("" = none)
-	filter   string // substring filter (active when filtering=true)
-	filtering bool  // true while the user is typing a filter query
+	active    bool
+	mode      pickerMode
+	cwd       string // absolute current directory (modeBrowse)
+	home      string // $HOME, for ~/ breadcrumb abbreviation
+	entries   []pickerEntry
+	files     []receivedFile // modeFiles listing (received this session), most recent first
+	loading   bool           // modeFiles: unused (listing is synchronous); kept for shape parity
+	cursor    int
+	offset    int      // first visible row in the scroll window
+	anchor    int      // range anchor (-1 = no active range)
+	visual    bool     // `v` visual mode: plain moves extend the range
+	buffered  []string // ordered keys: absolute local paths
+	inBuf     map[string]bool
+	notice    string // transient error line ("" = none)
+	filter    string // substring filter (active when filtering=true)
+	filtering bool   // true while the user is typing a filter query
 
 	// Detail window state (modeDetail).
-	detailFile *sessionFile // the file being inspected
-
-	// Delete mode state (modeDelete).
-	deleteMsgs  []chatMessage  // own messages, latest first
-	deleteFiles []sessionFile  // own files, latest first
+	detailFile *receivedFile // the file being inspected
 }
 
 func (p *pickerState) isActive() bool { return p.active }
@@ -121,9 +116,42 @@ func (c *chatScreen) openPicker() tea.Cmd {
 	return nil
 }
 
-// openFilesDrawer morphs the drawer into the room's shared-files list, most
-// recent first. The listing arrives asynchronously (filesListMsg).
+// openFilesDrawer morphs the drawer into the files-received-this-session
+// list, most recent first. There is no server file index anymore; the
+// listing is synchronous and local. Files mode is read-only: Space/selection
+// is disabled (nothing to fetch — everything listed is already saved), so it
+// gets a private empty buffer that closePicker must not sync back.
 func (c *chatScreen) openFilesDrawer() tea.Cmd {
+	c.palette.close()
+	c.input.SetValue("")
+	c.input.Placeholder = ""
+	files := make([]receivedFile, len(c.received))
+	copy(files, c.received)
+	// Recent first.
+	for i := 1; i < len(files); i++ {
+		for j := i; j > 0 && files[j].at.After(files[j-1].at); j-- {
+			files[j], files[j-1] = files[j-1], files[j]
+		}
+	}
+	c.picker = pickerState{
+		active:   true,
+		mode:     modeFiles,
+		home:     ".",
+		anchor:   -1,
+		files:    files,
+		buffered: nil,
+		inBuf:    map[string]bool{},
+	}
+	if len(files) == 0 {
+		c.picker.notice = "no files received yet — they appear here automatically"
+	}
+	c.picker.clampCursor()
+	return nil
+}
+
+// openBufferReview opens the buffer review drawer showing all queued upload files.
+// Users can navigate with arrows and deselect items with Ctrl+D.
+func (c *chatScreen) openBufferReview() tea.Cmd {
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
@@ -132,179 +160,26 @@ func (c *chatScreen) openFilesDrawer() tea.Cmd {
 	}
 	c.picker = pickerState{
 		active:   true,
-		mode:     modeFiles,
+		mode:     modeBuffer,
 		home:     ".",
 		anchor:   -1,
 		buffered: c.uploadBuf,
 		inBuf:    c.uploadBufSet,
-		notice:   "loading shared files…",
 	}
-	return c.doFetchAllFiles()
-}
-
-// deleteListMsg is the async result for /delete picker's data.
-type deleteListMsg struct {
-	msgs  []chatMessage
-	files []sessionFile
-	err   string
-}
-
-type deleteDoneMsg struct {
-	kind   string // "msg" or "file"
-	seq    int
-	fileId string
-	ok     string
-	err    string
-}
-
-// openDeletePicker shows own messages/files for deletion, 2 sections latest-first.
-func (c *chatScreen) openDeletePicker() tea.Cmd {
-	c.palette.close()
-	c.input.SetValue("")
-	c.input.Placeholder = ""
-	msgs := c.ownMessagesForDelete()
-	c.picker = pickerState{
-		active:      true,
-		mode:        modeDelete,
-		home:        ".",
-		anchor:      -1,
-		inBuf:       map[string]bool{},
-		notice:      "loading files…",
-		loading:     true,
-		cursor:      0,
-		offset:      0,
-		deleteMsgs:  msgs,
-		deleteFiles: nil,
+	if len(c.uploadBuf) == 0 {
+		c.picker.notice = "buffer empty — use /upload to add files"
 	}
-	if len(msgs) == 0 {
-		c.picker.notice = "loading files…"
-	}
-	// Kick async files fetch (non-blocking for messages)
-	client := c.client
-	conv := c.activeConv()
-	return func() tea.Msg {
-		files, err := client.fetchFiles("", conv)
-		if err != nil {
-			return deleteListMsg{msgs: msgs, err: err.Error()}
-		}
-		// Filter to own, not deleted, and latest first
-		var ownFiles []sessionFile
-		for _, f := range files {
-			if f.Username == c.me && f.Status == "UPLOADED" {
-				ownFiles = append(ownFiles, f)
-			}
-		}
-		sort.Slice(ownFiles, func(i, j int) bool {
-			return ownFiles[i].UploadedAt > ownFiles[j].UploadedAt
-		})
-		return deleteListMsg{msgs: msgs, files: ownFiles}
-	}
-}
-
-// ownMessagesForDelete returns own non-deleted messages in active conv, latest first.
-func (c *chatScreen) ownMessagesForDelete() []chatMessage {
-	var out []chatMessage
-	for _, m := range c.history {
-		if m.Username != c.me {
-			continue
-		}
-		if m.Status == "DELETED" {
-			continue
-		}
-		if !c.shouldRender(m) {
-			continue
-		}
-		if m.Kind == "system" {
-			continue
-		}
-		out = append(out, m)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		// latest first: larger seq or newer CreatedAt
-		if out[i].Seq != out[j].Seq {
-			return out[i].Seq > out[j].Seq
-		}
-		return out[i].CreatedAt > out[j].CreatedAt
-	})
-	return out
-}
-
-func (c *chatScreen) applyDeleteList(msg deleteListMsg) {
-	if !c.picker.isActive() || c.picker.mode != modeDelete {
-		return
-	}
-	c.picker.loading = false
-	if msg.err != "" {
-		c.picker.notice = msg.err
-		return
-	}
-	c.picker.deleteMsgs = msg.msgs
-	c.picker.deleteFiles = msg.files
-	c.picker.notice = ""
-	if len(msg.msgs) == 0 && len(msg.files) == 0 {
-		c.picker.notice = "no deletable items"
-	}
-	c.picker.clampCursor()
-}
-
-func (c *chatScreen) doDeleteAtCursor() tea.Cmd {
-	return func() tea.Msg {
-		p := &c.picker
-		if !p.isActive() || p.mode != modeDelete {
-			return deleteDoneMsg{err: "not in delete mode"}
-		}
-		total := len(p.deleteMsgs) + len(p.deleteFiles)
-		if p.cursor < 0 || p.cursor >= total {
-			return deleteDoneMsg{err: "nothing selected"}
-		}
-		if p.cursor < len(p.deleteMsgs) {
-			m := p.deleteMsgs[p.cursor]
-			err := c.client.deleteMessage(m.Seq)
-			if err != nil {
-				return deleteDoneMsg{err: err.Error()}
-			}
-			return deleteDoneMsg{kind: "msg", seq: m.Seq, ok: "deleted message"}
-		}
-		f := p.deleteFiles[p.cursor-len(p.deleteMsgs)]
-		err := c.client.deleteFile(f.FileId)
-		if err != nil {
-			return deleteDoneMsg{err: err.Error()}
-		}
-		return deleteDoneMsg{kind: "file", fileId: f.FileId, ok: "deleted file"}
-	}
-}
-
-// applyFilesList fills the drawer's listing; non-UPLOADED files never show.
-func (c *chatScreen) applyFilesList(files []sessionFile) {
-	if !c.picker.isActive() || c.picker.mode != modeFiles {
-		return
-	}
-	shown := make([]sessionFile, 0, len(files))
-	for _, f := range files {
-		if f.Status == "UPLOADED" {
-			shown = append(shown, f)
-		}
-	}
-	// Recent first: RFC3339 Z timestamps compare lexicographically.
-	for i := 1; i < len(shown); i++ {
-		for j := i; j > 0 && shown[j].UploadedAt > shown[j-1].UploadedAt; j-- {
-			shown[j], shown[j-1] = shown[j-1], shown[j]
-		}
-	}
-	c.picker.files = shown
-	c.picker.loading = false
-	c.picker.notice = ""
-	if len(shown) == 0 {
-		c.picker.notice = "no files shared yet"
-	}
-	c.picker.clampCursor()
+	return nil
 }
 
 // closePicker leaves browser mode; syncs buffer to persistent storage.
+// Files mode owns a private empty buffer (read-only listing) that must
+// never overwrite the upload buffer.
 func (c *chatScreen) closePicker(restore string) {
-	// Sync buffer back to persistent storage before clearing.
-	c.uploadBuf = c.picker.buffered
-	c.uploadBufSet = c.picker.inBuf
+	if c.picker.mode != modeFiles {
+		c.uploadBuf = c.picker.buffered
+		c.uploadBufSet = c.picker.inBuf
+	}
 	c.picker = pickerState{}
 	c.input.Placeholder = restore
 }
@@ -348,14 +223,14 @@ func (p *pickerState) filteredEntries() []pickerEntry {
 }
 
 // filteredFiles returns files matching the active filter (files mode).
-// Search matches against filename OR uploader username.
-func (p *pickerState) filteredFiles() []sessionFile {
+// Search matches against filename OR sender username.
+func (p *pickerState) filteredFiles() []receivedFile {
 	if p.filter == "" {
 		return p.files
 	}
-	var out []sessionFile
+	var out []receivedFile
 	for _, f := range p.files {
-		if pickerMatchFilter(f.Filename, p.filter) || pickerMatchFilter(f.Username, p.filter) {
+		if pickerMatchFilter(f.filename, p.filter) || pickerMatchFilter(f.from, p.filter) {
 			out = append(out, f)
 		}
 	}
@@ -457,9 +332,6 @@ func (p *pickerState) rowCount() int {
 	if p.mode == modeDetail {
 		return 0
 	}
-	if p.mode == modeDelete {
-		return len(p.deleteMsgs) + len(p.deleteFiles)
-	}
 	if p.mode == modeBuffer {
 		return len(p.buffered)
 	}
@@ -474,24 +346,8 @@ func (p *pickerState) rowCount() int {
 }
 
 // entryAt maps a row index onto its target. key is the buffer identity:
-// absolute path (browse) or fileId (files). ok=false for the ".." row.
+// absolute path (browse) or save path (files). ok=false for the ".." row.
 func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) {
-	if p.mode == modeDelete {
-		total := len(p.deleteMsgs) + len(p.deleteFiles)
-		if row < 0 || row >= total {
-			return pickerEntry{}, "", false
-		}
-		if row < len(p.deleteMsgs) {
-			m := p.deleteMsgs[row]
-			preview := m.Text
-			if len(preview) > 28 {
-				preview = preview[:28] + "…"
-			}
-			return pickerEntry{name: preview, size: int64(m.Seq)}, fmt.Sprintf("msg:%d", m.Seq), true
-		}
-		f := p.deleteFiles[row-len(p.deleteMsgs)]
-		return pickerEntry{name: f.Filename, size: f.Size}, f.FileId, true
-	}
 	if p.mode == modeBuffer {
 		if row < 0 || row >= len(p.buffered) {
 			return pickerEntry{}, "", false
@@ -507,7 +363,7 @@ func (p *pickerState) entryAt(row int) (entry pickerEntry, key string, ok bool) 
 			return pickerEntry{}, "", false
 		}
 		f := ff[row]
-		return pickerEntry{name: f.Filename, size: f.Size}, f.FileId, true
+		return pickerEntry{name: f.filename, size: f.size}, f.path, true
 	}
 	base := 0
 	if parentDir(p.cwd) != "" {
@@ -578,8 +434,13 @@ func (c *chatScreen) pickerCd(path string) {
 
 // pickerToggleBuffer adds/removes the highlighted item(s). With an active
 // range the WHOLE range flips in one press; without, only the cursor row.
-// Folders are buffered like files (the engine tarballs them).
+// Folders are buffered like files (the engine tarballs them). Files mode is
+// read-only: nothing there can be buffered (everything is already saved).
 func (c *chatScreen) pickerToggleBuffer() {
+	if c.picker.mode == modeFiles {
+		c.picker.notice = "already saved — Enter for details"
+		return
+	}
 	lo, hi := pickerRange(c.picker.anchor, c.picker.cursor)
 	for row := lo; row <= hi; row++ {
 		_, key, ok := c.picker.entryAt(row)
@@ -622,34 +483,21 @@ func (c *chatScreen) pickerBufferFolder() {
 }
 
 // pickerConfirm hands the buffered set to the active engine and closes:
-// browse mode uploads buffered paths; files mode downloads buffered fileIds.
+// browse mode uploads buffered paths; files mode is read-only (no buffering).
 func (c *chatScreen) pickerConfirm() tea.Cmd {
 	restore := composerPlaceholder
 	if c.picker.mode == modeFiles {
-		jobs := make([]dlJob, 0, len(c.picker.buffered))
-		for _, id := range c.picker.buffered {
-			for _, f := range c.picker.files {
-				if f.FileId == id {
-					jobs = append(jobs, dlJob{FileId: f.FileId, Filename: f.Filename, Size: f.Size})
-					break
-				}
-			}
-		}
+		// Read-only listing: everything shown is already saved. Just close.
 		c.closePicker(restore)
-		if len(jobs) == 0 {
-			return nil
-		}
-		return c.startDownloads(jobs)
+		return nil
 	}
 
 	jobs := make([]uploadJob, 0, len(c.picker.buffered))
-	// Determine conversation scope for file segregation.
-	var toConv string
-	if c.targetUser != "" {
-		toConv = conversationKey(c.me, c.targetUser)
-	}
+	// Raw recipient username ("" = room broadcast); the engine encrypts
+	// for exactly that audience.
+	to := c.targetUser
 	for _, abs := range c.picker.buffered {
-		jobs = append(jobs, uploadJob{Path: abs, To: toConv})
+		jobs = append(jobs, uploadJob{Path: abs, To: to})
 	}
 	// Clear persistent buffer — files are being sent.
 	c.uploadBuf = nil
@@ -661,6 +509,31 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 	return c.startUploads(jobs)
 }
 
+// sendBuffered sends all files currently in the persistent upload buffer.
+// Works from the command palette (/send) without needing the picker open.
+func (c *chatScreen) sendBuffered() tea.Cmd {
+	if len(c.uploadBuf) == 0 {
+		c.appendLine(tuiSystemStyle.Render("* buffer empty — use /upload to add files"))
+		return nil
+	}
+	jobs := make([]uploadJob, 0, len(c.uploadBuf))
+	to := c.targetUser
+	for _, abs := range c.uploadBuf {
+		jobs = append(jobs, uploadJob{Path: abs, To: to})
+	}
+	// Clear the persistent buffer.
+	c.uploadBuf = nil
+	c.uploadBufSet = map[string]bool{}
+	// Also clear picker buffer if picker is open.
+	c.picker.buffered = nil
+	c.picker.inBuf = map[string]bool{}
+	if c.picker.isActive() {
+		restore := composerPlaceholder
+		c.closePicker(restore)
+	}
+	return c.startUploads(jobs)
+}
+
 // ---- key handling --------------------------------------------------------------
 
 // handlePickerKeys intercepts every key while the browser is open. Returns
@@ -668,21 +541,14 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 	p := &c.picker
 
-	// Detail window mode: simple Enter/Esc only.
+	// Detail window mode: simple Enter/Esc only. Files are already saved;
+	// Enter returns to the list.
 	if p.mode == modeDetail {
 		switch msg.Type {
 		case tea.KeyEnter:
-			// Download the file shown in the detail window.
-			if p.detailFile != nil {
-				job := dlJob{
-					FileId:   p.detailFile.FileId,
-					Filename: p.detailFile.Filename,
-					Size:     p.detailFile.Size,
-				}
-				restore := composerPlaceholder
-				c.closePicker(restore)
-				return true, func() tea.Cmd { return c.startDownloads([]dlJob{job}) }
-			}
+			p.mode = modeFiles
+			p.detailFile = nil
+			p.clampCursor()
 			return true, nil
 		case tea.KeyEsc:
 			// Back to files list.
@@ -716,25 +582,6 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 			return true, nil
 		case tea.KeyCtrlJ: // Ctrl+Enter: send all remaining
 			return true, c.pickerConfirm
-		case tea.KeyEsc:
-			restore := composerPlaceholder
-			c.closePicker(restore)
-			return true, nil
-		}
-		return true, nil
-	}
-
-	// Delete mode: navigate own messages/files, Ctrl+D deletes for all.
-	if p.mode == modeDelete {
-		switch msg.Type {
-		case tea.KeyUp:
-			p.moveTo(p.cursor-1, false)
-			return true, nil
-		case tea.KeyDown:
-			p.moveTo(p.cursor+1, false)
-			return true, nil
-		case tea.KeyCtrlD:
-			return true, c.doDeleteAtCursor
 		case tea.KeyEsc:
 			restore := composerPlaceholder
 			c.closePicker(restore)
@@ -800,17 +647,10 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 		return true, nil
 	case tea.KeyEnter:
 		if p.mode == modeFiles {
-			// Open detail window for the selected file.
+			// Open detail window for the selected file (already saved).
 			ff := p.filteredFiles()
 			if p.cursor >= 0 && p.cursor < len(ff) {
 				f := ff[p.cursor]
-				// In private conversations, skip detail and download directly.
-				if c.targetUser != "" {
-					job := dlJob{FileId: f.FileId, Filename: f.Filename, Size: f.Size}
-					restore := composerPlaceholder
-					c.closePicker(restore)
-					return true, func() tea.Cmd { return c.startDownloads([]dlJob{job}) }
-				}
 				p.mode = modeDetail
 				p.detailFile = &f
 			}
@@ -944,9 +784,6 @@ func (c chatScreen) pickerView(maxW int) string {
 	if p.mode == modeBuffer {
 		return c.pickerBufferView(maxW, inner, pad)
 	}
-	if p.mode == modeDelete {
-		return c.pickerDeleteView(maxW, inner, pad)
-	}
 
 	var body []string
 	crumb := breadcrumb(p.cwd, p.home)
@@ -1034,7 +871,8 @@ func (c chatScreen) pickerView(maxW int) string {
 	return panel
 }
 
-// pickerDetailView renders the file detail window for download confirmation.
+// pickerDetailView renders the received-file detail window: metadata plus
+// where it was saved (files arrive complete — nothing left to download).
 func (c chatScreen) pickerDetailView(maxW, inner int, pad func(string) string) string {
 	f := c.picker.detailFile
 	var body []string
@@ -1042,18 +880,13 @@ func (c chatScreen) pickerDetailView(maxW, inner int, pad func(string) string) s
 	body = append(body, tuiPickerCrumbStyle.Render(pad("file details")))
 	body = append(body, "")
 
-	// Parse and format the upload time.
-	uploadTime := f.UploadedAt
-	if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
-		uploadTime = t.Format("2006-01-02 15:04:05")
-	}
-
-	body = append(body, pad(fmt.Sprintf("  Name:     %s", tuiPaletteMatchStyle.Render(f.Filename))))
-	body = append(body, pad(fmt.Sprintf("  Uploader: %s", tuiPaletteDescStyle.Render(f.Username))))
-	body = append(body, pad(fmt.Sprintf("  Size:     %s", humanSize(f.Size))))
-	body = append(body, pad(fmt.Sprintf("  Uploaded: %s", tuiDimStyle.Render(uploadTime))))
+	body = append(body, pad(fmt.Sprintf("  Name:     %s", tuiPaletteMatchStyle.Render(f.filename))))
+	body = append(body, pad(fmt.Sprintf("  From:     %s", tuiPaletteDescStyle.Render(f.from))))
+	body = append(body, pad(fmt.Sprintf("  Size:     %s", humanSize(f.size))))
+	body = append(body, pad(fmt.Sprintf("  Saved:    %s", tuiDimStyle.Render(f.path))))
+	body = append(body, pad(fmt.Sprintf("  Received: %s", tuiDimStyle.Render(f.at.Format("2006-01-02 15:04:05")))))
 	body = append(body, "")
-	body = append(body, tuiPaletteHintStyle.Render(pad("enter download · esc back")))
+	body = append(body, tuiPaletteHintStyle.Render(pad("enter back · esc close")))
 
 	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
 	if lipgloss.Width(panel) > maxW {
@@ -1110,87 +943,6 @@ func (c chatScreen) pickerBufferView(maxW, inner int, pad func(string) string) s
 	return panel
 }
 
-func (c chatScreen) pickerDeleteView(maxW, inner int, pad func(string) string) string {
-	p := c.picker
-	var body []string
-	total := len(p.deleteMsgs) + len(p.deleteFiles)
-	body = append(body, tuiPickerCrumbStyle.Render(pad(fmt.Sprintf("delete — %d item%s", total, plural(total)))))
-	body = append(body, "")
-	if p.loading {
-		body = append(body, tuiPaletteHintStyle.Render(pad("· loading…")))
-	} else if p.notice != "" {
-		style := tuiDimStyle
-		if total == 0 {
-			style = tuiDimStyle
-		}
-		body = append(body, style.Render(pad("· "+p.notice)))
-	}
-	// Section: Messages
-	body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("— Messages — %d —", len(p.deleteMsgs)))))
-	if len(p.deleteMsgs) == 0 && !p.loading {
-		body = append(body, tuiDimStyle.Render(pad("  (none)")))
-	} else if len(p.deleteMsgs) == 0 && p.loading {
-		body = append(body, tuiDimStyle.Render(pad("  (loading…)")))
-	} else {
-		// Find visible window that includes cursor if in messages section
-		// For simplicity, use p.offset/cursor over combined list, but render per section
-		for i, m := range p.deleteMsgs {
-			row := i
-			// Determine if this row is visible
-			if row < p.offset || row >= p.offset+pickerMaxVisible {
-				continue
-			}
-			ts := ""
-			if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-				ts = t.Local().Format("15:04")
-			}
-			preview := m.Text
-			if len(preview) > 28 {
-				preview = preview[:28] + "…"
-			}
-			line := fmt.Sprintf("  %s %s", tuiPaletteMatchStyle.Render(preview), tuiDimStyle.Render(ts))
-			if row == p.cursor {
-				body = append(body, tuiPaletteSelStyle.Render(pad(line)))
-			} else {
-				body = append(body, pad(line))
-			}
-		}
-	}
-	// Section: Files
-	body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("— Files — %d —", len(p.deleteFiles)))))
-	if len(p.deleteFiles) == 0 && p.loading {
-		body = append(body, tuiDimStyle.Render(pad("  (loading…)")))
-	} else if len(p.deleteFiles) == 0 {
-		body = append(body, tuiDimStyle.Render(pad("  (none)")))
-	} else {
-		for i, f := range p.deleteFiles {
-			row := len(p.deleteMsgs) + i
-			if row < p.offset || row >= p.offset+pickerMaxVisible {
-				continue
-			}
-			ts := ""
-			if t, err := time.Parse(time.RFC3339, f.UploadedAt); err == nil {
-				ts = t.Local().Format("15:04")
-			}
-			line := fmt.Sprintf("  %s %s", tuiPaletteMatchStyle.Render(f.Filename), tuiDimStyle.Render(ts))
-			if row == p.cursor {
-				body = append(body, tuiPaletteSelStyle.Render(pad(line)))
-			} else {
-				body = append(body, pad(line))
-			}
-		}
-	}
-	if more := p.rowCount() - p.offset - pickerMaxVisible; more > 0 {
-		body = append(body, tuiDimStyle.Render(pad(fmt.Sprintf("… +%d more", more))))
-	}
-	body = append(body, tuiPaletteHintStyle.Render(pad("↑↓ move · ctrl+d delete · esc close")))
-	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
-	if lipgloss.Width(panel) > maxW {
-		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
-	}
-	return panel
-}
-
 // plural returns "s" if n != 1.
 func plural(n int) string {
 	if n == 1 {
@@ -1202,16 +954,16 @@ func plural(n int) string {
 func parentRowAvailable(p *pickerState) bool { return parentRowCount(p) == 1 }
 
 const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · a buffer all · ^⏎ send · / filter · esc cancel"
-const pickerDlFooterHints = "↑↓ move · ⇧/⇧ range · enter details · / search · esc cancel"
+const pickerDlFooterHints = "↑↓ move · enter details · / search · esc close"
 
-// fileLabel resolves a buffered fileId to its filename for tray rendering.
-func (p *pickerState) fileLabel(fileId string) string {
+// fileLabel resolves a buffered path to its filename for tray rendering.
+func (p *pickerState) fileLabel(path string) string {
 	for _, f := range p.files {
-		if f.FileId == fileId {
-			return f.Filename
+		if f.path == path {
+			return f.filename
 		}
 	}
-	return fileId
+	return path
 }
 
 // pickerRowView renders ONE selectable row ("": skip). Browse mode: bold blue
@@ -1229,13 +981,10 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 			return ""
 		}
 		f := ff[row]
-		if p.inBuf[f.FileId] {
-			check = "✓"
-		}
 		return fmt.Sprintf("%s%s %s · %s %s", marker, check,
-			tuiPaletteMatchStyle.Render(f.Filename),
-			tuiPaletteDescStyle.Render(f.Username),
-			tuiDimStyle.Render(humanSize(f.Size)))
+			tuiPaletteMatchStyle.Render(sanitizeDisplay(f.filename)),
+			tuiPaletteDescStyle.Render(sanitizeDisplay(f.from)),
+			tuiDimStyle.Render(humanSize(f.size)))
 	}
 	if hasParent && row == 0 {
 		return marker + tuiPickerDirStyle.Render("../")
@@ -1253,8 +1002,8 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 		check = "✓"
 	}
 	if e.dir {
-		return fmt.Sprintf("%s%s %s", marker, check, tuiPickerDirStyle.Render(e.name+"/"))
+		return fmt.Sprintf("%s%s %s", marker, check, tuiPickerDirStyle.Render(sanitizeDisplay(e.name)+"/"))
 	}
-	return fmt.Sprintf("%s%s %s%s", marker, check, e.name,
+	return fmt.Sprintf("%s%s %s%s", marker, check, sanitizeDisplay(e.name),
 		tuiDimStyle.Render(" "+humanSize(e.size)))
 }

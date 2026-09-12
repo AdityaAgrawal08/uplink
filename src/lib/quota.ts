@@ -128,6 +128,23 @@ export async function logQuotaEvent(type: QuotaEvent["type"], message: string): 
   try {
     const db = await getDb();
     console.log(`[Quota Event] [${type}] ${message}`);
+
+    // B22 FIX: Archive old events to a separate collection before truncating.
+    // Previously the $slice:-50 silently discarded older events, losing
+    // historical data needed for capacity planning and incident analysis.
+    const doc = await db.collection<QuotaDoc>("quotas").findOne(
+      { _id: "r2_quota" },
+      { projection: { quotaEvents: 1 } }
+    );
+    if (doc && doc.quotaEvents && doc.quotaEvents.length >= 50) {
+      const archivedEvents = doc.quotaEvents.slice(0, -49); // keep newest 49
+      if (archivedEvents.length > 0) {
+        await db.collection("quota_events_archive").insertMany(
+          archivedEvents.map(e => ({ ...e, archivedAt: new Date() }))
+        );
+      }
+    }
+
     await db.collection<QuotaDoc>("quotas").updateOne(
       { _id: "r2_quota" },
       {
@@ -224,14 +241,19 @@ export async function commitUploadQuota(fileSize: number): Promise<void> {
   }
 
   const db = await getDb();
+  // B48 FIX: pipeline update clamps reservedBytes at 0. A double-commit
+  // (concurrent confirms racing past the idempotency check) previously
+  // drove reservedBytes negative and double-counted storageBytes.
   const res = await db.collection<QuotaDoc>("quotas").findOneAndUpdate(
     { _id: "r2_quota" },
-    {
-      $inc: {
-        storageBytes: fileSize,
-        reservedBytes: -fileSize,
+    [
+      {
+        $set: {
+          storageBytes: { $add: ["$storageBytes", fileSize] },
+          reservedBytes: { $max: [0, { $subtract: ["$reservedBytes", fileSize] }] },
+        },
       },
-    },
+    ] as unknown as import("mongodb").UpdateFilter<QuotaDoc>,
     { returnDocument: "after" }
   );
 
@@ -257,7 +279,7 @@ export async function releaseUploadQuota(fileSize: number, estimatedClassAOps: n
   }
 
   const db = await getDb();
-  
+
   // Guard decrements below 0
   const state = await getQuotaState();
   const refundSize = Math.min(fileSize, state.reservedBytes);
@@ -284,6 +306,31 @@ export async function releaseUploadQuota(fileSize: number, estimatedClassAOps: n
       );
     }
   }
+}
+
+// releaseUploadQuotaWithRetry wraps releaseUploadQuota with bounded retries.
+// B3 FIX: every caller that refunds a reservation on an error path should use
+// this so a transient Mongo failure cannot permanently leak reserved quota.
+export async function releaseUploadQuotaWithRetry(
+  fileSize: number,
+  estimatedClassAOps: number,
+  attempts = 3
+): Promise<boolean> {
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      await releaseUploadQuota(fileSize, estimatedClassAOps);
+      return true;
+    } catch (err) {
+      console.error(`Quota release attempt ${attempt + 1}/${attempts} failed:`, err);
+      if (attempt < attempts - 1) {
+        await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt)));
+      }
+    }
+  }
+  console.error(
+    `CRITICAL: Quota release failed after ${attempts} attempts (size=${fileSize}, ops=${estimatedClassAOps}). Manual recovery needed.`
+  );
+  return false;
 }
 
 // Atomically check and consume 1 Class B operation quota for reads
@@ -320,8 +367,9 @@ export async function recordDeleteQuota(fileSize: number): Promise<void> {
   const db = await getDb();
   
   const state = await getQuotaState();
-  const newSize = Math.max(0, state.storageBytes - fileSize);
-  const sizeDiff = state.storageBytes - newSize;
+  // B11 FIX: Simplify — Math.max(0, ...) was dead code since fileSize is
+  // validated upstream to be positive and storageBytes >= fileSize by design.
+  const sizeDiff = Math.min(fileSize, state.storageBytes);
 
   const res = await db.collection<QuotaDoc>("quotas").findOneAndUpdate(
     { _id: "r2_quota" },

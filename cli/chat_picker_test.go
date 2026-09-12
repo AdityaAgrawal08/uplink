@@ -2,18 +2,15 @@ package main
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -165,64 +162,24 @@ func TestPickerRangeSelectBuffersWholeRange(t *testing.T) {
 	}
 }
 
-// Enter on a file buffers it; Ctrl+D runs the upload pipeline.
+// Enter on a file buffers it; Ctrl+Enter runs the P2P upload pipeline: with
+// no live peer the engine seals frames into the inbox fallback, and the
+// transcript still gets its success card.
 func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
-	var calls []string
-	var announced struct {
-		Filename string `json:"filename"`
-		Size     int64  `json:"size"`
-		Sha256   string `json:"sha256"`
-	}
-	fileBody := []byte("session file payload")
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/announce"):
-			calls = append(calls, "announce")
-			json.NewDecoder(r.Body).Decode(&announced)
-			w.WriteHeader(201)
-			fmt.Fprint(w, `{"fileId":"fid-1","shareId":"sid-1"}`)
-		case r.URL.Path == "/api/v1/share/init":
-			calls = append(calls, "init")
-			var req map[string]any
-			json.NewDecoder(r.Body).Decode(&req)
-			if req["shareId"] != "sid-1" {
-				t.Errorf("init shareId = %v; want sid-1", req["shareId"])
-			}
-			fmt.Fprintf(w, `{"shareId":"sid-1","uploadUrl":%q,"objectKey":"k","filename":"f"}`,
-				srv.URL+"/put-here")
-		case r.URL.Path == "/put-here":
-			calls = append(calls, "PUT")
-			body, _ := io.ReadAll(r.Body)
-			if !bytes.Equal(body, fileBody) {
-				t.Errorf("uploaded bytes mismatch")
-			}
-			w.WriteHeader(200)
-		case strings.HasSuffix(r.URL.Path, "/confirm"):
-			calls = append(calls, "confirm")
-			fmt.Fprint(w, `{"message":"ok"}`)
-		case strings.HasSuffix(r.URL.Path, "/upload-complete"):
-			calls = append(calls, "complete")
-			var req map[string]any
-			json.NewDecoder(r.Body).Decode(&req)
-			if req["fileId"] != "fid-1" || req["shareId"] != "sid-1" {
-				t.Errorf("complete payload = %v", req)
-			}
-			fmt.Fprint(w, `{"success":true}`)
-		default:
-			http.Error(w, "unexpected "+r.URL.Path, 404)
-		}
-	}))
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
+
+	fileBody := []byte("session file payload")
 
 	root := t.TempDir()
 	os.WriteFile(filepath.Join(root, "payload.bin"), fileBody, 0o644)
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	sc := m.(chatScreen)
-	sc.client = newChatClient(srv.URL, "123456", "bob")
 	sc.picker = pickerState{active: true, cwd: root, home: root, anchor: -1, inBuf: map[string]bool{}}
 	sc.loadPickerDir()
 
@@ -250,13 +207,11 @@ func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	if done.err != nil {
 		t.Fatalf("upload failed: %v", done.err)
 	}
-	want := []string{"announce", "init", "PUT", "confirm", "complete"}
-	if strings.Join(calls, ",") != strings.Join(want, ",") {
-		t.Fatalf("wire sequence = %v; want %v", calls, want)
-	}
-	if announced.Size != int64(len(fileBody)) || announced.Filename != "payload.bin" ||
-		len(announced.Sha256) != 64 {
-		t.Fatalf("announce payload wrong: %+v", announced)
+	// No live data channel in this test, so the small file went as ONE
+	// self-contained box (streaming meta/chunk/complete frames share a
+	// msgId and would overwrite each other in the msgId-keyed inbox).
+	if n := inboxDeposits(fs, "alice"); n != 1 {
+		t.Fatalf("inbox deposits = %d; want 1 (single self-contained box)", n)
 	}
 
 	// Success annotates the transcript in the room bucket.
@@ -324,8 +279,8 @@ func TestUploadLocalGuards(t *testing.T) {
 
 	job := uploadJob{Path: big}
 	prog := make(chan uploadProgressMsg, 8) // left open; sends are select-defaulted
-	client := newChatClient(srv.URL, "123456", "bob")
-	if _, _, _, err := runSessionUpload(context.Background(), client, "bob", job, prog); err == nil {
+	eng := newEngine("bob", mustTestIdentity(t), &signalClient{serverURL: srv.URL, key: "123456", me: "bob"}, engineCallbacks{})
+	if _, _, err := runSessionUpload(context.Background(), eng, job, prog); err == nil {
 		t.Fatal("oversize upload must fail locally")
 	}
 	if hitServer {
@@ -334,49 +289,43 @@ func TestUploadLocalGuards(t *testing.T) {
 
 	empty := filepath.Join(t.TempDir(), "empty.txt")
 	os.WriteFile(empty, nil, 0o644)
-	if _, _, _, err := runSessionUpload(context.Background(), client, "bob", uploadJob{Path: empty}, prog); err == nil {
+	if _, _, err := runSessionUpload(context.Background(), eng, uploadJob{Path: empty}, prog); err == nil {
 		t.Fatal("empty upload must fail locally")
 	}
 }
 
-// Receiver side: unseen UPLOADED room files paint announcements; own files,
-// duplicates and non-UPLOADED statuses never do.
-func TestApplyRoomFilesAnnounces(t *testing.T) {
-	c := newFilterScreen("bob", "")
-	c.filesSeen = map[string]bool{}
-	files := []sessionFile{
-		{FileId: "f1", Username: "alice", Filename: "report.pdf", Size: 2400000, Status: "UPLOADED", UploadedAt: "2026-08-26T01:00:00Z"},
-		{FileId: "f2", Username: "bob", Filename: "mine.zip", Size: 10, Status: "UPLOADED", UploadedAt: "2026-08-26T01:01:00Z"},
-		{FileId: "f3", Username: "alice", Filename: "again.pdf", Size: 5, Status: "ANNOUNCED", UploadedAt: "2026-08-26T01:02:00Z"},
+// mustTestIdentity mints an engine identity (test-only; never touches disk).
+func mustTestIdentity(t *testing.T) *identityKey {
+	t.Helper()
+	id, err := generateIdentity()
+	if err != nil {
+		t.Fatal(err)
 	}
-	c.applyRoomFiles(files)
-	var lines []string
-	for _, ll := range c.localLines {
-		if ll.kind == lineFileCard && ll.fileData != nil {
-			lines = append(lines, ll.fileData.filename)
-		} else {
-			lines = append(lines, ll.text)
+	return id
+}
+
+// Receiver side: an arrived file paints one attachment card and is recorded
+// for the /download drawer.
+func TestNetFileMsgPaintsCard(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	sc := m.(chatScreen)
+	nm, _ := sc.Update(netFileMsg{file: engineFile{
+		MsgId: "f1", From: "alice", To: "", Filename: "report.pdf", Size: 2400000, Path: "/tmp/report.pdf",
+	}})
+	got := nm.(chatScreen)
+	found := false
+	for _, ll := range got.localLines {
+		if ll.kind == lineFileCard && ll.fileData != nil && ll.fileData.filename == "report.pdf" {
+			found = true
 		}
 	}
-	joined := strings.Join(lines, "|")
-	if !strings.Contains(joined, "report.pdf") {
-		t.Fatalf("missing alice announcement: %v", lines)
+	if !found {
+		t.Fatalf("no file card painted: %+v", got.localLines)
 	}
-	if strings.Contains(joined, "mine.zip") || strings.Contains(joined, "again.pdf") {
-		t.Fatalf("own or unannounced file leaked: %v", lines)
-	}
-	// Cursor advances only over PAINTED uploads: skipping ANNOUNCED rows
-	// must not move it, or their later completion (which bumps uploadedAt)
-	// would fall behind the watermark and never be announced.
-	if c.lastFilesAt != "2026-08-26T01:01:00Z" {
-		t.Fatalf("cursor = %q; want newest UPLOADED uploadedAt", c.lastFilesAt)
-	}
-
-	// Re-delivery of the same fileId must not duplicate the line.
-	before := len(c.localLines)
-	c.applyRoomFiles(files[:1])
-	if len(c.localLines) != before {
-		t.Fatal("duplicate fileId painted twice")
+	if len(got.received) != 1 || got.received[0].path != "/tmp/report.pdf" {
+		t.Fatalf("received not recorded: %+v", got.received)
 	}
 }
 
@@ -420,21 +369,18 @@ func TestKeyboardPeerCycleAndOpen(t *testing.T) {
 	_ = cmd // backlog fetch may be non-nil; harmless here
 }
 
-func newFilesDrawer(t *testing.T, files []sessionFile) chatScreen {
+func newFilesDrawer(t *testing.T, files []receivedFile) chatScreen {
 	t.Helper()
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
+	c.received = files
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	sc := m.(chatScreen)
-	sc.picker = pickerState{
-		active: true, mode: modeFiles, home: ".", anchor: -1,
-		inBuf: map[string]bool{},
-	}
-	sc.applyFilesList(files)
+	sc.openFilesDrawer()
 	return sc
 }
 
-// The /download listing shows only UPLOADED files, most recent first.
+// The /download listing shows received files, most recent first.
 func TestFilesDrawerSortsRecentFirst(t *testing.T) {
 	c := newPaletteScreen()
 	c, _ = typeKeys(c, "/download")
@@ -443,132 +389,90 @@ func TestFilesDrawerSortsRecentFirst(t *testing.T) {
 		t.Fatal("/download must open the files drawer")
 	}
 
-	got.applyFilesList([]sessionFile{
-		{FileId: "old", Filename: "old.txt", Username: "alice", Size: 5, Status: "UPLOADED", UploadedAt: "2026-08-26T01:00:00Z"},
-		{FileId: "new", Filename: "new.txt", Username: "bob", Size: 6, Status: "UPLOADED", UploadedAt: "2026-08-26T03:00:00Z"},
-		{FileId: "pend", Filename: "pending.txt", Username: "carol", Size: 7, Status: "ANNOUNCED", UploadedAt: "2026-08-26T04:00:00Z"},
-	})
+	old := time.Now().Add(-time.Hour)
+	newer := time.Now()
+	got.received = []receivedFile{
+		{filename: "old.txt", from: "alice", size: 5, path: "/tmp/old.txt", at: old},
+		{filename: "new.txt", from: "bob", size: 6, path: "/tmp/new.txt", at: newer},
+	}
+	got.openFilesDrawer()
 	var order []string
 	for _, f := range got.picker.files {
-		order = append(order, f.Filename)
+		order = append(order, f.filename)
 	}
 	if strings.Join(order, ",") != "new.txt,old.txt" {
-		t.Fatalf("listing = %v; want newest first, ANNOUNCED excluded", order)
+		t.Fatalf("listing = %v; want newest first", order)
 	}
 	if !strings.Contains(got.View(), "shared files — 2") {
 		t.Fatal("breadcrumb must show the count")
 	}
 }
 
-// Enter on a row in a private conversation downloads it directly.
-func TestFilesDrawerEnterDownloads(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-
-	payload := []byte("shared bytes for download")
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/download/fid-9"):
-			fmt.Fprint(w, `{"downloadUrl":"`+srv.URL+`/blob"}`)
-		case r.URL.Path == "/blob":
-			w.Write(payload)
-		default:
-			http.Error(w, "unexpected "+r.URL.Path, 404)
-		}
-	}))
-	defer srv.Close()
-
+// Enter on a row opens the detail window (files arrive complete; the
+// detail shows metadata plus the save location).
+func TestFilesDrawerEnterOpensDetail(t *testing.T) {
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
-	c.targetUser = "alice" // simulate private conversation
+	c.targetUser = "alice" // private conversation changes nothing now
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	sc := m.(chatScreen)
-	sc.client = c.client
 	sc.targetUser = "alice"
-	sc = newFilesDrawerAt(sc, []sessionFile{
-		{FileId: "fid-9", Filename: "grab.bin", Size: int64(len(payload)), Status: "UPLOADED"},
+	sc = newFilesDrawerAt(sc, []receivedFile{
+		{filename: "grab.bin", from: "alice", size: 25, path: "/tmp/grab.bin", at: time.Now()},
 	})
 
-	// Cursor sits on row 0; Enter downloads directly in private conversation.
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyEnter})
-	for _, msg := range drainCmds(cmd) {
-		sc, _ = step(sc, msg)
+	// Cursor sits on row 0; Enter opens detail (previously: downloaded).
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyEnter})
+	if !sc.picker.isActive() || sc.picker.mode != modeDetail {
+		t.Fatal("Enter must open the detail window")
 	}
-	data, err := os.ReadFile(filepath.Join(tmpHome, "Downloads", "grab.bin"))
-	if err != nil {
-		t.Fatalf("downloaded file missing: %v", err)
+	if sc.picker.detailFile == nil || sc.picker.detailFile.filename != "grab.bin" {
+		t.Fatalf("wrong detail file: %+v", sc.picker.detailFile)
 	}
-	if !bytes.Equal(data, payload) {
-		t.Fatal("downloaded bytes differ")
-	}
-	found := false
-	for _, ll := range sc.localLines {
-		if strings.Contains(ll.text, "saved grab.bin") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("missing save confirmation line: %v", sc.localLines)
+	// Enter again returns to the list.
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyEnter})
+	if sc.picker.mode != modeFiles {
+		t.Fatal("second Enter must return to the list")
 	}
 }
 
 // newFilesDrawerAt reuses an already-wired screen for pipeline tests.
-func newFilesDrawerAt(sc chatScreen, files []sessionFile) chatScreen {
+func newFilesDrawerAt(sc chatScreen, files []receivedFile) chatScreen {
 	sc.picker = pickerState{
 		active: true, mode: modeFiles, home: ".", anchor: -1,
+		files: files,
 		inBuf: map[string]bool{},
 	}
-	sc.applyFilesList(files)
+	sc.picker.clampCursor()
 	return sc
 }
 
-// Space buffers several, ^D downloads them sequentially.
-func TestFilesDrawerBufferedMultiDownload(t *testing.T) {
-	tmpHome := t.TempDir()
-	t.Setenv("HOME", tmpHome)
-
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/download/id") {
-			name := filepath.Base(r.URL.Path)
-			fmt.Fprint(w, `{"downloadUrl":"`+srv.URL+`/blob/`+name+`"}`)
-			return
-		}
-		if strings.HasPrefix(r.URL.Path, "/blob/") {
-			w.Write([]byte("data-of-" + filepath.Base(r.URL.Path)))
-			return
-		}
-		http.Error(w, "unexpected", 404)
-	}))
-	defer srv.Close()
-
+// Files mode is read-only: Space buffers nothing, Ctrl+Enter just closes.
+func TestFilesModeReadOnly(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	sc := m.(chatScreen)
-	sc.client = c.client
-	sc = newFilesDrawerAt(sc, []sessionFile{
-		{FileId: "id1", Filename: "one.txt", Size: 12, Status: "UPLOADED"},
-		{FileId: "id2", Filename: "two.txt", Size: 12, Status: "UPLOADED"},
+	sc = newFilesDrawerAt(sc, []receivedFile{
+		{filename: "one.txt", from: "alice", size: 12, path: "/tmp/one.txt", at: time.Now()},
+		{filename: "two.txt", from: "alice", size: 12, path: "/tmp/two.txt", at: time.Now()},
 	})
 
-	// Buffer both rows via space, then ^⏎ (Ctrl+Enter).
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
-	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyDown})
-	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
+	if len(sc.picker.buffered) != 0 {
+		t.Fatal("Space must not buffer in files mode")
+	}
+	if sc.picker.notice == "" {
+		t.Fatal("expected an explanatory notice")
+	}
 	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlJ})
-	sc = pump(sc, cmd)
-	for name, id := range map[string]string{"one.txt": "id1", "two.txt": "id2"} {
-		data, err := os.ReadFile(filepath.Join(tmpHome, "Downloads", name))
-		if err != nil {
-			t.Fatalf("%s missing: %v", name, err)
-		}
-		if string(data) != "data-of-"+id {
-			t.Fatalf("%s content wrong: %q", name, data)
-		}
+	_ = cmd
+	if sc.picker.isActive() {
+		t.Fatal("Ctrl+Enter must close the read-only drawer")
+	}
+	// Upload buffer untouched by the files drawer.
+	if len(sc.uploadBuf) != 0 {
+		t.Fatal("files drawer must not pollute the upload buffer")
 	}
 }
 

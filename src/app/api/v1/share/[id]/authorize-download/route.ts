@@ -26,7 +26,9 @@ export async function POST(
     const body = await req.json().catch(() => ({}));
     const { password, preview } = body;
 
-    const clientIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    // B8 FIX: Split x-forwarded-for by comma and take the first entry.
+    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
     const ipHash = anonymizeIp(clientIp);
 
     const db = await getDb();
@@ -37,35 +39,36 @@ export async function POST(
       return apiError("Share not found", 404);
     }
 
-    // 1. Rate Limiting check
-    const rateLimitKey = `rate:download:${ipHash}:${share.shareId}`;
-    const attemptsStr = await redis.get(rateLimitKey);
-    const attempts = typeof attemptsStr === "string" ? parseInt(attemptsStr, 10) : 0;
-    if (attempts > 5) {
+    // 1. Rate Limiting check.
+    // B42 FIX: password failures and public authorizes use SEPARATE keys.
+    // Previously both shared one counter with a threshold of 5, so ~6
+    // concurrent legitimate authorizes on a public share tripped the
+    // "too many failed attempts" lockout. Failure budget stays tight (5);
+    // public throughput gets its own generous window (120 / 5 min).
+    const failKey = `rate:download:fail:${ipHash}:${share.shareId}`;
+    const failStr = await redis.get(failKey);
+    const failures = typeof failStr === "string" ? parseInt(failStr, 10) : 0;
+    if (failures > 5) {
       return apiError("Too many failed attempts. Locked out for 5 minutes.", 429);
     }
 
     if (!share.passwordHash) {
-      const currentAttempts = await redis.incr(rateLimitKey);
-      if (currentAttempts === 1) {
-        await redis.expire(rateLimitKey, 300); // 5-minute window
+      const pubKey = `rate:download:pub:${ipHash}:${share.shareId}`;
+      try {
+        const hits = await redis.incr(pubKey);
+        if (hits === 1) await redis.expire(pubKey, 300);
+        if (hits > 120) {
+          return apiError("Too many download requests. Locked out for 5 minutes.", 429);
+        }
+      } catch (limiterErr) {
+        console.warn("public download rate-limiter unavailable; failing open:", limiterErr);
       }
-    }
-
-    // 2. Class B Operation Quota check (Milestone 5)
-    try {
-      const classBApproved = await consumeClassBQuota();
-      if (!classBApproved) {
-        return apiError("Service is temporarily unavailable due to operations quota limit exhaustion.", 503);
-      }
-    } catch (quotaErr) {
-      console.error("Fail-closed: Class B quota check error:", quotaErr);
-      return apiError("Service is temporarily unavailable due to system quota validation failure.", 503);
     }
 
     const now = new Date();
 
-    // Check expiration
+    // 2. Expiry and status check (before password verification so dead links
+    //    fail fast without burning a password attempt).
     if (new Date(share.expiresAt) < now || share.status === "EXPIRED") {
       if (share.status !== "EXPIRED" && share.status !== "DELETED" && share.status !== "PENDING_DELETE") {
         await db.collection("shares").updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
@@ -77,7 +80,9 @@ export async function POST(
       return apiError(`This share link is not active (${share.status})`, 400);
     }
 
-    // 3. Password Verification
+    // 3. Password Verification (before any quota spend: failed guesses must
+    //    not burn Class B operations — otherwise an attacker can exhaust the
+    //    daily R2 budget with wrong passwords).
     if (share.passwordHash) {
       if (!password) {
         return NextResponse.json(
@@ -87,16 +92,16 @@ export async function POST(
       }
       const isPasswordValid = await verifyPassword(password, share.passwordHash);
       if (!isPasswordValid) {
-        const attempts = await redis.incr(rateLimitKey);
+        const attempts = await redis.incr(failKey);
         if (attempts === 1) {
-          await redis.expire(rateLimitKey, 300); // 5-minute window
+          await redis.expire(failKey, 300); // 5-minute window
         }
         return NextResponse.json(
           { error: "Incorrect password", passwordRequired: true },
           { status: 401 }
         );
       }
-      await redis.del(rateLimitKey);
+      await redis.del(failKey);
     }
 
     // 4. Atomic Download Counter and Limit Check
@@ -136,7 +141,20 @@ export async function POST(
       }
     }
 
-    // 5. Generate Presigned GET URL
+    // 5. Class B Operation Quota check — placed AFTER auth, expiry, and
+    //    limit checks so failed guesses, dead links, and exhausted shares
+    //    never spend R2 operations budget (B38).
+    try {
+      const classBApproved = await consumeClassBQuota();
+      if (!classBApproved) {
+        return apiError("Service is temporarily unavailable due to operations quota limit exhaustion.", 503);
+      }
+    } catch (quotaErr) {
+      console.error("Fail-closed: Class B quota check error:", quotaErr);
+      return apiError("Service is temporarily unavailable due to system quota validation failure.", 503);
+    }
+
+    // 6. Generate Presigned GET URL
     const downloadUrlExpiry = 3600; // 1h expiry for download link
     const downloadUrl = await getPresignedDownloadUrl(
       share.objectKey,
@@ -170,9 +188,9 @@ export async function POST(
       await performCleanup().catch(err => console.error("Background cleanup failed:", err));
     });
 
-    if (!share.passwordHash) {
-      await redis.del(rateLimitKey);
-    }
+    // (No redis.del here: public authorizes consume from their own fixed
+    // window, which expires on its own. Deleting on success is what caused
+    // the old shared counter to never accumulate — see B42.)
 
     return NextResponse.json({
       downloadUrl,
@@ -184,7 +202,6 @@ export async function POST(
     });
   } catch (error: unknown) {
     console.error("Error in POST /api/v1/share/[id]/authorize-download:", error);
-    const errMsg = error instanceof Error ? error.message : "Internal Server Error";
-    return apiError(errMsg, 500);
+    return apiError("Internal server error", 500);
   }
 }

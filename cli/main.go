@@ -112,8 +112,14 @@ func main() {
 		}
 		if lm, ok := fm.(landingModel); ok && lm.result != nil {
 			r := lm.result
-			// transition directly into chat
-			runChat(serverURL, r.Key, r.Username, false)
+			// transition directly into chat (identity reloads inside;
+			// same device key the landing flow just advertised)
+			id, err := loadOrCreateIdentity()
+			if err != nil {
+				fmt.Printf("device identity unavailable: %v\n", err)
+				os.Exit(1)
+			}
+			runChat(serverURL, r.Key, r.Username, id, r.Password)
 			return
 		}
 		return
@@ -497,7 +503,12 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			return "", "", "", 0, fmt.Errorf("E2EE encryption stream: %w", err)
 		}
 		filePath = tempEncFile.Name()
-		fileInfo, _ = os.Stat(filePath)
+		// B55 FIX: check the stat error. The old `fileInfo, _ = os.Stat`
+		// left fileInfo nil on failure, panicking at fileInfo.Size() below.
+		fileInfo, err = os.Stat(filePath)
+		if err != nil {
+			return "", "", "", 0, fmt.Errorf("E2EE temp file stat: %w", err)
+		}
 	}
 
 	file, err := os.Open(filePath)
@@ -1389,7 +1400,9 @@ func handleReceive(args []string) {
 			printer.Print(written)
 		})
 	} else {
-		downloadResp, err := http.Get(authData.DownloadUrl)
+		// B54 FIX: same bounded client for the non-resumable fallback path,
+		// which previously used timeout-less http.Get.
+		downloadResp, err := downloadHTTPClient.Get(authData.DownloadUrl)
 		if err != nil {
 			fmt.Printf("✗ Error: Downloading file failed: %v\n", err)
 			os.Exit(1)

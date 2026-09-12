@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -173,14 +174,61 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 	ti.Focus()
 	ti.CharLimit = 500
 	return &chatScreen{
-		me:         me,
-		targetUser: target,
-		users:      users,
-		rendered:   map[int]bool{},
-		unread:     map[string]int{},
-		lastDMAt:   map[string]time.Time{},
-		input:      ti,
+		me:          me,
+		targetUser:  target,
+		users:       users,
+		rendered:    map[int]bool{},
+		renderCache: map[int]string{},
+		tsCache:     map[int]time.Time{},
+		wrapCache:   map[string]string{},
+		unread:      map[string]int{},
+		lastDMAt:    map[string]time.Time{},
+		input:       ti,
 	}
+}
+
+// wireTestEngine attaches a live signal client + engine (backed by srv, a
+// fake signaling server) to a bare screen, joins me and every peer, and
+// seeds the engine roster. Returns peer pubkeys keyed by username for
+// assertions that need them.
+func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string, peers ...string) map[string]string {
+	t.Helper()
+	id, err := generateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := &signalClient{serverURL: srv.URL, me: me}
+	// First user creates the room; if it already exists (shared server),
+	// fall back to joining it.
+	if sid, err := sig.createRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); err == nil {
+		sig.key = sid
+	} else if _, jerr := sig.joinRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); jerr != nil {
+		t.Fatalf("create/join %s: %v / %v", me, err, jerr)
+	} else {
+		sig.key = "123456"
+	}
+	pubkeys := map[string]string{}
+	for _, p := range peers {
+		pid, err := generateIdentity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pk := base64.StdEncoding.EncodeToString(pid.publicKey())
+		psig := &signalClient{serverURL: srv.URL, key: "123456", me: p}
+		if _, err := psig.joinRoom(p, pk, ""); err != nil {
+			t.Fatalf("join %s: %v", p, err)
+		}
+		pubkeys[p] = pk
+	}
+	c.sig = sig
+	c.eng = newEngine(me, id, sig, engineCallbacks{})
+	c.netCh = make(chan tea.Msg, 256)
+	roster := []rosterMember{}
+	for u, pk := range pubkeys {
+		roster = append(roster, rosterMember{Username: u, Pubkey: pk, Online: true})
+	}
+	c.eng.setRoster(roster)
+	return pubkeys
 }
 
 // Visibility is now purely conversational; see chat_conv_test.go for the
@@ -497,8 +545,10 @@ func maxLineWidth(s string) int {
 
 // ---------------------------------------------------------------------------
 // Wire-level send integration: Update(Enter) must produce a command whose
-// invocation performs the HTTP POST. Regression for the silent-send bug where
-// the optimistic echo painted but no request ever left the process.
+// invocation performs the inbox deposit. Regression for the silent-send bug
+// where the optimistic echo painted but no request ever left the process.
+// Bodies are sealed E2E boxes (opaque by design); assertions count deposits
+// and check routing fields, never plaintext.
 // ---------------------------------------------------------------------------
 
 func newFakeChatServer(t *testing.T, got *[][]byte) *httptest.Server {
@@ -517,14 +567,20 @@ func newFakeChatServer(t *testing.T, got *[][]byte) *httptest.Server {
 	}))
 }
 
+func inboxDeposits(fs *fakeSignalServer, user string) int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return len(fs.boxes["123456/"+user])
+}
+
 func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 
 	model, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter, Runes: []rune{}})
@@ -547,8 +603,8 @@ func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
 	if !ok {
 		t.Fatalf("send cmd yielded %T; want sendDoneMsg", msg)
 	}
-	if len(received) != 1 || !strings.Contains(string(received[0]), "hello") {
-		t.Fatalf("wire payload wrong: %v", received)
+	if inboxDeposits(fs, "alice") != 1 {
+		t.Fatal("broadcast must deposit exactly one box for the single peer")
 	}
 
 	// Feed the confirmation back through Update; echo must resolve.
@@ -570,13 +626,13 @@ func TestUpdateEnterActuallySendsOverWire(t *testing.T) {
 }
 
 func TestOutboxPromotionGoesOverWire(t *testing.T) {
-	var received [][]byte
-	srv := newFakeChatServer(t, &received)
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
 	defer srv.Close()
 
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
-	c.client = newChatClient(srv.URL, "123456", "bob")
+	wireTestEngine(t, c, srv, "bob", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
 	scr := m.(chatScreen)
 
@@ -626,12 +682,108 @@ func TestOutboxPromotionGoesOverWire(t *testing.T) {
 	if promo3 != nil {
 		t.Fatal("spurious promotion after last message")
 	}
-	if len(received) != 3 {
-		t.Fatalf("wire saw %d posts; want 3 (%v)", len(received), received)
+	// Three sends → three inbox boxes for the peer. Payloads are sealed
+	// boxes (opaque); counting deposits proves the pipeline drained.
+	if inboxDeposits(fs, "alice") != 3 {
+		t.Fatalf("wire saw %d deposits; want 3", inboxDeposits(fs, "alice"))
 	}
-	for i, want := range []string{"one", "two", "three"} {
-		if !strings.Contains(string(received[i]), want) {
-			t.Errorf("post %d = %q; want %q", i, received[i], want)
+}
+
+// History and received-files stay bounded in marathon sessions.
+func TestTranscriptBounds(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	// Pre-fill directly (bypassing per-add rebuilds) then trigger ONE trim.
+	for i := 0; i < maxHistory+100; i++ {
+		c.history = append(c.history, chatMessage{Seq: i, Username: "alice", Kind: "chat", Text: "x", ConvID: generalConv})
+		c.rendered[i] = true
+	}
+	c.addMessage(chatMessage{Seq: maxHistory + 100, Username: "alice", Kind: "chat", Text: "y", ConvID: generalConv})
+	if len(c.history) != maxHistory {
+		t.Fatalf("history = %d; want cap %d", len(c.history), maxHistory)
+	}
+	if len(c.rendered) != maxHistory {
+		t.Fatalf("rendered = %d; want cap %d", len(c.rendered), maxHistory)
+	}
+	// Oldest fell off; newest retained.
+	if c.history[0].Seq != 101 || c.history[len(c.history)-1].Seq != maxHistory+100 {
+		t.Fatal("trim kept the wrong window")
+	}
+}
+
+// Render caches must hold: a few hundred live adds stay fast. This fails if
+// cache invalidation ever regresses (e.g. clearing every rebuild), which
+// once made this suite take 8+ minutes.
+func TestRebuildStaysFast(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(120, 30)
+	start := time.Now()
+	for i := 0; i < 300; i++ {
+		c.addMessage(chatMessage{Seq: i, Username: "alice", Kind: "chat", Text: "hello world test message", ConvID: generalConv})
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("300 adds took %v; render caches likely broken", elapsed)
+	}
+}
+
+func TestReceivedFilesBound(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	sc := m.(chatScreen)
+	for i := 0; i < maxReceivedFiles+10; i++ {
+		nm, _ := sc.Update(netFileMsg{file: engineFile{MsgId: "m", From: "alice", Filename: "f.txt", Size: 1, Path: "/tmp/f"}})
+		sc = nm.(chatScreen)
+	}
+	if len(sc.received) != maxReceivedFiles {
+		t.Fatalf("received = %d; want cap %d", len(sc.received), maxReceivedFiles)
+	}
+}
+
+// The engine->Update bridge must be self-perpetuating: a one-shot drain
+// would strand all later engine traffic in netCh forever (the TUI would go
+// deaf while plain mode kept working — exactly the failure this guards).
+// Proof obligation: EVERY pump outcome re-arms the next pump cycle.
+func TestDrainPumpSelfPerpetuating(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.netCh = make(chan tea.Msg, 4)
+
+	// Empty channel: pump yields netIdleMsg promptly (bounded wait).
+	got := c.drainNetCmd()()
+	if _, ok := got.(netIdleMsg); !ok {
+		t.Fatalf("idle pump yielded %T; want netIdleMsg", got)
+	}
+
+	// Queued event: pump delivers it.
+	c.netCh <- netChatMsg{chat: engineChat{MsgId: "m", From: "a", Text: "hi"}}
+	got = c.drainNetCmd()()
+	if _, ok := got.(netChatMsg); !ok {
+		t.Fatalf("pump yielded %T; want netChatMsg", got)
+	}
+
+	// Every pump outcome, fed through Update, must schedule the next cycle.
+	// (netChatMsg also schedules its ACK closure; Batch is non-nil either way.)
+	for _, msg := range []tea.Msg{
+		netIdleMsg{},
+		netChatMsg{chat: engineChat{MsgId: "m2", From: "a", Text: "x"}},
+		netFileMsg{file: engineFile{MsgId: "f1", From: "a", Filename: "x", Size: 1, Path: "/tmp/x"}},
+		netFileErrMsg{msgId: "f", from: "a", reason: "r"},
+		netReadyMsg{user: "a", code: "c"},
+		netLostMsg{user: "a"},
+		netErrMsg{err: errTestSink},
+	} {
+		if _, cmd := c.Update(msg); cmd == nil {
+			t.Fatalf("Update(%T) did not re-arm the pump", msg)
 		}
 	}
 }
+
+var errTestSink = errTestSinkNew()
+
+func errTestSinkNew() error {
+	return errTestSinkVal{}
+}
+
+type errTestSinkVal struct{}
+
+func (errTestSinkVal) Error() string { return "sink" }

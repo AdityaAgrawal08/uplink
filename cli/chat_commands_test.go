@@ -168,16 +168,16 @@ func TestPaletteNavigationAndTabCompletes(t *testing.T) {
 	down := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown}); return m.(chatScreen) }
 	up := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyUp}); return m.(chatScreen) }
 
-	// Ranked "" = [/delete, /download, /help, /upload]; down lands on /download, up
-	// returns to the top (= /delete).
+	// Ranked "" = [/download, /help, /upload]; down lands on /help, up
+	// returns to the top (= /download).
 	c = down(c)
 	if got := c.input.Value(); got != "/" || c.palette.sel != 1 {
 		t.Fatalf("down did not move to second row: input=%q sel=%d", got, c.palette.sel)
 	}
 	c = up(c)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyTab})
-	if got := c.input.Value(); got != "/delete " {
-		t.Fatalf("tab completion gave %q; want \"/delete \"", got)
+	if got := c.input.Value(); got != "/download " {
+		t.Fatalf("tab completion gave %q; want \"/download \"", got)
 	}
 	if c.palette.visible() {
 		t.Fatal("tab completion must close the drawer")

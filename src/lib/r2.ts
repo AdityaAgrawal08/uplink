@@ -249,7 +249,10 @@ export async function completeMultipartUpload(
   uploadId: string,
   parts: PartInfo[]
 ): Promise<{ etag?: string; checksumCrc64nvme?: string; error?: string }> {
-  if (!s3Client) {
+  // B2 FIX: Use isMockStorage() instead of !s3Client to be consistent with
+  // every other function in this file. When FORCE_MOCK_STORAGE=true but
+  // s3Client is non-null, !s3Client would incorrectly try to use real S3.
+  if (isMockStorage()) {
     const localPath = path.join(process.cwd(), "uploads_dev", objectKey);
     const dir = path.dirname(localPath);
     if (!fs.existsSync(dir)) {
@@ -290,6 +293,13 @@ export async function completeMultipartUpload(
       const errMsg = err instanceof Error ? err.message : "Failed to write assembled mock file";
       return { error: errMsg };
     }
+  }
+
+  // B2 FIX: isMockStorage() covers both the null-client case and the
+  // FORCE_MOCK_STORAGE flag. Guard the real path explicitly so TypeScript
+  // can narrow s3Client to non-null.
+  if (!s3Client) {
+    return { error: "S3 client not initialized" };
   }
 
   try {

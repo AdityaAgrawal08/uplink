@@ -28,6 +28,12 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# go build artifacts (never commit compiled binaries)
+/cli/cli
+/server/server
+*.test
+*.out
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)

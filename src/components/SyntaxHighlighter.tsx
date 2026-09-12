@@ -18,8 +18,12 @@ export default function SyntaxHighlighter({ code, language }: Props) {
   const lang = safeLanguage(language);
   let highlightedValue = "";
   try {
-    // highlight.js HTML-escapes the code content itself, making its output
-    // safe to embed once the language token is allow-listed above.
+    // B16 NOTE: highlight.js HTML-escapes the code content itself, making
+    // its output safe to embed in dangerouslySetInnerHTML. The language
+    // token is allow-listed by safeLanguage() to prevent class attribute
+    // injection. This is safe as long as hljs.highlight continues to escape
+    // HTML entities in its output (verified: hljs.highlight calls
+    // escapeHTML internally).
     const result = hljs.highlight(code, { language: lang });
     highlightedValue = `<pre class="hljs"><code class="language-${lang}">${result.value}</code></pre>`;
   } catch {

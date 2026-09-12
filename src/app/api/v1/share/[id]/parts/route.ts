@@ -20,16 +20,23 @@ export async function GET(
     const { id } = await props.params;
     const db = await getDb();
 
+    // B6 FIX: Require uploadId as proof of ownership. Previously anyone who
+    // knew a shareId could enumerate upload parts without authentication.
+    const uploadIdParam = req.nextUrl.searchParams.get("uploadId");
+    if (!uploadIdParam) {
+      return NextResponse.json({ error: "uploadId query parameter is required" }, { status: 401 });
+    }
+
     // 1. Find the share
     const share = await db.collection("shares").findOne({ $or: [{ shareId: id }, { downloadCode: id }] });
     if (!share) {
       return NextResponse.json({ error: "Share not found" }, { status: 404 });
     }
 
-    // 2. Find the upload session
-    const session = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
+    // 2. Find the upload session — must match the provided uploadId
+    const session = await db.collection("upload_sessions").findOne({ shareId: share.shareId, uploadId: uploadIdParam });
     if (!session) {
-      return NextResponse.json({ error: "Upload session not found" }, { status: 404 });
+      return NextResponse.json({ error: "Upload session not found or uploadId mismatch" }, { status: 404 });
     }
 
     let parts: ResponsePart[] = [];

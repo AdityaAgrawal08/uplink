@@ -1,0 +1,51 @@
+# GoReleaser: one config builds, signs, and publishes everything the
+# install link needs — per-OS/arch binaries, checksums.txt (verified by
+# install.sh / install.ps1), and Homebrew/Scoop manifests.
+version: 2
+
+project_name: uplink
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: uplink-cli
+    main: ./cli
+    binary: uplink
+    goos: [linux, windows, darwin]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: uplink-archives
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: []
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# NOTE: GPG signing (signs:) and package-manager taps (brews:, scoops:)
+# are intentionally absent: they need secrets and tap repos that don't
+# exist yet. Add them when ready — install.sh, install.ps1, and
+# `uplink update` all verify checksums.txt, which this file publishes.
+# Homebrew/Scoop users can still install via the one-link scripts until
+# the taps land.
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
