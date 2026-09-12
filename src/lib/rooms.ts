@@ -7,7 +7,7 @@ import { anonymizeIp } from "./crypto";
 // Rooms live in Redis ONLY. There is no permanent record: a room exists from
 // creation until its last member leaves, plus a sliding 24h TTL as a safety
 // net against crashed clients that never send leave. Member rosters carry
-// each device's long-lived Ed25519 public key so peers can E2E-encrypt
+// each device's long-lived X25519 static public key so peers can E2E-encrypt
 // without any global key directory (code-only rooms need nothing else).
 //
 // Key layout:
@@ -90,7 +90,7 @@ export function assertRoomCode(code: unknown): asserts code is string {
   }
 }
 
-// Ed25519 public keys are 32 bytes; clients send base64.
+// X25519 static public keys are 32 bytes; clients send base64.
 export function assertPubkey(pubkey: unknown): asserts pubkey is string {
   if (typeof pubkey !== "string" || pubkey.length === 0 || pubkey.length > 128) {
     throw new RoomError(400, "Identity public key is required");
@@ -102,7 +102,7 @@ export function assertPubkey(pubkey: unknown): asserts pubkey is string {
     throw new RoomError(400, "Identity public key must be base64");
   }
   if (raw.length !== 32) {
-    throw new RoomError(400, "Identity public key must decode to 32 bytes (Ed25519)");
+    throw new RoomError(400, "Identity public key must decode to 32 bytes (X25519 static)");
   }
 }
 
