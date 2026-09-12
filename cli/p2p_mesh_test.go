@@ -53,6 +53,30 @@ func (p *meshProbe) callbacks() meshCallbacks {
 	}
 }
 
+// pumpNotes simulates the engine's single signal poll loop: drain my queue,
+// forward offer/answer notes into the mesh. Runs until stop closes.
+func pumpNotes(sig *signalClient, m *mesh, stop <-chan struct{}, t *testing.T) {
+	t.Helper()
+	go func() {
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				notes, err := sig.signalPoll()
+				if err != nil {
+					continue
+				}
+				for _, n := range notes {
+					m.deliver(n)
+				}
+			}
+		}
+	}()
+}
+
 func waitUp(t *testing.T, p *meshProbe, peer string) {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
@@ -114,6 +138,11 @@ func TestMeshLoopback(t *testing.T) {
 
 	ma.ensurePeer("bob")
 	mb.ensurePeer("alice")
+
+	stop := make(chan struct{})
+	defer close(stop)
+	pumpNotes(sa, ma, stop, t)
+	pumpNotes(sb, mb, stop, t)
 
 	waitUp(t, pa, "bob")
 	waitUp(t, pb, "alice")

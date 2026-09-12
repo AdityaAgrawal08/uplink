@@ -53,7 +53,12 @@ type mesh struct {
 	cb       meshCallbacks
 	mu       sync.Mutex
 	peers    map[string]*meshPeer
-	closed   bool
+	// noteQs routes server-drained signaling notes to the setup goroutine
+	// waiting for them. The engine owns the ONLY signal poll loop (drain
+	// clears the server queue, so two pollers would steal each other's
+	// notes); it forwards offer/answer notes here.
+	noteQs map[string]chan signalNote
+	closed bool
 }
 
 func newMesh(me string, sig *signalClient, stun []string, cb meshCallbacks) *mesh {
@@ -66,6 +71,7 @@ func newMesh(me string, sig *signalClient, stun []string, cb meshCallbacks) *mes
 		stunURLs: stun,
 		cb:       cb,
 		peers:    map[string]*meshPeer{},
+		noteQs:   map[string]chan signalNote{},
 	}
 }
 
@@ -107,12 +113,56 @@ func (m *mesh) send(peer string, raw []byte) error {
 	return mp.dc.Send(raw)
 }
 
+// deliver routes a drained offer/answer note to the setup goroutine for
+// that peer. Only the engine calls this. Unknown or finished peers are
+// ignored; a full queue drops (setup timeout covers the loss).
+func (m *mesh) deliver(n signalNote) {
+	if n.Type != "offer" && n.Type != "answer" {
+		return
+	}
+	m.mu.Lock()
+	q, ok := m.noteQs[n.From]
+	if !ok {
+		if _, setup := m.peers[n.From]; !setup {
+			m.mu.Unlock()
+			return
+		}
+		q = make(chan signalNote, 16)
+		m.noteQs[n.From] = q
+	}
+	m.mu.Unlock()
+	select {
+	case q <- n:
+	default:
+	}
+}
+
+// dropQueue discards a peer's note queue (setup finished or failed).
+func (m *mesh) dropQueue(peer string) {
+	m.mu.Lock()
+	delete(m.noteQs, peer)
+	m.mu.Unlock()
+}
+
+// queueFor returns (creating) the routed-note queue for a peer in setup.
+func (m *mesh) queueFor(peer string) chan signalNote {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	q, ok := m.noteQs[peer]
+	if !ok {
+		q = make(chan signalNote, 16)
+		m.noteQs[peer] = q
+	}
+	return q
+}
+
 // dropPeer tears down a peer (leave, ban, or re-setup).
 func (m *mesh) dropPeer(username string) {
 	m.mu.Lock()
 	mp, ok := m.peers[username]
 	if ok {
 		delete(m.peers, username)
+		delete(m.noteQs, username)
 	}
 	m.mu.Unlock()
 	if ok {
@@ -136,6 +186,7 @@ func (m *mesh) close() {
 	m.closed = true
 	peers := m.peers
 	m.peers = map[string]*meshPeer{}
+	m.noteQs = map[string]chan signalNote{}
 	m.mu.Unlock()
 	for _, mp := range peers {
 		m.closePeer(mp)
@@ -147,6 +198,7 @@ func (m *mesh) failPeer(username string) {
 	_, ok := m.peers[username]
 	if ok {
 		delete(m.peers, username)
+		delete(m.noteQs, username)
 	}
 	m.mu.Unlock()
 	if ok {
@@ -273,27 +325,22 @@ func (m *mesh) setupOfferer(ctx context.Context, mp *meshPeer, pc *webrtc.PeerCo
 		return err
 	}
 
-	// Await the answer.
-	ticker := time.NewTicker(meshPollEvery)
-	defer ticker.Stop()
+	// Await the answer on our routed note queue (the engine is the sole
+	// signal poller; notes arrive via deliver).
+	q := m.queueFor(peer)
+	defer m.dropQueue(peer)
 	for {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("answer wait timed out")
 		case <-failed:
 			return fmt.Errorf("connection failed during setup")
-		case <-ticker.C:
-			notes, err := m.sig.signalPoll()
-			if err != nil {
-				continue // transient poll failure; keep waiting
-			}
-			for _, n := range notes {
-				if n.From == peer && n.Type == "answer" {
-					return pc.SetRemoteDescription(webrtc.SessionDescription{
-						Type: webrtc.SDPTypeAnswer,
-						SDP:  n.Payload,
-					})
-				}
+		case n := <-q:
+			if n.From == peer && n.Type == "answer" {
+				return pc.SetRemoteDescription(webrtc.SessionDescription{
+					Type: webrtc.SDPTypeAnswer,
+					SDP:  n.Payload,
+				})
 			}
 		}
 	}
@@ -308,45 +355,39 @@ func (m *mesh) setupAnswerer(ctx context.Context, mp *meshPeer, pc *webrtc.PeerC
 		}
 	})
 
-	ticker := time.NewTicker(meshPollEvery)
-	defer ticker.Stop()
+	q := m.queueFor(peer)
+	defer m.dropQueue(peer)
 	for {
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("offer wait timed out")
 		case <-failed:
 			return fmt.Errorf("connection failed during setup")
-		case <-ticker.C:
-			notes, err := m.sig.signalPoll()
-			if err != nil {
+		case n := <-q:
+			if n.From != peer || n.Type != "offer" {
 				continue
 			}
-			for _, n := range notes {
-				if n.From != peer || n.Type != "offer" {
-					continue
-				}
-				if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-					Type: webrtc.SDPTypeOffer,
-					SDP:  n.Payload,
-				}); err != nil {
-					return err
-				}
-				answer, err := pc.CreateAnswer(nil)
-				if err != nil {
-					return err
-				}
-				if err := pc.SetLocalDescription(answer); err != nil {
-					return err
-				}
-				if err := waitGatheringComplete(pc, 10*time.Second); err != nil {
-					return err
-				}
-				local := pc.LocalDescription()
-				if local == nil {
-					return fmt.Errorf("no local description")
-				}
-				return m.sig.signalSend(peer, "answer", local.SDP)
+			if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+				Type: webrtc.SDPTypeOffer,
+				SDP:  n.Payload,
+			}); err != nil {
+				return err
 			}
+			answer, err := pc.CreateAnswer(nil)
+			if err != nil {
+				return err
+			}
+			if err := pc.SetLocalDescription(answer); err != nil {
+				return err
+			}
+			if err := waitGatheringComplete(pc, 10*time.Second); err != nil {
+				return err
+			}
+			local := pc.LocalDescription()
+			if local == nil {
+				return fmt.Errorf("no local description")
+			}
+			return m.sig.signalSend(peer, "answer", local.SDP)
 		}
 	}
 }
