@@ -6,11 +6,35 @@ export interface IRedisClient {
   incr(key: string): Promise<number>;
   expire(key: string, seconds: number): Promise<number>;
   del(key: string): Promise<number>;
+  // Hash ops (rooms, members, inboxes). All values are strings.
+  hsetnx(key: string, field: string, value: string): Promise<number>;
+  hset(key: string, field: string, value: string): Promise<number>;
+  hgetall(key: string): Promise<Record<string, string> | null>;
+  hdel(key: string, ...fields: string[]): Promise<number>;
+  hlen(key: string): Promise<number>;
+  // List ops (signaling queues).
+  rpush(key: string, ...values: string[]): Promise<number>;
+  lrange(key: string, start: number, stop: number): Promise<string[]>;
+  ltrim(key: string, start: number, stop: number): Promise<string>;
+  llen(key: string): Promise<number>;
 }
 
 // Exported for unit tests (and available as a last-resort embeddable store).
 export class MockRedis implements IRedisClient {
   private store: Map<string, { value: unknown; expiry: number | null; isObject: boolean }> = new Map();
+  private hashes: Map<string, { fields: Map<string, string>; expiry: number | null }> = new Map();
+  private lists: Map<string, { items: string[]; expiry: number | null }> = new Map();
+
+  // Drop the key if its TTL passed. Returns true when the key is gone.
+  private expired(map: Map<string, { expiry: number | null }>, key: string): boolean {
+    const item = map.get(key);
+    if (!item) return true;
+    if (item.expiry && Date.now() > item.expiry) {
+      map.delete(key);
+      return true;
+    }
+    return false;
+  }
 
   async get(key: string): Promise<unknown> {
     const item = this.store.get(key);
@@ -67,15 +91,111 @@ export class MockRedis implements IRedisClient {
   }
 
   async expire(key: string, seconds: number): Promise<number> {
+    // TTLs apply to plain keys, hashes, and lists alike (room sliding expiry
+    // refreshes member/signal/inbox keys together).
+    let found = 0;
+    const expiry = Date.now() + seconds * 1000;
     const item = this.store.get(key);
-    if (!item) return 0;
-    item.expiry = Date.now() + seconds * 1000;
-    return 1;
+    if (item) {
+      item.expiry = expiry;
+      found = 1;
+    }
+    const h = this.hashes.get(key);
+    if (h) {
+      h.expiry = expiry;
+      found = 1;
+    }
+    const l = this.lists.get(key);
+    if (l) {
+      l.expiry = expiry;
+      found = 1;
+    }
+    return found;
   }
 
   async del(key: string): Promise<number> {
-    const deleted = this.store.delete(key);
-    return deleted ? 1 : 0;
+    let n = 0;
+    if (this.store.delete(key)) n++;
+    if (this.hashes.delete(key)) n++;
+    if (this.lists.delete(key)) n++;
+    return n;
+  }
+
+  // ---- hashes ----
+
+  async hsetnx(key: string, field: string, value: string): Promise<number> {
+    if (this.expired(this.hashes, key)) {
+      this.hashes.set(key, { fields: new Map(), expiry: null });
+    }
+    const h = this.hashes.get(key)!;
+    if (h.fields.has(field)) return 0;
+    h.fields.set(field, value);
+    return 1;
+  }
+
+  async hset(key: string, field: string, value: string): Promise<number> {
+    if (this.expired(this.hashes, key)) {
+      this.hashes.set(key, { fields: new Map(), expiry: null });
+    }
+    const h = this.hashes.get(key)!;
+    const isNew = h.fields.has(field) ? 0 : 1;
+    h.fields.set(field, value);
+    return isNew;
+  }
+
+  async hgetall(key: string): Promise<Record<string, string> | null> {
+    if (this.expired(this.hashes, key)) return null;
+    const h = this.hashes.get(key)!;
+    if (h.fields.size === 0) return null;
+    const out: Record<string, string> = {};
+    for (const [f, v] of h.fields) out[f] = v;
+    return out;
+  }
+
+  async hdel(key: string, ...fields: string[]): Promise<number> {
+    if (this.expired(this.hashes, key)) return 0;
+    const h = this.hashes.get(key)!;
+    let n = 0;
+    for (const f of fields) {
+      if (h.fields.delete(f)) n++;
+    }
+    return n;
+  }
+
+  async hlen(key: string): Promise<number> {
+    if (this.expired(this.hashes, key)) return 0;
+    return this.hashes.get(key)!.fields.size;
+  }
+
+  // ---- lists ----
+
+  async rpush(key: string, ...values: string[]): Promise<number> {
+    if (this.expired(this.lists, key)) {
+      this.lists.set(key, { items: [], expiry: null });
+    }
+    const l = this.lists.get(key)!;
+    l.items.push(...values);
+    return l.items.length;
+  }
+
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    if (this.expired(this.lists, key)) return [];
+    const items = this.lists.get(key)!.items;
+    const end = stop < 0 ? items.length + stop + 1 : stop + 1;
+    return items.slice(Math.max(0, start), Math.max(0, end));
+  }
+
+  async ltrim(key: string, start: number, stop: number): Promise<string> {
+    if (this.expired(this.lists, key)) return "OK";
+    const l = this.lists.get(key)!;
+    const end = stop < 0 ? l.items.length + stop + 1 : stop + 1;
+    l.items = l.items.slice(Math.max(0, start), Math.max(0, end));
+    return "OK";
+  }
+
+  async llen(key: string): Promise<number> {
+    if (this.expired(this.lists, key)) return 0;
+    return this.lists.get(key)!.items.length;
   }
 }
 
@@ -137,6 +257,42 @@ class LazyRedisClient implements IRedisClient {
 
   async del(key: string): Promise<number> {
     return this.executeWithFallback(c => c.del(key));
+  }
+
+  async hsetnx(key: string, field: string, value: string): Promise<number> {
+    return this.executeWithFallback(c => c.hsetnx(key, field, value));
+  }
+
+  async hset(key: string, field: string, value: string): Promise<number> {
+    return this.executeWithFallback(c => c.hset(key, field, value));
+  }
+
+  async hgetall(key: string): Promise<Record<string, string> | null> {
+    return this.executeWithFallback(c => c.hgetall(key));
+  }
+
+  async hdel(key: string, ...fields: string[]): Promise<number> {
+    return this.executeWithFallback(c => c.hdel(key, ...fields));
+  }
+
+  async hlen(key: string): Promise<number> {
+    return this.executeWithFallback(c => c.hlen(key));
+  }
+
+  async rpush(key: string, ...values: string[]): Promise<number> {
+    return this.executeWithFallback(c => c.rpush(key, ...values));
+  }
+
+  async lrange(key: string, start: number, stop: number): Promise<string[]> {
+    return this.executeWithFallback(c => c.lrange(key, start, stop));
+  }
+
+  async ltrim(key: string, start: number, stop: number): Promise<string> {
+    return this.executeWithFallback(c => c.ltrim(key, start, stop));
+  }
+
+  async llen(key: string): Promise<number> {
+    return this.executeWithFallback(c => c.llen(key));
   }
 }
 
