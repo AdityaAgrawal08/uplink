@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { verifyPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
+import { validateSignalingEnv } from "@/lib/env";
 import { RoomError, joinRoom, getRoomMeta } from "@/lib/rooms";
 
 export async function POST(
@@ -8,6 +9,7 @@ export async function POST(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     const { sessionId } = await props.params;
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

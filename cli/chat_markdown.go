@@ -29,11 +29,35 @@ var (
 			Bold(true)
 )
 
+// sanitizeDisplay strips terminal escape machinery from untrusted strings
+// before they are rendered. lipgloss/bubbletea pass content through, so an
+// ESC byte from a peer message or filename would otherwise execute in the
+// receiver's terminal (clear screen, title set, hidden text, hyperlink
+// injection). Removing the introducer byte is total: without ESC no
+// sequence — CSI, OSC, charset, or lone — can function; residue renders as
+// harmless visible text. BEL and other C0 controls go too, except \n and
+// \t which layout legitimately uses.
+func sanitizeDisplay(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == 0x1b || r == 0x07 {
+			return -1
+		}
+		if r < 0x20 && r != '\n' && r != '\t' {
+			return -1
+		}
+		if r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // renderMarkdown applies lightweight inline markdown to a single line of text.
 // Supports: **bold**, `inline code`, [text](url). Code blocks (multi-line)
 // are handled at the caller level via renderChatLine.
 func renderMarkdown(text string) string {
-	// Code blocks: ```lang\n...``` — render the content with code style
+	// Untrusted input first: peer messages arrive raw over the wire.
+	text = sanitizeDisplay(text)
 	if strings.HasPrefix(text, "```") {
 		// Strip the opening ```lang and closing ```
 		lines := strings.SplitN(text, "\n", 2)

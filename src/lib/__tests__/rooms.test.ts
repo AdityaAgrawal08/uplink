@@ -1,4 +1,5 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+import { redis } from "../redis";
 import {
   RoomError,
   createRoom,
@@ -124,6 +125,21 @@ describe("rooms signaling plane", () => {
     const e = new RoomError(429, "slow");
     expect(e.status).toBe(429);
     expect(e.message).toBe("slow");
+  });
+
+  // Production backend gap: real Upstash Redis returns {} (not null) for
+  // HGETALL on missing keys, while MockRedis returns null. The rooms layer
+  // must treat both as missing, or ghost rooms read as existing in prod
+  // (usernames claimable into rooms with no metadata, 404s become 403s).
+  it("treats Upstash-style empty objects as missing keys", async () => {
+    const spy = vi.spyOn(redis, "hgetall").mockResolvedValue({});
+    try {
+      expect(await roomExists("000000")).toBe(false);
+      expect(await getRoster("000000")).toEqual([]);
+      await expect(joinRoom("000000", "ghost", PUBKEY)).rejects.toMatchObject({ status: 404 });
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {

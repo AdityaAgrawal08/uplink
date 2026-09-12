@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { hashPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
+import { validateSignalingEnv } from "@/lib/env";
 import {
   RoomError,
   createRoom,
@@ -13,6 +14,7 @@ import {
 // public key so peers can E2E-encrypt with no global key directory.
 export async function POST(req: NextRequest) {
   try {
+    validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { username, pubkey, password } = parsed.body;

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
+import { validateSignalingEnv } from "@/lib/env";
 import {
   RoomError,
   depositBox,
@@ -21,6 +22,7 @@ export async function POST(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);

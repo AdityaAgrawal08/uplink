@@ -74,6 +74,16 @@ const membersKey = (code: string) => `room:${code}:members`;
 const sigKey = (code: string, username: string) => `room:${code}:sig:${username}`;
 const inboxKey = (code: string, username: string) => `room:${code}:inbox:${username}`;
 
+// hgetall normalizes backend differences: MockRedis returns null for
+// missing keys, but real Upstash Redis returns an empty object. Without
+// this, roomExists() is true for ghost rooms in production (members get
+// claimed into rooms with no metadata, 404s become 403s, sweeps leak).
+async function hgetall(key: string): Promise<Record<string, string> | null> {
+  const v = await redis.hgetall(key);
+  if (!v || Object.keys(v).length === 0) return null;
+  return v;
+}
+
 export function generateRoomCode(): string {
   return String(crypto.randomInt(0, 1000000)).padStart(6, "0");
 }
@@ -132,12 +142,12 @@ async function touchRoom(code: string): Promise<void> {
 }
 
 export async function roomExists(code: string): Promise<boolean> {
-  const meta = await redis.hgetall(roomKey(code));
+  const meta = await hgetall(roomKey(code));
   return meta !== null;
 }
 
 export async function getRoomMeta(code: string): Promise<{ passwordHash: string | null; createdAt: string } | null> {
-  const meta = await redis.hgetall(roomKey(code));
+  const meta = await hgetall(roomKey(code));
   if (!meta || typeof meta.meta !== "string") return null;
   // BUGFIX: room metadata lives under the single "meta" field (written by
   // createRoom); reading passwordHash/createdAt as top-level fields always
@@ -233,7 +243,7 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
 }
 
 export async function getRoster(code: string): Promise<MemberInfo[]> {
-  const all = await redis.hgetall(membersKey(code));
+  const all = await hgetall(membersKey(code));
   if (!all) return [];
   const out: MemberInfo[] = [];
   for (const [username, raw] of Object.entries(all)) {
@@ -245,7 +255,7 @@ export async function getRoster(code: string): Promise<MemberInfo[]> {
 }
 
 async function requireMember(code: string, username: string): Promise<Record<string, string>> {
-  const all = await redis.hgetall(membersKey(code));
+  const all = await hgetall(membersKey(code));
   if (!all) throw new RoomError(404, "Session not found");
   if (!all[username]) throw new RoomError(403, "Not in this session");
   return all;
@@ -290,7 +300,7 @@ export async function heartbeat(
 export async function leaveRoom(code: string, username: string): Promise<{ remaining: number; ended: boolean }> {
   assertRoomCode(code);
   assertUsername(username);
-  const all = await redis.hgetall(membersKey(code));
+  const all = await hgetall(membersKey(code));
   if (!all || !all[username]) {
     // Idempotent leave: already gone still reports the true count.
     const count = all ? Object.keys(all).length : 0;
@@ -312,7 +322,7 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
 }
 
 export async function destroyRoom(code: string): Promise<void> {
-  const members = (await redis.hgetall(membersKey(code))) || {};
+  const members = (await hgetall(membersKey(code))) || {};
   const keys = [roomKey(code), membersKey(code)];
   for (const username of Object.keys(members)) {
     keys.push(sigKey(code, username), inboxKey(code, username));
@@ -414,7 +424,7 @@ export async function fetchBoxes(code: string, username: string): Promise<InboxB
   assertRoomCode(code);
   assertUsername(username);
   await requireMember(code, username);
-  const all = await redis.hgetall(inboxKey(code, username));
+  const all = await hgetall(inboxKey(code, username));
   if (!all) return [];
   const out: InboxBox[] = [];
   for (const raw of Object.values(all)) {
@@ -477,12 +487,12 @@ export async function sweepRooms(): Promise<{ processed: number; prunedMembers: 
         await unindexRoom(code);
         continue;
       }
-      const meta = await redis.hgetall(roomKey(code));
+      const meta = await hgetall(roomKey(code));
       if (!meta) {
         await unindexRoom(code); // room key gone (TTL) — drop index entry
         continue;
       }
-      const members = (await redis.hgetall(membersKey(code))) || {};
+      const members = (await hgetall(membersKey(code))) || {};
       const stale: string[] = [];
       for (const [username, raw] of Object.entries(members)) {
         const m = parseMember(username, raw);

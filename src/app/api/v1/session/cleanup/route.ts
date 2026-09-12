@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { apiError } from "@/lib/api-utils";
+import { validateSignalingEnv } from "@/lib/env";
 import { sweepRooms } from "@/lib/rooms";
 
 // Cron + opportunistic trigger: prune lapsed heartbeats, destroy emptied
@@ -15,6 +16,7 @@ export async function POST() {
 
 export async function performSessionCleanup() {
   try {
+    validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     const { processed, prunedMembers, destroyed } = await sweepRooms();
     return NextResponse.json({
       message: "Session cleanup complete",

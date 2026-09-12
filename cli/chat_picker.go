@@ -982,8 +982,8 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 		}
 		f := ff[row]
 		return fmt.Sprintf("%s%s %s · %s %s", marker, check,
-			tuiPaletteMatchStyle.Render(f.filename),
-			tuiPaletteDescStyle.Render(f.from),
+			tuiPaletteMatchStyle.Render(sanitizeDisplay(f.filename)),
+			tuiPaletteDescStyle.Render(sanitizeDisplay(f.from)),
 			tuiDimStyle.Render(humanSize(f.size)))
 	}
 	if hasParent && row == 0 {
@@ -1002,8 +1002,8 @@ func pickerRowView(p *pickerState, row int, hasParent bool, lo, hi int) string {
 		check = "✓"
 	}
 	if e.dir {
-		return fmt.Sprintf("%s%s %s", marker, check, tuiPickerDirStyle.Render(e.name+"/"))
+		return fmt.Sprintf("%s%s %s", marker, check, tuiPickerDirStyle.Render(sanitizeDisplay(e.name)+"/"))
 	}
-	return fmt.Sprintf("%s%s %s%s", marker, check, e.name,
+	return fmt.Sprintf("%s%s %s%s", marker, check, sanitizeDisplay(e.name),
 		tuiDimStyle.Render(" "+humanSize(e.size)))
 }

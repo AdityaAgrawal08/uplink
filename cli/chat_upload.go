@@ -165,7 +165,9 @@ func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 			conv: conv,
 			kind: lineFileCard,
 			fileData: &fileCardData{
-				filename:  msg.display,
+				// Local FS names can carry escapes too (self-inflicted or
+				// synced folders); sanitize like peer filenames.
+				filename:  sanitizeDisplay(msg.display),
 				username:  c.me,
 				size:      humanSize(msg.size),
 				time:      ts,

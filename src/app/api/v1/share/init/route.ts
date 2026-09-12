@@ -42,7 +42,12 @@ export async function POST(req: NextRequest) {
     if (text.length > 1024 * 100) { // 100 KB max for init metadata
       return apiError("Request body too large", 413);
     }
-    const body = text ? JSON.parse(text) : {};
+    let body: Record<string, unknown>;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      return apiError("Request body must be valid JSON", 400);
+    }
 
     const {
       filename,
