@@ -199,9 +199,30 @@ export class MockRedis implements IRedisClient {
   }
 }
 
-class LazyRedisClient implements IRedisClient {
+export class LazyRedisClient implements IRedisClient {
   private client: IRedisClient | null = null;
   private isFallbackToMock = false;
+  private fallbackWarned = false;
+
+  // Production must never silently serve split-brain state: without a
+  // shared backend, every serverless isolate gets its own memory, so rooms
+  // created on one request 404 on the next. Fail loud (503) unless the
+  // operator explicitly opts into mock mode (CI does: ALLOW_MOCK_REDIS).
+  private mockAllowed(): boolean {
+    if (process.env.NODE_ENV !== "production") return true;
+    return process.env.ALLOW_MOCK_REDIS === "true";
+  }
+
+  private warnFallbackOnce(err: unknown): void {
+    if (this.fallbackWarned) return;
+    this.fallbackWarned = true;
+    console.warn(
+      "Upstash Redis unreachable and no usable fallback: signaling is DOWN. " +
+      "Set UPSTASH_REDIS_REST_URL/TOKEN (and redeploy), or ALLOW_MOCK_REDIS=true " +
+      "only for throwaway/CI environments — mock mode split-brains across instances."
+    );
+    console.warn(err);
+  }
 
   private getClient(): IRedisClient {
     if (this.client) return this.client;
@@ -216,18 +237,22 @@ class LazyRedisClient implements IRedisClient {
         url: redisUrl,
         token: redisToken,
       }) as unknown as IRedisClient;
-    } else {
-      if (this.isFallbackToMock) {
-        console.warn("Upstash Redis connection failed or unreachable. Falling back to local in-memory MockRedis.");
-      } else if (!redisUrl || !redisToken || isPlaceholder(redisUrl) || isPlaceholder(redisToken)) {
-        // silent fallback for local/dev without credentials
-        this.client = new MockRedis();
-        return this.client;
-      } else {
-        console.log("Upstash Redis credentials missing. Using local in-memory MockRedis.");
-      }
-      this.client = new MockRedis();
+      return this.client;
     }
+
+    // No usable backend: MockRedis only where it cannot split-brain.
+    if (!this.mockAllowed()) {
+      throw new Error(
+        "No Redis backend configured (set UPSTASH_REDIS_REST_URL/TOKEN) and " +
+        "ALLOW_MOCK_REDIS is not enabled. Refusing MockRedis in production: " +
+        "per-instance memory would split-brain rooms across serverless isolates."
+      );
+    }
+    if (!this.isFallbackToMock) {
+      // silent in dev without credentials; loud once after a real failure
+      console.log("Using local in-memory MockRedis (no usable Upstash credentials).");
+    }
+    this.client = new MockRedis();
     return this.client;
   }
 
@@ -236,6 +261,10 @@ class LazyRedisClient implements IRedisClient {
       return await operation(this.getClient());
     } catch (err) {
       if (!this.isFallbackToMock) {
+        if (!this.mockAllowed()) {
+          this.warnFallbackOnce(err);
+          throw err;
+        }
         console.warn("Upstash Redis operation failed. Falling back to local in-memory MockRedis.", err);
         this.isFallbackToMock = true;
         this.client = null; // force re-creation of client as MockRedis

@@ -114,6 +114,10 @@ jobs:
       R2_BUCKET_NAME: uplink-ci-bucket
       UPSTASH_REDIS_REST_URL: https://placeholder.upstash.io
       UPSTASH_REDIS_REST_TOKEN: placeholder_token
+      # Production build refuses MockRedis unless explicitly allowed (it
+      # split-brains rooms across serverless isolates). CI has no real
+      # Redis, so opt in to the throwaway in-memory backend here.
+      ALLOW_MOCK_REDIS: "true"
       IP_ANONYMIZATION_SECRET: ci_ip_anonymization_secret
       APP_URL: http://localhost:3000
       FORCE_MOCK_STORAGE: "true"
