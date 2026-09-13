@@ -216,6 +216,17 @@ func normalizeFlagOrder(args []string, valueFlags map[string]bool) []string {
 	return append(flags, positional...)
 }
 
+// unpackCap bounds extraction: compressed archives can expand far beyond
+// their download size (decompression bombs). Heuristic, not a guarantee —
+// disk quotas remain the real defense.
+func unpackCap(compressedSize int64) int64 {
+	cap := compressedSize*10 + (64 << 20)
+	if cap < (256 << 20) {
+		cap = 256 << 20
+	}
+	return cap
+}
+
 func formatBytes(bytes int64) string {
 	const unit = 1024
 	if bytes < unit {
@@ -1148,7 +1159,7 @@ func handleReceive(args []string) {
 						os.Remove(tempTarFile)
 						os.Exit(1)
 					}
-					err = tarball.Unpack(tarReader, finalExtractDir)
+					err = tarball.UnpackLimit(tarReader, finalExtractDir, unpackCap(size))
 					tarReader.Close()
 					os.Remove(tempTarFile)
 					if err != nil {
@@ -1469,7 +1480,7 @@ func handleReceive(args []string) {
 			os.Remove(tempTarFile)
 			os.Exit(1)
 		}
-		err = tarball.Unpack(tarReader, finalExtractDir)
+		err = tarball.UnpackLimit(tarReader, finalExtractDir, unpackCap(meta.Size))
 		tarReader.Close()
 		os.Remove(tempTarFile)
 		if err != nil {

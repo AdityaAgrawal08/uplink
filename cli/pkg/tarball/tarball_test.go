@@ -94,3 +94,44 @@ func TestTarSlipProtection(t *testing.T) {
 		t.Errorf("Expected path traversal warning error, got: %v", err)
 	}
 }
+
+func TestUnpackLimitStopsBomb(t *testing.T) {
+	// 20 MB of zeros compresses to ~20 KB: a classic decompression bomb.
+	var buf bytes.Buffer
+	gzw := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gzw)
+	hdr := &tar.Header{Name: "zeros.bin", Mode: 0o644, Size: 20 << 20}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	chunk := make([]byte, 1<<20)
+	for written := 0; written < 20; written++ {
+		if _, err := tw.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tw.Close()
+	gzw.Close()
+
+	destDir, err := os.MkdirTemp("", "bomb_test_dest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(destDir)
+
+	// Same archive under a generous cap extracts fine.
+	if err := UnpackLimit(bytes.NewReader(buf.Bytes()), destDir, 64<<20); err != nil {
+		t.Fatalf("generous cap should pass: %v", err)
+	}
+
+	destDir2, err := os.MkdirTemp("", "bomb_test_dest2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(destDir2)
+
+	// Under a tight cap it must abort, not fill the disk.
+	if err := UnpackLimit(bytes.NewReader(buf.Bytes()), destDir2, 1<<20); err == nil {
+		t.Fatal("bomb must be rejected under tight cap")
+	}
+}
