@@ -142,6 +142,38 @@ describe("rooms signaling plane", () => {
     }
   });
 
+  // The real Upstash client auto-parses JSON-looking strings into objects
+  // on read (verified live against production). Every decode path must
+  // tolerate object values, or the entire plane reads as missing on real
+  // Redis while MockRedis tests stay green — exactly the outage this
+  // guards. Simulates full object-shape roundtrips.
+  it("tolerates Upstash auto-parsed object values end to end", async () => {
+    const { parseStored } = await import("../rooms");
+    // unit level: both shapes decode identically
+    const doc = { a: 1, b: "x" };
+    expect(parseStored<typeof doc>(JSON.stringify(doc))).toEqual(doc);
+    expect(parseStored<typeof doc>(doc)).toEqual(doc);
+    expect(parseStored("not json{{{")).toBeNull();
+    expect(parseStored<typeof doc>(null)).toBeNull();
+    expect(parseStored<typeof doc>(42)).toBeNull();
+
+    // behavior level: object-valued hashes still resolve rooms + rosters
+    const metaObj = { passwordHash: null, createdAt: new Date().toISOString() };
+    const memObj = { pubkey: PUBKEY, beat: Date.now() };
+    const hgetSpy = vi.spyOn(redis, "hgetall").mockImplementation(async (key: string) => {
+      if (key.endsWith(":members")) return { alice: memObj } as unknown as Record<string, string>;
+      return { meta: metaObj } as unknown as Record<string, string>;
+    });
+    try {
+      expect(await roomExists("123456")).toBe(true);
+      const roster = await getRoster("123456");
+      expect(roster.map((m) => m.username)).toEqual(["alice"]);
+      expect(roster[0].pubkey).toBe(PUBKEY);
+    } finally {
+      hgetSpy.mockRestore();
+    }
+  });
+
   it("rate limiters trip at their budgets with 429", async () => {
     const { checkJoinLimit, checkReadLimit, checkSendLimit } = await import("../rooms");
     const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
