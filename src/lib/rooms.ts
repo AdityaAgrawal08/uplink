@@ -36,6 +36,8 @@ export const MAX_BOX_PAYLOAD = 256 * 1024; // fallback relay: text + small files
 export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
 export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox sends per IP per 5 min
 export const SEND_WINDOW_SEC = 5 * 60;
+export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
+export const READ_LIMIT_PER_WINDOW = 600; // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
 
 export class RoomError extends Error {
   status: number;
@@ -177,6 +179,29 @@ export async function checkSendLimit(kind: "sig" | "inbox", ipHash: string): Pro
   const hits = await redis.incr(key);
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
   if (hits > SEND_LIMIT_PER_WINDOW) {
+    throw new RoomError(429, "Too many requests. Slow down and try again.");
+  }
+}
+
+// checkReadLimit budgets the high-frequency read path (heartbeats, signal
+// drains, inbox fetches/acks). Members hit these constantly, so the budget
+// is generous — it exists to stop floods, not normal use.
+export async function checkReadLimit(ipHash: string): Promise<void> {
+  const key = `rate:read:${ipHash}`;
+  const hits = await redis.incr(key);
+  if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
+  if (hits > READ_LIMIT_PER_WINDOW) {
+    throw new RoomError(429, "Too many requests. Slow down and try again.");
+  }
+}
+
+// checkJoinLimit budgets membership mutations (joins + leaves). Joining is
+// otherwise an unbounded Redis-op faucet for any room member.
+export async function checkJoinLimit(ipHash: string): Promise<void> {
+  const key = `rate:join:${ipHash}`;
+  const hits = await redis.incr(key);
+  if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
+  if (hits > JOIN_LIMIT_PER_WINDOW) {
     throw new RoomError(429, "Too many requests. Slow down and try again.");
   }
 }

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, leaveRoom } from "@/lib/rooms";
+import { RoomError, leaveRoom, checkJoinLimit, clientIpHash } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -9,6 +9,7 @@ export async function POST(
 ) {
   try {
     validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
+    await checkJoinLimit(clientIpHash(req)); // membership mutations are Redis-op faucets
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);

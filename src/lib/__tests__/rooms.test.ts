@@ -142,6 +142,22 @@ describe("rooms signaling plane", () => {
     }
   });
 
+  it("rate limiters trip at their budgets with 429", async () => {
+    const { checkJoinLimit, checkReadLimit, checkSendLimit } = await import("../rooms");
+    const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
+    // join budget: 120 per window
+    for (let i = 0; i < 120; i++) await checkJoinLimit(ip);
+    await expect(checkJoinLimit(ip)).rejects.toMatchObject({ status: 429 });
+    // read budget is roomier but finite
+    const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 600; i++) await checkReadLimit(ip2);
+    await expect(checkReadLimit(ip2)).rejects.toMatchObject({ status: 429 });
+    // send budget unchanged
+    const ip3 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 120; i++) await checkSendLimit("sig", ip3);
+    await expect(checkSendLimit("sig", ip3)).rejects.toMatchObject({ status: 429 });
+  });
+
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
     const username = `u_${Math.random().toString(36).slice(2, 10)}`;
     const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");

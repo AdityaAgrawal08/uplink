@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, joinRoom, getRoomMeta } from "@/lib/rooms";
+import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, clientIpHash } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -10,6 +10,7 @@ export async function POST(
 ) {
   try {
     validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
+    await checkJoinLimit(clientIpHash(req)); // membership mutations are Redis-op faucets
     const { sessionId } = await props.params;
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, ackBoxes } from "@/lib/rooms";
+import { RoomError, ackBoxes, checkReadLimit, clientIpHash } from "@/lib/rooms";
 
 // Explicit acknowledgement: deletes exactly the listed boxes. A message is
 // forgotten by the server only after the recipient confirms receipt.
@@ -11,6 +11,7 @@ export async function POST(
 ) {
   try {
     validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
+    await checkReadLimit(clientIpHash(req)); // high-frequency reads get a generous budget
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);

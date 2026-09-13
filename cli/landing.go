@@ -140,7 +140,7 @@ type landingModel struct {
 func newLandingModel(serverURL string) landingModel {
 	ui := textinput.New()
 	ui.Placeholder = "alice_42"
-	ui.CharLimit = 32
+	ui.CharLimit = 20 // server: 3-20 alphanumerics/underscore; longer input can never join
 	ui.Prompt = "> "
 	ui.Width = 40
 	ui.Focus()
@@ -390,11 +390,11 @@ func (m landingModel) layout() landingLayout {
 	}
 	tabOuterW := innerW / 2
 	return landingLayout{
-		outerW: outerW,
-		outerH: 16,
-		tabW:   tabOuterW, // outer width per tab (including its border)
-		inputW: inputW,
-		labelW: labelW,
+		outerW:  outerW,
+		outerH:  16,
+		tabW:    tabOuterW, // outer width per tab (including its border)
+		inputW:  inputW,
+		labelW:  labelW,
 		buttonW: 20,
 	}
 }
@@ -669,14 +669,13 @@ func (m *landingModel) validate() string {
 	}
 	if m.tab == tabJoin {
 		c := strings.TrimSpace(m.codeInput.Value())
-		if c == "" {
-			return "code required"
-		}
+		// Session codes are always exactly 6 digits (generateRoomCode).
+		// Anything else is a typo — reject locally with a clear message
+		// instead of sending a doomed join that 404s as "session not
+		// found" (the old len>=4 fallback admitted 5-digit codes and
+		// misled users into thinking the room had vanished).
 		if !regexp.MustCompile(`^[0-9]{6}$`).MatchString(c) {
-			// also allow alphanum fallback like session tokens
-			if len(c) < 4 {
-				return "code must be 6 digits"
-			}
+			return "code must be exactly 6 digits"
 		}
 	}
 	return ""
@@ -730,7 +729,9 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 			return landingDoneMsg{err: "could not reach server: " + err.Error()}
 		}
 		if code != 201 {
-			var e struct{ Error string `json:"error"`}
+			var e struct {
+				Error string `json:"error"`
+			}
 			_ = jsonDecode(body, &e)
 			if e.Error == "" {
 				e.Error = string(body)
@@ -768,7 +769,9 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 		if c == 200 {
 			return landingJoinOkMsg{username: username, password: password, code: code}
 		}
-		var e struct{ Error string `json:"error"`}
+		var e struct {
+			Error string `json:"error"`
+		}
 		_ = jsonDecode(body, &e)
 		switch c {
 		case 401:
@@ -776,8 +779,9 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 		case 409:
 			return landingDoneMsg{err: "'" + username + "' already in this session"}
 		case 404:
-			// Rooms vanish when emptied — there is no other terminal state.
-			return landingDoneMsg{err: "session not found (rooms vanish when emptied)"}
+			// A validated 6-digit code that 404s is either mistyped or a
+			// room whose last member already left (rooms vanish on empty).
+			return landingDoneMsg{err: "session not found — check the 6-digit code (rooms vanish when emptied)"}
 		default:
 			if e.Error == "" {
 				e.Error = string(body)
