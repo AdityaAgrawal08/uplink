@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -225,11 +226,10 @@ func TestResolveStunURLs(t *testing.T) {
 	}
 }
 
-// Roster ticks announce membership deltas as transcript system lines and
-// repaint immediately (appendLocal rebuilds). Regression: the tick used to
-// update c.users with no rebuild, so the sidebar visibly refreshed only
-// when the next message triggered a repaint.
-func TestRosterTickAnnouncesJoinsLeaves(t *testing.T) {
+// Roster ticks update the Online sidebar silently: membership lives ONLY
+// in the sidebar, never as transcript lines. The tick must still repaint
+// immediately on change (rebuildView), not on the next message.
+func TestRosterTickSilentSidebar(t *testing.T) {
 	fs := newFakeSignalServer()
 	srv := httptest.NewServer(fs)
 	defer srv.Close()
@@ -249,14 +249,10 @@ func TestRosterTickAnnouncesJoinsLeaves(t *testing.T) {
 	if len(c.users) != 2 {
 		t.Fatalf("roster after join = %v; want [bob alice]", c.users)
 	}
-	found := false
 	for _, l := range c.localLines[before:] {
-		if l.text == "* alice joined" {
-			found = true
+		if strings.Contains(l.text, "alice joined") {
+			t.Fatal("join must not print a transcript line (sidebar only)")
 		}
-	}
-	if !found {
-		t.Fatal("join produced no '* alice joined' system line")
 	}
 
 	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
@@ -270,14 +266,10 @@ func TestRosterTickAnnouncesJoinsLeaves(t *testing.T) {
 	if len(c.users) != 1 {
 		t.Fatalf("roster after leave = %v; want [bob]", c.users)
 	}
-	found = false
 	for _, l := range c.localLines[before:] {
-		if l.text == "* alice left" {
-			found = true
+		if strings.Contains(l.text, "alice left") {
+			t.Fatal("leave must not print a transcript line (sidebar only)")
 		}
-	}
-	if !found {
-		t.Fatal("leave produced no '* alice left' system line")
 	}
 
 	// Steady state: no membership change, no announcement spam.
@@ -637,5 +629,141 @@ func TestMeshFailTeardownAndInboxFallback(t *testing.T) {
 	}
 	if len(boxes) != 1 || boxes[0].MsgId != "m-teardown" {
 		t.Fatalf("fallback boxes wrong: %+v", boxes)
+	}
+}
+
+// Stream frames must never take the inbox fallback: the server keys boxes
+// by msgId, so a chunk would overwrite its siblings and the file could
+// never complete. Loud error instead (sender retries on a fresh line).
+func TestStreamFramesNeverInbox(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	ea := newEngine("alice", ida, sigA, engineCallbacks{})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	})
+
+	// No live session: stream chunk must fail, not inbox-corrupt.
+	chunk := newFrame(frameFileChunk, "stream-1", "alice", "bob")
+	chunk.Data = base64.StdEncoding.EncodeToString([]byte("x"))
+	raw, _ := encodeFrame(chunk)
+	if err := ea.sendOne("bob", chunk, raw); err == nil {
+		t.Fatal("stream chunk without a live line must fail loud")
+	}
+	meta := newFrame(frameFileMeta, "stream-1", "alice", "bob")
+	rawMeta, _ := encodeFrame(meta)
+	if err := ea.sendOne("bob", meta, rawMeta); err == nil {
+		t.Fatal("stream meta without a live line must fail loud")
+	}
+	if n := inboxDeposits(fs, "bob"); n != 0 {
+		t.Fatalf("stream frames reached the inbox (%d boxes) — msgId collision", n)
+	}
+
+	// Chat still falls back fine on the same dead line.
+	chat := newFrame(frameChat, "c1", "alice", "bob")
+	chat.Data = "hi"
+	rawChat, _ := encodeFrame(chat)
+	if err := ea.sendOne("bob", chat, rawChat); err != nil {
+		t.Fatalf("chat fallback must work: %v", err)
+	}
+	if n := inboxDeposits(fs, "bob"); n != 1 {
+		t.Fatalf("chat fallback boxes = %d; want 1", n)
+	}
+}
+
+// A failed inbox deposit arms the backstop instead of losing the frame.
+func TestInboxFailureArmsBackstop(t *testing.T) {
+	dead, _ := generateIdentity()
+	// Server URL that refuses connections: every HTTP call fails.
+	badSig := &signalClient{serverURL: "http://127.0.0.1:1", me: "alice"}
+	e := newEngine("alice", dead, badSig, engineCallbacks{})
+	defer e.stop()
+	peerId, _ := generateIdentity()
+	e.mu.Lock()
+	e.roster["bob"] = peerId.publicKey()
+	e.mu.Unlock()
+
+	f := newFrame(frameChat, "m-fail", "alice", "bob")
+	f.Data = "important"
+	raw, _ := encodeFrame(f)
+	if err := e.sendOne("bob", f, raw); err == nil {
+		t.Fatal("dead server must surface an inbox error")
+	}
+	e.mu.Lock()
+	_, tracked := e.unacked[unackedKey("m-fail", "bob")]
+	e.mu.Unlock()
+	if !tracked {
+		t.Fatal("failed inbox deposit must arm the ack backstop")
+	}
+}
+
+// Join visibility without anyone sending: a newcomer must appear in the
+// survivor's presence through beats alone, within a few beat intervals.
+func TestRosterVisibilityWithoutSends(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	ea := newEngineWithStun("alice", ida, sigA, engineCallbacks{}, []string{})
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+	ea.start()
+	defer ea.stop()
+
+	// Bob joins a second later; nobody sends anything, ever.
+	time.Sleep(1100 * time.Millisecond)
+	sigB := &signalClient{serverURL: srv.URL, key: sigA.key, me: "bob"}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	joinedAt := time.Now()
+	deadline := joinedAt.Add(15 * time.Second)
+	for {
+		ea.mu.Lock()
+		var names []string
+		for _, m := range ea.presence {
+			if m.Online {
+				names = append(names, m.Username)
+			}
+		}
+		ea.mu.Unlock()
+		found := false
+		for _, n := range names {
+			if n == "bob" {
+				found = true
+			}
+		}
+		if found {
+			t.Logf("bob visible after %v", time.Since(joinedAt).Round(100*time.Millisecond))
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("bob never appeared in alice's presence (had %v)", names)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

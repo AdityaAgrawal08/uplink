@@ -21,12 +21,11 @@ type slashCommand struct {
 }
 
 // slashCommands is the full catalogue. Keep it the ONLY place a command is
-// declared; execution switches on Name below.
+// declared; execution switches on Name below. Product direction: exactly
+// /help, /upload, /download — nothing else.
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
-	{Name: "/upload-review", Desc: "review buffered files before sending"},
-	{Name: "/send", Desc: "send all buffered files now"},
 	{Name: "/download", Desc: "fetch shared room files"},
 }
 
@@ -310,10 +309,6 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return nil
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
-	case "/upload-review":
-		return c.openBufferReview() // show buffered files for review
-	case "/send":
-		return c.sendBuffered() // send all buffered files now
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
 	default:

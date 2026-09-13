@@ -1108,7 +1108,7 @@ func (c chatScreen) sidebarInnerWidth() int {
 // ---- async commands --------------------------------------------------------
 
 func scheduleRoster() tea.Cmd {
-	return tea.Tick(5*time.Second, func(time.Time) tea.Msg { return rosterTickMsg{} })
+	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return rosterTickMsg{} })
 }
 
 // drainNetCmd is a self-perpetuating event pump: it waits briefly for the
@@ -1293,29 +1293,20 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
-		// owns the 5s beat; this only renders). Membership deltas are
-		// announced as system lines AND repaint immediately — previously
-		// the tick updated c.users without any rebuildView, so the sidebar
-		// visibly refreshed only when the next message triggered a repaint.
+		// owns the 5s beat; this only renders, every 2s). Membership lives
+		// ONLY in the Online sidebar — no join/leave lines in the
+		// transcript by product direction. On ANY change, rebuild
+		// immediately: the tick used to update c.users with no repaint, so
+		// the list visibly refreshed only when the next message arrived.
 		roster := c.eng.peers()
 		users := onlineNames(roster, c.me)
-		had := map[string]bool{}
-		for _, u := range c.users {
-			had[u] = true
-		}
-		has := map[string]bool{}
-		for _, u := range users {
-			has[u] = true
-		}
-		var joined, left []string
-		for _, u := range users {
-			if !had[u] && u != c.me {
-				joined = append(joined, u)
-			}
-		}
-		for _, u := range c.users {
-			if !has[u] && u != c.me {
-				left = append(left, u)
+		changed := len(users) != len(c.users)
+		if !changed {
+			for i := range users {
+				if users[i] != c.users[i] {
+					changed = true
+					break
+				}
 			}
 		}
 		c.users = users
@@ -1336,11 +1327,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.hoverPeer != "" && !live[c.hoverPeer] {
 			c.hoverPeer = ""
 		}
-		for _, u := range joined {
-			c.appendLocal(generalConv, "* "+u+" joined") // appendLocal rebuilds (repaints sidebar now, not on next message)
-		}
-		for _, u := range left {
-			c.appendLocal(generalConv, "* "+u+" left")
+		if changed {
+			c.rebuildView() // repaint the sidebar NOW, not on the next message
 		}
 		cmds = append(cmds, scheduleRoster())
 
