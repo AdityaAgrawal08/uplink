@@ -836,7 +836,26 @@ func (e *engine) sendOne(peer string, f frame, raw []byte) error {
 	if !known {
 		return fmt.Errorf("unknown peer %s", peer)
 	}
-	return e.sendInbox(peer, key, f, raw)
+	// Stream frames (meta/chunks/complete share one msgId) must NEVER take
+	// the inbox path: the server keys boxes by msgId, so a chunk would
+	// overwrite its siblings and the receiver's assembly could never
+	// complete — a silent file loss. Fail loud instead; the sender retries
+	// once the direct line is back.
+	switch f.Type {
+	case frameFileMeta, frameFileChunk, frameFileComplete:
+		return fmt.Errorf("direct line to %s dropped mid-stream — retry the file", peer)
+	}
+	if err := e.sendInbox(peer, key, f, raw); err != nil {
+		// Durable path failed too (transient server/rate-limit errors):
+		// arm the ack backstop so the frame is retried instead of lost.
+		// Bounded and deduped on receipt, so a false failure (the box
+		// actually landed — HSET is idempotent on msgId) just overwrites.
+		if f.Type == frameChat || f.Type == frameFile {
+			e.trackUnacked(peer, f)
+		}
+		return err
+	}
+	return nil
 }
 
 // sendInbox seals one frame as a durable pairwise box. Re-sealed per call

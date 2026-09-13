@@ -149,29 +149,6 @@ func (c *chatScreen) openFilesDrawer() tea.Cmd {
 	return nil
 }
 
-// openBufferReview opens the buffer review drawer showing all queued upload files.
-// Users can navigate with arrows and deselect items with Ctrl+D.
-func (c *chatScreen) openBufferReview() tea.Cmd {
-	c.palette.close()
-	c.input.SetValue("")
-	c.input.Placeholder = ""
-	if c.uploadBufSet == nil {
-		c.uploadBufSet = map[string]bool{}
-	}
-	c.picker = pickerState{
-		active:   true,
-		mode:     modeBuffer,
-		home:     ".",
-		anchor:   -1,
-		buffered: c.uploadBuf,
-		inBuf:    c.uploadBufSet,
-	}
-	if len(c.uploadBuf) == 0 {
-		c.picker.notice = "buffer empty — use /upload to add files"
-	}
-	return nil
-}
-
 // closePicker leaves browser mode; syncs buffer to persistent storage.
 // Files mode owns a private empty buffer (read-only listing) that must
 // never overwrite the upload buffer.
@@ -505,31 +482,6 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 	c.closePicker(restore)
 	if len(jobs) == 0 {
 		return nil
-	}
-	return c.startUploads(jobs)
-}
-
-// sendBuffered sends all files currently in the persistent upload buffer.
-// Works from the command palette (/send) without needing the picker open.
-func (c *chatScreen) sendBuffered() tea.Cmd {
-	if len(c.uploadBuf) == 0 {
-		c.appendLine(tuiSystemStyle.Render("* buffer empty — use /upload to add files"))
-		return nil
-	}
-	jobs := make([]uploadJob, 0, len(c.uploadBuf))
-	to := c.targetUser
-	for _, abs := range c.uploadBuf {
-		jobs = append(jobs, uploadJob{Path: abs, To: to})
-	}
-	// Clear the persistent buffer.
-	c.uploadBuf = nil
-	c.uploadBufSet = map[string]bool{}
-	// Also clear picker buffer if picker is open.
-	c.picker.buffered = nil
-	c.picker.inBuf = map[string]bool{}
-	if c.picker.isActive() {
-		restore := composerPlaceholder
-		c.closePicker(restore)
 	}
 	return c.startUploads(jobs)
 }
