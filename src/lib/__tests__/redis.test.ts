@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { MockRedis } from "../redis";
+import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { MockRedis, LazyRedisClient } from "../redis";
 
 // MockRedis mirrors the tiny Redis surface the app relies on. These tests pin
 // its semantics so the graceful-degradation path behaves identically to real
@@ -118,5 +118,45 @@ describe("MockRedis", () => {
     expect(await r.hgetall("h")).toBeNull();
     expect(await r.del("l")).toBe(1);
     expect(await r.llen("l")).toBe(0);
+  });
+
+  // Production without a Redis backend must fail LOUD (split-brain rooms
+  // across serverless isolates are worse than an outage). MockRedis is
+  // only allowed outside production, or with explicit ALLOW_MOCK_REDIS
+  // opt-in (CI uses it).
+  describe("production backend gating", () => {
+    const saved: Record<string, string | undefined> = {};
+    beforeEach(() => {
+      for (const k of ["NODE_ENV", "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN", "ALLOW_MOCK_REDIS"]) {
+        saved[k] = process.env[k];
+        delete process.env[k];
+      }
+    });
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+      vi.unstubAllEnvs();
+    });
+
+    it("throws in production with no backend and no opt-in", async () => {
+      vi.stubEnv("NODE_ENV", "production");
+      const c = new LazyRedisClient();
+      await expect(c.incr("k")).rejects.toThrow(/No Redis backend/);
+    });
+
+    it("uses MockRedis in production with explicit opt-in", async () => {
+      vi.stubEnv("NODE_ENV", "production");
+      vi.stubEnv("ALLOW_MOCK_REDIS", "true");
+      const c = new LazyRedisClient();
+      await expect(c.incr("k")).resolves.toBe(1);
+    });
+
+    it("uses MockRedis outside production without opt-in", async () => {
+      vi.stubEnv("NODE_ENV", "development");
+      const c = new LazyRedisClient();
+      await expect(c.incr("k")).resolves.toBe(1);
+    });
   });
 });
