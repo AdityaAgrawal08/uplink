@@ -373,3 +373,269 @@ func TestEnginePeerRestartConverges(t *testing.T) {
 		t.Fatalf("wrong reply envelope: %+v", got)
 	}
 }
+
+// The ack backstop: mesh-sent frames unacked past ackTimeout are re-sent via
+// the durable inbox; acks graduate entries; exhausted/peer-gone entries die.
+func TestAckBackstopRetryAndGraduate(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	pa := newEngineProbe()
+	ea := newEngine("alice", ida, sigA, pa.callbacks())
+	defer ea.stop()
+	members := []rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	}
+	ea.setRoster(members)
+
+	backdate := func(msgId string) {
+		ea.mu.Lock()
+		ea.unacked[unackedKey(msgId, "bob")].sent = time.Now().Add(-time.Hour)
+		ea.mu.Unlock()
+	}
+
+	// Overdue entry is re-sent through the inbox (durable, re-sealed).
+	f := newFrame(frameChat, "m1", "alice", "bob")
+	f.Data = "hi"
+	ea.trackUnacked("bob", f)
+	backdate("m1")
+	ea.retryOnce()
+	boxes, err := sigB.inboxFetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 1 {
+		t.Fatalf("retry deposited %d boxes; want 1", len(boxes))
+	}
+	rawPubA, _ := base64.StdEncoding.DecodeString(pubA)
+	pt, err := openBox(idb, rawPubA, boxes[0].Payload)
+	if err != nil {
+		t.Fatalf("retry box undecryptable: %v", err)
+	}
+	rf, err := decodeFrame(pt)
+	if err != nil || rf.Type != frameChat || rf.MsgId != "m1" || rf.Data != "hi" {
+		t.Fatalf("retry box wrong: %+v err=%v", rf, err)
+	}
+	ea.mu.Lock()
+	tries := ea.unacked[unackedKey("m1", "bob")].tries
+	ea.mu.Unlock()
+	if tries != 1 {
+		t.Fatalf("tries = %d; want 1", tries)
+	}
+
+	// Fresh entries are left alone.
+	f2 := newFrame(frameChat, "m2", "alice", "bob")
+	f2.Data = "fresh"
+	ea.trackUnacked("bob", f2)
+	ea.retryOnce()
+	if n := inboxDeposits(fs, "bob"); n != 1 {
+		t.Fatalf("fresh entry re-sent: %d boxes; want 1", n)
+	}
+
+	// Delivery ack graduates the entry (correlated by original id in Data).
+	ack := newFrame(frameAck, "ack-1", "bob", "alice")
+	ack.Data = "m1"
+	ea.dispatch(ack)
+	ea.mu.Lock()
+	_, still := ea.unacked[unackedKey("m1", "bob")]
+	ea.mu.Unlock()
+	if still {
+		t.Fatal("acked entry not graduated")
+	}
+
+	// Exhausted entries die quietly (no further re-send).
+	ea.mu.Lock()
+	ea.unacked[unackedKey("m9", "bob")] = &pendingAck{to: "bob", f: f, sent: time.Now().Add(-time.Hour), tries: maxInboxRetries}
+	ea.mu.Unlock()
+	ea.retryOnce()
+	if n := inboxDeposits(fs, "bob"); n != 1 {
+		t.Fatalf("exhausted entry re-sent: %d boxes; want 1", n)
+	}
+	ea.mu.Lock()
+	_, ghost := ea.unacked[unackedKey("m9", "bob")]
+	ea.mu.Unlock()
+	if ghost {
+		t.Fatal("exhausted entry not dropped")
+	}
+
+	// Peer-gone entries die quietly.
+	ea.mu.Lock()
+	ea.unacked[unackedKey("mx", "ghost")] = &pendingAck{to: "ghost", f: f, sent: time.Now().Add(-time.Hour)}
+	ea.mu.Unlock()
+	ea.retryOnce() // must not panic or send
+	ea.mu.Lock()
+	_, left := ea.unacked[unackedKey("mx", "ghost")]
+	ea.mu.Unlock()
+	if left {
+		t.Fatal("peer-gone entry not dropped")
+	}
+}
+
+func TestInboundChatDedup(t *testing.T) {
+	a, _ := generateIdentity()
+	p := newEngineProbe()
+	e := newEngine("alice", a, &signalClient{}, p.callbacks())
+	defer e.stop()
+	f := newFrame(frameChat, "dup-1", "bob", "alice")
+	f.Data = "hello"
+	e.dispatch(f)
+	e.dispatch(f) // mesh delivery + backstop retry of the same frame
+	p.mu.Lock()
+	n := len(p.chats)
+	p.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("duplicate chat displayed %d times; want exactly 1", n)
+	}
+}
+
+func TestSendAckNamesOriginal(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	ea := newEngine("alice", ida, sigA, engineCallbacks{})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	})
+	// No live session: ack travels the inbox path.
+	if err := ea.sendAck("bob", "orig-99"); err != nil {
+		t.Fatal(err)
+	}
+	boxes, err := sigB.inboxFetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 1 {
+		t.Fatalf("ack boxes = %d; want 1", len(boxes))
+	}
+	rawPubA, _ := base64.StdEncoding.DecodeString(pubA)
+	pt, err := openBox(idb, rawPubA, boxes[0].Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	af, err := decodeFrame(pt)
+	if err != nil || af.Type != frameAck || af.Data != "orig-99" {
+		t.Fatalf("ack frame wrong: %+v err=%v", af, err)
+	}
+}
+
+// Mesh send failing AFTER Noise encrypt must tear the session down (the send
+// nonce advanced without the peer receiving — keeping the session would
+// poison every future frame) and still deliver durably via inbox.
+func TestMeshFailTeardownAndInboxFallback(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive a local XX handshake to a READY initiator session (no network).
+	psA, m1, err := beginNoise(ida, "bob", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	psB, _, err := beginNoise(idb, "alice", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := psB.stepNoise(m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m3, err := psA.stepNoise(m2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := psB.stepNoise(m3); err != nil {
+		t.Fatal(err)
+	}
+	if !psA.isReady() || !psB.isReady() {
+		t.Fatal("local handshake did not reach ready")
+	}
+
+	ea := newEngine("alice", ida, sigA, engineCallbacks{})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	})
+	ea.mu.Lock()
+	ea.noise["bob"] = psA
+	ea.mu.Unlock()
+	// Mesh entry present but with no open channel: encrypt succeeds, send fails.
+	ea.mesh.mu.Lock()
+	ea.mesh.peers["bob"] = &meshPeer{username: "bob"}
+	ea.mesh.mu.Unlock()
+
+	f := newFrame(frameChat, "m-teardown", "alice", "bob")
+	f.Data = "via fallback"
+	raw, _ := encodeFrame(f)
+	if err := ea.sendOne("bob", f, raw); err != nil {
+		t.Fatalf("sendOne must fall back, not fail: %v", err)
+	}
+	// Poisoned session torn down...
+	ea.mu.Lock()
+	_, live := ea.noise["bob"]
+	_, tracked := ea.unacked[unackedKey("m-teardown", "bob")]
+	ea.mu.Unlock()
+	if live {
+		t.Fatal("desynced session kept — future mesh frames would fail decrypt")
+	}
+	if tracked {
+		t.Fatal("inbox-first delivery must not arm the ack backstop")
+	}
+	if ea.mesh.hasPeer("bob") {
+		t.Fatal("dead transport entry kept — reconcile would stall on it")
+	}
+	// ...and the frame still delivered durably.
+	boxes, err := sigB.inboxFetch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(boxes) != 1 || boxes[0].MsgId != "m-teardown" {
+		t.Fatalf("fallback boxes wrong: %+v", boxes)
+	}
+}

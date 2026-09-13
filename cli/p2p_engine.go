@@ -29,9 +29,14 @@ import (
 
 const (
 	engineSignalEvery = 2 * time.Second
-	engineInboxEvery  = 5 * time.Second
-	engineBeatEvery   = 5 * time.Second
-	inboxBoxKind      = "p2p"
+	// engineInboxEvery sets fallback/offline delivery latency. 2s (was 5s):
+	// the inbox is the durability backstop for every mesh-path loss, so a
+	// faster poll directly shrinks worst-case delivery time. Cost is one
+	// cheap fetch per cycle; the per-user read budget (600/5min) still has
+	// headroom over steady-state use (~330/5min across all three loops).
+	engineInboxEvery = 2 * time.Second
+	engineBeatEvery  = 5 * time.Second
+	inboxBoxKind     = "p2p"
 	// fallbackFileMax caps single-box files on the inbox path. Math: the
 	// server caps box payloads at 256KB; base64 inflates raw bytes 4/3 plus
 	// JSON overhead, so ~160KB raw fits with margin. Larger files need the
@@ -91,6 +96,13 @@ type engine struct {
 	// (throttled). Success clears both; departure clears both.
 	lastFail  map[string]time.Time
 	failCount map[string]int
+	// unacked tracks mesh-sent chat/file frames awaiting a delivery ack,
+	// keyed msgId+"\\x00"+peer (broadcasts fan out per peer; each recipient
+	// acks). Entries graduate on ack and expire after maxInboxRetries
+	// inbox re-sends — the backstop for frames the mesh ate (sent into a
+	// dead or cross-generation session). Inbox-first sends are durable by
+	// construction (1h server TTL + redelivery) and are never tracked.
+	unacked   map[string]*pendingAck
 	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
@@ -114,6 +126,31 @@ const rosterFreshTTL = 5 * time.Second
 // setupRetryBackoff is the minimum gap between setup attempts for one peer
 // after a failure. Var (not const) so tests can shrink it.
 var setupRetryBackoff = 30 * time.Second
+
+const (
+	// ackTimeout is how long a mesh-sent frame waits for its delivery ack
+	// before the first inbox re-send. Mesh RTT is milliseconds; 3s covers
+	// scheduling jitter without stalling the backstop behind a dead peer.
+	ackTimeout = 3 * time.Second
+	// maxInboxRetries bounds the backstop: initial mesh attempt + this many
+	// durable inbox re-sends, then the entry is dropped. A longer-gone peer
+	// is offline; its mail is either already durable (inbox-first sends
+	// persist 1h server-side) or stops deserving retries. Unbounded retry
+	// would leak memory and spam a dead peer's queue.
+	maxInboxRetries = 3
+	// retryEvery sets the backstop sweep cadence (piggybacks the 2s class).
+	retryEvery = 2 * time.Second
+)
+
+// pendingAck is one mesh-sent frame awaiting its delivery ack.
+type pendingAck struct {
+	to    string
+	f     frame
+	sent  time.Time
+	tries int // inbox re-sends so far
+}
+
+func unackedKey(msgId, peer string) string { return msgId + "\x00" + peer }
 
 // hsEnvelope wraps one Noise handshake message with the initiator's epoch
 // (unix nanos at handshake start). Epochs order handshakes per peer pair:
@@ -163,6 +200,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		completedEpoch: map[string]int64{},
 		lastFail:       map[string]time.Time{},
 		failCount:      map[string]int{},
+		unacked:        map[string]*pendingAck{},
 		seen:           newSeenSet(2000),
 		files:          map[string]*fileAssembly{},
 		announced:      map[string]bool{},
@@ -212,10 +250,11 @@ func (e *engine) peers() []rosterMember {
 // ─── lifecycle ──────────────────────────────────────────────────────────────
 
 func (e *engine) start() {
-	e.wg.Add(3)
+	e.wg.Add(4)
 	go e.signalLoop()
 	go e.inboxLoop()
 	go e.beatLoop()
+	go e.retryLoop()
 }
 
 func (e *engine) stop() {
@@ -649,10 +688,10 @@ func (e *engine) inboxOnce() {
 	}
 	var ack []string
 	for _, b := range boxes {
-		if e.seen.seen("inbox:" + b.MsgId) {
-			ack = append(ack, b.MsgId) // already processed: just collect the delete
-			continue
-		}
+		// NOTE: no seen-prefilter here. Inbound dedup lives in dispatch
+		// (msgId-keyed, type-aware); pre-marking every box broke nothing
+		// but hid redeliveries from the type-aware path. Already-processed
+		// boxes re-dispatch harmlessly (deduped) and are acked below.
 		e.mu.Lock()
 		senderKey, known := e.roster[b.From]
 		e.mu.Unlock()
@@ -685,14 +724,30 @@ func (e *engine) inboxOnce() {
 // ─── dispatch ───────────────────────────────────────────────────────────────
 
 func (e *engine) dispatch(f frame) {
+	// Inbound dedup by msgId: a mesh delivery plus a backstop inbox retry
+	// of the same frame must never double-display. Restricted to chat and
+	// single-box files — stream frames (meta/chunks/complete) SHARE one
+	// msgId by design and must all be processed.
+	if f.Type == frameChat || f.Type == frameFile {
+		if f.MsgId == "" || e.seen.seen("msg:"+f.MsgId) {
+			return
+		}
+	}
 	switch f.Type {
 	case frameChat:
 		if e.cb.onChat != nil {
 			e.cb.onChat(engineChat{MsgId: f.MsgId, From: f.From, To: f.To, Text: f.Data})
 		}
 	case frameAck:
+		// The ack names the ORIGINAL message in Data (MsgId is the ack's
+		// own fresh id). Graduate the sender's backstop entry, if any.
+		orig := f.Data
+		if orig == "" {
+			orig = f.MsgId
+		}
+		e.ackReceived(f.From, orig)
 		if e.cb.onDelivered != nil {
-			e.cb.onDelivered(f.MsgId)
+			e.cb.onDelivered(orig)
 		}
 	case frameTyping:
 		if e.cb.onTyping != nil {
@@ -758,19 +813,111 @@ func (e *engine) sendOne(peer string, f frame, raw []byte) error {
 	if ok && ps.isReady() {
 		if ct, err := ps.encrypt(raw); err == nil {
 			if err := e.mesh.send(peer, ct); err == nil {
+				// Mesh delivery is NOT assumed: the frame may land in a
+				// dead or cross-generation session and be dropped on
+				// decrypt. Track chat/file payloads for the ack backstop
+				// (streams and control frames are excluded — see below).
+				if f.Type == frameChat || f.Type == frameFile {
+					e.trackUnacked(peer, f)
+				}
 				return nil
 			}
+			// Encrypted into a dead channel: the send nonce advanced but
+			// the peer never got the ciphertext, so the session's nonce
+			// streams are now desynced — every FUTURE mesh frame would
+			// fail decrypt too. Tear down to force a clean re-handshake
+			// instead of limping with a poisoned session, then fall
+			// through to the durable inbox path.
+			e.mesh.dropPeer(peer)
+			e.dropNoise(peer)
 		}
 		// channel dead: fall through to inbox (mesh will report down)
 	}
 	if !known {
 		return fmt.Errorf("unknown peer %s", peer)
 	}
+	return e.sendInbox(peer, key, f, raw)
+}
+
+// sendInbox seals one frame as a durable pairwise box. Re-sealed per call
+// (fresh ephemeral key), so retries never replay identical bytes.
+func (e *engine) sendInbox(peer string, key []byte, f frame, raw []byte) error {
 	box, err := sealBox(e.id, key, raw)
 	if err != nil {
 		return err
 	}
 	return e.sig.inboxSend(peer, f.MsgId, inboxBoxKind, box)
+}
+
+// trackUnacked records a mesh-sent frame for the ack backstop.
+func (e *engine) trackUnacked(peer string, f frame) {
+	e.mu.Lock()
+	e.unacked[unackedKey(f.MsgId, peer)] = &pendingAck{to: peer, f: f, sent: time.Now()}
+	e.mu.Unlock()
+}
+
+// ackReceived graduates a tracked frame: the peer confirmed receipt.
+func (e *engine) ackReceived(peer, msgId string) {
+	if msgId == "" {
+		return
+	}
+	e.mu.Lock()
+	delete(e.unacked, unackedKey(msgId, peer))
+	e.mu.Unlock()
+}
+
+// ─── ack backstop (retry loop) ──────────────────────────────────────────────
+// Mesh-sent frames whose ack doesn't arrive within ackTimeout are re-sent
+// via the durable inbox path (never via mesh — replaying into a suspect
+// session risks duplicates AND nonce churn). Bounded by maxInboxRetries,
+// then dropped; the receiver dedups by msgId so a late mesh delivery plus
+// an inbox retry can never double-display.
+
+func (e *engine) retryLoop() {
+	defer e.wg.Done()
+	ticker := time.NewTicker(retryEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			e.retryOnce()
+		}
+	}
+}
+
+func (e *engine) retryOnce() {
+	now := time.Now()
+	e.mu.Lock()
+	var due []*pendingAck
+	for k, p := range e.unacked {
+		if now.Sub(p.sent) < ackTimeout {
+			continue
+		}
+		if _, known := e.roster[p.to]; !known {
+			delete(e.unacked, k) // peer left: nothing to retry to
+			continue
+		}
+		if p.tries >= maxInboxRetries {
+			delete(e.unacked, k)
+			continue
+		}
+		p.tries++
+		p.sent = now
+		due = append(due, p)
+	}
+	e.mu.Unlock()
+	for _, p := range due {
+		raw, err := encodeFrame(p.f)
+		if err != nil {
+			continue
+		}
+		e.mu.Lock()
+		key := e.roster[p.to]
+		e.mu.Unlock()
+		_ = e.sendInbox(p.to, key, p.f, raw)
+	}
 }
 
 func (e *engine) sendChat(to, text string) (string, error) {
@@ -816,7 +963,11 @@ func (e *engine) sendAck(to, msgId string) error {
 	if err != nil {
 		return err
 	}
-	return e.sendFrame(to, newFrame(frameAck, id, e.me, to))
+	// Data names the ORIGINAL message: the ack's own MsgId is fresh per
+	// ack, so without this the sender could never correlate delivery.
+	ack := newFrame(frameAck, id, e.me, to)
+	ack.Data = msgId
+	return e.sendFrame(to, ack)
 }
 
 func (e *engine) emitErr(err error) {
