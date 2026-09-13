@@ -201,7 +201,7 @@ func cmdJoinChat(args []string, cfg *Config) {
 		case strings.Contains(msg, "status 409"):
 			fmt.Printf("'%s' is already in this session — choose another.\n", username)
 		case strings.Contains(msg, "status 404"):
-			fmt.Println("✗ This session does not exist (rooms vanish when emptied).")
+			fmt.Println("✗ Session not found — check the 6-digit code (rooms vanish when emptied).")
 			os.Exit(1)
 		default:
 			fmt.Printf("✗ Join failed: %s\n", msg)

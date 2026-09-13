@@ -150,13 +150,18 @@ describe("MockRedis", () => {
       vi.stubEnv("NODE_ENV", "production");
       vi.stubEnv("ALLOW_MOCK_REDIS", "true");
       const c = new LazyRedisClient();
-      await expect(c.incr("k")).resolves.toBe(1);
+      // NOTE: the dev MockRedis is process-global (globalThis, so Next.js
+      // dev hot-reloads don't reset signaling state); tests must use fresh
+      // keys instead of assuming a pristine store.
+      const k = `optin-${Math.random().toString(36).slice(2)}`;
+      await expect(c.incr(k)).resolves.toBe(1);
     });
 
     it("uses MockRedis outside production without opt-in", async () => {
       vi.stubEnv("NODE_ENV", "development");
       const c = new LazyRedisClient();
-      await expect(c.incr("k")).resolves.toBe(1);
+      const k = `dev-${Math.random().toString(36).slice(2)}`;
+      await expect(c.incr(k)).resolves.toBe(1);
     });
   });
 });

@@ -6,6 +6,7 @@ import {
   depositSignal,
   drainSignals,
   checkSendLimit,
+  checkReadLimit,
   clientIpHash,
 } from "@/lib/rooms";
 
@@ -42,6 +43,7 @@ export async function GET(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    await checkReadLimit(clientIpHash(req)); // drains are the hot poll path
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);

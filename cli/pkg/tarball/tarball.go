@@ -129,8 +129,17 @@ func Pack(srcDir string, writer io.Writer) error {
 	return err
 }
 
-// Unpack tarball with Tar-Slip protection
+// Unpack tarball with Tar-Slip protection.
+// Prefer UnpackLimit: unbounded extraction lets a malicious archive
+// (decompression bomb) fill the receiver's disk.
 func Unpack(reader io.Reader, destDir string) error {
+	return UnpackLimit(reader, destDir, 2<<30) // 2 GB backstop
+}
+
+// UnpackLimit is Unpack with a cap on total unpacked file bytes. Breach
+// aborts with an error (partial files may remain; callers dealing with
+// untrusted archives should extract to a fresh temp dir).
+func UnpackLimit(reader io.Reader, destDir string, maxBytes int64) error {
 	absDestDir, err := filepath.Abs(destDir)
 	if err != nil {
 		return err
@@ -144,6 +153,7 @@ func Unpack(reader io.Reader, destDir string) error {
 
 	tr := tar.NewReader(gzr)
 
+	var written int64
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -187,10 +197,14 @@ func Unpack(reader io.Reader, destDir string) error {
 				return err
 			}
 
-			_, err = io.Copy(file, tr)
+			n, err := io.Copy(file, tr)
 			file.Close() // Close immediately
 			if err != nil {
 				return err
+			}
+			written += n
+			if written > maxBytes {
+				return fmt.Errorf("security error: archive unpacked size exceeds %d bytes (possible decompression bomb)", maxBytes)
 			}
 
 		default:

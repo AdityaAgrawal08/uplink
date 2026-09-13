@@ -17,6 +17,17 @@ export interface IRedisClient {
   lrange(key: string, start: number, stop: number): Promise<string[]>;
   ltrim(key: string, start: number, stop: number): Promise<string>;
   llen(key: string): Promise<number>;
+  pipeline(ops: PipeOp[]): Promise<unknown[]>;
+}
+
+// One pipelined operation: Upstash executes the batch in a single round
+// trip (verified: 3 ops in ~300ms vs ~500ms+ sequential at 170ms RTT).
+// Results come back positionally; a failing command throws (fail-fast),
+// matching sequential semantics where the error would surface inline.
+export interface PipeOp {
+  cmd: "hsetnx" | "hset" | "expire" | "rpush" | "ltrim" | "del" | "hgetall" | "hdel" | "lrange" | "llen" | "hlen" | "incr";
+  key: string;
+  args: Array<string | number>;
 }
 
 // Exported for unit tests (and available as a last-resort embeddable store).
@@ -197,6 +208,45 @@ export class MockRedis implements IRedisClient {
     if (this.expired(this.lists, key)) return 0;
     return this.lists.get(key)!.items.length;
   }
+
+  // Sequential execution with identical ordering/error semantics to a
+  // server-side pipeline (errors thrown by an op abort the batch, mirroring
+  // Upstash exec fail-fast so both backends behave alike).
+  async pipeline(ops: PipeOp[]): Promise<unknown[]> {
+    const out: unknown[] = [];
+    for (const op of ops) {
+      switch (op.cmd) {
+        case "hsetnx": out.push(await this.hsetnx(op.key, String(op.args[0]), String(op.args[1]))); break;
+        case "hset": out.push(await this.hset(op.key, String(op.args[0]), String(op.args[1]))); break;
+        case "expire": out.push(await this.expire(op.key, Number(op.args[0]))); break;
+        case "rpush": out.push(await this.rpush(op.key, ...op.args.map(String))); break;
+        case "ltrim": out.push(await this.ltrim(op.key, Number(op.args[0]), Number(op.args[1]))); break;
+        case "del": out.push(await this.del(op.key)); break;
+        case "hgetall": out.push(await this.hgetall(op.key)); break;
+        case "hdel": out.push(await this.hdel(op.key, ...op.args.map(String))); break;
+        case "lrange": out.push(await this.lrange(op.key, Number(op.args[0]), Number(op.args[1]))); break;
+        case "llen": out.push(await this.llen(op.key)); break;
+        case "hlen": out.push(await this.hlen(op.key)); break;
+        case "incr": out.push(await this.incr(op.key)); break;
+        default: throw new Error(`unsupported pipeline op: ${op.cmd}`);
+      }
+    }
+    return out;
+  }
+}
+
+// getDevMockRedis returns a process-wide MockRedis in development, cached
+// on globalThis so Next.js dev hot-reloads (which re-execute route modules)
+// don't silently reset signaling state mid-session. Same convention as the
+// Mongo client cache in mongodb.ts. Production never reaches here without
+// ALLOW_MOCK_REDIS (fail-loud above), and serverless isolates stay separate
+// by design — shared state there comes only from Upstash.
+function getDevMockRedis(): MockRedis {
+  const g = globalThis as typeof globalThis & { __uplinkMockRedis?: MockRedis };
+  if (!g.__uplinkMockRedis) {
+    g.__uplinkMockRedis = new MockRedis();
+  }
+  return g.__uplinkMockRedis;
 }
 
 export class LazyRedisClient implements IRedisClient {
@@ -252,7 +302,7 @@ export class LazyRedisClient implements IRedisClient {
       // silent in dev without credentials; loud once after a real failure
       console.log("Using local in-memory MockRedis (no usable Upstash credentials).");
     }
-    this.client = new MockRedis();
+    this.client = getDevMockRedis();
     return this.client;
   }
 
@@ -299,7 +349,28 @@ export class LazyRedisClient implements IRedisClient {
   }
 
   async hset(key: string, field: string, value: string): Promise<number> {
-    return this.executeWithFallback(c => c.hset(key, field, value));
+    // Upstash v1.38 hset accepts ONLY the object form — hset(key, field,
+    // value) silently spreads the field string into indexed garbage fields
+    // (verified live: {"0":"a","1":"l",...}). MockRedis takes positional
+    // args. Adapt at this boundary so one contract serves both backends.
+    const run = async (): Promise<number> => {
+      const client = this.getClient();
+      if (client instanceof MockRedis) return client.hset(key, field, value);
+      const raw = client as unknown as {
+        hset(k: string, obj: Record<string, string>): Promise<number>;
+      };
+      return raw.hset(key, { [field]: value });
+    };
+    try {
+      return await run();
+    } catch (err) {
+      if (!this.isFallbackToMock && this.mockAllowed()) {
+        this.isFallbackToMock = true;
+        this.client = null;
+        return (this.getClient() as MockRedis).hset(key, field, value);
+      }
+      throw err;
+    }
   }
 
   async hgetall(key: string): Promise<Record<string, string> | null> {
@@ -328,6 +399,47 @@ export class LazyRedisClient implements IRedisClient {
 
   async llen(key: string): Promise<number> {
     return this.executeWithFallback(c => c.llen(key));
+  }
+
+  async pipeline(ops: PipeOp[]): Promise<unknown[]> {
+    const run = async (): Promise<unknown[]> => {
+      const client = this.getClient();
+      if (client instanceof MockRedis) return client.pipeline(ops);
+      // Real Upstash: one round trip via the pipeline builder. Method
+      // names match 1:1 (lowercase); exec fail-fasts like sequential ops.
+      const raw = client as unknown as {
+        pipeline(): Record<string, (...args: unknown[]) => unknown> & { exec(): Promise<unknown[]> };
+      };
+      const p = raw.pipeline();
+      for (const op of ops) {
+        if (op.cmd === "hset") {
+          // Object form only (see hset override): positional spreads the
+          // field string into indexed garbage fields on real Upstash.
+          const [field, value] = op.args;
+          (p.hset as unknown as (k: string, o: Record<string, string>) => unknown).call(
+            p, op.key, { [String(field)]: String(value) }
+          );
+          continue;
+        }
+        const fn = p[op.cmd];
+        if (typeof fn !== "function") throw new Error(`unsupported pipeline op: ${op.cmd}`);
+        fn.call(p, op.key, ...op.args);
+      }
+      return p.exec();
+    };
+    try {
+      return await run();
+    } catch (err) {
+      // Single-request batch: a network failure means nothing ran
+      // server-side, so one mock retry is safe (same guarantee as the
+      // per-op fallback). Production without opt-in fails loud instead.
+      if (!this.isFallbackToMock && this.mockAllowed()) {
+        this.isFallbackToMock = true;
+        this.client = null;
+        return (this.getClient() as MockRedis).pipeline(ops);
+      }
+      throw err;
+    }
   }
 }
 
