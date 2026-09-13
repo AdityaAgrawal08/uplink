@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,34 @@ const (
 	stunServer       = "stun:stun.l.google.com:19302"
 )
 
+// disconnectGraceTimeout is how long a Disconnected PC may flap before we
+// declare it dead. Disconnected is TRANSIENT (NAT rebinding, brief radio
+// loss) — the old code treated it as terminal, tearing down healthy
+// channels and churning full re-handshakes. Overridable in tests.
+var disconnectGraceTimeout = 10 * time.Second
+
+// resolveStunURLs picks ICE servers: explicit list wins (tests pass an
+// empty slice for pure loopback), then UPLINK_STUN (comma-separated),
+// then the public Google default. Production-grade override without
+// recompiling: UPLINK_STUN="stun:host1:3478,stun:host2:3478".
+func resolveStunURLs(explicit []string) []string {
+	if explicit != nil {
+		return explicit
+	}
+	if env, ok := os.LookupEnv("UPLINK_STUN"); ok {
+		var out []string
+		for _, s := range strings.Split(env, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				out = append(out, s)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return []string{stunServer}
+}
+
 type meshCallbacks struct {
 	onBytes    func(peer string, raw []byte) // inbound data-channel payload
 	onPeerUp   func(peer string)             // channel open, ready to send
@@ -62,13 +92,10 @@ type mesh struct {
 }
 
 func newMesh(me string, sig *signalClient, stun []string, cb meshCallbacks) *mesh {
-	if stun == nil {
-		stun = []string{stunServer}
-	}
 	return &mesh{
 		me:       me,
 		sig:      sig,
-		stunURLs: stun,
+		stunURLs: resolveStunURLs(stun),
 		cb:       cb,
 		peers:    map[string]*meshPeer{},
 		noteQs:   map[string]chan signalNote{},
@@ -103,16 +130,24 @@ func (m *mesh) ensurePeer(username string) {
 
 // send transmits bytes to an OPEN channel. Fails fast otherwise — the
 // engine treats failure as "use inbox fallback", never blocks here.
+// The connection-state gate is load-bearing: without it, bytes written
+// into a half-open (dead but not yet reaped) channel vanish silently with
+// no fallback, because Send itself may still succeed into kernel buffers.
 func (m *mesh) send(peer string, raw []byte) error {
 	m.mu.Lock()
 	mp, ok := m.peers[peer]
 	var dc *webrtc.DataChannel
+	var pc *webrtc.PeerConnection
 	if ok {
-		dc = mp.dc
+		dc, pc = mp.dc, mp.pc
 	}
 	m.mu.Unlock()
-	if !ok || dc == nil {
+	if !ok || dc == nil || pc == nil {
 		return fmt.Errorf("no open channel to %s", peer)
+	}
+	if dc.ReadyState() != webrtc.DataChannelStateOpen ||
+		pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
+		return fmt.Errorf("channel to %s not connected", peer)
 	}
 	return dc.Send(raw)
 }
@@ -225,18 +260,22 @@ func (m *mesh) close() {
 	}
 }
 
-func (m *mesh) failPeer(username string) {
+// peerDown tears down one peer connection: pointer-guarded so stale
+// callbacks (superseded setups, timers firing after close) are no-ops
+// instead of double-firing onPeerDown. Exactly-once notification.
+func (m *mesh) peerDown(mp *meshPeer) {
 	m.mu.Lock()
-	_, ok := m.peers[username]
-	if ok {
-		delete(m.peers, username)
-		delete(m.noteQs, username)
+	cur, ok := m.peers[mp.username]
+	if !ok || cur != mp {
+		m.mu.Unlock()
+		return
 	}
+	delete(m.peers, mp.username)
+	delete(m.noteQs, mp.username)
 	m.mu.Unlock()
-	if ok {
-		if m.cb.onPeerDown != nil {
-			m.cb.onPeerDown(username)
-		}
+	m.closePeer(mp)
+	if m.cb.onPeerDown != nil {
+		m.cb.onPeerDown(mp.username)
 	}
 }
 
@@ -270,28 +309,58 @@ func (m *mesh) setupPeer(mp *meshPeer) {
 
 	pc, err := m.newPC()
 	if err != nil {
-		m.failPeer(peer)
+		m.peerDown(mp)
 		return
 	}
 	m.setPC(mp, pc)
 
-	// Any terminal connection state fails this attempt; the engine may
-	// re-ensure (fresh PC + fresh Noise handshake).
+	// Terminal states fail the attempt; transient Disconnected gets a grace
+	// window to recover (NAT rebinding, brief radio loss) before we tear
+	// down. onPeerDown fires at most once per peerDown-guarded teardown.
 	failed := make(chan struct{}, 1)
+	signalFailed := func() {
+		select {
+		case failed <- struct{}{}:
+		default:
+		}
+	}
+	var graceMu sync.Mutex
+	var graceTimer *time.Timer
+	stopGrace := func() {
+		graceMu.Lock()
+		if graceTimer != nil {
+			graceTimer.Stop()
+			graceTimer = nil
+		}
+		graceMu.Unlock()
+	}
+	defer stopGrace()
+	opened := make(chan struct{})
+	var openedOnce sync.Once
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
-		if s == webrtc.PeerConnectionStateFailed ||
-			s == webrtc.PeerConnectionStateClosed ||
-			s == webrtc.PeerConnectionStateDisconnected {
-			select {
-			case failed <- struct{}{}:
-			default:
+		switch s {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			stopGrace()
+			m.peerDown(mp)
+			signalFailed()
+		case webrtc.PeerConnectionStateDisconnected:
+			graceMu.Lock()
+			if graceTimer == nil {
+				graceTimer = time.AfterFunc(disconnectGraceTimeout, func() {
+					m.peerDown(mp)
+					signalFailed()
+				})
 			}
+			graceMu.Unlock()
+		case webrtc.PeerConnectionStateConnected:
+			stopGrace()
 		}
 	})
 
 	wireChannel := func(dc *webrtc.DataChannel) {
 		m.setDC(mp, dc)
 		dc.OnOpen(func() {
+			openedOnce.Do(func() { close(opened) })
 			if m.cb.onPeerUp != nil {
 				m.cb.onPeerUp(peer)
 			}
@@ -306,26 +375,30 @@ func (m *mesh) setupPeer(mp *meshPeer) {
 	if m.iOffer(peer) {
 		if err := m.setupOfferer(ctx, mp, pc, failed, wireChannel); err != nil {
 			_ = pc.Close()
-			m.failPeer(peer)
+			m.peerDown(mp)
 			return
 		}
 	} else {
 		if err := m.setupAnswerer(ctx, mp, pc, failed, wireChannel); err != nil {
 			_ = pc.Close()
-			m.failPeer(peer)
+			m.peerDown(mp)
 			return
 		}
 	}
 
 	// Wait for the channel to open (or failure/timeout). closePeer
-	// surfaces here through the connection-state callback.
+	// surfaces here through the connection-state callback. On success we
+	// RETURN with the connection live — the old code fell through to the
+	// timeout branch and killed every healthy peer 30s after setup,
+	// flapping the whole mesh on a fixed schedule.
 	select {
 	case <-ctx.Done():
 		_ = pc.Close()
-		m.failPeer(peer)
+		m.peerDown(mp)
 	case <-failed:
 		_ = pc.Close()
-		m.failPeer(peer)
+		m.peerDown(mp)
+	case <-opened:
 	}
 }
 

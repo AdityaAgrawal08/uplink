@@ -7,7 +7,7 @@ import {
   drainSignals,
   checkSendLimit,
   checkReadLimit,
-  clientIpHash,
+  scopedBudgetKey,
 } from "@/lib/rooms";
 
 // WebRTC rendezvous: members exchange SDP offers/answers and ICE candidates
@@ -28,7 +28,7 @@ export async function POST(
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { to, type, payload } = parsed.body as { to?: unknown; type?: unknown; payload?: unknown };
 
-    await checkSendLimit("sig", clientIpHash(req));
+    await checkSendLimit("sig", scopedBudgetKey(req, username));
     await depositSignal(sessionId, username, to as string, type as string, payload as string);
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (error) {
@@ -43,10 +43,10 @@ export async function GET(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    await checkReadLimit(clientIpHash(req)); // drains are the hot poll path
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
 
     const notes = await drainSignals(sessionId, username);
     return NextResponse.json({ notes });
