@@ -1293,9 +1293,31 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
-		// owns the 15s beat; this only renders).
+		// owns the 5s beat; this only renders). Membership deltas are
+		// announced as system lines AND repaint immediately — previously
+		// the tick updated c.users without any rebuildView, so the sidebar
+		// visibly refreshed only when the next message triggered a repaint.
 		roster := c.eng.peers()
 		users := onlineNames(roster, c.me)
+		had := map[string]bool{}
+		for _, u := range c.users {
+			had[u] = true
+		}
+		has := map[string]bool{}
+		for _, u := range users {
+			has[u] = true
+		}
+		var joined, left []string
+		for _, u := range users {
+			if !had[u] && u != c.me {
+				joined = append(joined, u)
+			}
+		}
+		for _, u := range c.users {
+			if !has[u] && u != c.me {
+				left = append(left, u)
+			}
+		}
 		c.users = users
 		live := map[string]bool{c.me: true}
 		for _, u := range users {
@@ -1313,6 +1335,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if c.hoverPeer != "" && !live[c.hoverPeer] {
 			c.hoverPeer = ""
+		}
+		for _, u := range joined {
+			c.appendLocal(generalConv, "* "+u+" joined") // appendLocal rebuilds (repaints sidebar now, not on next message)
+		}
+		for _, u := range left {
+			c.appendLocal(generalConv, "* "+u+" left")
 		}
 		cmds = append(cmds, scheduleRoster())
 
@@ -1376,11 +1404,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netReadyMsg:
-		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("🔒 encrypted channel to %s (safety %s)", msg.user, msg.code)))
+		// E2E established: deliberately silent in the transcript (the safety
+		// code check happens in-engine; KEY SWAP attacks still surface via
+		// netErrMsg). Keeps the conversation clean per product direction.
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netLostMsg:
-		c.appendLine(tuiSystemStyle.Render(fmt.Sprintf("* lost direct line to %s (fallback relay active)", msg.user)))
+		// Transport drops stay out of the transcript; delivery continues over
+		// the inbox fallback and the channel re-establishes quietly.
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:

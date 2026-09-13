@@ -60,3 +60,13 @@ uplink config set server https://YOUR-APP.vercel.app
 Both chatters must use the **same** server URL — same code on two backends
 (e.g. one tab on `localhost:3000`, one on Vercel) is two different rooms
 by construction.
+
+## 5. Client tunables (optional)
+
+- `UPLINK_STUN`: comma-separated STUN servers for WebRTC NAT traversal.
+  Default: `stun:stun.l.google.com:19302`. Example:
+  `UPLINK_STUN="stun:stun.l.google.com:19302" uplink ...`
+- The `sharp` / `unrs-resolver` lines in the Vercel build log
+  (`npm warn allow-scripts ...`) are informational: they name transitive
+  Next.js dependencies with install scripts and do not fail or affect the
+  build. No action needed.

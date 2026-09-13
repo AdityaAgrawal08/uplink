@@ -7,7 +7,7 @@ import {
   fetchBoxes,
   checkSendLimit,
   checkReadLimit,
-  clientIpHash,
+  scopedBudgetKey,
 } from "@/lib/rooms";
 
 // Unified offline/fallback inbox. Boxes are ciphertext the server cannot
@@ -34,7 +34,7 @@ export async function POST(
       to?: unknown; msgId?: unknown; kind?: unknown; payload?: unknown;
     };
 
-    await checkSendLimit("inbox", clientIpHash(req));
+    await checkSendLimit("inbox", scopedBudgetKey(req, username));
     await depositBox(sessionId, username, to as string, msgId as string, kind as string, payload as string);
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (error) {
@@ -49,10 +49,10 @@ export async function GET(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
-    await checkReadLimit(clientIpHash(req)); // drains are the hot poll path
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
 
     const boxes = await fetchBoxes(sessionId, username);
     return NextResponse.json({ boxes });

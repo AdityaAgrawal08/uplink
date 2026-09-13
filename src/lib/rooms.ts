@@ -26,7 +26,7 @@ export const ROOM_CODE_RE = /^[0-9]{6}$/;
 export const ROOM_TTL_SEC = 24 * 3600; // sliding safety net; rooms die on empty, not time
 export const SIG_TTL_SEC = 5 * 60; // connection notes live minutes
 export const INBOX_TTL_SEC = 60 * 60; // frozen spec: undelivered boxes evaporate after 1h
-export const PRESENCE_TIMEOUT_MS = 45 * 1000; // 3 missed 15s heartbeats = offline
+export const PRESENCE_TIMEOUT_MS = 20 * 1000; // ~4 missed 5s heartbeats = offline (fast join/leave visibility; beats are cheap pipelined reads)
 
 export const MAX_SIG_QUEUE = 50; // signaling notes queued per user
 export const MAX_INBOX = 200; // undelivered boxes held per user
@@ -224,6 +224,15 @@ export function clientIpHash(req: Request): string {
   const raw = req.headers.get("x-forwarded-for") || "127.0.0.1";
   const ip = raw.split(",")[0].trim() || "127.0.0.1";
   return anonymizeIp(ip);
+}
+
+// scopedBudgetKey extends a budget key with the caller's username so members
+// behind one NAT (office, dorm) don't share a single throttle bucket.
+// Usernames can't contain ":" (validated charset), so the composition is
+// unambiguous. Join/leave/create deliberately stay IP-scoped: budgets that
+// gate Sybil-able actions must not be dodgeable by minting names.
+export function scopedBudgetKey(req: Request, username: string): string {
+  return clientIpHash(req) + ":" + username;
 }
 
 export async function createRoom(

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -29,8 +30,8 @@ import (
 const (
 	engineSignalEvery = 2 * time.Second
 	engineInboxEvery  = 5 * time.Second
-	engineBeatEvery   = 15 * time.Second
-	inboxBoxKind = "p2p"
+	engineBeatEvery   = 5 * time.Second
+	inboxBoxKind      = "p2p"
 	// fallbackFileMax caps single-box files on the inbox path. Math: the
 	// server caps box payloads at 256KB; base64 inflates raw bytes 4/3 plus
 	// JSON overhead, so ~160KB raw fits with margin. Larger files need the
@@ -67,16 +68,29 @@ type fileAssembly struct {
 }
 
 type engine struct {
-	me        string
-	id        *identityKey
-	sig       *signalClient
-	mesh      *mesh
-	cb        engineCallbacks
-	mu        sync.Mutex
-	roster    map[string][]byte // username -> static pubkey
-	noise     map[string]*peerSession
-	hs        map[string]*peerSession // handshakes in progress
-	hsAt      map[string]time.Time   // handshake start times (stuck-hs expiry)
+	me     string
+	id     *identityKey
+	sig    *signalClient
+	mesh   *mesh
+	cb     engineCallbacks
+	mu     sync.Mutex
+	roster map[string][]byte // username -> static pubkey
+	noise  map[string]*peerSession
+	hs     map[string]*peerSession // handshakes in progress
+	hsAt   map[string]time.Time    // handshake start times (stuck-hs expiry)
+	// hsEpoch tracks the epoch of each in-progress handshake; completedEpoch
+	// tracks the epoch of the live session. A re-handshake always carries a
+	// newer epoch, so duplicate/redelivered notes (same or older epoch) are
+	// ignored instead of nuking a healthy session.
+	hsEpoch        map[string]int64
+	completedEpoch map[string]int64
+	// lastFail throttles setup retries per peer (setupRetryBackoff) so a
+	// persistently failing peer can't churn PC+handshake storms.
+	// failCount distinguishes a first drop (retry on next beat — likely
+	// transient, and the common rejoin case) from repeated quick failures
+	// (throttled). Success clears both; departure clears both.
+	lastFail  map[string]time.Time
+	failCount map[string]int
 	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
@@ -97,6 +111,38 @@ type engine struct {
 // refresh when a send would otherwise address a stale world.
 const rosterFreshTTL = 5 * time.Second
 
+// setupRetryBackoff is the minimum gap between setup attempts for one peer
+// after a failure. Var (not const) so tests can shrink it.
+var setupRetryBackoff = 30 * time.Second
+
+// hsEnvelope wraps one Noise handshake message with the initiator's epoch
+// (unix nanos at handshake start). Epochs order handshakes per peer pair:
+// a note carrying an epoch at or below the completed one is a duplicate or
+// a stale retransmit and must be ignored — never allowed to tear down the
+// live session. Without this, signal-queue redelivery nukes healthy E2E
+// channels and both sides flap forever.
+type hsEnvelope struct {
+	Epoch int64  `json:"epoch"`
+	Data  string `json:"data"`
+}
+
+func wrapHs(epoch int64, msg []byte) string {
+	raw, _ := json.Marshal(hsEnvelope{Epoch: epoch, Data: base64.StdEncoding.EncodeToString(msg)})
+	return string(raw)
+}
+
+func unwrapHs(payload string) (int64, []byte, error) {
+	var env hsEnvelope
+	if err := json.Unmarshal([]byte(payload), &env); err != nil {
+		return 0, nil, err
+	}
+	msg, err := base64.StdEncoding.DecodeString(env.Data)
+	if err != nil {
+		return 0, nil, err
+	}
+	return env.Epoch, msg, nil
+}
+
 func newEngine(me string, id *identityKey, sig *signalClient, cb engineCallbacks) *engine {
 	return newEngineWithStun(me, id, sig, cb, nil)
 }
@@ -105,18 +151,22 @@ func newEngine(me string, id *identityKey, sig *signalClient, cb engineCallbacks
 // empty list for pure-loopback (offline-safe) operation.
 func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineCallbacks, stun []string) *engine {
 	e := &engine{
-		me:        me,
-		id:        id,
-		sig:       sig,
-		cb:        cb,
-		roster:    map[string][]byte{},
-		noise:     map[string]*peerSession{},
-		hs:        map[string]*peerSession{},
-		hsAt:      map[string]time.Time{},
-		seen:      newSeenSet(2000),
-		files:     map[string]*fileAssembly{},
-		announced: map[string]bool{},
-		stopCh:    make(chan struct{}),
+		me:             me,
+		id:             id,
+		sig:            sig,
+		cb:             cb,
+		roster:         map[string][]byte{},
+		noise:          map[string]*peerSession{},
+		hs:             map[string]*peerSession{},
+		hsAt:           map[string]time.Time{},
+		hsEpoch:        map[string]int64{},
+		completedEpoch: map[string]int64{},
+		lastFail:       map[string]time.Time{},
+		failCount:      map[string]int{},
+		seen:           newSeenSet(2000),
+		files:          map[string]*fileAssembly{},
+		announced:      map[string]bool{},
+		stopCh:         make(chan struct{}),
 	}
 	e.mesh = newMesh(me, sig, stun, meshCallbacks{
 		onBytes:    e.onMeshBytes,
@@ -224,6 +274,15 @@ func (e *engine) setRoster(members []rosterMember) {
 	for _, u := range removed {
 		e.mesh.dropPeer(u)
 		e.dropNoise(u)
+		// Departed users leave no residue: stale epochs/penalties must not
+		// mute a future rejoin, and a rejoining user (possibly a new device
+		// key) must re-announce its safety code instead of inheriting trust.
+		e.mu.Lock()
+		delete(e.completedEpoch, u)
+		delete(e.lastFail, u)
+		delete(e.failCount, u)
+		delete(e.announced, u)
+		e.mu.Unlock()
 	}
 }
 
@@ -232,14 +291,18 @@ func (e *engine) dropNoise(peer string) {
 	delete(e.noise, peer)
 	delete(e.hs, peer)
 	delete(e.hsAt, peer)
+	delete(e.hsEpoch, peer)
+	// NOTE: completedEpoch and lastFail intentionally survive — the former
+	// rejects duplicate notes after teardown, the latter throttles retries.
 	e.mu.Unlock()
 }
 
 // trackHs records a handshake start for stuck-handshake expiry.
-func (e *engine) trackHs(peer string, ps *peerSession) {
+func (e *engine) trackHs(peer string, ps *peerSession, epoch int64) {
 	e.mu.Lock()
 	e.hs[peer] = ps
 	e.hsAt[peer] = time.Now()
+	e.hsEpoch[peer] = epoch
 	e.mu.Unlock()
 }
 
@@ -297,7 +360,7 @@ func isNotMember(err error) bool {
 const stuckHsTTL = 60 * time.Second
 
 // reconcilePeers closes the retry gap: failed mesh setups leave no trace
-// (failPeer removes the entry) and stuck handshakes leave only an hs entry,
+// (teardown removes the entry) and stuck handshakes leave only an hs entry,
 // so without this a transient failure would strand a peer until the roster
 // itself changed. In-flight setups and fresh handshakes are left alone.
 func (e *engine) reconcilePeers(roster []rosterMember) {
@@ -310,6 +373,8 @@ func (e *engine) reconcilePeers(roster []rosterMember) {
 		_, live := e.noise[m.Username]
 		_, hs := e.hs[m.Username]
 		started := e.hsAt[m.Username]
+		backoff := e.lastFail[m.Username]
+		flaps := e.failCount[m.Username]
 		e.mu.Unlock()
 		if live {
 			continue
@@ -318,11 +383,24 @@ func (e *engine) reconcilePeers(roster []rosterMember) {
 			if now.Sub(started) < stuckHsTTL {
 				continue // handshake in progress; leave it alone
 			}
-			// stuck: full restart (fresh PC + fresh Noise = fresh nonces)
+			// stuck: full restart (fresh PC + fresh Noise = fresh nonces).
+			// The 60s stall already served as the throttle — clear any
+			// retry penalty so the replacement attempt starts now.
 			e.mesh.dropPeer(m.Username)
 			e.dropNoise(m.Username)
+			e.mu.Lock()
+			delete(e.lastFail, m.Username)
+			delete(e.failCount, m.Username)
+			e.mu.Unlock()
 		} else if e.mesh.hasPeer(m.Username) {
 			continue // mesh setup in flight; leave it alone
+		}
+		// Throttle restarts: a repeatedly flapping peer re-runs full setup
+		// at most every setupRetryBackoff. A first (or long-quiet) failure
+		// retries on the next beat instead — transient drops and rejoins
+		// recover in seconds, not backoff windows.
+		if flaps >= 2 && !backoff.IsZero() && now.Sub(backoff) < setupRetryBackoff {
+			continue
 		}
 		e.mesh.ensurePeer(m.Username)
 	}
@@ -378,8 +456,9 @@ func (e *engine) onMeshUp(peer string) {
 			e.emitErr(err)
 			return
 		}
-		e.trackHs(peer, ps)
-		if err := e.sig.signalSend(peer, noiseSig1, base64.StdEncoding.EncodeToString(m1)); err != nil {
+		epoch := time.Now().UnixNano()
+		e.trackHs(peer, ps, epoch)
+		if err := e.sig.signalSend(peer, noiseSig1, wrapHs(epoch, m1)); err != nil {
 			e.emitErr(err)
 		}
 	}
@@ -387,7 +466,7 @@ func (e *engine) onMeshUp(peer string) {
 }
 
 func (e *engine) onHandshakeNote(n signalNote) {
-	raw, err := base64.StdEncoding.DecodeString(n.Payload)
+	epoch, raw, err := unwrapHs(n.Payload)
 	if err != nil {
 		return
 	}
@@ -396,23 +475,47 @@ func (e *engine) onHandshakeNote(n signalNote) {
 		if e.me < n.From {
 			return // I initiate; ignore their attempt (glare rule)
 		}
+		e.mu.Lock()
+		completed, done := e.completedEpoch[n.From]
+		e.mu.Unlock()
+		if done && epoch <= completed {
+			return // duplicate/redelivered note: must never touch the live session
+		}
+		if done {
+			// Genuine restart (newer epoch after a completed session):
+			// drop stale transport + session FIRST so both sides converge
+			// on this handshake instead of straddling two generations
+			// (cross-encrypting = mutual decrypt fails). First contact
+			// (no completed session) drops nothing — the transport the
+			// handshake itself needs stays up.
+			e.mesh.dropPeer(n.From)
+			e.dropNoise(n.From)
+			// Deliberate restart, not failure: clear any retry penalty so
+			// the transport re-establishes immediately instead of sitting
+			// out the 30s flap backoff on inbox fallback.
+			e.mu.Lock()
+			delete(e.lastFail, n.From)
+			delete(e.failCount, n.From)
+			e.mu.Unlock()
+		}
 		ps, _, err := beginNoise(e.id, n.From, false)
 		if err != nil {
 			return
 		}
-		e.trackHs(n.From, ps)
+		e.trackHs(n.From, ps, epoch)
 		m2, err := ps.stepNoise(raw)
 		if err != nil || m2 == nil {
 			e.dropNoise(n.From)
 			return
 		}
-		_ = e.sig.signalSend(n.From, noiseSig2, base64.StdEncoding.EncodeToString(m2))
+		_ = e.sig.signalSend(n.From, noiseSig2, wrapHs(epoch, m2))
 	case noiseSig2:
 		e.mu.Lock()
 		ps, ok := e.hs[n.From]
+		wantEpoch, tracked := e.hsEpoch[n.From]
 		e.mu.Unlock()
-		if !ok {
-			return
+		if !ok || !tracked || wantEpoch != epoch {
+			return // stale retransmit for a superseded attempt
 		}
 		m3, err := ps.stepNoise(raw)
 		if err != nil {
@@ -420,15 +523,16 @@ func (e *engine) onHandshakeNote(n signalNote) {
 			return
 		}
 		if m3 != nil {
-			_ = e.sig.signalSend(n.From, noiseSig3, base64.StdEncoding.EncodeToString(m3))
+			_ = e.sig.signalSend(n.From, noiseSig3, wrapHs(epoch, m3))
 		}
 		e.verifyReady(n.From, ps)
 	case noiseSig3:
 		e.mu.Lock()
 		ps, ok := e.hs[n.From]
+		wantEpoch, tracked := e.hsEpoch[n.From]
 		e.mu.Unlock()
-		if !ok {
-			return
+		if !ok || !tracked || wantEpoch != epoch {
+			return // stale retransmit for a superseded attempt
 		}
 		if _, err := ps.stepNoise(raw); err != nil {
 			e.dropNoise(n.From)
@@ -449,6 +553,10 @@ func (e *engine) verifyReady(peer string, ps *peerSession) {
 	e.mu.Lock()
 	want, ok := e.roster[peer]
 	if !ok || !equalBytes(want, ps.remoteKey()) {
+		// Back off before any retry: under active key-swap attack this
+		// path would otherwise handshake-storm every beat.
+		e.lastFail[peer] = time.Now()
+		e.failCount[peer] = 2
 		e.mu.Unlock()
 		e.mesh.dropPeer(peer)
 		e.dropNoise(peer)
@@ -458,6 +566,15 @@ func (e *engine) verifyReady(peer string, ps *peerSession) {
 	e.noise[peer] = ps
 	delete(e.hs, peer)
 	delete(e.hsAt, peer)
+	// Handshake epoch graduates: future notes at/below this epoch are
+	// duplicates and must never touch the live session again.
+	if epoch, ok := e.hsEpoch[peer]; ok {
+		e.completedEpoch[peer] = epoch
+		delete(e.hsEpoch, peer)
+	}
+	// Healthy peers carry no retry penalty.
+	delete(e.lastFail, peer)
+	delete(e.failCount, peer)
 	announced := e.announced[peer]
 	if !announced {
 		e.announced[peer] = true
@@ -688,6 +805,9 @@ func (e *engine) ensureFreshRoster() {
 	if err != nil {
 		return
 	}
+	e.mu.Lock()
+	e.presence = roster
+	e.mu.Unlock()
 	e.setRoster(roster)
 }
 
@@ -933,7 +1053,25 @@ func (e *engine) sweepAssemblies() {
 
 func (e *engine) onMeshDown(peer string) {
 	e.dropNoise(peer)
-	if e.cb.onPeerLost != nil {
+	e.mu.Lock()
+	announced := e.announced[peer]
+	// Flap counting: a first drop retries on the next beat (likely
+	// transient — the common rejoin case). Only repeated drops in quick
+	// succession arm the setupRetryBackoff throttle, so one flapping peer
+	// can't churn PC+handshake storms at beat frequency.
+	prev := e.lastFail[peer]
+	if !prev.IsZero() && time.Since(prev) < 60*time.Second {
+		e.failCount[peer]++
+	} else {
+		e.failCount[peer] = 1
+	}
+	e.lastFail[peer] = time.Now()
+	e.mu.Unlock()
+	// Notify the UI only for peers that once had verified E2E. Setup-time
+	// failures (never ready) retry quietly via reconcile — previously every
+	// failed setup printed "lost direct line", which was both wrong (no
+	// line ever existed) and spammy.
+	if announced && e.cb.onPeerLost != nil {
 		e.cb.onPeerLost(peer)
 	}
 }
