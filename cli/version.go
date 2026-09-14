@@ -106,6 +106,10 @@ func handleUpdate() {
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("✗ GitHub API returned status %d: %s\n", resp.StatusCode, truncateStringPlain(string(body), 120))
+		if resp.StatusCode == 404 && ghToken == "" {
+			fmt.Println("  If this repo is private, anonymous checks always 404: export GITHUB_TOKEN")
+			fmt.Println("  (a PAT with 'repo' scope, or run: export GITHUB_TOKEN=$(gh auth token)) and retry.")
+		}
 		os.Exit(1)
 	}
 
