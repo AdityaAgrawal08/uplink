@@ -97,12 +97,19 @@ type engine struct {
 	lastFail  map[string]time.Time
 	failCount map[string]int
 	// unacked tracks mesh-sent chat/file frames awaiting a delivery ack,
-	// keyed msgId+"\\x00"+peer (broadcasts fan out per peer; each recipient
-	// acks). Entries graduate on ack and expire after maxInboxRetries
-	// inbox re-sends — the backstop for frames the mesh ate (sent into a
-	// dead or cross-generation session). Inbox-first sends are durable by
-	// construction (1h server TTL + redelivery) and are never tracked.
-	unacked   map[string]*pendingAck
+	// keyed msgId+"|"+peer (hex ids, alphanumeric usernames — unambiguous).
+	// Broadcasts fan out per peer and each recipient acks. Entries graduate
+	// on ack and expire after maxInboxRetries inbox re-sends — the backstop
+	// for frames the mesh ate (sent into a dead or cross-generation
+	// session). Inbox-first sends are durable by construction (1h server
+	// TTL + redelivery) and are never tracked.
+	unacked map[string]*pendingAck
+	// sendMu serializes the mesh fast path per peer so encrypt order ==
+	// wire order. Noise nonces are sequential: concurrent encrypt+send
+	// from the chat and file-upload goroutines could otherwise swap two
+	// frames on the wire, and the receiver would fail-decrypt the first
+	// arrival and tear down a healthy session. Guarded by e.mu.
+	sendMu    map[string]*sync.Mutex
 	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
@@ -150,7 +157,7 @@ type pendingAck struct {
 	tries int // inbox re-sends so far
 }
 
-func unackedKey(msgId, peer string) string { return msgId + "\x00" + peer }
+func unackedKey(msgId, peer string) string { return msgId + "|" + peer }
 
 // hsEnvelope wraps one Noise handshake message with the initiator's epoch
 // (unix nanos at handshake start). Epochs order handshakes per peer pair:
@@ -201,6 +208,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		lastFail:       map[string]time.Time{},
 		failCount:      map[string]int{},
 		unacked:        map[string]*pendingAck{},
+		sendMu:         map[string]*sync.Mutex{},
 		seen:           newSeenSet(2000),
 		files:          map[string]*fileAssembly{},
 		announced:      map[string]bool{},
@@ -321,6 +329,7 @@ func (e *engine) setRoster(members []rosterMember) {
 		delete(e.lastFail, u)
 		delete(e.failCount, u)
 		delete(e.announced, u)
+		delete(e.sendMu, u)
 		e.mu.Unlock()
 	}
 }
@@ -809,19 +818,30 @@ func (e *engine) sendOne(peer string, f frame, raw []byte) error {
 	ps, ok := e.noise[peer]
 	key, known := e.roster[peer]
 	e.mu.Unlock()
-	// fast path: live Noise session + open channel
+	// fast path: live Noise session + open channel. Serialized per peer so
+	// concurrent chat and file-upload goroutines can't swap two frames on
+	// the wire out of Noise nonce order (the receiver would fail-decrypt
+	// the first arrival and tear down a healthy session).
 	if ok && ps.isReady() {
-		if ct, err := ps.encrypt(raw); err == nil {
-			if err := e.mesh.send(peer, ct); err == nil {
-				// Mesh delivery is NOT assumed: the frame may land in a
-				// dead or cross-generation session and be dropped on
-				// decrypt. Track chat/file payloads for the ack backstop
-				// (streams and control frames are excluded — see below).
-				if f.Type == frameChat || f.Type == frameFile {
-					e.trackUnacked(peer, f)
-				}
-				return nil
+		sm := e.sendMuFor(peer)
+		sm.Lock()
+		ct, encErr := ps.encrypt(raw)
+		var sendErr error
+		if encErr == nil {
+			sendErr = e.mesh.send(peer, ct)
+		}
+		sm.Unlock()
+		if encErr == nil && sendErr == nil {
+			// Mesh delivery is NOT assumed: the frame may land in a
+			// dead or cross-generation session and be dropped on
+			// decrypt. Track chat/file payloads for the ack backstop
+			// (streams and control frames are excluded — see below).
+			if f.Type == frameChat || f.Type == frameFile {
+				e.trackUnacked(peer, f)
 			}
+			return nil
+		}
+		if encErr == nil {
 			// Encrypted into a dead channel: the send nonce advanced but
 			// the peer never got the ciphertext, so the session's nonce
 			// streams are now desynced — every FUTURE mesh frame would
@@ -866,6 +886,20 @@ func (e *engine) sendInbox(peer string, key []byte, f frame, raw []byte) error {
 		return err
 	}
 	return e.sig.inboxSend(peer, f.MsgId, inboxBoxKind, box)
+}
+
+// sendMuFor returns the per-peer mesh fast-path serializer, creating it.
+// Callers hold it across encrypt+send so frame order on the wire matches
+// Noise nonce order for that peer.
+func (e *engine) sendMuFor(peer string) *sync.Mutex {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sm, ok := e.sendMu[peer]
+	if !ok {
+		sm = &sync.Mutex{}
+		e.sendMu[peer] = sm
+	}
+	return sm
 }
 
 // trackUnacked records a mesh-sent frame for the ack backstop.
@@ -1061,6 +1095,51 @@ func (e *engine) allLive(to string) bool {
 }
 
 // sendFileStream streams meta/chunks/complete down the live path.
+const (
+	// fileBackpressureHigh caps SCTP bytes in flight per file stream.
+	// Without it a 25MB transfer fills kernel buffers and chat frames
+	// queue behind megabytes on the same ordered channel (head-of-line
+	// blocking = chat latency + apparent loss). 512KB bounds the chat
+	// delay behind bulk bytes while keeping enough window for healthy
+	// throughput on high-RTT links.
+	fileBackpressureHigh = 512 * 1024
+	// fileBackpressureStall aborts a stream whose buffers never drain
+	// (dead link the PC state hasn't noticed yet) instead of wedging the
+	// single upload-queue slot forever. Loud error; the user retries.
+	fileBackpressureStall = 60 * time.Second
+	// fileBackpressurePoll sets the drain-check cadence inside a stream.
+	fileBackpressurePoll = 10 * time.Millisecond
+)
+
+// awaitDrain blocks until every recipient's queued bytes fit under the
+// backpressure window (or the stall deadline hits). Broadcasts wait on
+// the slowest peer — one wedged receiver must not wedge the sender, so
+// the deadline converts that into a loud error instead.
+func (e *engine) awaitDrain(to string) error {
+	deadline := time.Now().Add(fileBackpressureStall)
+	for {
+		var max uint64
+		if to != "" {
+			max = e.mesh.bufferedAmount(to)
+		} else {
+			e.mu.Lock()
+			for u := range e.roster {
+				if n := e.mesh.bufferedAmount(u); n > max {
+					max = n
+				}
+			}
+			e.mu.Unlock()
+		}
+		if max <= fileBackpressureHigh {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("direct line stalled under backpressure — retry the file")
+		}
+		time.Sleep(fileBackpressurePoll)
+	}
+}
+
 func (e *engine) sendFileStream(to, id, display string, data []byte, sumHex string, prog chan<- uploadProgressMsg) (string, int64, error) {
 	chunks := splitChunks(data)
 	meta := newFrame(frameFileMeta, id, e.me, to)
@@ -1072,6 +1151,9 @@ func (e *engine) sendFileStream(to, id, display string, data []byte, sumHex stri
 		return "", 0, err
 	}
 	for i, c := range chunks {
+		if err := e.awaitDrain(to); err != nil {
+			return "", 0, err
+		}
 		cf := newFrame(frameFileChunk, id, e.me, to)
 		cf.ChunkIndex = i
 		cf.Data = base64.StdEncoding.EncodeToString(c)

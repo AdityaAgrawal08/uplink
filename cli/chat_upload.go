@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -274,9 +275,31 @@ func tarballDir(dir string) (string, error) {
 	}
 	defer f.Close()
 
-	if err := tarball.Pack(dir, f); err != nil {
+	// Cap the pack AS it writes: without this a multi-GB folder packs in
+	// full to temp (disk + minutes of gzip) before the 25MB check below
+	// can reject it. Anything past the cap would be rejected anyway, so
+	// aborting early only saves time and disk.
+	capped := &capWriter{w: f, cap: uploadMaxBytes}
+	if err := tarball.Pack(dir, capped); err != nil {
 		os.Remove(out)
 		return "", err
 	}
 	return out, nil
+}
+
+// capWriter aborts a stream past cap with an error (Pack propagates writer
+// errors instead of producing a truncated archive).
+type capWriter struct {
+	w   io.Writer
+	n   int64
+	cap int64
+}
+
+func (c *capWriter) Write(p []byte) (int, error) {
+	if c.n+int64(len(p)) > c.cap {
+		return 0, fmt.Errorf("folder compresses past the %s cap", humanSize(c.cap))
+	}
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }

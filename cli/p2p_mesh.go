@@ -152,6 +152,24 @@ func (m *mesh) send(peer string, raw []byte) error {
 	return dc.Send(raw)
 }
 
+// bufferedAmount reports SCTP bytes still queued for one peer (0 when the
+// peer has no channel). Drives file-upload backpressure: without it a bulk
+// transfer fills kernel/SCTP buffers with megabytes and chat frames queue
+// behind them on the same ordered channel.
+func (m *mesh) bufferedAmount(peer string) uint64 {
+	m.mu.Lock()
+	mp, ok := m.peers[peer]
+	var dc *webrtc.DataChannel
+	if ok {
+		dc = mp.dc
+	}
+	m.mu.Unlock()
+	if !ok || dc == nil {
+		return 0
+	}
+	return dc.BufferedAmount()
+}
+
 // deliver routes a drained offer/answer note to the setup goroutine for
 // that peer. Only the engine calls this. Unknown or finished peers are
 // ignored; a full queue drops (setup timeout covers the loss).
