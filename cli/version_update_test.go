@@ -7,6 +7,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -93,5 +94,24 @@ func TestExtractReleaseAssetEmpty(t *testing.T) {
 	p := makeTar(t, map[string]string{"README.md": "docs"})
 	if _, err := extractReleaseAsset(p); err == nil {
 		t.Fatal("archive without binary must fail")
+	}
+}
+
+func TestUpdateFailureHint(t *testing.T) {
+	if got := updateFailureHint(500, false); got != "" {
+		t.Fatalf("non-404 must stay silent, got %q", got)
+	}
+	if got := updateFailureHint(404, true); got != "" {
+		t.Fatalf("token present must stay silent, got %q", got)
+	}
+	priv := updateFailureHintWith(false)
+	for _, want := range []string{"private", "GITHUB_TOKEN", "manually"} {
+		if !strings.Contains(priv, want) {
+			t.Fatalf("private hint missing %q: %q", want, priv)
+		}
+	}
+	pub := updateFailureHintWith(true)
+	if !strings.Contains(pub, "No published release") {
+		t.Fatalf("public hint wrong: %q", pub)
 	}
 }

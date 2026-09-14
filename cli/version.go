@@ -29,6 +29,45 @@ func handleVersion() {
 	fmt.Printf("uplink %s (%s/%s) commit %s built %s\n", version, runtime.GOOS, runtime.GOARCH, commit, date)
 }
 
+// updateFailureHint explains an update-check failure in plain language.
+// A 404 without a token is ambiguous: either no release is published yet
+// (public repo) or the repo is private (the anonymous API is blind to it,
+// so automatic update is impossible). Probe the repo endpoint once to tell
+// the two apart instead of leaving the user guessing.
+func updateFailureHint(status int, hasToken bool) string {
+	if status != 404 || hasToken {
+		return ""
+	}
+	return updateFailureHintWith(repoVisibleAnonymously())
+}
+
+// updateFailureHintWith is the pure, testable core: visible tells whether
+// the repo endpoint answers anonymously (public) or not (private).
+func updateFailureHintWith(visible bool) string {
+	if visible {
+		return "  No published release found — the maintainers haven't cut one yet."
+	}
+	return "  This repo looks private: anonymous update checks cannot see it,\n" +
+		"  so automatic update is not possible.\n" +
+		"  Options:\n" +
+		"    1. export GITHUB_TOKEN=<token> (PAT with 'repo' scope, or: export GITHUB_TOKEN=$(gh auth token)) and retry\n" +
+		"    2. Download the release manually from the GitHub Releases page\n" +
+		"    3. Ask a maintainer to make the repo public for anonymous updates"
+}
+
+// repoVisibleAnonymously reports whether the repo endpoint answers 200
+// without credentials (i.e. the repo is public). Best-effort: any error
+// reads as not-visible, which yields the private-repo hint.
+func repoVisibleAnonymously() bool {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/AdityaAgrawal08/uplink-delta")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
 // githubRelease mirrors the subset of the GitHub releases API we need.
 type githubRelease struct {
 	TagName string `json:"tag_name"`
@@ -106,6 +145,9 @@ func handleUpdate() {
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		fmt.Printf("✗ GitHub API returned status %d: %s\n", resp.StatusCode, truncateStringPlain(string(body), 120))
+		if hint := updateFailureHint(resp.StatusCode, ghToken != ""); hint != "" {
+			fmt.Println(hint)
+		}
 		os.Exit(1)
 	}
 
