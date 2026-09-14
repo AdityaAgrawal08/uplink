@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/base64"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -765,5 +768,130 @@ func TestRosterVisibilityWithoutSends(t *testing.T) {
 			t.Fatalf("bob never appeared in alice's presence (had %v)", names)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Mid-session desync (issue #1 "Yeah" loss): the sender's session stays
+// live while the receiver's generation is gone, so a mesh-sent frame is
+// dropped on decrypt. The ack backstop must still deliver it — exactly
+// once — via the durable inbox path.
+func TestMidSessionDesyncRecoversViaBackstop(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	members := []rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	}
+	pa, pb := newEngineProbe(), newEngineProbe()
+	ea := newEngineWithStun("alice", ida, sigA, pa.callbacks(), []string{})
+	eb := newEngineWithStun("bob", idb, sigB, pb.callbacks(), []string{})
+	defer ea.stop()
+	defer eb.stop()
+	ea.setRoster(members)
+	eb.setRoster(members)
+	ea.start()
+	eb.start()
+	waitReady(t, pa, "bob")
+	waitReady(t, pb, "alice")
+
+	// Bob's session generation silently dies (sender still believes live).
+	eb.dropNoise("alice")
+
+	if msgId, err := ea.sendChat("bob", "yeah"); err != nil {
+		t.Fatalf("sendChat: %v", err)
+	} else {
+		// Fast-forward the backstop: the 3s ack timeout need not gate the test.
+		ea.mu.Lock()
+		if p, ok := ea.unacked[unackedKey(msgId, "bob")]; ok {
+			p.sent = time.Now().Add(-time.Hour)
+		}
+		ea.mu.Unlock()
+	}
+	got := waitChat(t, pb, "yeah")
+	if got.From != "alice" {
+		t.Fatalf("wrong envelope: %+v", got)
+	}
+	// No double display from mesh copy + inbox retry (settle past a retry).
+	time.Sleep(5 * time.Second)
+	pb.mu.Lock()
+	n := 0
+	for _, c := range pb.chats {
+		if c.Text == "yeah" {
+			n++
+		}
+	}
+	pb.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("chat displayed %d times; want exactly 1", n)
+	}
+}
+
+func TestSendMuPerPeer(t *testing.T) {
+	a, _ := generateIdentity()
+	e := newEngine("alice", a, &signalClient{}, engineCallbacks{})
+	defer e.stop()
+	if e.sendMuFor("bob") != e.sendMuFor("bob") {
+		t.Fatal("same peer must share one serializer")
+	}
+	if e.sendMuFor("bob") == e.sendMuFor("carol") {
+		t.Fatal("different peers must not share a serializer")
+	}
+	// Departure sheds serializers with the rest of the residue.
+	e.mu.Lock()
+	e.roster["bob"] = []byte{1, 2, 3}
+	e.mu.Unlock()
+	e.setRoster([]rosterMember{})
+	e.mu.Lock()
+	_, left := e.sendMu["bob"]
+	e.mu.Unlock()
+	if left {
+		t.Fatal("departed peer serializer leaked")
+	}
+}
+
+func TestBackpressureNoPeer(t *testing.T) {
+	a, _ := generateIdentity()
+	e := newEngine("alice", a, &signalClient{}, engineCallbacks{})
+	defer e.stop()
+	if n := e.mesh.bufferedAmount("ghost"); n != 0 {
+		t.Fatalf("unknown peer buffered = %d; want 0", n)
+	}
+	if err := e.awaitDrain("ghost"); err != nil {
+		t.Fatalf("drain with no backlog must pass: %v", err)
+	}
+	if err := e.awaitDrain(""); err != nil {
+		t.Fatalf("broadcast drain with empty roster must pass: %v", err)
+	}
+}
+
+func TestTarballDirSizeCap(t *testing.T) {
+	dir := t.TempDir()
+	// ~30MB of incompressible bytes: must abort during packing, before
+	// the 25MB downstream check could ever see it.
+	big := make([]byte, 30<<20)
+	if _, err := rand.Read(big); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "big.bin"), big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := tarballDir(dir)
+	if err == nil {
+		os.Remove(out)
+		t.Fatal("oversize folder must fail packing, not pack-then-reject")
 	}
 }

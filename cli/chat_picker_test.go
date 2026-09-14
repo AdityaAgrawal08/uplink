@@ -162,9 +162,9 @@ func TestPickerRangeSelectBuffersWholeRange(t *testing.T) {
 	}
 }
 
-// Enter on a file buffers it; Ctrl+Enter runs the P2P upload pipeline: with
-// no live peer the engine seals frames into the inbox fallback, and the
-// transcript still gets its success card.
+// Enter on a file is a no-op (it only opens folders); Space buffers and
+// Ctrl+S runs the P2P upload pipeline: with no live peer the engine seals
+// frames into the inbox fallback, and the transcript still gets its card.
 func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	fs := newFakeSignalServer()
 	srv := httptest.NewServer(fs)
@@ -183,14 +183,18 @@ func TestPickerEnterOnFileRunsUploadPipeline(t *testing.T) {
 	sc.picker = pickerState{active: true, cwd: root, home: root, anchor: -1, inBuf: map[string]bool{}}
 	sc.loadPickerDir()
 
-	// Cursor onto the single file row and press Enter (buffers it).
+	// Cursor onto the single file row: Enter must do NOTHING (no buffering).
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyDown})
 	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(sc.picker.buffered) != 1 {
-		t.Fatalf("Enter should buffer the file; got %d buffered", len(sc.picker.buffered))
+	if len(sc.picker.buffered) != 0 {
+		t.Fatalf("Enter on a file must not buffer; got %d buffered", len(sc.picker.buffered))
 	}
-	// Ctrl+Enter triggers the upload pipeline.
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlJ})
+	// Space buffers it; Ctrl+S triggers the upload pipeline.
+	sc, _ = step(sc, tea.KeyMsg{Type: tea.KeySpace})
+	if len(sc.picker.buffered) != 1 {
+		t.Fatalf("Space should buffer the file; got %d buffered", len(sc.picker.buffered))
+	}
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlS})
 	// Drain the batched cmds until the done message lands.
 	msgs := drainCmds(cmd)
 	var done *uploadDoneMsg
@@ -447,7 +451,7 @@ func newFilesDrawerAt(sc chatScreen, files []receivedFile) chatScreen {
 	return sc
 }
 
-// Files mode is read-only: Space buffers nothing, Ctrl+Enter just closes.
+// Files mode is read-only: Space buffers nothing, Ctrl+S just closes.
 func TestFilesModeReadOnly(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
@@ -465,10 +469,10 @@ func TestFilesModeReadOnly(t *testing.T) {
 	if sc.picker.notice == "" {
 		t.Fatal("expected an explanatory notice")
 	}
-	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlJ})
+	sc, cmd := step(sc, tea.KeyMsg{Type: tea.KeyCtrlS})
 	_ = cmd
 	if sc.picker.isActive() {
-		t.Fatal("Ctrl+Enter must close the read-only drawer")
+		t.Fatal("Ctrl+S must close the read-only drawer")
 	}
 	// Upload buffer untouched by the files drawer.
 	if len(sc.uploadBuf) != 0 {

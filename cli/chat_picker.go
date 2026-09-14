@@ -16,7 +16,8 @@ import (
 // Selecting "/upload" morphs the command drawer into an ls -a style browser:
 // ".." pinned first, directories before files, alphabetical within each group,
 // dotfiles included. A selection buffer accumulates paths across directories;
-// Ctrl+Enter hands them all to the upload engine, Esc discards.
+// Ctrl+S hands them all to the upload engine, Esc discards. Enter opens
+// folders and never touches files; Space buffers (ranges included).
 //
 // Selecting "/download" opens a read-only browser of files received this
 // session (newest first) with a detail window showing sender, size, and
@@ -532,7 +533,7 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 				p.notice = "buffer empty — use /upload to add files"
 			}
 			return true, nil
-		case tea.KeyCtrlJ: // Ctrl+Enter: send all remaining
+		case tea.KeyCtrlS: // Ctrl+S: send all remaining
 			return true, c.pickerConfirm
 		case tea.KeyEsc:
 			restore := composerPlaceholder
@@ -608,33 +609,20 @@ func (c *chatScreen) handlePickerKeys(msg tea.KeyMsg) (bool, func() tea.Cmd) {
 			}
 			return true, nil
 		}
-		// modeBrowse: Enter buffers the file or opens the directory.
-		// If visual range is active, buffer the ENTIRE range, then clear it.
-		if p.anchor >= 0 && p.visual {
-			c.pickerToggleBuffer() // buffers the whole range
-			p.anchor = -1
-			p.visual = false
-			return true, nil
-		}
+		// modeBrowse: Enter OPENS directories and does nothing on files
+		// (product direction). Buffering is Space's job; sending is
+		// Ctrl+S for everything buffered. Visual ranges included: Enter
+		// never mutates the buffer, it only navigates or hints.
+		p.anchor = -1
+		p.visual = false
 		entry, key, _ := p.entryAt(p.cursor)
-		switch {
-		case !entry.dir:
-			c.pickerToggleBuffer() // buffer this single file
-			p.anchor = -1
-			p.visual = false
-			return true, nil
-		case key == parentDir(p.cwd):
-			p.anchor = -1
-			p.visual = false
-			c.pickerCd(key) // the ".." row
-		default:
-			p.anchor = -1
-			p.visual = false
-			c.pickerCd(key) // browse into the folder
+		if entry.dir {
+			c.pickerCd(key) // folders (and "..") navigate
+		} else {
+			p.notice = "space buffers files · ctrl+s sends everything"
 		}
 		return true, nil
-	case tea.KeyCtrlJ: // Ctrl+Enter (LF — standard on most terminals)
-		// Ctrl+Enter: upload/download all buffered.
+	case tea.KeyCtrlS: // Ctrl+S: send everything buffered (files + folders)
 		return true, c.pickerConfirm
 	case tea.KeyEsc:
 		restore := composerPlaceholder
@@ -886,7 +874,7 @@ func (c chatScreen) pickerBufferView(maxW, inner int, pad func(string) string) s
 	}
 
 	body = append(body, tuiPaletteHintStyle.Render(
-		pad("↑↓ move · ctrl+d remove · ^⏎ send all · esc back")))
+		pad("↑↓ move · ctrl+d remove · ^S send all · esc back")))
 
 	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(body, "\n"))
 	if lipgloss.Width(panel) > maxW {
@@ -905,7 +893,7 @@ func plural(n int) string {
 
 func parentRowAvailable(p *pickerState) bool { return parentRowCount(p) == 1 }
 
-const pickerFooterHints = "↑↓ move · space buffer · v/⇧ range · enter open · a buffer all · ^⏎ send · / filter · esc cancel"
+const pickerFooterHints = "↑↓ move · space buffer · v range · enter open folder · ^S send all · / filter · esc cancel"
 const pickerDlFooterHints = "↑↓ move · enter details · / search · esc close"
 
 // fileLabel resolves a buffered path to its filename for tray rendering.
