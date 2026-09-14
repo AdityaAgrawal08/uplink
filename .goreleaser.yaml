@@ -7,9 +7,9 @@ project_name: uplink
 
 before:
   hooks:
-    # Plain string only (before-hooks don't take maps): the Go module
-    # lives in cli/, not the repo root.
-    - cd cli && go mod tidy
+    # Plain string, no shell: go -C scopes the tidy to the cli/ module
+    # (repo root has no go.mod).
+    - go -C cli mod tidy
 
 builds:
   - id: uplink-cli
