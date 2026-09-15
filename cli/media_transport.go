@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,10 @@ const (
 	mediaKindKeyReq = 0x03
 	mediaKindPing   = 0x04
 	mediaKindPong   = 0x05
+	// Pre-handshake path probes (unencrypted, cookie-matched). Used to
+	// nominate a reachable address before any session exists.
+	mediaKindPingPre = 0x06
+	mediaKindPongPre = 0x07
 
 	mediaHS1 = "mnoise1"
 	mediaHS2 = "mnoise2"
@@ -94,6 +99,8 @@ type mediaPeer struct {
 	hs        *peerSession
 	hsAt      time.Time
 	epoch     int64
+	hsM1      []byte // initiator first message (retransmits on stall)
+	hsTries   int
 	lastRx    time.Time
 }
 
@@ -113,7 +120,7 @@ type mediaTransport struct {
 	peers          map[string]*mediaPeer
 	hsEpoch        map[string]int64
 	completedEpoch map[string]int64
-	hsCount        map[string]int // pending handshakes per source IP (DoS throttle)
+	prePongs       map[uint64]chan *net.UDPAddr
 	closed         bool
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
@@ -136,8 +143,9 @@ func newMediaTransport(me string, id *identityKey, sendNote func(to, noteType, p
 	return &mediaTransport{
 		me: me, id: id, conn: conn, sendNote: sendNote, roster: roster, cb: cb,
 		peers: map[string]*mediaPeer{}, hsEpoch: map[string]int64{},
-		completedEpoch: map[string]int64{}, hsCount: map[string]int{},
-		stopCh: make(chan struct{}),
+		completedEpoch: map[string]int64{},
+		prePongs:       map[uint64]chan *net.UDPAddr{},
+		stopCh:         make(chan struct{}),
 	}, nil
 }
 
@@ -146,8 +154,108 @@ func (m *mediaTransport) localAddr() *net.UDPAddr {
 }
 
 func (m *mediaTransport) start() {
-	m.wg.Add(1)
+	m.wg.Add(2)
 	go m.readLoop()
+	go m.beatLoop()
+}
+
+// beatLoop retransmits stalled handshakes and purges dead ones. A lost
+// mnoise note must not strand a call forever with zero diagnostics.
+func (m *mediaTransport) beatLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.beatOnce()
+		}
+	}
+}
+
+func (m *mediaTransport) beatOnce() {
+	now := time.Now()
+	m.mu.Lock()
+	type retry struct {
+		peer  string
+		epoch int64
+		m1    []byte
+	}
+	var retries []retry
+	for username, p := range m.peers {
+		if p.ready || p.hs == nil {
+			continue
+		}
+		age := now.Sub(p.hsAt)
+		if age > hsAttemptTTL {
+			p.hs = nil
+			delete(m.hsEpoch, username)
+			continue
+		}
+		if age > 8*time.Second && p.hsTries < 3 {
+			p.hsTries++
+			retries = append(retries, retry{peer: username, epoch: p.epoch, m1: p.hsM1})
+		}
+	}
+	m.mu.Unlock()
+	for _, r := range retries {
+		if len(r.m1) == 0 {
+			continue
+		}
+		_ = m.sendNote(r.peer, mediaHS1, wrapHs(r.epoch, r.m1))
+	}
+}
+
+// nominate probes candidate ip:ports in parallel and returns the first that
+// answers (600ms deadline). Unanswered candidates are unroutable from here
+// (wrong subnet, AP isolation, firewall) — never silently chosen.
+func (m *mediaTransport) nominate(ips []string, port int) *net.UDPAddr {
+	var targets []*net.UDPAddr
+	seen := map[string]bool{}
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip == "" || seen[ip] {
+			continue
+		}
+		seen[ip] = true
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", ip, port))
+		if err != nil {
+			continue
+		}
+		targets = append(targets, addr)
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	// No single-candidate fast path: an untested single IP is exactly how
+	// calls blackhole with perfect signaling. 600ms worst case, once per
+	// setup; LAN pongs land in single-digit ms.
+	var cookieB [8]byte
+	if _, err := rand.Read(cookieB[:]); err != nil {
+		return targets[0]
+	}
+	cookie := binary.BigEndian.Uint64(cookieB[:])
+	ch := make(chan *net.UDPAddr, len(targets))
+	m.mu.Lock()
+	m.prePongs[cookie] = ch
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.prePongs, cookie)
+		m.mu.Unlock()
+	}()
+	pkt := append([]byte{mediaVer, mediaKindPingPre}, cookieB[:]...)
+	for _, t := range targets {
+		_, _ = m.conn.WriteToUDP(pkt, t)
+	}
+	select {
+	case winner := <-ch:
+		return winner
+	case <-time.After(600 * time.Millisecond):
+		return nil
+	}
 }
 
 func (m *mediaTransport) stop() {
@@ -202,7 +310,7 @@ func (m *mediaTransport) beginHandshake(peer string) {
 	}
 	epoch := time.Now().UnixNano()
 	m.mu.Lock()
-	p.hs, p.hsAt, p.epoch = ps, time.Now(), epoch
+	p.hs, p.hsAt, p.epoch, p.hsM1, p.hsTries = ps, time.Now(), epoch, m1, 1
 	m.hsEpoch[peer] = epoch
 	m.mu.Unlock()
 	if err := m.sendNote(peer, mediaHS1, wrapHs(epoch, m1)); err != nil {
@@ -330,6 +438,14 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	}
 }
 
+// peerReady reports whether the media session to peer is live.
+func (m *mediaTransport) peerReady(peer string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p, ok := m.peers[peer]
+	return ok && p.ready
+}
+
 // lastRxAt reports when a peer's datagrams last arrived (watchdog input).
 func (m *mediaTransport) lastRxAt(peer string) time.Time {
 	m.mu.Lock()
@@ -390,6 +506,28 @@ func (m *mediaTransport) onDatagram(src *net.UDPAddr, raw []byte) {
 		return
 	}
 	kind := raw[1]
+	// Pre-handshake path probes (unencrypted, cookie-matched): nominate a
+	// reachable address before any session exists.
+	if kind == mediaKindPingPre && len(raw) >= mediaHeaderLen {
+		reply := append([]byte{mediaVer, mediaKindPongPre}, raw[2:10]...)
+		_, _ = m.conn.WriteToUDP(reply, src)
+		return
+	}
+	if kind == mediaKindPongPre && len(raw) >= mediaHeaderLen {
+		cookie := binary.BigEndian.Uint64(raw[2:10])
+		m.mu.Lock()
+		ch, ok := m.prePongs[cookie]
+		m.mu.Unlock()
+		if ok {
+			cp := *src
+			cp.IP = append(net.IP(nil), src.IP...)
+			select {
+			case ch <- &cp:
+			default:
+			}
+		}
+		return
+	}
 	nonce := binary.BigEndian.Uint64(raw[2:10])
 	ct := raw[10:]
 	m.mu.Lock()

@@ -88,6 +88,25 @@ func callPair(t *testing.T) (a, b *callManager, feedA, feedB chan []int16, heard
 	return ma, mb, feedA, feedB, heardA, heardB, states
 }
 
+func dumpState(m *callManager) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	audio := m.audioStop != nil
+	return m.state.String() + "/" + m.peer + "/audio:" + map[bool]string{true: "on", false: "off"}[audio]
+}
+
+func dumpMedia(m *callManager, peer string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.transport == nil {
+		return "no-transport"
+	}
+	if m.transport.peerReady(peer) {
+		return "media-ready"
+	}
+	return "transport-no-session"
+}
+
 func waitCallState(t *testing.T, states chan string, want string) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
@@ -138,7 +157,8 @@ func TestCallOfferAcceptAudioBothWays(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("audio not flowing both ways: a=%d b=%d frames", heardA.count(), heardB.count())
+			t.Fatalf("audio not flowing both ways: a=%d b=%d; astate=%s amedia=%s; bstate=%s bmedia=%s",
+				heardA.count(), heardB.count(), dumpState(ma), dumpMedia(ma, "bob"), dumpState(mb), dumpMedia(mb, "alice"))
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

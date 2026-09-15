@@ -1,6 +1,7 @@
 package main
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -200,5 +201,84 @@ func TestAudioVideoCodecRoundtrip(t *testing.T) {
 	}
 	if _, err := decodeVideoFrag([]byte{1, 2}); err == nil {
 		t.Fatal("short frag must fail")
+	}
+}
+
+func TestNominateSkipsUnroutable(t *testing.T) {
+	mkT := func() *mediaTransport {
+		ida, _ := generateIdentity()
+		m, err := newMediaTransport("x", ida,
+			func(to, typ, payload string) error { return nil },
+			func() map[string][]byte { return map[string][]byte{} },
+			mediaCallbacks{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.start()
+		t.Cleanup(m.stop)
+		return m
+	}
+	prober, peer := mkT(), mkT()
+	peerPort := peer.localAddr().Port
+	// TEST-NET-1 is unroutable; loopback answers. Must pick loopback.
+	winner := prober.nominate([]string{"192.0.2.1", "127.0.0.1"}, peerPort)
+	if winner == nil || !winner.IP.IsLoopback() {
+		t.Fatalf("nomination picked %v; want loopback", winner)
+	}
+	// Nothing listening anywhere: nil, not a guess.
+	if got := prober.nominate([]string{"192.0.2.1"}, 9); got != nil {
+		t.Fatalf("dead candidates must yield nil, got %v", got)
+	}
+	_ = peer
+}
+
+func TestHandshakeRetransmitAndPurge(t *testing.T) {
+	ida, _ := generateIdentity()
+	var sent []string
+	var mu sync.Mutex
+	m, err := newMediaTransport("alice", ida,
+		func(to, typ, payload string) error {
+			mu.Lock()
+			sent = append(sent, typ)
+			mu.Unlock()
+			return nil
+		},
+		func() map[string][]byte { return map[string][]byte{} },
+		mediaCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.stop()
+	ps, m1, err := beginNoise(ida, "bob", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.peers["bob"] = &mediaPeer{username: "bob", hs: ps, hsAt: time.Now().Add(-10 * time.Second), epoch: 11, hsM1: m1}
+	m.hsEpoch["bob"] = 11
+	m.mu.Unlock()
+	m.beatOnce()
+	mu.Lock()
+	n := len(sent)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("stalled handshake re-sent %d notes; want 1", n)
+	}
+	// Aged past TTL: purged, never retried again.
+	m.mu.Lock()
+	m.peers["bob"].hsAt = time.Now().Add(-61 * time.Second)
+	m.mu.Unlock()
+	m.beatOnce()
+	m.mu.Lock()
+	stillHs := m.peers["bob"].hs != nil
+	m.mu.Unlock()
+	if stillHs {
+		t.Fatal("stuck handshake not purged past TTL")
+	}
+	mu.Lock()
+	n2 := len(sent)
+	mu.Unlock()
+	if n2 != 1 {
+		t.Fatalf("purged handshake re-sent: %d total notes", n2)
 	}
 }

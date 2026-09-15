@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,15 +30,17 @@ const (
 )
 
 type callOfferPayload struct {
-	IP   string `json:"ip"`
-	Port int    `json:"port"`
-	Ts   int64  `json:"ts"`
+	IP   string   `json:"ip"`
+	Ips  []string `json:"ips,omitempty"`
+	Port int      `json:"port"`
+	Ts   int64    `json:"ts"`
 }
 
 type callAnswerPayload struct {
-	IP     string `json:"ip"`
-	Port   int    `json:"port"`
-	Accept bool   `json:"accept"`
+	IP     string   `json:"ip"`
+	Ips    []string `json:"ips,omitempty"`
+	Port   int      `json:"port"`
+	Accept bool     `json:"accept"`
 }
 
 type callState int
@@ -93,8 +96,13 @@ type callManager struct {
 	offerFrom     string
 	warnedNoMedia bool
 	rxOn          bool
+	// mediaReadyAt anchors the no-media watchdog: silence before the Noise
+	// session exists is handshake timing (~3 polls), not a fault.
+	mediaReadyAt time.Time
 	// dialIP overrides localLANIP (tests pin loopback).
 	dialIP string
+	// lanIPs lists advertised addresses (tests pin loopback).
+	lanIPs func() []string
 	// video live-cycle (nil unless streaming).
 	videoStop  chan struct{}
 	videoAsm   *fragAssembler
@@ -109,6 +117,7 @@ type callManager struct {
 func newCallManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb callCallbacks) *callManager {
 	return &callManager{
 		me: me, id: id, sendNote: sendNote, roster: roster, cb: cb,
+		lanIPs:   localLANIPs,
 		micSrc:   openMicFrames,
 		playSink: openPlaySink,
 	}
@@ -150,16 +159,25 @@ func openPlaySink() (func([]int16), func(), error) {
 	return sp.play, sp.close, nil
 }
 
-// localLANIP returns the first non-loopback IPv4 on an up interface.
-func localLANIP() (string, error) {
+// localLANIPs returns usable local IPv4s, best first: skip virtual/docker/
+// VPN interfaces, prefer RFC1918. A single wrong pick (docker bridge, VPN)
+// blackholes all media with perfect signaling — so offers carry the whole
+// list and the peer nominates by provable reachability.
+func localLANIPs() []string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return "", err
+		return nil
 	}
+	var preferred, fallback []string
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
 		}
+		name := iface.Name
+		virtual := strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "veth") ||
+			strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "tun") ||
+			strings.HasPrefix(name, "tap") || strings.HasPrefix(name, "tailscale") ||
+			strings.HasPrefix(name, "utun")
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
@@ -172,15 +190,27 @@ func localLANIP() (string, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			if ip == nil || ip.IsLoopback() {
+			v4 := ip.To4()
+			if v4 == nil || ip.IsLoopback() {
 				continue
 			}
-			if v4 := ip.To4(); v4 != nil {
-				return v4.String(), nil
+			if virtual {
+				fallback = append(fallback, v4.String())
+			} else {
+				preferred = append(preferred, v4.String())
 			}
 		}
 	}
-	return "", fmt.Errorf("no LAN IPv4 found")
+	return append(preferred, fallback...)
+}
+
+// localLANIP returns the best single guess (first of the ranked list).
+func localLANIP() (string, error) {
+	ips := localLANIPs()
+	if len(ips) == 0 {
+		return "", fmt.Errorf("no LAN IPv4 found")
+	}
+	return ips[0], nil
 }
 
 func (c *callManager) emitState(info string) {
@@ -205,14 +235,21 @@ func (c *callManager) Call(peer string) error {
 	if err != nil {
 		return err
 	}
-	ip, err := localLANIP()
+	ips := localLANIPs()
+	if c.lanIPs != nil {
+		ips = c.lanIPs()
+	}
+	ip := ""
+	if len(ips) > 0 {
+		ip = ips[0]
+	}
 	if c.dialIP != "" {
-		ip = c.dialIP
+		ip, ips = c.dialIP, []string{c.dialIP}
 	}
-	if err != nil && c.dialIP == "" {
-		return err
+	if ip == "" {
+		return fmt.Errorf("no LAN IPv4 found")
 	}
-	raw, _ := json.Marshal(callOfferPayload{IP: ip, Port: t.localAddr().Port, Ts: time.Now().Unix()})
+	raw, _ := json.Marshal(callOfferPayload{IP: ip, Ips: ips, Port: t.localAddr().Port, Ts: time.Now().Unix()})
 	c.mu.Lock()
 	c.transport, c.state, c.peer = t, callOutgoing, peer
 	c.mu.Unlock()
@@ -239,20 +276,37 @@ func (c *callManager) Accept() error {
 	if err != nil {
 		return err
 	}
-	ip, err := localLANIP()
+	// Start the socket loop BEFORE nominating: pong replies are processed
+	// by readLoop, and probing a deaf socket always yields nil.
+	t.start()
+	ips := localLANIPs()
+	if c.lanIPs != nil {
+		ips = c.lanIPs()
+	}
+	ip := ""
+	if len(ips) > 0 {
+		ip = ips[0]
+	}
 	if c.dialIP != "" {
-		ip = c.dialIP
-	} else if err != nil {
+		ip, ips = c.dialIP, []string{c.dialIP}
+	}
+	if ip == "" {
+		return fmt.Errorf("no LAN IPv4 found")
+	}
+	// Nominate a provably reachable address from the peer's candidates
+	// (plus their primary) instead of blindly trusting one IP.
+	cands := append(append([]string{}, offer.Ips...), offer.IP)
+	winner := t.nominate(cands, offer.Port)
+	if winner == nil {
+		return fmt.Errorf("no reachable address for %s (tried %d candidate(s))", peer, len(cands))
+	}
+	if err := t.dialPeer(peer, winner.IP.String(), winner.Port); err != nil {
 		return err
 	}
-	if err := t.dialPeer(peer, offer.IP, offer.Port); err != nil {
-		return err
-	}
-	raw, _ := json.Marshal(callAnswerPayload{IP: ip, Port: t.localAddr().Port, Accept: true})
+	raw, _ := json.Marshal(callAnswerPayload{IP: ip, Ips: ips, Port: t.localAddr().Port, Accept: true})
 	c.mu.Lock()
 	c.transport = t
 	c.mu.Unlock()
-	t.start()
 	if err := c.sendNote(peer, callAccept, string(raw)); err != nil {
 		c.teardownLocked("accept failed")
 		return err
@@ -301,7 +355,40 @@ func (c *callManager) setLiveLocked(peer string) {
 	c.state = callLive
 	c.mu.Unlock()
 	c.emitState("live with " + peer)
-	c.startAudio(peer)
+	// Audio starts on transport ready, not here: the media handshake still
+	// needs ~3 signal polls, and starting early only burns mic frames and
+	// trips the no-media watchdog before any datagram could exist.
+	c.maybeStartAudio(peer)
+}
+
+// onTransportReady fires when the Noise session goes live: anchor the
+// no-media watchdog and start audio if the call is already live (otherwise
+// setLiveLocked picks it up — handshake and call-state race either order
+// depending on note timing).
+func (c *callManager) onTransportReady(peer string) {
+	c.mu.Lock()
+	c.mediaReadyAt = time.Now()
+	c.mu.Unlock()
+	c.maybeStartAudio(peer)
+	c.emitState("media secured with " + peer)
+}
+
+// maybeStartAudio starts the audio pipeline once the call is live AND the
+// transport is ready, whichever comes last. Safe to call from both paths.
+func (c *callManager) maybeStartAudio(peer string) {
+	c.mu.Lock()
+	if c.state != callLive || c.audioStop != nil {
+		c.mu.Unlock()
+		return
+	}
+	var ready bool
+	if c.transport != nil {
+		ready = c.transport.peerReady(peer)
+	}
+	c.mu.Unlock()
+	if ready {
+		c.startAudio(peer)
+	}
 }
 
 func (c *callManager) teardownLocked(info string) {
@@ -395,7 +482,13 @@ func (c *callManager) onSignalNote(n signalNote) {
 			c.teardownLocked(n.From + " declined")
 			return
 		}
-		if err := t.dialPeer(n.From, ans.IP, ans.Port); err != nil {
+		cands := append(append([]string{}, ans.Ips...), ans.IP)
+		winner := t.nominate(cands, ans.Port)
+		if winner == nil {
+			c.teardownLocked("no reachable address for " + n.From)
+			return
+		}
+		if err := t.dialPeer(n.From, winner.IP.String(), winner.Port); err != nil {
 			c.teardownLocked("bad accept address")
 			return
 		}
@@ -422,7 +515,7 @@ func (c *callManager) mediaCB() mediaCallbacks {
 	return mediaCallbacks{
 		onAudio: c.onRemoteAudio,
 		onVideo: func(_ string, frag videoFrag) { c.onVideoFrag(frag) },
-		onReady: func(peer, code string) { c.emitState("media secured with " + peer) },
+		onReady: func(peer, code string) { c.onTransportReady(peer) },
 		onLost:  func(peer string) { c.emitState("media line lost — will rejoin on traffic") },
 		onError: func(err error) { c.emitState("media: " + err.Error()) },
 	}
@@ -555,9 +648,19 @@ func (c *callManager) startAudio(peer string) {
 					watchTick = 0
 					c.mu.Lock()
 					t := c.transport
+					readyAt := c.mediaReadyAt
 					warned := c.warnedNoMedia
 					c.mu.Unlock()
-					if t != nil && !warned && time.Since(t.lastRxAt(peer)) > callWatchdogAfter {
+					var lastRx time.Time
+					if t != nil {
+						lastRx = t.lastRxAt(peer)
+					}
+					// Both clocks must agree: session live 10s+ with zero
+					// datagrams in 10s. Before the session exists (or right
+					// after it forms) silence is normal handshake timing.
+					if t != nil && !warned && !readyAt.IsZero() &&
+						time.Since(readyAt) > callWatchdogAfter &&
+						time.Since(lastRx) > callWatchdogAfter {
 						c.mu.Lock()
 						c.warnedNoMedia = true
 						c.mu.Unlock()
