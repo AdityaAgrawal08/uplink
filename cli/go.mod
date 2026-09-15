@@ -15,6 +15,7 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.41.0
 	github.com/muesli/termenv v0.16.0
 	github.com/multiformats/go-multihash v0.2.3
+	github.com/pion/rtp v1.8.19
 	github.com/pion/webrtc/v4 v4.1.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/tphakala/go-audio-capture v0.5.0
@@ -105,7 +106,6 @@ require (
 	github.com/pion/mdns/v2 v2.0.7 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtcp v1.2.16 // indirect
-	github.com/pion/rtp v1.8.19 // indirect
 	github.com/pion/sctp v1.8.39 // indirect
 	github.com/pion/sdp/v3 v3.0.18 // indirect
 	github.com/pion/srtp/v3 v3.0.6 // indirect

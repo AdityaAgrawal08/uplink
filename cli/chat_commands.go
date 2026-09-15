@@ -32,6 +32,7 @@ var slashCommands = []slashCommand{
 	{Name: "/decline", Desc: "decline the ringing call"},
 	{Name: "/hangup", Desc: "end the current call"},
 	{Name: "/mute", Desc: "mute/unmute your mic"},
+	{Name: "/video", Desc: "start camera video in a live call"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -156,6 +157,9 @@ func (c chatScreen) paletteRows() int {
 	if c.picker.isActive() {
 		return c.pickerRows()
 	}
+	if len(c.videoLines) > 0 && c.videoActive() {
+		return 1 + min(len(c.videoLines)+1, videoPaneRows+1) + 2 // spacer + hint + frame rows + border
+	}
 	if !c.palette.visible() {
 		return 0
 	}
@@ -179,12 +183,35 @@ func (c chatScreen) layoutFor() layout {
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot: the file browser
-// (picker) or the "/" command list.
+// (picker), live video, or the "/" command list.
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
+	if len(c.videoLines) > 0 && c.videoActive() {
+		return c.videoView(maxW)
+	}
 	return c.paletteView(maxW)
+}
+
+// videoActive reports whether remote video should paint (streaming call;
+// picker wins the slot when open).
+func (c chatScreen) videoActive() bool {
+	return c.call != nil && c.call.VideoOn()
+}
+
+// videoView renders the latest decoded ASCII frame in the drawer slot.
+func (c chatScreen) videoView(maxW int) string {
+	inner := maxW - 2
+	rows := make([]string, 0, len(c.videoLines)+1)
+	rows = append(rows, tuiPaletteHintStyle.Render("live video — /hangup ends the call"))
+	for _, ln := range c.videoLines {
+		if lipgloss.Width(ln) > inner {
+			ln = lipgloss.NewStyle().MaxWidth(inner).Render(ln)
+		}
+		rows = append(rows, ln)
+	}
+	return tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -326,6 +353,8 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return c.callHangup()
 	case "/mute":
 		return c.callMute()
+	case "/video":
+		return c.callVideo()
 	default:
 		return nil
 	}

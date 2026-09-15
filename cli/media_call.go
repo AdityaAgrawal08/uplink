@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/rtp/codecs"
 )
 
 // ─── Voice calls (LAN, 1:1) ─────────────────────────────────────────────────
@@ -61,9 +63,10 @@ func (s callState) String() string {
 }
 
 type callCallbacks struct {
-	onRinging func(peer string)                               // incoming offer worth showing
-	onState   func(state callState, peer string, info string) // transitions + errors
-	onLevel   func(level float64)                             // mic loudness 0..1 (throttled)
+	onRinging    func(peer string)                               // incoming offer worth showing
+	onState      func(state callState, peer string, info string) // transitions + errors
+	onLevel      func(level float64)                             // mic loudness 0..1 (throttled)
+	onVideoFrame func(lines []string)                            // decoded ASCII video frame
 }
 
 type callManager struct {
@@ -86,11 +89,21 @@ type callManager struct {
 	stopPlay      func()
 	rxJb          *jitterBuffer
 	muted         atomic.Bool
-	offer         callOfferPayload // pending incoming offer
+	offer         callOfferPayload
 	offerFrom     string
 	warnedNoMedia bool
+	rxOn          bool
 	// dialIP overrides localLANIP (tests pin loopback).
 	dialIP string
+	// video live-cycle (nil unless streaming).
+	videoStop  chan struct{}
+	videoAsm   *fragAssembler
+	videoDec   frameDecoder
+	videoSrc   func() (<-chan []byte, func(), error)
+	videoDecFn func() (frameDecoder, error)
+	videoOn    bool
+	videoSeq   uint16
+	videoTs    uint32
 }
 
 func newCallManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb callCallbacks) *callManager {
@@ -302,11 +315,19 @@ func (c *callManager) teardownLocked(info string) {
 	stopMic, stopPlay := c.stopMic, c.stopPlay
 	c.stopMic, c.stopPlay = nil, nil
 	c.rxJb = nil
+	vstop, vdec := c.videoStop, c.videoDec
+	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn = nil, nil, nil, false, false
 	c.mu.Unlock()
 	if stop != nil {
 		close(stop)
 	}
+	if vstop != nil {
+		close(vstop)
+	}
 	c.audioWg.Wait()
+	if vdec != nil {
+		vdec.close()
+	}
 	if stopMic != nil {
 		stopMic()
 	}
@@ -400,6 +421,7 @@ func (c *callManager) onSignalNote(n signalNote) {
 func (c *callManager) mediaCB() mediaCallbacks {
 	return mediaCallbacks{
 		onAudio: c.onRemoteAudio,
+		onVideo: func(_ string, frag videoFrag) { c.onVideoFrag(frag) },
 		onReady: func(peer, code string) { c.emitState("media secured with " + peer) },
 		onLost:  func(peer string) { c.emitState("media line lost — will rejoin on traffic") },
 		onError: func(err error) { c.emitState("media: " + err.Error()) },
@@ -578,4 +600,194 @@ func rosterMap(peers []rosterMember) map[string][]byte {
 		out[m.Username] = raw
 	}
 	return out
+}
+
+// ─── Video live-cycle ───────────────────────────────────────────────────────
+
+// StartVideo begins camera send + remote render. Live call required.
+func (c *callManager) StartVideo() error {
+	c.mu.Lock()
+	if c.state != callLive {
+		st := c.state
+		c.mu.Unlock()
+		return fmt.Errorf("no live call (state %s)", st)
+	}
+	if c.videoOn {
+		c.mu.Unlock()
+		return fmt.Errorf("video already on")
+	}
+	peer := c.peer
+	srcFn, decFn := c.videoSrc, c.videoDecFn
+	if srcFn == nil {
+		srcFn = defaultVideoSrc
+	}
+	if decFn == nil {
+		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
+	}
+	c.mu.Unlock()
+
+	frames, stopSrc, err := srcFn()
+	if err != nil {
+		return err
+	}
+	dec, err := decFn()
+	if err != nil {
+		stopSrc()
+		return err
+	}
+	stop := make(chan struct{})
+	c.mu.Lock()
+	c.videoStop, c.videoAsm, c.videoDec, c.videoOn = stop, newFragAssembler(), dec, true
+	c.mu.Unlock()
+	c.emitState("video on with " + peer)
+	depay := &codecs.VP8Packet{}
+	// TX: camera frames → frag → send.
+	c.audioWg.Add(1)
+	go func() {
+		defer c.audioWg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			case f, ok := <-frames:
+				if !ok {
+					return
+				}
+				payloads, err := fragVP8(f)
+				if err != nil {
+					continue
+				}
+				c.mu.Lock()
+				t := c.transport
+				c.videoTs++
+				ts := c.videoTs
+				c.mu.Unlock()
+				if t == nil {
+					return
+				}
+				for i, p := range payloads {
+					c.mu.Lock()
+					c.videoSeq++
+					seq := c.videoSeq
+					c.mu.Unlock()
+					_ = t.sendMedia(peer, mediaKindVideo, encodeVideoFrag(seq, uint16(i), uint16(len(payloads)), ts, p))
+				}
+			}
+		}
+	}()
+	_ = depay
+	return nil
+}
+
+// ensureRxLocked builds the receive pipeline on first inbound video (a
+// peer may publish while we only watch). Runs under c.mu.
+func (c *callManager) ensureRxLocked() bool {
+	if c.videoAsm != nil && c.videoDec != nil {
+		return true
+	}
+	if c.state != callLive {
+		return false
+	}
+	decFn := c.videoDecFn
+	if decFn == nil {
+		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
+	}
+	dec, err := decFn()
+	if err != nil {
+		return false
+	}
+	c.videoAsm = newFragAssembler()
+	c.videoDec = dec
+	return true
+}
+
+// onVideoFrag reassembles, decodes, and renders one remote fragment.
+// Depacketize first (FU-A descriptors are transport, not picture data),
+// then assemble by timestamp; only complete frames decode.
+func (c *callManager) onVideoFrag(frag videoFrag) {
+	c.mu.Lock()
+	if !c.ensureRxLocked() {
+		c.mu.Unlock()
+		return
+	}
+	asm, dec := c.videoAsm, c.videoDec
+	c.mu.Unlock()
+	payload, err := func() ([]byte, error) {
+		depay := &codecs.VP8Packet{}
+		return depay.Unmarshal(frag.Data)
+	}()
+	if err != nil {
+		return
+	}
+	complete := asm.push(videoFrag{
+		Seq: frag.Seq, FragIdx: frag.FragIdx, FragTotal: frag.FragTotal,
+		Ts: frag.Ts, Data: payload,
+	})
+	if complete == nil {
+		return
+	}
+	rgb, err := dec.decode(complete)
+	if err != nil {
+		return
+	}
+	c.mu.Lock()
+	c.rxOn = true
+	onFrame := c.cb.onVideoFrame
+	c.mu.Unlock()
+	if onFrame != nil {
+		onFrame(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+	}
+}
+
+// StopVideo ends camera send + remote render, keeping audio up.
+func (c *callManager) StopVideo() {
+	c.mu.Lock()
+	stop := c.videoStop
+	dec := c.videoDec
+	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn = nil, nil, nil, false, false
+	c.mu.Unlock()
+	if stop != nil {
+		close(stop)
+	}
+	if dec != nil {
+		dec.close()
+	}
+}
+
+// VideoOn reports whether video is streaming.
+func (c *callManager) VideoOn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.videoOn
+}
+
+func defaultVideoSrc() (<-chan []byte, func(), error) {
+	enc, err := startVideoEncoder()
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make(chan []byte, 8)
+	done := make(chan struct{})
+	go func() {
+		defer close(out)
+		defer enc.stop()
+		r := newIvfReader(enc.out)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			f, err := r.frame()
+			if err != nil {
+				return
+			}
+			select {
+			case out <- f:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return out, func() { close(done) }, nil
 }

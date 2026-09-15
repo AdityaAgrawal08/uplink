@@ -11,8 +11,43 @@ import (
 )
 
 // callPair wires two managers with direct note routing + synthetic audio:
+// heardFrames is a mutex-guarded capture of played-back audio.
+type heardFrames struct {
+	mu     sync.Mutex
+	frames [][]int16
+}
+
+func (h *heardFrames) add(pcm []int16) {
+	h.mu.Lock()
+	h.frames = append(h.frames, append([]int16(nil), pcm...))
+	h.mu.Unlock()
+}
+
+func (h *heardFrames) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.frames)
+}
+
+func (h *heardFrames) energy() float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var e float64
+	var n int
+	for _, f := range h.frames {
+		for _, s := range f {
+			e += float64(s) * float64(s)
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return e / float64(n)
+}
+
 // full call stack, no server, no hardware.
-func callPair(t *testing.T) (a, b *callManager, feedA, feedB chan []int16, heardA, heardB *[][]int16, states chan string) {
+func callPair(t *testing.T) (a, b *callManager, feedA, feedB chan []int16, heardA, heardB *heardFrames, states chan string) {
 	t.Helper()
 	ida, _ := generateIdentity()
 	idb, _ := generateIdentity()
@@ -20,15 +55,10 @@ func callPair(t *testing.T) (a, b *callManager, feedA, feedB chan []int16, heard
 	rosterB := map[string][]byte{"alice": ida.publicKey()}
 	states = make(chan string, 16)
 	var ma, mb *callManager
-	mkSink := func(store *[][]int16, mu *sync.Mutex) (func([]int16), func(), error) {
-		return func(pcm []int16) {
-			mu.Lock()
-			*store = append(*store, append([]int16(nil), pcm...))
-			mu.Unlock()
-		}, func() {}, nil
+	mkSink := func(store *heardFrames) (func([]int16), func(), error) {
+		return store.add, func() {}, nil
 	}
-	var muA, muB sync.Mutex
-	var gotA, gotB [][]int16
+	gotA, gotB := &heardFrames{}, &heardFrames{}
 	feedA = make(chan []int16, 32)
 	feedB = make(chan []int16, 32)
 	ma = newCallManager("alice", ida,
@@ -48,9 +78,9 @@ func callPair(t *testing.T) (a, b *callManager, feedA, feedB chan []int16, heard
 	ma.dialIP, mb.dialIP = "127.0.0.1", "127.0.0.1"
 	ma.micSrc = func() (<-chan []int16, func(), error) { return feedA, func() {}, nil }
 	mb.micSrc = func() (<-chan []int16, func(), error) { return feedB, func() {}, nil }
-	ma.playSink = func() (func([]int16), func(), error) { return mkSink(&gotA, &muA) }
-	mb.playSink = func() (func([]int16), func(), error) { return mkSink(&gotB, &muB) }
-	heardA, heardB = &gotA, &gotB
+	ma.playSink = func() (func([]int16), func(), error) { return mkSink(gotA) }
+	mb.playSink = func() (func([]int16), func(), error) { return mkSink(gotB) }
+	heardA, heardB = gotA, gotB
 	t.Cleanup(func() {
 		_ = ma.Hangup()
 		_ = mb.Hangup()
@@ -104,31 +134,16 @@ func TestCallOfferAcceptAudioBothWays(t *testing.T) {
 	feedTone(feedB, 8)
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if len(*heardA) >= 4 && len(*heardB) >= 4 {
+		if heardA.count() >= 4 && heardB.count() >= 4 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("audio not flowing both ways: a=%d b=%d frames", len(*heardA), len(*heardB))
+			t.Fatalf("audio not flowing both ways: a=%d b=%d frames", heardA.count(), heardB.count())
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	// Energy check: received audio is signal, not silence.
-	var energy func([][]int16) float64
-	energy = func(frames [][]int16) float64 {
-		var e float64
-		var n int
-		for _, f := range frames {
-			for _, s := range f {
-				e += float64(s) * float64(s)
-				n++
-			}
-		}
-		if n == 0 {
-			return 0
-		}
-		return e / float64(n)
-	}
-	if energy(*heardA) < 1000 || energy(*heardB) < 1000 {
+	if heardA.energy() < 1000 || heardB.energy() < 1000 {
 		t.Fatal("received audio has no energy (silence looped back?)")
 	}
 	if err := ma.Hangup(); err != nil {
@@ -172,10 +187,10 @@ func TestCallMuteStopsVoice(t *testing.T) {
 	waitCallState(t, states, "a:live:bob")
 	waitCallState(t, states, "b:live:alice")
 	ma.Mute(true)
-	n0 := len(*heardB)
+	n0 := heardB.count()
 	feedTone(feedA, 10)
 	time.Sleep(1500 * time.Millisecond)
-	if n1 := len(*heardB); n1 != n0 {
+	if n1 := heardB.count(); n1 != n0 {
 		t.Fatalf("muted sender delivered %d frames", n1-n0)
 	}
 	_ = heardA
@@ -255,5 +270,93 @@ func TestCallNoPeerHint(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("peerless /call must hint usage")
+	}
+}
+
+func TestVideoSyntheticLoopback(t *testing.T) {
+	ma, mb, _, _, _, _, states := callPair(t)
+	if err := ma.Call("bob"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mb.Accept(); err != nil {
+		t.Fatal(err)
+	}
+	waitCallState(t, states, "a:live:bob")
+	waitCallState(t, states, "b:live:alice")
+
+	// Synthetic camera: two arbitrary frames (payloader fragments bytes).
+	frames := make(chan []byte, 4)
+	f1 := make([]byte, 3000)
+	for i := range f1 {
+		f1[i] = byte(i)
+	}
+	f2 := make([]byte, 500)
+	for i := range f2 {
+		f2[i] = byte(255 - i)
+	}
+	frames <- append([]byte(nil), f1...)
+	frames <- append([]byte(nil), f2...)
+	ma.mu.Lock()
+	ma.videoSrc = func() (<-chan []byte, func(), error) { return frames, func() {}, nil }
+	ma.mu.Unlock()
+	mb.mu.Lock()
+	mb.videoDecFn = func() (frameDecoder, error) {
+		return &identityDecoder{}, nil
+	}
+	mb.mu.Unlock()
+	rendered := make(chan []string, 8)
+	mb.mu.Lock()
+	mb.cb.onVideoFrame = func(lines []string) { rendered <- lines }
+	mb.mu.Unlock()
+	if err := ma.StartVideo(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case lines := <-rendered:
+		if len(lines) == 0 {
+			t.Fatal("empty render")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("no video frame rendered loopback")
+	}
+	ma.StopVideo()
+	ma.mu.Lock()
+	on := ma.videoOn
+	ma.mu.Unlock()
+	if on {
+		t.Fatal("StopVideo must clear streaming flag")
+	}
+}
+
+type identityDecoder struct{}
+
+func (identityDecoder) decode(frame []byte) ([]byte, error) {
+	_ = frame
+	rgb := make([]byte, videoWidth*videoHeight*3)
+	for i := 0; i < len(rgb); i += 3 {
+		rgb[i], rgb[i+1], rgb[i+2] = 128, 128, 128
+	}
+	return rgb, nil
+}
+
+func (identityDecoder) close() {}
+
+func TestVideoDrawerShowsFrames(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sc := m.(chatScreen)
+	sc.call = &callManager{videoOn: true}
+	m2, _ := sc.Update(netVideoMsg{lines: []string{"██", "░░"}})
+	sc = m2.(chatScreen)
+	if len(sc.videoLines) != 2 {
+		t.Fatal("video lines not stored")
+	}
+	if got := sc.drawerView(100); !strings.Contains(got, "██") {
+		t.Fatalf("drawer missing video frame: %q", got)
+	}
+	sc.call = &callManager{videoOn: false}
+	if got := sc.drawerView(100); strings.Contains(got, "██") {
+		t.Fatal("drawer must hide video when off")
 	}
 }

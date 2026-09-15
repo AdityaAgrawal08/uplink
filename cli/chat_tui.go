@@ -385,6 +385,9 @@ type callStateMsg struct {
 }
 type callLevelMsg struct{ level float64 }
 
+// netVideoMsg carries one decoded ASCII video frame for the drawer pane.
+type netVideoMsg struct{ lines []string }
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -450,6 +453,7 @@ type chatScreen struct {
 	// call owns the voice-call lifecycle (nil-safe: no call ever started).
 	call         *callManager
 	callLevel    float64 // mic loudness for the header meter
+	videoLines   []string
 	vp           viewport.Model
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
@@ -571,6 +575,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 			onRinging: func(peer string) { push(callRingMsg{peer: peer}) },
 			onState:   func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
 			onLevel:   func(level float64) { push(callLevelMsg{level: level}) },
+			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
 		})
 	var eng *engine
 	eng = newEngine(me, id, sig, engineCallbacks{
@@ -1394,6 +1399,19 @@ func (c *chatScreen) callMute() tea.Cmd {
 	return nil
 }
 
+func (c *chatScreen) callVideo() tea.Cmd {
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* no call: /call <user> first"))
+		return nil
+	}
+	if err := c.call.StartVideo(); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
+	} else {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on"))
+	}
+	return nil
+}
+
 // callStatus renders the in-call header chip ("" when idle).
 func (c *chatScreen) callStatus() string {
 	if c.call == nil {
@@ -1737,6 +1755,11 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case callLevelMsg:
 		c.callLevel = msg.level
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netVideoMsg:
+		c.videoLines = msg.lines
+		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
