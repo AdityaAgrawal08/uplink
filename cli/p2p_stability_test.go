@@ -1357,3 +1357,148 @@ func TestRosterLearnedAfterOpenStillHandshakes(t *testing.T) {
 	waitReady(t, pa, "bob")
 	waitReady(t, pb, "alice")
 }
+
+// Faithful screenshot reproduction: two live TUI screens, rapid alternating
+// sends with no pacing (exercises pending/outbox/settle paths), real engines
+// over loopback. Every sent text must land exactly once in the peer's
+// history.
+func TestTuiRapidConversationCrossDelivery(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", pubA, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	mkScreen := func(me, key string, id *identityKey) *chatScreen {
+		sc := newChatScreen(srv.URL, key, me, id, "")
+		sc.vp = *viewportPtr(60, 20)
+		m, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+		out := m.(chatScreen)
+		if roster, err := out.sig.heartbeat("", nil); err == nil {
+			out.eng.setRoster(roster)
+			out.users = onlineNames(roster, me)
+		}
+		out.eng.start()
+		return &out
+	}
+	sa := mkScreen("alice", sid, ida)
+	sb := mkScreen("bob", sid, idb)
+	defer sa.eng.stop()
+	defer sb.eng.stop()
+
+	type send struct {
+		to   *chatScreen
+		text string
+	}
+	script := []send{
+		{sa, "Hey"}, {sa, "Hello"}, {sb, "hi"}, {sa, "yo"},
+		{sb, "Nice to meet you"}, {sa, "how are you"},
+	}
+	// Fire with no pacing, following only sendDoneMsg chains (promotion).
+	// Drain re-arms are endless by design and must NOT be followed here.
+	follow := func(sc **chatScreen, cmd tea.Cmd) {
+		for depth := 0; cmd != nil && depth < 8; depth++ {
+			msg := cmd()
+			if msg == nil {
+				return
+			}
+			var out tea.Model
+			var next tea.Cmd
+			out, next = (*sc).Update(msg)
+			**sc = out.(chatScreen)
+			if _, ok := msg.(sendDoneMsg); !ok {
+				return
+			}
+			cmd = next
+		}
+	}
+	for _, s := range script {
+		follow(&s.to, s.to.submitLine(s.text))
+	}
+	// Pump both drains until every text is cross-visible exactly once.
+	countText := func(sc *chatScreen, text string) int {
+		n := 0
+		for _, h := range sc.history {
+			if h.Text == text {
+				n++
+			}
+		}
+		return n
+	}
+	done := func() bool {
+		for _, want := range []string{"Hey", "Hello", "yo", "how are you"} {
+			if countText(sb, want) != 1 {
+				return false
+			}
+		}
+		for _, want := range []string{"hi", "Nice to meet you"} {
+			if countText(sa, want) != 1 {
+				return false
+			}
+		}
+		return true
+	}
+	deadline := time.Now().Add(40 * time.Second)
+	for !done() && time.Now().Before(deadline) {
+		for _, sc := range []*chatScreen{sa, sb} {
+			for {
+				select {
+				case m := <-sc.netCh:
+					var out tea.Model
+					var cmd tea.Cmd
+					out, cmd = sc.Update(m)
+					*sc = out.(chatScreen)
+					follow(&sc, cmd)
+				default:
+					goto drained
+				}
+			}
+		drained:
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	dump := func(tag string, sc *chatScreen, peer string) {
+		var hs []string
+		for _, h := range sc.history {
+			hs = append(hs, h.Username+":"+h.Text)
+		}
+		sc.eng.mu.Lock()
+		unacked := len(sc.eng.unacked)
+		_, live := sc.eng.noise[peer]
+		sc.eng.mu.Unlock()
+		t.Logf("%s history=%v outbox=%d pending=%v locals=%d unacked=%d live=%v", tag, hs, len(sc.outbox), sc.pending != nil, len(sc.localLines), unacked, live)
+	}
+	for _, want := range []string{"Hey", "Hello", "yo", "how are you"} {
+		if n := countText(sb, want); n != 1 {
+			dump("bob", sb, "alice")
+			dump("alice", sa, "bob")
+			fs.mu.Lock()
+			var boxes []string
+			for k, m := range fs.boxes {
+				for id := range m {
+					boxes = append(boxes, k+"/"+id)
+				}
+			}
+			fs.mu.Unlock()
+			t.Logf("server boxes residue: %v", boxes)
+			t.Fatalf("bob shows %q %d times; want exactly 1", want, n)
+		}
+	}
+	for _, want := range []string{"hi", "Nice to meet you"} {
+		if n := countText(sa, want); n != 1 {
+			t.Errorf("alice shows %q %d times; want exactly 1", want, n)
+		}
+	}
+}
