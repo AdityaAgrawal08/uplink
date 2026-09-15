@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Standalone npm shim (own CommonJS module system, not Next.js code).
+    "npm/**",
   ]),
 ]);
 
