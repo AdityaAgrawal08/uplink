@@ -771,6 +771,15 @@ func historyHasSeq(history []chatMessage, seq int) bool {
 	return false
 }
 
+// allocSeq hands out the next display sequence number. ALL consumers
+// (own-send reservation, inbound assignment, settle reallocation) go
+// through here: taking c.nextSeq raw reuses the last settled number and
+// silently drops the message via the rendered[] guard.
+func (c *chatScreen) allocSeq() int {
+	c.nextSeq++
+	return c.nextSeq
+}
+
 // peerOf extracts the OTHER participant from a canonical "a|b" pair key.
 func peerOf(me, conv string) string {
 	parts := strings.Split(conv, "|")
@@ -1391,8 +1400,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	if target == "" && c.pending.conv == generalConv {
 		target = ""
 	}
-	c.nextSeq++
-	seq := c.nextSeq
+	seq := c.allocSeq()
 	c.rebuildView()
 	return c.doSend(text, target, seq)
 }
@@ -1505,12 +1513,11 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		cm := chatMessage{
-			Seq: c.nextSeq, MsgId: m.MsgId, Username: m.From, Kind: "chat",
+			Seq: c.allocSeq(), MsgId: m.MsgId, Username: m.From, Kind: "chat",
 			Text: m.Text, To: m.To,
 			ConvID:    convFor(m.From, m.To),
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
-		c.nextSeq++
 		c.handleNewMessage(cm)
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -1780,8 +1787,8 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
-		// Inbound traffic shares the seq counter and may have taken ours
-		// while sending: reallocate instead of dropping our message.
+		// Defensive: seqs come from one allocator now, but never drop a
+		// confirmed own message over a counter surprise.
 		for c.rendered[m.Seq] || historyHasSeq(c.history, m.Seq) {
 			c.nextSeq++
 			m.Seq = c.nextSeq

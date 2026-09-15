@@ -126,8 +126,8 @@ type engine struct {
 	// room reports once, a failing rejoin backs off to 60s.
 	endedNotified bool
 	lastRejoinErr time.Time
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
 }
 
 // rosterFreshTTL bounds how stale the send path's roster may be. 2s keeps
