@@ -82,6 +82,14 @@ func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 		onError: func(err error) {
 			fmt.Printf("* %v\n", err)
 		},
+		onSignalNote: func(n signalNote) {
+			// Headless has no ringing UI: announce and decline. Voice
+			// needs an interactive peer; silent drops would ring forever.
+			if n.Type == callOffer {
+				fmt.Printf("* Incoming call from %s (headless mode: declined)\n", n.From)
+				_ = sig.signalSend(n.From, callAccept, declinePayload())
+			}
+		},
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
 
@@ -106,7 +114,7 @@ func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
 		}
 	}() // registered first → runs second (engine already down)
-	defer eng.stop()      // registered second → runs first
+	defer eng.stop() // registered second → runs first
 
 	fmt.Printf("Connected to session %s as '%s'. Type /exit to leave.\n", key, me)
 

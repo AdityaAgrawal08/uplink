@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -544,4 +545,37 @@ func (c *callManager) startAudio(peer string) {
 			}
 		}
 	}()
+}
+
+// State reports the call state snapshot for UI rendering.
+func (c *callManager) State() (callState, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state, c.peer
+}
+
+func (c *callManager) Muted() bool { return c.muted.Load() }
+
+// declinePayload is the wire bytes for refusing a call (shared with the
+// headless auto-decline path, which has no manager).
+func declinePayload() string {
+	raw, _ := json.Marshal(callAnswerPayload{Accept: false})
+	return string(raw)
+}
+
+// rosterMap converts engine roster snapshots to verify keys (skips garbage
+// instead of failing the whole map).
+func rosterMap(peers []rosterMember) map[string][]byte {
+	out := map[string][]byte{}
+	for _, m := range peers {
+		if m.Username == "" {
+			continue
+		}
+		raw, err := base64.StdEncoding.DecodeString(m.Pubkey)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		out[m.Username] = raw
+	}
+	return out
 }

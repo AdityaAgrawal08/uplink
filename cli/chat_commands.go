@@ -27,6 +27,11 @@ var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
+	{Name: "/call", Desc: "voice-call a peer: /call <user> (or in their DM)"},
+	{Name: "/accept", Desc: "accept the ringing call"},
+	{Name: "/decline", Desc: "decline the ringing call"},
+	{Name: "/hangup", Desc: "end the current call"},
+	{Name: "/mute", Desc: "mute/unmute your mic"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -311,6 +316,16 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
+	case "/call":
+		return c.callPeer("")
+	case "/accept":
+		return c.callAccept()
+	case "/decline":
+		return c.callDecline()
+	case "/hangup":
+		return c.callHangup()
+	case "/mute":
+		return c.callMute()
 	default:
 		return nil
 	}

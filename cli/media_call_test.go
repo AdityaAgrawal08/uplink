@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/base64"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 // callPair wires two managers with direct note routing + synthetic audio:
@@ -176,4 +180,80 @@ func TestCallMuteStopsVoice(t *testing.T) {
 	}
 	_ = heardA
 	_ = mb
+}
+
+func TestCallCommandsRegistered(t *testing.T) {
+	want := map[string]bool{"/help": false, "/upload": false, "/download": false, "/call": false, "/accept": false, "/decline": false, "/hangup": false, "/mute": false}
+	for _, c := range slashCommands {
+		if _, ok := want[c.Name]; ok {
+			want[c.Name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("command %s missing from palette", name)
+		}
+	}
+}
+
+func TestCallRingLineAndHeader(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sc := m.(chatScreen)
+	before := len(sc.localLines)
+	m2, _ := sc.Update(callRingMsg{peer: "alice"})
+	sc = m2.(chatScreen)
+	if len(sc.localLines) != before+1 {
+		t.Fatal("ringing must announce exactly one line")
+	}
+	sc.callLevel = 0.5
+	if !strings.Contains(sc.headerView(), normVersion(version)) {
+		t.Fatal("header lost version segment")
+	}
+}
+
+func TestRosterMapSkipsGarbage(t *testing.T) {
+	peers := []rosterMember{
+		{Username: "ok", Pubkey: base64.StdEncoding.EncodeToString(make([]byte, 32)), Online: true},
+		{Username: "short", Pubkey: base64.StdEncoding.EncodeToString(make([]byte, 4)), Online: true},
+		{Username: "bad", Pubkey: "%%%", Online: true},
+		{Username: "", Pubkey: base64.StdEncoding.EncodeToString(make([]byte, 32)), Online: true},
+	}
+	m := rosterMap(peers)
+	if len(m) != 1 || len(m["ok"]) != 32 {
+		t.Fatalf("rosterMap wrong: %v", m)
+	}
+}
+
+func TestVuBarBounds(t *testing.T) {
+	if got := vuBar(-1); len(got) == 0 {
+		t.Fatal("empty bar")
+	}
+	if got := vuBar(0); strings.Count(got, "▂") != 0 {
+		t.Fatalf("silent bar lit: %q", got)
+	}
+	if got := vuBar(1); strings.Count(got, "▂") != 8 {
+		t.Fatalf("full bar wrong: %q", got)
+	}
+	if got := vuBar(99); strings.Count(got, "▂") != 8 {
+		t.Fatalf("clamp wrong: %q", got)
+	}
+}
+
+func TestCallNoPeerHint(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sc := m.(chatScreen)
+	sc.callPeer("")
+	found := false
+	for _, l := range sc.localLines {
+		if strings.Contains(l.text, "/call <user>") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("peerless /call must hint usage")
+	}
 }

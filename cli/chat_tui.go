@@ -376,6 +376,15 @@ const receiptExpiry = 5 * time.Minute
 // netDeliveredMsg arrives when the peer acked one of our messages.
 type netDeliveredMsg struct{ msgId string }
 
+// Call UI messages (voice): ringing prompt, state transitions, VU level.
+type callRingMsg struct{ peer string }
+type callStateMsg struct {
+	state callState
+	peer  string
+	info  string
+}
+type callLevelMsg struct{ level float64 }
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -436,8 +445,11 @@ type chatScreen struct {
 	// in view (broadcasts otherwise paint nowhere and badge nothing — a
 	// message can sit in history looking "missing"). Cleared on return to
 	// the room. DM unreads keep using the per-peer map.
-	roomUnread   int
-	users        []string
+	roomUnread int
+	users      []string
+	// call owns the voice-call lifecycle (nil-safe: no call ever started).
+	call         *callManager
+	callLevel    float64 // mic loudness for the header meter
 	vp           viewport.Model
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
@@ -552,6 +564,14 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		default:
 		}
 	}
+	callMgr := newCallManager(me, id,
+		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
+		nil, // roster bound below once eng exists
+		callCallbacks{
+			onRinging: func(peer string) { push(callRingMsg{peer: peer}) },
+			onState:   func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
+			onLevel:   func(level float64) { push(callLevelMsg{level: level}) },
+		})
 	var eng *engine
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
@@ -560,17 +580,20 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 			_ = eng.sendAck(c.From, c.MsgId)
 			push(netChatMsg{chat: c})
 		},
-		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
-		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
-		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
-		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
-		onDelivered: func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
-		onError:     func(err error) { push(netErrMsg{err: err}) },
+		onFile:       func(f engineFile) { push(netFileMsg{file: f}) },
+		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
+		onPeerReady:  func(user, code string) { push(netReadyMsg{user: user, code: code}) },
+		onPeerLost:   func(user string) { push(netLostMsg{user: user}) },
+		onDelivered:  func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
+		onError:      func(err error) { push(netErrMsg{err: err}) },
+		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
+	callMgr.roster = func() map[string][]byte { return rosterMap(eng.peers()) }
 	return chatScreen{
 		sig:         sig,
 		eng:         eng,
+		call:        callMgr,
 		key:         key,
 		me:          me,
 		vp:          vp,
@@ -1078,8 +1101,8 @@ func (c chatScreen) headerView() string {
 	}
 	// Binary version in the banner: screenshots become self-identifying
 	// (which build each side runs is otherwise unknowable in bug reports).
-	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s ",
-		c.key, c.me, len(c.users), normVersion(version), mode)
+	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s%s ",
+		c.key, c.me, len(c.users), normVersion(version), mode, c.callStatus())
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
@@ -1307,6 +1330,106 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
+// ---- voice calls -------------------------------------------------------------
+
+// callPeer starts a call (explicit peer, else the open DM thread).
+func (c *chatScreen) callPeer(peer string) tea.Cmd {
+	if peer == "" {
+		peer = c.targetUser
+	}
+	if peer == "" {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /call <user> (or open their DM first)"))
+		return nil
+	}
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* calls unavailable here"))
+		return nil
+	}
+	if err := c.call.Call(peer); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* call failed: "+err.Error()))
+	}
+	return nil
+}
+
+func (c *chatScreen) callAccept() tea.Cmd {
+	if c.call == nil {
+		return nil
+	}
+	if err := c.call.Accept(); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
+	}
+	return nil
+}
+
+func (c *chatScreen) callDecline() tea.Cmd {
+	if c.call == nil {
+		return nil
+	}
+	if err := c.call.Decline(); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
+	}
+	return nil
+}
+
+func (c *chatScreen) callHangup() tea.Cmd {
+	if c.call == nil {
+		return nil
+	}
+	if err := c.call.Hangup(); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
+	}
+	return nil
+}
+
+func (c *chatScreen) callMute() tea.Cmd {
+	if c.call == nil {
+		return nil
+	}
+	c.call.Mute(!c.call.Muted())
+	if c.call.Muted() {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* mic muted"))
+	} else {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* mic live"))
+	}
+	return nil
+}
+
+// callStatus renders the in-call header chip ("" when idle).
+func (c *chatScreen) callStatus() string {
+	if c.call == nil {
+		return ""
+	}
+	st, peer := c.call.State()
+	if st == callIdle {
+		return ""
+	}
+	s := " · ● call " + peer + " " + st.String()
+	if c.call.Muted() {
+		s += " (muted)"
+	} else if c.callLevel > 0.02 {
+		s += " " + vuBar(c.callLevel)
+	}
+	return s
+}
+
+func vuBar(level float64) string {
+	n := int(level*8 + 0.5)
+	if n < 0 {
+		n = 0
+	}
+	if n > 8 {
+		n = 8
+	}
+	full, empty := "", ""
+	for i := 0; i < n; i++ {
+		full += "▂"
+	}
+	for i := n; i < 8; i++ {
+		empty += "·"
+	}
+	return full + empty
+}
+
 // enterPrivate switches to a 1:1 thread. There is no server history to
 // deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
@@ -1335,6 +1458,9 @@ func (c *chatScreen) exitPrivate() {
 // typed "/help" behaves exactly like one picked from the palette.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
 	t := strings.ToLower(strings.TrimSpace(text))
+	if rest, ok := strings.CutPrefix(strings.TrimSpace(text), "/call "); ok {
+		return c.callPeer(strings.TrimSpace(rest))
+	}
 	for _, cmd := range slashCommands {
 		if t == cmd.Name {
 			return c.runCommand(t)
@@ -1596,6 +1722,21 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		c.evictRenderCache(msg.msgId)
 		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case callRingMsg:
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render(fmt.Sprintf("* Incoming call from %s — /accept or /decline", msg.peer)))
+		cmds = append(cmds, c.drainNetCmd())
+
+	case callStateMsg:
+		if msg.info != "" {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* call "+msg.peer+": "+msg.info))
+		}
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case callLevelMsg:
+		c.callLevel = msg.level
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
