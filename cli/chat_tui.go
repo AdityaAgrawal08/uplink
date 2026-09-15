@@ -361,6 +361,20 @@ type netLostMsg struct{ user string }
 type netErrMsg struct{ err error }
 type rosterTickMsg struct{}
 
+// unconfirmedAfter is how long an own message may sit without a delivery
+// ack before the status line warns. Churn windows (re-handshake + 3 inbox
+// retries) legitimately take ~10-15s; past 30s something is wrong enough
+// to say so out loud instead of showing false confidence.
+const unconfirmedAfter = 30 * time.Second
+
+// receiptExpiry forgets an unacked own message (dimming lifts). Past this
+// point the engine's retries are over; a still-missing ack is far likelier
+// a lost ack frame than a lost message, so nagging forever would cry wolf.
+const receiptExpiry = 5 * time.Minute
+
+// netDeliveredMsg arrives when the peer acked one of our messages.
+type netDeliveredMsg struct{ msgId string }
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -406,12 +420,22 @@ type chatScreen struct {
 	// message content). Without them every new message re-renders and
 	// re-measures the entire transcript (grapheme segmentation dominates
 	// profiles) — O(n) per message, ~90ms at 5000 lines.
-	renderCache  map[int]string
-	tsCache      map[int]time.Time
-	wrapCache    map[string]string
-	cacheWidth   int
-	pending      *pendingSend // single in-flight send (nil = idle)
-	outbox       []queuedLine // queued sends waiting for the in-flight one
+	renderCache map[int]string
+	tsCache     map[int]time.Time
+	wrapCache   map[string]string
+	cacheWidth  int
+	pending     *pendingSend // single in-flight send (nil = idle)
+	outbox      []queuedLine // queued sends waiting for the in-flight one
+	// unackedUI tracks own confirmed sends awaiting a delivery ack
+	// (msgId -> send time). Own bubbles render dimmed until the ack lands;
+	// entries older than unconfirmedAfter raise the status warning below.
+	// The engine owns retry/expiry — this map is display state only.
+	unackedUI map[string]time.Time
+	// roomUnread counts room broadcasts that arrived while a DM thread is
+	// in view (broadcasts otherwise paint nowhere and badge nothing — a
+	// message can sit in history looking "missing"). Cleared on return to
+	// the room. DM unreads keep using the per-peer map.
+	roomUnread   int
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -523,6 +547,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
 		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
 		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
+		onDelivered: func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
 		onError:     func(err error) { push(netErrMsg{err: err}) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
@@ -658,6 +683,12 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	var style lipgloss.Style
 	if isOwn {
 		style = tuiOwnBubbleStyle
+		// Unconfirmed own message (sent, no delivery ack yet): render dim
+		// so "sent" is never confused with "received". The ack
+		// (netDeliveredMsg) restores full brightness.
+		if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
+			style = style.Faint(true)
+		}
 	} else {
 		style = tuiOtherBubbleStyle
 	}
@@ -690,6 +721,13 @@ func (c *chatScreen) addMessage(m chatMessage) {
 				c.unread[peer]++ // badge only when the thread is out of sight
 			}
 		}
+	}
+	// Room broadcasts arriving while a DM thread is in view get no paint
+	// and no badge by the rules above — count them so the header can say
+	// "N new in room" instead of looking like loss. (Empty ConvID is a
+	// legacy room message, same as shouldRender treats it.)
+	if (m.ConvID == generalConv || m.ConvID == "") && m.Username != c.me && c.activeConv() != generalConv {
+		c.roomUnread++
 	}
 	c.history = append(c.history, m)
 	// Bound the transcript: marathon sessions must not grow it without
@@ -750,6 +788,19 @@ func (c *chatScreen) cacheForWidth(w int) {
 		c.tsCache = map[int]time.Time{}
 		c.wrapCache = map[string]string{}
 		c.cacheWidth = w
+	}
+}
+
+// evictRenderCache drops the memoized bubble for one msgId (dim state
+// changed), so the next rebuild repaints it instead of reusing stale art.
+func (c *chatScreen) evictRenderCache(msgId string) {
+	if msgId == "" || len(c.renderCache) == 0 {
+		return
+	}
+	for _, h := range c.history {
+		if h.MsgId == msgId {
+			delete(c.renderCache, h.Seq)
+		}
 	}
 }
 
@@ -967,9 +1018,14 @@ func (c chatScreen) headerView() string {
 	mode := ""
 	if c.targetUser != "" {
 		mode = fmt.Sprintf(" · private with %s · ESC = general", c.targetUser)
+		if c.roomUnread > 0 {
+			mode += fmt.Sprintf(" · %d new in room", c.roomUnread)
+		}
 	}
-	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
-		c.key, c.me, len(c.users), mode)
+	// Binary version in the banner: screenshots become self-identifying
+	// (which build each side runs is otherwise unknowable in bug reports).
+	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s ",
+		c.key, c.me, len(c.users), normVersion(version), mode)
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
@@ -1206,6 +1262,7 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.palette.close()
+	c.roomUnread = 0 // back in the room: everything is visible again
 	c.rebuildView()
 }
 
@@ -1348,6 +1405,30 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if changed {
 			c.rebuildView() // repaint the sidebar NOW, not on the next message
 		}
+		// Delivery-receipt sweep: warn on messages unacked past
+		// unconfirmedAfter; forget entries past receiptExpiry (the engine's
+		// own retries are long over by then — most likely a lost ack frame,
+		// not a lost message). Evict repaints so dimming lifts.
+		if len(c.unackedUI) > 0 {
+			now := time.Now()
+			stale := 0
+			for id, at := range c.unackedUI {
+				age := now.Sub(at)
+				if age > receiptExpiry {
+					delete(c.unackedUI, id)
+					c.evictRenderCache(id)
+				} else if age > unconfirmedAfter {
+					stale++
+				}
+			}
+			if stale > 0 {
+				c.status = fmt.Sprintf("* %d message(s) unconfirmed — still retrying", stale)
+			} else if strings.HasPrefix(c.status, "* ") && strings.Contains(c.status, "unconfirmed") {
+				c.status = ""
+			}
+		} else if strings.HasPrefix(c.status, "* ") && strings.Contains(c.status, "unconfirmed") {
+			c.status = ""
+		}
 		cmds = append(cmds, scheduleRoster())
 
 	case netChatMsg:
@@ -1415,6 +1496,18 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				c.lastDMAt[peer] = ts
 			}
 		}
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netDeliveredMsg:
+		// Peer acked one of ours: full confidence, undim the bubble.
+		// (Acks are best-effort frames themselves; a lost ack just leaves
+		// the bubble dimmed until the expiry sweep below.) Evict the
+		// cached bubble or the dimmed paint would stick.
+		if c.unackedUI != nil {
+			delete(c.unackedUI, msg.msgId)
+		}
+		c.evictRenderCache(msg.msgId)
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -1616,6 +1709,15 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	}
 
 	c.pending = nil
+	// Track the confirmed send for delivery receipts: the bubble stays
+	// dimmed until the peer's ack arrives (netDeliveredMsg). Failures
+	// (429/410/500 + errors) keep their annotations instead.
+	if msg.err == nil && msg.code == 201 && msg.msgId != "" {
+		if c.unackedUI == nil {
+			c.unackedUI = map[string]time.Time{}
+		}
+		c.unackedUI[msg.msgId] = time.Now()
+	}
 	c.rebuildView()
 
 	if msg.code == 410 {

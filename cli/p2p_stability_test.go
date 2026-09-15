@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestHsEnvelopeRoundtrip(t *testing.T) {
@@ -994,5 +996,102 @@ func TestTuiDedupsRetriedFileCard(t *testing.T) {
 	}
 	if len(c2.received) != 1 {
 		t.Fatalf("received drawer has %d entries; want 1", len(c2.received))
+	}
+}
+
+// Delivery receipts: a confirmed own send dims until the peer ack lands,
+// then restores. Stale unacked sends raise the status warning.
+func TestDeliveryReceiptDimAndRestore(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	sc := m.(chatScreen)
+
+	sc.settleSend(sendDoneMsg{text: "hi", to: "", seq: 99, msgId: "r1", code: 201})
+	if len(sc.unackedUI) != 1 {
+		t.Fatalf("confirmed send not tracked: %v", sc.unackedUI)
+	}
+	own := chatMessage{Seq: 99, MsgId: "r1", Username: "bob", Kind: "chat", Text: "hi", ConvID: generalConv, CreatedAt: "2026-09-15T19:21:00Z"}
+	_ = sc.renderedLine(own) // prime the bubble cache
+	if _, ok := sc.renderCache[99]; !ok {
+		t.Fatal("bubble was not cached")
+	}
+	// Eviction itself is unit-covered (rebuildView re-caches right after,
+	// so absence can never hold post-Update — by design, not a leak).
+	sc.evictRenderCache("r1")
+	if _, ok := sc.renderCache[99]; ok {
+		t.Fatal("evictRenderCache left the dimmed paint cached")
+	}
+	m2, _ := sc.Update(netDeliveredMsg{msgId: "r1"})
+	sc = m2.(chatScreen)
+	if len(sc.unackedUI) != 0 {
+		t.Fatal("ack did not graduate the receipt")
+	}
+	// NOTE: the dim itself is asserted structurally (map + eviction): with
+	// no TTY attached lipgloss strips the faint SGR, so byte comparison
+	// cannot see it here, but bright terminals render Faint distinctly.
+}
+
+// Stale unacked sends warn via the status line; ancient ones expire quiet.
+func TestUnconfirmedStatusSweep(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	wireTestEngine(t, c, srv, "bob")
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	sc := m.(chatScreen)
+
+	sc.unackedUI = map[string]time.Time{"old": time.Now().Add(-time.Hour)}
+	m2, _ := sc.Update(rosterTickMsg{})
+	sc = m2.(chatScreen)
+	if len(sc.unackedUI) != 0 {
+		t.Fatal("hour-old receipt should expire, not nag forever")
+	}
+	if sc.status != "" {
+		t.Fatalf("status should clear with no stale entries, got %q", sc.status)
+	}
+
+	sc.unackedUI = map[string]time.Time{"slow": time.Now().Add(-time.Minute)}
+	m3, _ := sc.Update(rosterTickMsg{})
+	sc = m3.(chatScreen)
+	if !strings.Contains(sc.status, "unconfirmed") {
+		t.Fatalf("stale receipt must warn, status = %q", sc.status)
+	}
+}
+
+// Room broadcasts arriving in a DM thread count up instead of vanishing
+// silently; returning to the room clears the counter.
+func TestRoomUnreadInThread(t *testing.T) {
+	c := newFilterScreen("bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
+	sc := m.(chatScreen)
+	if sc.activeConv() == generalConv {
+		t.Fatal("fixture must start inside the DM thread")
+	}
+	sc.handleNewMessage(chatMessage{Seq: 7, MsgId: "b1", Username: "alice", Kind: "chat", Text: "room ping", ConvID: generalConv, CreatedAt: "2026-09-15T19:21:00Z"})
+	if sc.roomUnread != 1 {
+		t.Fatalf("roomUnread = %d; want 1", sc.roomUnread)
+	}
+	if !strings.Contains(sc.headerView(), "1 new in room") {
+		t.Fatalf("header must advertise the room backlog: %q", sc.headerView())
+	}
+	sc.exitPrivate()
+	if sc.roomUnread != 0 {
+		t.Fatal("returning to the room must clear the counter")
+	}
+}
+
+// The banner names the binary version: screenshots become self-identifying.
+func TestHeaderShowsVersion(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sc := m.(chatScreen)
+	if !strings.Contains(sc.headerView(), "v"+normVersion(version)) {
+		t.Fatalf("header lacks version: %q", sc.headerView())
 	}
 }
