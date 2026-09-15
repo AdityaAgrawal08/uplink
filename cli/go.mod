@@ -17,6 +17,8 @@ require (
 	github.com/multiformats/go-multihash v0.2.3
 	github.com/pion/webrtc/v4 v4.1.2
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
+	github.com/tphakala/go-audio-capture v0.5.0
+	github.com/tphakala/go-opus v1.1.0
 	golang.org/x/crypto v0.50.0
 	golang.org/x/term v0.45.0
 )
@@ -124,6 +126,7 @@ require (
 	github.com/sergeymakinen/go-ico v1.0.0-beta.0 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
+	github.com/tphakala/simd v1.8.0 // indirect
 	github.com/whyrusleeping/go-keyspace v0.0.0-20160322163242-5b898ac5add1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
