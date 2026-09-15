@@ -29,6 +29,13 @@ func handleVersion() {
 	fmt.Printf("uplink %s (%s/%s) commit %s built %s\n", version, runtime.GOOS, runtime.GOARCH, commit, date)
 }
 
+// normVersion strips a leading "v" so bare numbers (dev builds) and raw
+// tags (release builds, and TagName from the API) compare equal when they
+// denote the same release. Without this, release binaries (version
+// "v0.0.2") never matched the trimmed tag ("0.0.2") and always reported
+// an update available — including printing "vv0.0.2" in the prompt.
+func normVersion(v string) string { return strings.TrimPrefix(v, "v") }
+
 // updateFailureHint explains an update-check failure in plain language.
 // A 404 without a token is ambiguous: either no release is published yet
 // (public repo) or the repo is private (the anonymous API is blind to it,
@@ -157,13 +164,14 @@ func handleUpdate() {
 		os.Exit(1)
 	}
 
-	latestTag := strings.TrimPrefix(release.TagName, "v")
-	if latestTag == version {
-		fmt.Printf("✓ Already up to date (v%s)\n", version)
+	latestTag := normVersion(release.TagName)
+	current := normVersion(version)
+	if latestTag == current {
+		fmt.Printf("✓ Already up to date (v%s)\n", current)
 		return
 	}
 
-	fmt.Printf("Update available: v%s → v%s\n", version, latestTag)
+	fmt.Printf("Update available: v%s → v%s\n", current, latestTag)
 
 	// Find matching asset
 	suffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)

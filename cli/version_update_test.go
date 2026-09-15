@@ -115,3 +115,19 @@ func TestUpdateFailureHint(t *testing.T) {
 		t.Fatalf("public hint wrong: %q", pub)
 	}
 }
+
+func TestNormVersion(t *testing.T) {
+	cases := map[string]string{"v0.0.2": "0.0.2", "0.0.2": "0.0.2", "v0.0.1": "0.0.1", "": ""}
+	for in, want := range cases {
+		if got := normVersion(in); got != want {
+			t.Fatalf("normVersion(%q) = %q; want %q", in, got, want)
+		}
+	}
+	// The shipped bug: release binary ("v0.0.2") vs trimmed tag ("0.0.2").
+	if normVersion("v0.0.2") != normVersion("v0.0.2") {
+		t.Fatal("identical releases must compare equal")
+	}
+	if normVersion("v0.0.1") == normVersion("v0.0.2") {
+		t.Fatal("different releases must compare different")
+	}
+}
