@@ -430,7 +430,7 @@ func (c *callManager) teardownLocked(info string) {
 // onSignalNote handles call control + media handshake notes.
 func (c *callManager) onSignalNote(n signalNote) {
 	switch n.Type {
-	case mediaHS1, mediaHS2, mediaHS3:
+	case mediaHS1, mediaHS2, mediaHS3, mediaHSRestart:
 		c.mu.Lock()
 		t := c.transport
 		c.mu.Unlock()

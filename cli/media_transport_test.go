@@ -282,3 +282,102 @@ func TestHandshakeRetransmitAndPurge(t *testing.T) {
 		t.Fatalf("purged handshake re-sent: %d total notes", n2)
 	}
 }
+
+// Screenshot scenario: larger-side responder drops verification on a stale
+// roster (silently, no alert), asks for restart; smaller side re-initiates;
+// once beats learn the peer, the parked attempt completes. Both live.
+func TestVerifyUnknownRecoversViaRestart(t *testing.T) {
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	rosterA := map[string][]byte{"bob": idb.publicKey()}
+	rosterB := map[string][]byte{} // stale: beats haven't learned alice
+	var mu sync.Mutex
+	var restarts int
+	var ma, mb *mediaTransport
+	var err error
+	ma, err = newMediaTransport("alice", ida,
+		func(to, typ, payload string) error { mb.onHandshakeNote("alice", typ, payload); return nil },
+		func() map[string][]byte { return rosterA },
+		mediaCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb, err = newMediaTransport("bob", idb,
+		func(to, typ, payload string) error {
+			if typ == mediaHSRestart {
+				mu.Lock()
+				restarts++
+				mu.Unlock()
+			}
+			ma.onHandshakeNote("bob", typ, payload)
+			return nil
+		},
+		func() map[string][]byte { return rosterB },
+		mediaCallbacks{})
+	if err != nil {
+		ma.stop()
+		t.Fatal(err)
+	}
+	pa, pb := ma.localAddr(), mb.localAddr()
+	if err := ma.dialPeer("bob", "127.0.0.1", pb.Port); err != nil {
+		t.Fatal(err)
+	}
+	if err := mb.dialPeer("alice", "127.0.0.1", pa.Port); err != nil {
+		t.Fatal(err)
+	}
+	ma.start()
+	mb.start()
+	defer ma.stop()
+	defer mb.stop()
+
+	ma.beginHandshake("bob")
+	// Alice (smaller, roster complete) goes live; Bob parks unknown.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ma.mu.Lock()
+		_, alive := ma.peers["bob"]
+		live := alive && ma.peers["bob"].ready
+		ma.mu.Unlock()
+		if live {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("alice never went live")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Bob asked for exactly one restart (throttled, not a storm).
+	time.Sleep(500 * time.Millisecond)
+	mu.Lock()
+	n := restarts
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("restart requests = %d; want exactly 1", n)
+	}
+	// Beats learn alice; Bob's parked attempt completes without new notes.
+	rosterB["alice"] = ida.publicKey()
+	mb.beatOnce()
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		mb.mu.Lock()
+		var bread bool
+		if p, ok := mb.peers["alice"]; ok {
+			bread = p.ready
+		}
+		mb.mu.Unlock()
+		if bread {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bob never went live after roster learned alice")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Media flows both ways now.
+	if err := ma.sendMedia("bob", mediaKindAudio, encodeAudioPacket(1, 1, []byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := mb.sendMedia("alice", mediaKindAudio, encodeAudioPacket(2, 2, []byte("y"))); err != nil {
+		t.Fatal(err)
+	}
+}

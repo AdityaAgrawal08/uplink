@@ -36,6 +36,12 @@ const (
 	mediaHS1 = "mnoise1"
 	mediaHS2 = "mnoise2"
 	mediaHS3 = "mnoise3"
+	// Restart requests let the non-initiating side recover a dead handshake:
+	// only the smaller username may initiate, so a larger side that drops
+	// verification can never restart by itself — it asks the smaller side to.
+	mediaHSRestart = "mnoise-restart"
+
+	restartThrottle = 10 * time.Second
 
 	mediaNonceSize   = 8
 	mediaHeaderLen   = 1 + 1 + mediaNonceSize
@@ -90,18 +96,19 @@ func (d *dgramCipher) open(nonce uint64, ct []byte) ([]byte, error) {
 
 // mediaPeer tracks one call peer: handshake state, then live ciphers.
 type mediaPeer struct {
-	username  string
-	addr      *net.UDPAddr
-	send      *dgramCipher
-	recv      *dgramCipher
-	ready     bool
-	announced bool
-	hs        *peerSession
-	hsAt      time.Time
-	epoch     int64
-	hsM1      []byte // initiator first message (retransmits on stall)
-	hsTries   int
-	lastRx    time.Time
+	username      string
+	addr          *net.UDPAddr
+	send          *dgramCipher
+	recv          *dgramCipher
+	ready         bool
+	announced     bool
+	hs            *peerSession
+	hsAt          time.Time
+	epoch         int64
+	hsM1          []byte // initiator first message (retransmits on stall)
+	hsTries       int
+	verifyPending bool // roster-unknown at verify; beat loop retries boundedly
+	lastRx        time.Time
 }
 
 // mediaTransport owns the UDP socket and per-peer media sessions.
@@ -121,6 +128,7 @@ type mediaTransport struct {
 	hsEpoch        map[string]int64
 	completedEpoch map[string]int64
 	prePongs       map[uint64]chan *net.UDPAddr
+	restartedAt    map[string]time.Time
 	closed         bool
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
@@ -145,6 +153,7 @@ func newMediaTransport(me string, id *identityKey, sendNote func(to, noteType, p
 		peers: map[string]*mediaPeer{}, hsEpoch: map[string]int64{},
 		completedEpoch: map[string]int64{},
 		prePongs:       map[uint64]chan *net.UDPAddr{},
+		restartedAt:    map[string]time.Time{},
 		stopCh:         make(chan struct{}),
 	}, nil
 }
@@ -184,8 +193,28 @@ func (m *mediaTransport) beatOnce() {
 		m1    []byte
 	}
 	var retries []retry
+	type reverify struct {
+		peer string
+		hs   *peerSession
+	}
+	var reverifies []reverify
 	for username, p := range m.peers {
-		if p.ready || p.hs == nil {
+		if p.ready {
+			continue
+		}
+		if p.verifyPending && p.hs != nil {
+			// Roster may have learned the peer since: bounded retries.
+			if p.hsTries >= 3 {
+				p.hs = nil
+				p.verifyPending = false
+				delete(m.hsEpoch, username)
+				continue
+			}
+			p.hsTries++
+			reverifies = append(reverifies, reverify{peer: username, hs: p.hs})
+			continue
+		}
+		if p.hs == nil {
 			continue
 		}
 		age := now.Sub(p.hsAt)
@@ -206,9 +235,24 @@ func (m *mediaTransport) beatOnce() {
 		}
 		_ = m.sendNote(r.peer, mediaHS1, wrapHs(r.epoch, r.m1))
 	}
+	for _, r := range reverifies {
+		m.verifyReady(r.peer, r.hs)
+	}
 }
 
-// nominate probes candidate ip:ports in parallel and returns the first that
+// sendRestart asks the smaller peer to begin a fresh handshake (throttled:
+// a hostile or confused peer must not turn this into churn).
+func (m *mediaTransport) sendRestart(peer string) {
+	m.mu.Lock()
+	if time.Since(m.restartedAt[peer]) < restartThrottle {
+		m.mu.Unlock()
+		return
+	}
+	m.restartedAt[peer] = time.Now()
+	m.mu.Unlock()
+	_ = m.sendNote(peer, mediaHSRestart, wrapHs(time.Now().UnixNano(), []byte("restart")))
+}
+
 // answers (600ms deadline). Unanswered candidates are unroutable from here
 // (wrong subnet, AP isolation, firewall) — never silently chosen.
 func (m *mediaTransport) nominate(ips []string, port int) *net.UDPAddr {
@@ -354,6 +398,8 @@ func (m *mediaTransport) onHandshakeNote(from string, noteType, payload string) 
 			return
 		}
 		_ = m.sendNote(from, mediaHS2, wrapHs(epoch, m2))
+	case mediaHSRestart:
+		m.onRestartNote(from, epoch)
 	case mediaHS2, mediaHS3:
 		m.mu.Lock()
 		p, ok := m.peers[from]
@@ -394,6 +440,39 @@ func (m *mediaTransport) dropHandshake(peer string) {
 	defer m.mu.Unlock()
 	if p, ok := m.peers[peer]; ok {
 		p.hs = nil
+		p.verifyPending = false
+	}
+	delete(m.hsEpoch, peer)
+}
+
+// onRestartNote handles a peer's request to begin a fresh handshake.
+// Only the smaller username may initiate (glare rule mirrored); anyone
+// else asking is ignored. Throttled like sends.
+func (m *mediaTransport) onRestartNote(from string, epoch int64) {
+	if m.me > from {
+		return
+	}
+	m.mu.Lock()
+	if completed, done := m.completedEpoch[from]; done && epoch <= completed {
+		m.mu.Unlock()
+		return
+	}
+	if time.Since(m.restartedAt[from]) < restartThrottle {
+		m.mu.Unlock()
+		return
+	}
+	m.restartedAt[from] = time.Now()
+	m.mu.Unlock()
+	m.dropNoise(from)
+	m.beginHandshake(from)
+}
+
+// dropNoise clears live + in-progress session state (transport kept).
+func (m *mediaTransport) dropNoise(peer string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.peers[peer]; ok {
+		p.send, p.recv, p.ready, p.hs = nil, nil, false, nil
 	}
 	delete(m.hsEpoch, peer)
 }
@@ -407,8 +486,23 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	keys := m.roster()
 	want, ok := keys[peer]
 	if !ok {
-		m.dropHandshake(peer)
-		return
+		// Stale snapshot, not an attack: re-read once (beats may have
+		// landed mid-handshake). Still unknown → park the attempt and let
+		// the beat loop re-verify (bounded); larger sides additionally ask
+		// the peer to restart, since only the smaller may initiate.
+		if want2, ok2 := m.roster()[peer]; ok2 {
+			want, ok = want2, true
+		} else {
+			m.mu.Lock()
+			if p, found := m.peers[peer]; found && p.hs != nil {
+				p.verifyPending = true
+			}
+			m.mu.Unlock()
+			if m.me > peer {
+				m.sendRestart(peer)
+			}
+			return
+		}
 	}
 	if !equalBytes(want, ps.remoteKey()) {
 		m.dropHandshake(peer)
@@ -425,6 +519,7 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	p.recv = &dgramCipher{c: ps.recv.Cipher()}
 	p.ready = true
 	p.hs = nil
+	p.verifyPending = false
 	p.lastRx = time.Now()
 	if epoch, has := m.hsEpoch[peer]; has {
 		m.completedEpoch[peer] = epoch
