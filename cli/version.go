@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
 // version/commit/date are set via ldflags at build time (see .goreleaser.yaml):
@@ -120,10 +122,29 @@ type githubRelease struct {
 	} `json:"assets"`
 }
 
+// setAuth attaches the GitHub token when present. Private repos need it on
+// EVERY request (API check, asset download, checksums) — anonymous asset
+// downloads 404 just like the API does.
+func setAuth(req *http.Request, ghToken string) {
+	if ghToken != "" {
+		req.Header.Set("Authorization", "Bearer "+ghToken)
+	}
+}
+
+// authedGet is client.Get with the token attached (see setAuth).
+func authedGet(client *http.Client, ghToken, url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	setAuth(req, ghToken)
+	return client.Do(req)
+}
+
 // verifyReleaseChecksum downloads checksums.txt from the same release and
 // compares the downloaded asset's SHA-256. hasher already consumed the
 // downloaded bytes. Missing/mismatched checksums fail closed.
-func verifyReleaseChecksum(client *http.Client, release githubRelease, assetName string, hasher hash.Hash) error {
+func verifyReleaseChecksum(client *http.Client, ghToken string, release githubRelease, assetName string, hasher hash.Hash) error {
 	var checksumURL string
 	for _, a := range release.Assets {
 		if a.Name == "checksums.txt" {
@@ -134,7 +155,7 @@ func verifyReleaseChecksum(client *http.Client, release githubRelease, assetName
 	if checksumURL == "" {
 		return fmt.Errorf("release has no checksums.txt — refusing to install")
 	}
-	resp, err := client.Get(checksumURL)
+	resp, err := authedGet(client, ghToken, checksumURL)
 	if err != nil {
 		return fmt.Errorf("checksum download failed: %w", err)
 	}
@@ -173,9 +194,7 @@ func handleUpdate() {
 		fmt.Printf("✗ Failed to build request: %v\n", err)
 		os.Exit(1)
 	}
-	if ghToken != "" {
-		req.Header.Set("Authorization", "Bearer "+ghToken)
-	}
+	setAuth(req, ghToken)
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
@@ -245,7 +264,7 @@ func handleUpdate() {
 	}
 	defer os.Remove(tmpFile.Name())
 
-	dlResp, err := client.Get(downloadURL)
+	dlResp, err := authedGet(client, ghToken, downloadURL)
 	if err != nil {
 		fmt.Printf("✗ Download failed: %v\n", err)
 		os.Exit(1)
@@ -264,7 +283,7 @@ func handleUpdate() {
 	}
 	tmpFile.Close()
 
-	if err := verifyReleaseChecksum(client, release, filepath.Base(downloadURL), hasher); err != nil {
+	if err := verifyReleaseChecksum(client, ghToken, release, filepath.Base(downloadURL), hasher); err != nil {
 		fmt.Printf("✗ %v\n", err)
 		os.Exit(1)
 	}
@@ -291,28 +310,61 @@ func handleUpdate() {
 		os.Exit(1)
 	}
 
-	if err := os.Rename(binPath, selfPath); err != nil {
-		// Try copy if rename fails (cross-device)
-		in, err := os.Open(binPath)
-		if err != nil {
-			fmt.Printf("✗ Cannot read new binary: %v\n", err)
-			os.Exit(1)
-		}
-		defer in.Close()
-		out, err := os.OpenFile(selfPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
-		if err != nil {
+	if err := installBinary(binPath, selfPath); err != nil {
+		if os.IsPermission(err) && runtime.GOOS != "windows" &&
+			term.IsTerminal(int(os.Stdin.Fd())) && promptSudo(selfPath) {
+			if serr := sudoInstall(binPath, selfPath); serr != nil {
+				fmt.Printf("✗ Privileged install failed: %v\n", serr)
+				os.Exit(1)
+			}
+		} else {
 			fmt.Printf("✗ Cannot write to %s: %v\n", selfPath, err)
+			fmt.Println("  Re-run with sudo to install system-wide, or install to a user-owned directory instead.")
 			os.Exit(1)
 		}
-		defer out.Close()
-		if _, err := io.Copy(out, in); err != nil {
-			fmt.Printf("✗ Install failed: %v\n", err)
-			os.Exit(1)
-		}
-		os.Remove(binPath)
 	}
 
 	fmt.Printf("✓ Updated to v%s (%s)\n", latestTag, selfPath)
+}
+
+// installBinary places the new binary (rename, else copy for cross-device).
+func installBinary(binPath, selfPath string) error {
+	if err := os.Rename(binPath, selfPath); err == nil {
+		return nil
+	}
+	in, err := os.Open(binPath)
+	if err != nil {
+		return fmt.Errorf("cannot read new binary: %w", err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(selfPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("install failed: %w", err)
+	}
+	os.Remove(binPath)
+	return nil
+}
+
+// promptSudo asks once whether to retry via sudo. Non-tty callers never see it.
+func promptSudo(selfPath string) bool {
+	fmt.Printf("Need root to write %s. Retry with sudo? [y/N] ", selfPath)
+	var answer string
+	if _, err := fmt.Scanln(&answer); err != nil {
+		return false
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "y" || answer == "yes"
+}
+
+// sudoInstall copies via sudo (stdio passthrough for the password prompt).
+func sudoInstall(binPath, selfPath string) error {
+	cmd := exec.Command("sudo", "install", "-m", "0755", binPath, selfPath)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return cmd.Run()
 }
 
 // extractReleaseAsset unpacks a downloaded release archive and returns the

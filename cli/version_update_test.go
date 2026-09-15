@@ -5,10 +5,13 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func makeTar(t *testing.T, files map[string]string) string {
@@ -149,5 +152,35 @@ func TestCmpVersions(t *testing.T) {
 		if got := cmpVersions(c.a, c.b); got != c.want {
 			t.Fatalf("cmpVersions(%q,%q) = %d; want %d", c.a, c.b, got, c.want)
 		}
+	}
+}
+
+func TestAuthedGetSendsToken(t *testing.T) {
+	var gotAuth, gotNoAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/with" {
+			gotAuth = r.Header.Get("Authorization")
+		} else {
+			gotNoAuth = r.Header.Get("Authorization")
+		}
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := authedGet(client, "tok123", srv.URL+"/with")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if gotAuth != "Bearer tok123" {
+		t.Fatalf("token not attached: %q", gotAuth)
+	}
+	resp2, err := authedGet(client, "", srv.URL+"/without")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if gotNoAuth != "" {
+		t.Fatalf("anonymous request carried auth: %q", gotNoAuth)
 	}
 }

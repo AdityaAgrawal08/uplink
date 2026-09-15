@@ -528,6 +528,11 @@ const maxReceivedFiles = 200
 // scrollback falls off first).
 const maxHistory = 5000
 
+// maxLocalLines bounds transient echo/note/card rows likewise. Echoes and
+// progress rows are removed in place; error/help rows would otherwise grow
+// without limit. Dropped file cards stay reachable in the files drawer.
+const maxLocalLines = 500
+
 func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
@@ -778,8 +783,30 @@ func peerOf(me, conv string) string {
 }
 
 func (c *chatScreen) appendLocal(conv, text string) {
-	c.localLines = append(c.localLines, localLine{conv: conv, text: text, kind: lineText})
+	c.pushLocalLine(localLine{conv: conv, text: text, kind: lineText})
 	c.rebuildView()
+}
+
+// pushLocalLine appends a transcript row, enforcing the cap. Dropping head
+// rows shifts stored indices (in-flight echo, upload progress): adjust them
+// so later lookups still hit their row, invalidating ones that fell off.
+func (c *chatScreen) pushLocalLine(ll localLine) {
+	c.localLines = append(c.localLines, ll)
+	if overflow := len(c.localLines) - maxLocalLines; overflow > 0 {
+		c.localLines = append([]localLine(nil), c.localLines[overflow:]...)
+		if c.pending != nil {
+			c.pending.localIdx -= overflow
+			if c.pending.localIdx < 0 {
+				c.pending.localIdx = -1
+			}
+		}
+		if c.uploadQ.lineIdx >= 0 {
+			c.uploadQ.lineIdx -= overflow
+			if c.uploadQ.lineIdx < 0 {
+				c.uploadQ.lineIdx = -1
+			}
+		}
+	}
 }
 
 // rebuildView derives the painted transcript from raw history + local lines,
@@ -1358,7 +1385,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	}
 	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(innerWithTs)
 	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
-	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
+	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
 	if target == "" && c.pending.conv == generalConv {
@@ -1531,7 +1558,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if c.activeConv() != generalConv {
 			c.roomUnread++
 		}
-		c.localLines = append(c.localLines, localLine{
+		c.pushLocalLine(localLine{
 			conv: conv,
 			kind: lineFileCard,
 			fileData: &fileCardData{
