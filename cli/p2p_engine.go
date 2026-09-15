@@ -110,7 +110,6 @@ type engine struct {
 	// frames on the wire, and the receiver would fail-decrypt the first
 	// arrival and tear down a healthy session. Guarded by e.mu.
 	sendMu    map[string]*sync.Mutex
-	seen      *seenSet
 	files     map[string]*fileAssembly
 	announced map[string]bool // safety codes already shown
 	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
@@ -209,7 +208,6 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		failCount:      map[string]int{},
 		unacked:        map[string]*pendingAck{},
 		sendMu:         map[string]*sync.Mutex{},
-		seen:           newSeenSet(2000),
 		files:          map[string]*fileAssembly{},
 		announced:      map[string]bool{},
 		stopCh:         make(chan struct{}),
@@ -697,10 +695,11 @@ func (e *engine) inboxOnce() {
 	}
 	var ack []string
 	for _, b := range boxes {
-		// NOTE: no seen-prefilter here. Inbound dedup lives in dispatch
-		// (msgId-keyed, type-aware); pre-marking every box broke nothing
-		// but hid redeliveries from the type-aware path. Already-processed
-		// boxes re-dispatch harmlessly (deduped) and are acked below.
+		// NOTE: no seen-prefilter here. Inbound dedup lives in the
+		// consumers (TUI/headless ack every copy they receive and display
+		// only the first), so redelivered boxes re-dispatch harmlessly and
+		// are acked below. Engine-side marking used to swallow retries for
+		// frames the consumer never consumed — a permanent silent loss.
 		e.mu.Lock()
 		senderKey, known := e.roster[b.From]
 		e.mu.Unlock()
@@ -733,14 +732,18 @@ func (e *engine) inboxOnce() {
 // ─── dispatch ───────────────────────────────────────────────────────────────
 
 func (e *engine) dispatch(f frame) {
-	// Inbound dedup by msgId: a mesh delivery plus a backstop inbox retry
-	// of the same frame must never double-display. Restricted to chat and
-	// single-box files — stream frames (meta/chunks/complete) SHARE one
-	// msgId by design and must all be processed.
-	if f.Type == frameChat || f.Type == frameFile {
-		if f.MsgId == "" || e.seen.seen("msg:"+f.MsgId) {
-			return
-		}
+	// NO inbound dedup here by design. Consumers (TUI, headless) dedup by
+	// msgId themselves AND ack every copy they receive. The old
+	// engine-side marking swallowed backstop retries for frames the
+	// consumer never consumed (e.g. a dropped TUI queue slot under burst):
+	// the retry arrived, dispatch dropped it as "seen", no ack ever went
+	// out, the sender retried into the void 3x and gave up — one
+	// permanently vanished message with no error anywhere. At-least-once
+	// delivery plus consumer-side exactly-once display is the correct
+	// split. Stream frames (shared msgId) were never marked and still
+	// aren't; only chat/single-box frames need consumer dedup.
+	if (f.Type == frameChat || f.Type == frameFile) && f.MsgId == "" {
+		return // protocol garbage: displayable frames need ids
 	}
 	switch f.Type {
 	case frameChat:

@@ -731,11 +731,17 @@ func TestReceivedFilesBound(t *testing.T) {
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	sc := m.(chatScreen)
 	for i := 0; i < maxReceivedFiles+10; i++ {
-		nm, _ := sc.Update(netFileMsg{file: engineFile{MsgId: "m", From: "alice", Filename: "f.txt", Size: 1, Path: "/tmp/f"}})
+		nm, _ := sc.Update(netFileMsg{file: engineFile{MsgId: fmt.Sprintf("cap-%d", i), From: "alice", Filename: "f.txt", Size: 1, Path: "/tmp/f"}})
 		sc = nm.(chatScreen)
 	}
 	if len(sc.received) != maxReceivedFiles {
 		t.Fatalf("received = %d; want cap %d", len(sc.received), maxReceivedFiles)
+	}
+	// Same frame redelivered (backstop retry) collapses by msgId instead.
+	nm, _ := sc.Update(netFileMsg{file: engineFile{MsgId: "m", From: "alice", Filename: "f.txt", Size: 1, Path: "/tmp/f"}})
+	sc = nm.(chatScreen)
+	if len(sc.received) != maxReceivedFiles {
+		t.Fatalf("retry grew the drawer: %d; want cap %d", len(sc.received), maxReceivedFiles)
 	}
 }
 

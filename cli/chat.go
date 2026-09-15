@@ -50,14 +50,27 @@ func runChat(serverURL, key, me string, id *identityKey, password string) {
 // the room is live from the moment you join.
 func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
-	eng := newEngine(me, id, sig, engineCallbacks{
+	// Consumer-side exactly-once (mirrors the TUI): every received copy is
+	// acked so the sender's backstop graduates, but only the first copy
+	// prints. Previously plain mode never acked at all, so senders retried
+	// every message 3x and only engine-side swallowing hid the duplicates.
+	var eng *engine
+	seenChat := newSeenSet(5000)
+	seenFile := newSeenSet(2000)
+	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
-			ts := time.Now().Format("15:04")
-			if c.To == "" || c.To == me {
-				fmt.Printf("[%s] %s: %s\n", ts, c.From, c.Text)
+			if !seenChat.seen("msg:" + c.MsgId) {
+				ts := time.Now().Format("15:04")
+				if c.To == "" || c.To == me {
+					fmt.Printf("[%s] %s: %s\n", ts, c.From, c.Text)
+				}
 			}
+			_ = eng.sendAck(c.From, c.MsgId)
 		},
 		onFile: func(f engineFile) {
+			if seenFile.seen("msg:" + f.MsgId) {
+				return
+			}
 			fmt.Printf("* %s shared %s (%s) -> %s\n", f.From, f.Filename, humanSize(f.Size), f.Path)
 		},
 		onPeerReady: func(user, code string) {

@@ -394,6 +394,11 @@ type chatScreen struct {
 	lastDMAt   map[string]time.Time // peer -> newest incoming DM (recency sort)
 	lines      []string             // DERIVED paint buffer: rebuildView() owns it
 	rendered   map[int]bool         // local seqs already rendered
+	// seenMsg dedups inbound chat/file frames by msgId (consumer-side
+	// exactly-once). Every received copy is still acked — only the first
+	// paints. Bounded via seenSet; lazily created so every constructor
+	// (including tests) is safe without explicit init.
+	seenMsg *seenSet
 	// Render caches (perf): renderCache memoizes per-message bubbles,
 	// tsCache memoizes parsed timestamps, wrapCache memoizes width-wrapped
 	// lines by content. All three are keyed independent of position and are
@@ -1167,6 +1172,19 @@ func (c chatScreen) Init() tea.Cmd {
 	return tea.Batch(c.drainNetCmd(), scheduleRoster())
 }
 
+// markSeen records an inbound msgId, reporting true on repeats (skip
+// display, but the caller must still ack — the sender retries until it
+// hears back). First sighting returns false (display it).
+func (c *chatScreen) markSeen(msgId string) bool {
+	if c.seenMsg == nil {
+		c.seenMsg = newSeenSet(5000)
+	}
+	if msgId == "" {
+		return false // engine drops id-less frames; display defensively
+	}
+	return c.seenMsg.seen("msg:" + msgId)
+}
+
 func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
@@ -1334,6 +1352,19 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case netChatMsg:
 		m := msg.chat
+		// Delivery receipt back to the sender for EVERY copy (best-effort;
+		// the sender's backstop retries until it hears back). Display only
+		// the first: a dropped queue slot must not silence the retries
+		// that recover it, and retries must not double-paint.
+		sender, msgId := m.From, m.MsgId
+		cmds = append(cmds, func() tea.Msg {
+			_ = c.eng.sendAck(sender, msgId)
+			return nil
+		})
+		if c.markSeen(m.MsgId) {
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		cm := chatMessage{
 			Seq: c.nextSeq, MsgId: m.MsgId, Username: m.From, Kind: "chat",
 			Text: m.Text, To: m.To,
@@ -1341,18 +1372,18 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
 		c.nextSeq++
-		// Delivery receipt back to the sender (best-effort; inbox
-		// redelivery covers loss, dedup covers repeats).
-		sender, msgId := m.From, m.MsgId
-		cmds = append(cmds, func() tea.Msg {
-			_ = c.eng.sendAck(sender, msgId)
-			return nil
-		})
 		c.handleNewMessage(cm)
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileMsg:
 		f := msg.file
+		// Retry copies of an already-carded file (same msgId) are
+		// swallowed: the bytes are already saved and displayed. Stream
+		// completions carry unique ids, so only true duplicates collapse.
+		if c.markSeen(f.MsgId) {
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		// Peer-controlled filename: sanitize before it touches the
 		// transcript, the drawer, or the filesystem-adjacent path display.
 		f.Filename = sanitizeDisplay(f.Filename)
