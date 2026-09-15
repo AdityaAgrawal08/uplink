@@ -482,7 +482,10 @@ func TestAckBackstopRetryAndGraduate(t *testing.T) {
 	}
 }
 
-func TestInboundChatDedup(t *testing.T) {
+// Engine dispatch is at-least-once by design: every copy reaches the
+// consumer (which dedups by msgId and acks every copy). Swallowing retries
+// here used to permanently lose frames the consumer never consumed.
+func TestEnginePassesRetriesThrough(t *testing.T) {
 	a, _ := generateIdentity()
 	p := newEngineProbe()
 	e := newEngine("alice", a, &signalClient{}, p.callbacks())
@@ -494,8 +497,8 @@ func TestInboundChatDedup(t *testing.T) {
 	p.mu.Lock()
 	n := len(p.chats)
 	p.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("duplicate chat displayed %d times; want exactly 1", n)
+	if n != 2 {
+		t.Fatalf("consumer got %d copies; want 2 (dedup lives consumer-side)", n)
 	}
 }
 
@@ -811,32 +814,76 @@ func TestMidSessionDesyncRecoversViaBackstop(t *testing.T) {
 	// Bob's session generation silently dies (sender still believes live).
 	eb.dropNoise("alice")
 
-	if msgId, err := ea.sendChat("bob", "yeah"); err != nil {
+	if _, err := ea.sendChat("bob", "yeah"); err != nil {
 		t.Fatalf("sendChat: %v", err)
-	} else {
-		// Fast-forward the backstop: the 3s ack timeout need not gate the test.
-		ea.mu.Lock()
-		if p, ok := ea.unacked[unackedKey(msgId, "bob")]; ok {
-			p.sent = time.Now().Add(-time.Hour)
-		}
-		ea.mu.Unlock()
 	}
+	// Fast-forward the backstop: the 3s ack timeout need not gate the test.
+	ea.mu.Lock()
+	for _, p := range ea.unacked {
+		p.sent = time.Now().Add(-time.Hour)
+	}
+	ea.mu.Unlock()
+	// Production-faithful acking: the consumer acks every receipt within
+	// ~100ms (like the TUI handler), long before any second retry is due.
+	// A manual ack after waitChat would race the 3s retry clock under load.
+	stopAck := make(chan struct{})
+	defer close(stopAck)
+	go func() {
+		acked := map[string]bool{}
+		for {
+			select {
+			case <-stopAck:
+				return
+			default:
+			}
+			pb.mu.Lock()
+			var ids []string
+			for _, c := range pb.chats {
+				if c.Text == "yeah" && !acked[c.MsgId] {
+					acked[c.MsgId] = true
+					ids = append(ids, c.MsgId)
+				}
+			}
+			pb.mu.Unlock()
+			for _, id := range ids {
+				_ = eb.sendAck("alice", id)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 	got := waitChat(t, pb, "yeah")
 	if got.From != "alice" {
 		t.Fatalf("wrong envelope: %+v", got)
 	}
-	// No double display from mesh copy + inbox retry (settle past a retry).
+	// Settle past a full retry window. A second retry may legitimately be
+	// in flight already (worst-case ack round trip spans both 2s inbox
+	// polls, exceeding the 3s backstop): production correctness is that
+	// the consumer collapses copies by msgId, and the sender eventually
+	// graduates when an ack lands — both asserted below.
 	time.Sleep(5 * time.Second)
 	pb.mu.Lock()
-	n := 0
+	unique := map[string]bool{}
 	for _, c := range pb.chats {
 		if c.Text == "yeah" {
-			n++
+			unique[c.MsgId] = true
 		}
 	}
 	pb.mu.Unlock()
-	if n != 1 {
-		t.Fatalf("chat displayed %d times; want exactly 1", n)
+	if len(unique) != 1 {
+		t.Fatalf("consumer-visible ids = %d; want exactly 1 (deduped display)", len(unique))
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ea.mu.Lock()
+		pending := len(ea.unacked)
+		ea.mu.Unlock()
+		if pending == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backstop never graduated — ack loop not terminating")
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -893,5 +940,59 @@ func TestTarballDirSizeCap(t *testing.T) {
 	if err == nil {
 		os.Remove(out)
 		t.Fatal("oversize folder must fail packing, not pack-then-reject")
+	}
+}
+
+// A retried chat (mesh copy + backstop retry, or a TUI queue redelivery)
+// paints exactly once but is acked per copy: the sender retries until it
+// hears back, and display stays single.
+func TestTuiDedupsRetriedChatButAcksBoth(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "alice")
+
+	dup := netChatMsg{chat: engineChat{MsgId: "dup-9", From: "alice", To: "", Text: "hi again"}}
+	c1, cmd1 := step(c, dup)
+	drainCmds(cmd1)
+	c2, cmd2 := step(c1, dup)
+	drainCmds(cmd2)
+
+	rows := 0
+	for _, h := range c2.history {
+		if h.MsgId == "dup-9" {
+			rows++
+		}
+	}
+	if rows != 1 {
+		t.Fatalf("retried chat painted %d rows; want exactly 1", rows)
+	}
+	// Both copies acked (distinct ack ids) so the sender graduates.
+	if n := inboxDeposits(fs, "alice"); n != 2 {
+		t.Fatalf("ack deposits for alice = %d; want 2 (one per copy)", n)
+	}
+}
+
+// A retried single-box file must not double-card nor double-list.
+func TestTuiDedupsRetriedFileCard(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	f := netFileMsg{file: engineFile{MsgId: "file-1", From: "alice", Filename: "a.txt", Size: 3, Path: "/tmp/a.txt"}}
+	c1, _ := step(c, f)
+	c2, _ := step(c1, f)
+	cards := 0
+	for _, l := range c2.localLines {
+		if l.kind == lineFileCard {
+			cards++
+		}
+	}
+	if cards != 1 {
+		t.Fatalf("retried file carded %d times; want exactly 1", cards)
+	}
+	if len(c2.received) != 1 {
+		t.Fatalf("received drawer has %d entries; want 1", len(c2.received))
 	}
 }
