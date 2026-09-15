@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -121,6 +122,7 @@ type landingResult struct {
 	Password string
 	Code     string // for join
 	Key      string // session key returned from server
+	ID       *identityKey
 }
 
 type landingModel struct {
@@ -336,17 +338,22 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.errMsg = msg.err
 			return m, nil
 		}
+		if msg.result == nil {
+			m.submitting = false
+			m.errMsg = "unexpected server response — try again"
+			return m, nil
+		}
 		m.result = msg.result
 		return m, tea.Quit
 
 	case landingCreateOkMsg:
 		m.submitting = false
-		m.result = &landingResult{Mode: tabCreate, Username: msg.username, Password: msg.password, Key: msg.key}
+		m.result = &landingResult{Mode: tabCreate, Username: msg.username, Password: msg.password, Key: msg.key, ID: msg.id}
 		return m, tea.Quit
 
 	case landingJoinOkMsg:
 		m.submitting = false
-		m.result = &landingResult{Mode: tabJoin, Username: msg.username, Password: msg.password, Code: msg.code, Key: msg.code}
+		m.result = &landingResult{Mode: tabJoin, Username: msg.username, Password: msg.password, Code: msg.code, Key: msg.code, ID: msg.id}
 		return m, tea.Quit
 	}
 
@@ -685,8 +692,15 @@ type landingDoneMsg struct {
 	result *landingResult
 	err    string
 }
-type landingCreateOkMsg struct{ username, password, key string }
-type landingJoinOkMsg struct{ username, password, code string }
+type landingCreateOkMsg struct {
+	username, password, key string
+	id *identityKey // device key advertised; reuse, never reload
+}
+
+type landingJoinOkMsg struct {
+	username, password, code string
+	id *identityKey
+}
 
 func (m *landingModel) submit() tea.Cmd {
 	if m.submitting {
@@ -734,7 +748,10 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 			}
 			_ = jsonDecode(body, &e)
 			if e.Error == "" {
-				e.Error = string(body)
+				e.Error = strings.TrimSpace(string(body))
+			}
+			if e.Error == "" {
+				e.Error = fmt.Sprintf("server returned status %d", code)
 			}
 			return landingDoneMsg{err: e.Error}
 		}
@@ -744,7 +761,7 @@ func (m *landingModel) doCreate(username, password string) tea.Cmd {
 		if err := jsonDecode(body, &r); err != nil || r.SessionID == "" {
 			return landingDoneMsg{err: "unexpected server response"}
 		}
-		return landingCreateOkMsg{username: username, password: password, key: r.SessionID}
+		return landingCreateOkMsg{username: username, password: password, key: r.SessionID, id: id}
 	}
 }
 
@@ -767,7 +784,7 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 			return landingDoneMsg{err: "could not reach server: " + err.Error()}
 		}
 		if c == 200 {
-			return landingJoinOkMsg{username: username, password: password, code: code}
+			return landingJoinOkMsg{username: username, password: password, code: code, id: id}
 		}
 		var e struct {
 			Error string `json:"error"`
@@ -784,7 +801,10 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 			return landingDoneMsg{err: "session not found — check the 6-digit code (rooms vanish when emptied)"}
 		default:
 			if e.Error == "" {
-				e.Error = string(body)
+				e.Error = strings.TrimSpace(string(body))
+			}
+			if e.Error == "" {
+				e.Error = fmt.Sprintf("server returned status %d", c)
 			}
 			return landingDoneMsg{err: e.Error}
 		}

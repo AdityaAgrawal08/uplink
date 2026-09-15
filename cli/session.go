@@ -134,7 +134,7 @@ func cmdCreateSession(args []string, cfg *Config) {
 	fmt.Printf("  │  KEY: %-29s │\n", sid)
 	fmt.Printf("  │  Share it: uplink join %-12s │\n", sid)
 	fmt.Println("  └─────────────────────────────────────┘")
-	fmt.Printf("\nYou are '%s'. Connecting to your room… (/exit to leave)\n", username)
+	fmt.Printf("\nYou are '%s'. Connecting to your room… (Ctrl+C to leave)\n", username)
 
 	// The creator is already a participant server-side — drop them straight
 	// into the room so their username isn't stranded without a UI.
@@ -174,35 +174,41 @@ func cmdJoinChat(args []string, cfg *Config) {
 
 	// Unique-username loop — server rejects duplicates with 409, missing
 	// passwords with 401, and gone rooms with 404 (rooms die on empty).
-	var username string
+	// Transients (5xx, network) retry with backoff; anything else exits.
+	username := promptChatUsername(reader)
+	transientFails := 0
 	for {
-		username = promptChatUsername(reader)
 		sc := &signalClient{serverURL: serverURL, me: username, key: key}
 		_, err := sc.joinRoom(username, pubkey, password)
 		if err == nil {
 			break
 		}
 		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "status 401"):
-			if password == "" {
-				fmt.Print("This session is password-protected. Enter password: ")
-				pwdBytes, perr := reader.ReadString('\n')
-				if perr != nil {
-					fmt.Printf("Error reading password: %v\n", perr)
-					os.Exit(1)
-				}
-				password = strings.TrimSpace(pwdBytes)
-				continue // retry with password
+		switch code := apiStatusCode(err); {
+		case code == 401:
+			fmt.Print("Password required or incorrect. Enter password: ")
+			pwdBytes, perr := reader.ReadString('\n')
+			if perr != nil {
+				fmt.Printf("Error reading password: %v\n", perr)
+				os.Exit(1)
 			}
-			fmt.Println("✗ Incorrect password.")
-			password = ""
+			password = strings.TrimSpace(pwdBytes)
+			transientFails = 0
 			continue
-		case strings.Contains(msg, "status 409"):
+		case code == 409:
 			fmt.Printf("'%s' is already in this session — choose another.\n", username)
-		case strings.Contains(msg, "status 404"):
+			username = promptChatUsername(reader)
+			transientFails = 0
+		case code == 404:
 			fmt.Println("✗ Session not found — check the 6-digit code (rooms vanish when emptied).")
 			os.Exit(1)
+		case code >= 500 || code == 0:
+			transientFails++
+			if transientFails > 3 {
+				fmt.Printf("✗ Join failed: %s\n", msg)
+				os.Exit(1)
+			}
+			time.Sleep(time.Duration(transientFails) * 2 * time.Second)
 		default:
 			fmt.Printf("✗ Join failed: %s\n", msg)
 			os.Exit(1)

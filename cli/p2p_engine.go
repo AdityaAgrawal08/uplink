@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/sha256"
 	"encoding/base64"
@@ -9,7 +10,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -120,14 +120,20 @@ type engine struct {
 	// on demand when stale (rosterFreshTTL), so a join is never missed
 	// for longer than this — without putting a Redis read on every send.
 	lastRosterAt time.Time
-	stopCh       chan struct{}
-	wg           sync.WaitGroup
+	// lastTrigger throttles traffic-triggered refreshes (see triggerRefresh).
+	lastTrigger time.Time
+	// endedNotified/lastRejoinErr quiet the beat failure paths: a destroyed
+	// room reports once, a failing rejoin backs off to 60s.
+	endedNotified bool
+	lastRejoinErr time.Time
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
 }
 
-// rosterFreshTTL bounds how stale the send path's roster may be. The 15s
-// beat loop keeps it fresh in the background; this only fires a synchronous
-// refresh when a send would otherwise address a stale world.
-const rosterFreshTTL = 5 * time.Second
+// rosterFreshTTL bounds how stale the send path's roster may be. 2s keeps
+// the join-then-send blind window human-imperceptible; the beat loop and
+// traffic-triggered refreshes cover the rest.
+const rosterFreshTTL = 2 * time.Second
 
 // setupRetryBackoff is the minimum gap between setup attempts for one peer
 // after a failure. Var (not const) so tests can shrink it.
@@ -216,6 +222,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		onBytes:    e.onMeshBytes,
 		onPeerUp:   e.onMeshUp,
 		onPeerDown: e.onMeshDown,
+		onError:    e.emitErr,
 	})
 	return e
 }
@@ -226,20 +233,31 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 func loadOrCreateIdentity() (*identityKey, error) {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return generateIdentity()
+		return nil, fmt.Errorf("cannot determine home directory for device identity: %v", err)
 	}
 	path := filepath.Join(home, ".uplink", "identity")
-	if raw, err := os.ReadFile(path); err == nil && len(raw) == 32 {
-		if priv, err := ecdh.X25519().NewPrivateKey(raw); err == nil {
-			return &identityKey{priv: priv, pub: priv.PublicKey().Bytes()}, nil
+	if raw, rerr := os.ReadFile(path); rerr == nil {
+		if len(raw) != 32 {
+			return nil, fmt.Errorf("device identity at %s is corrupt (%d bytes) — move it aside to regenerate", path, len(raw))
 		}
+		if priv, kerr := ecdh.X25519().NewPrivateKey(raw); kerr == nil {
+			return &identityKey{priv: priv, pub: priv.PublicKey().Bytes()}, nil
+		} else {
+			return nil, fmt.Errorf("device identity at %s is corrupt — move it aside to regenerate: %v", path, kerr)
+		}
+	} else if !os.IsNotExist(rerr) {
+		return nil, fmt.Errorf("cannot read device identity at %s: %v", path, rerr)
 	}
 	id, err := generateIdentity()
 	if err != nil {
 		return nil, err
 	}
-	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	_ = os.WriteFile(path, id.priv.Bytes(), 0o600)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("cannot create %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, id.priv.Bytes(), 0o600); err != nil {
+		return nil, fmt.Errorf("cannot persist device identity at %s: %v", path, err)
+	}
 	return id, nil
 }
 
@@ -315,6 +333,7 @@ func (e *engine) setRoster(members []rosterMember) {
 
 	for _, u := range added {
 		e.mesh.ensurePeer(u)
+		e.maybeInitiate(u) // channel may predate the roster entry
 	}
 	for _, u := range removed {
 		e.mesh.dropPeer(u)
@@ -376,14 +395,36 @@ func (e *engine) beatOnce() {
 		// instead of rotting at 403 forever. A 409 here means someone took
 		// our name meanwhile — surface it, don't loop.
 		if isNotMember(err) {
+			e.mu.Lock()
+			recentErr := time.Since(e.lastRejoinErr) < 60*time.Second
+			e.mu.Unlock()
 			if _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
-				e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
+				e.mu.Lock()
+				e.lastRejoinErr = time.Now()
+				e.mu.Unlock()
+				if !recentErr {
+					e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
+				}
 				return
 			}
+			e.mu.Lock()
+			e.lastRejoinErr = time.Time{}
+			e.mu.Unlock()
 			roster, err = e.sig.heartbeat("", nil)
 			if err != nil {
 				return
 			}
+		} else if apiStatusCode(err) == 404 {
+			// Room destroyed under us (last one out ends it): nothing to
+			// rejoin — say so once instead of rotting silently.
+			e.mu.Lock()
+			notified := e.endedNotified
+			e.endedNotified = true
+			e.mu.Unlock()
+			if !notified {
+				e.emitErr(fmt.Errorf("session ended — rooms vanish when emptied; create or join a new one"))
+			}
+			return
 		} else {
 			return // transient; next tick retries
 		}
@@ -397,7 +438,7 @@ func (e *engine) beatOnce() {
 
 // isNotMember reports the server's "you are not in this session" rejection.
 func isNotMember(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "403")
+	return apiStatusCode(err) == 403
 }
 
 // stuckHsTTL bounds a handshake with no progress. Past it the attempt is
@@ -489,32 +530,61 @@ func (e *engine) onNote(n signalNote) {
 // this makes glare structurally impossible.
 
 func (e *engine) onMeshUp(peer string) {
-	if e.me < peer {
-		e.mu.Lock()
-		_, hasNoise := e.noise[peer]
-		_, hasHs := e.hs[peer]
-		e.mu.Unlock()
-		if hasNoise || hasHs {
-			return
-		}
-		ps, m1, err := beginNoise(e.id, peer, true)
-		if err != nil {
-			e.emitErr(err)
-			return
-		}
-		epoch := time.Now().UnixNano()
-		e.trackHs(peer, ps, epoch)
-		if err := e.sig.signalSend(peer, noiseSig1, wrapHs(epoch, m1)); err != nil {
-			e.emitErr(err)
-		}
+	e.maybeInitiate(peer)
+	// larger side waits for noise1; nothing else to do on channel open
+}
+
+// maybeInitiate starts the Noise handshake as the deterministic initiator
+// (smaller username). Called from onMeshUp AND when a beat learns a peer
+// whose channel is already open — without the second call site, peers
+// learned after their channel opened would never handshake until a flap.
+func (e *engine) maybeInitiate(peer string) {
+	if e.me >= peer {
+		return
 	}
-	// larger side waits for noise1; nothing to do on channel open
+	e.mu.Lock()
+	_, live := e.noise[peer]
+	_, hs := e.hs[peer]
+	e.mu.Unlock()
+	if live || hs {
+		return
+	}
+	ps, m1, err := beginNoise(e.id, peer, true)
+	if err != nil {
+		e.emitErr(err)
+		return
+	}
+	epoch := time.Now().UnixNano()
+	e.trackHs(peer, ps, epoch)
+	if err := e.sig.signalSend(peer, noiseSig1, wrapHs(epoch, m1)); err != nil {
+		e.emitErr(err)
+	}
+}
+
+// triggerRefresh refreshes the roster outside the beat cadence when live
+// traffic proves it stale (notes/boxes from unknown senders). Throttled
+// to one per 2s; the beat loop owns the steady state.
+func (e *engine) triggerRefresh() {
+	e.mu.Lock()
+	if time.Since(e.lastTrigger) < 2*time.Second {
+		e.mu.Unlock()
+		return
+	}
+	e.lastTrigger = time.Now()
+	e.mu.Unlock()
+	e.beatOnce()
 }
 
 func (e *engine) onHandshakeNote(n signalNote) {
 	epoch, raw, err := unwrapHs(n.Payload)
 	if err != nil {
 		return
+	}
+	e.mu.Lock()
+	_, known := e.roster[n.From]
+	e.mu.Unlock()
+	if !known {
+		e.triggerRefresh()
 	}
 	switch n.Type {
 	case noiseSig1:
@@ -598,7 +668,17 @@ func (e *engine) verifyReady(peer string, ps *peerSession) {
 	}
 	e.mu.Lock()
 	want, ok := e.roster[peer]
-	if !ok || !equalBytes(want, ps.remoteKey()) {
+	if !ok {
+		// Roster hasn't learned this peer yet (fast join-chat race), not
+		// an attack: drop the attempt FIRST so the refresh below sees a
+		// clean slate, then refresh now. The roster-added path restarts
+		// the handshake with the key known.
+		e.mu.Unlock()
+		e.dropNoise(peer)
+		e.triggerRefresh()
+		return
+	}
+	if !equalBytes(want, ps.remoteKey()) {
 		// Back off before any retry: under active key-swap attack this
 		// path would otherwise handshake-storm every beat.
 		e.lastFail[peer] = time.Now()
@@ -705,11 +785,18 @@ func (e *engine) inboxOnce() {
 		e.mu.Unlock()
 		if !known {
 			// Sender not in MY roster snapshot (typically it is stale and
-			// a beat refresh is pending). Leave the box UNACKED so a later
-			// poll — after the roster refreshes — can still deliver it.
-			// Purging here ate legitimate mail whenever rosters lagged.
+			// a beat refresh is pending). Refresh now — the sender is
+			// provably live — and deliver immediately if learned.
+			// Otherwise leave the box UNACKED for a later poll. Purging
+			// here ate legitimate mail whenever rosters lagged.
 			// Stragglers are bounded by the 1h server TTL + per-user cap.
-			continue
+			e.triggerRefresh()
+			e.mu.Lock()
+			senderKey, known = e.roster[b.From]
+			e.mu.Unlock()
+			if !known {
+				continue
+			}
 		}
 		pt, err := openBox(e.id, senderKey, b.Payload)
 		if err != nil {
@@ -1034,7 +1121,7 @@ func (e *engine) emitErr(err error) {
 
 // ─── files ──────────────────────────────────────────────────────────────────
 
-func (e *engine) sendFile(to, path, display string, prog chan<- uploadProgressMsg) (string, int64, error) {
+func (e *engine) sendFile(ctx context.Context, to, path, display string, prog chan<- uploadProgressMsg) (string, int64, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", 0, err
@@ -1051,7 +1138,7 @@ func (e *engine) sendFile(to, path, display string, prog chan<- uploadProgressMs
 	// When anyone is unreachable, small files go as ONE self-contained box
 	// and larger ones fail fast with an actionable error.
 	if e.allLive(to) {
-		_, _, serr := e.sendFileStream(to, id, display, data, sumHex, prog)
+		_, _, serr := e.sendFileStream(ctx, to, id, display, data, sumHex, prog)
 		if serr != nil {
 			return "", 0, serr
 		}
@@ -1118,9 +1205,14 @@ const (
 // backpressure window (or the stall deadline hits). Broadcasts wait on
 // the slowest peer — one wedged receiver must not wedge the sender, so
 // the deadline converts that into a loud error instead.
-func (e *engine) awaitDrain(to string) error {
+func (e *engine) awaitDrain(ctx context.Context, to string) error {
 	deadline := time.Now().Add(fileBackpressureStall)
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		var max uint64
 		if to != "" {
 			max = e.mesh.bufferedAmount(to)
@@ -1143,7 +1235,7 @@ func (e *engine) awaitDrain(to string) error {
 	}
 }
 
-func (e *engine) sendFileStream(to, id, display string, data []byte, sumHex string, prog chan<- uploadProgressMsg) (string, int64, error) {
+func (e *engine) sendFileStream(ctx context.Context, to, id, display string, data []byte, sumHex string, prog chan<- uploadProgressMsg) (string, int64, error) {
 	chunks := splitChunks(data)
 	meta := newFrame(frameFileMeta, id, e.me, to)
 	meta.Filename = display
@@ -1154,7 +1246,7 @@ func (e *engine) sendFileStream(to, id, display string, data []byte, sumHex stri
 		return "", 0, err
 	}
 	for i, c := range chunks {
-		if err := e.awaitDrain(to); err != nil {
+		if err := e.awaitDrain(ctx, to); err != nil {
 			return "", 0, err
 		}
 		cf := newFrame(frameFileChunk, id, e.me, to)

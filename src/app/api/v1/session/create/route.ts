@@ -13,7 +13,7 @@ import {
 } from "@/lib/rooms";
 
 // Rooms live until the last member leaves — there is no duration/expiry
-// parameter. Codes are 6 digits; membership carries each device's Ed25519
+// parameter. Codes are 6 digits; membership carries each device's X25519
 // public key so peers can E2E-encrypt with no global key directory.
 export async function POST(req: NextRequest) {
   try {

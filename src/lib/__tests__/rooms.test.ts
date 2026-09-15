@@ -180,9 +180,9 @@ describe("rooms signaling plane", () => {
     // join budget: 120 per window
     for (let i = 0; i < 120; i++) await checkJoinLimit(ip);
     await expect(checkJoinLimit(ip)).rejects.toMatchObject({ status: 429 });
-    // read budget is roomier but finite
+    // read budget covers two same-user tabs plus ack overhead
     const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 600; i++) await checkReadLimit(ip2);
+    for (let i = 0; i < 1200; i++) await checkReadLimit(ip2);
     await expect(checkReadLimit(ip2)).rejects.toMatchObject({ status: 429 });
     // send budget unchanged
     const ip3 = `test-ip-${Math.random().toString(36).slice(2)}`;
@@ -199,5 +199,55 @@ describe("rooms signaling plane", () => {
     const open = await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, null);
     const openMeta = await getRoomMeta(open.sessionId);
     expect(openMeta?.passwordHash).toBeNull();
+  });
+});
+
+describe("delivery hardening", () => {
+  it("drain preserves send order and empties the queue", async () => {
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    await depositSignal(sessionId, username, peer, "offer", "sdp1");
+    await depositSignal(sessionId, username, peer, "answer", "sdp2");
+    const notes = await drainSignals(sessionId, peer);
+    expect(notes.map((n) => n.payload)).toEqual(["sdp1", "sdp2"]);
+    expect(await drainSignals(sessionId, peer)).toEqual([]);
+  });
+
+  it("same-sender idempotent retry bypasses a full inbox; cross-sender claim 409s", async () => {
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    const big = "x".repeat(1024);
+    for (let i = 0; i < 200; i++) {
+      await depositBox(sessionId, username, peer, `m-${i}`, "p2p", big);
+    }
+    await expect(depositBox(sessionId, username, peer, "m-new", "p2p", big)).rejects.toMatchObject({ status: 429 });
+    await depositBox(sessionId, username, peer, "m-0", "p2p", big); // same sender+id: retry succeeds
+    const other = `o_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, other, PUBKEY);
+    await expect(depositBox(sessionId, other, peer, "m-0", "p2p", big)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("fetch caps at 50 and reaps corrupt fields", async () => {
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    for (let i = 0; i < 60; i++) {
+      await depositBox(sessionId, username, peer, `c-${i}`, "p2p", "e30=");
+    }
+    const boxes = await fetchBoxes(sessionId, peer);
+    expect(boxes.length).toBe(50);
+    expect(boxes[0].msgId).toBe("c-0");
+  });
+
+  it("ack reports skipped ids", async () => {
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    await depositBox(sessionId, username, peer, "a-1", "p2p", "e30=");
+    const res = await ackBoxes(sessionId, peer, ["a-1", 42, ""]);
+    expect(res.removed).toBe(1);
+    expect(res.skipped).toBe(2);
   });
 });

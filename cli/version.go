@@ -31,10 +31,46 @@ func handleVersion() {
 
 // normVersion strips a leading "v" so bare numbers (dev builds) and raw
 // tags (release builds, and TagName from the API) compare equal when they
-// denote the same release. Without this, release binaries (version
-// "v0.0.2") never matched the trimmed tag ("0.0.2") and always reported
-// an update available — including printing "vv0.0.2" in the prompt.
+// denote the same release.
 func normVersion(v string) string { return strings.TrimPrefix(v, "v") }
+
+// cmpVersions compares dotted numerics: -1/0/1, or -2 when unparseable
+// (caller falls back to "update available" rather than guessing).
+func cmpVersions(a, b string) int {
+	pa, oka := parseVersionParts(a)
+	pb, okb := parseVersionParts(b)
+	if !oka || !okb {
+		return -2
+	}
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		if pa[i] != pb[i] {
+			if pa[i] < pb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+func parseVersionParts(v string) ([]int, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, false
+	}
+	var out []int
+	for _, p := range strings.Split(v, ".") {
+		n := 0
+		for i := 0; i < len(p); i++ {
+			if p[i] < '0' || p[i] > '9' {
+				return nil, false
+			}
+			n = n*10 + int(p[i]-'0')
+		}
+		out = append(out, n)
+	}
+	return out, true
+}
 
 // updateFailureHint explains an update-check failure in plain language.
 // A 404 without a token is ambiguous: either no release is published yet
@@ -166,22 +202,33 @@ func handleUpdate() {
 
 	latestTag := normVersion(release.TagName)
 	current := normVersion(version)
-	if latestTag == current {
+	switch cmpVersions(current, latestTag) {
+	case 0:
 		fmt.Printf("✓ Already up to date (v%s)\n", current)
+		return
+	case 1:
+		fmt.Printf("✓ Ahead of latest release (v%s; latest v%s)\n", current, latestTag)
 		return
 	}
 
 	fmt.Printf("Update available: v%s → v%s\n", current, latestTag)
 
-	// Find matching asset
+	// Find matching asset: exact os-arch first; the loose darwin fallback
+	// stays only for archives predating arch-qualified names.
 	suffix := fmt.Sprintf("%s-%s", runtime.GOOS, runtime.GOARCH)
-	var downloadURL string
+	var downloadURL, fallbackURL string
 	for _, a := range release.Assets {
 		name := strings.ToLower(a.Name)
-		if strings.Contains(name, suffix) || (runtime.GOOS == "darwin" && strings.Contains(name, "darwin")) {
+		if strings.Contains(name, suffix) {
 			downloadURL = a.BrowserDownloadURL
 			break
 		}
+		if fallbackURL == "" && runtime.GOOS == "darwin" && strings.Contains(name, "darwin") {
+			fallbackURL = a.BrowserDownloadURL
+		}
+	}
+	if downloadURL == "" {
+		downloadURL = fallbackURL
 	}
 
 	if downloadURL == "" {

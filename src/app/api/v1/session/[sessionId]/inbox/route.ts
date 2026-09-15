@@ -8,6 +8,7 @@ import {
   checkSendLimit,
   checkReadLimit,
   scopedBudgetKey,
+  assertUsernameHeader,
 } from "@/lib/rooms";
 
 // Unified offline/fallback inbox. Boxes are ciphertext the server cannot
@@ -18,6 +19,8 @@ import {
 // POST deposits one box (rate-limited per IP). GET fetches without deleting;
 // deletion happens only via POST /inbox/ack, so a client crash between fetch
 // and processing loses nothing.
+export const dynamic = "force-dynamic"; // GET fetches (ack deletes): never cacheable
+
 export async function POST(
   req: NextRequest,
   props: { params: Promise<{ sessionId: string }> }
@@ -27,6 +30,7 @@ export async function POST(
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    assertUsernameHeader(username);
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
@@ -49,9 +53,11 @@ export async function GET(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    validateSignalingEnv();
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    assertUsernameHeader(username);
     await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
 
     const boxes = await fetchBoxes(sessionId, username);

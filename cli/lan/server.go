@@ -23,10 +23,10 @@ func GetActiveConnections() int32 {
 // progressWriter wraps http.ResponseWriter to track bytes written.
 type progressWriter struct {
 	http.ResponseWriter
-	total    int64
-	written  int64
-	onProg   func(written, total int64)
-	once     sync.Once
+	total   int64
+	written int64
+	onProg  func(written, total int64)
+	once    sync.Once
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {

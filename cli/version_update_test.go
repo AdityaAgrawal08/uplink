@@ -131,3 +131,23 @@ func TestNormVersion(t *testing.T) {
 		t.Fatal("different releases must compare different")
 	}
 }
+
+func TestCmpVersions(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"0.0.2", "0.0.2", 0},
+		{"0.0.1", "0.0.2", -1},
+		{"0.0.3", "0.0.2", 1},
+		{"0.1", "0.0.9", 1},
+		{"dev", "0.0.2", -2},
+		{"", "0.0.2", -2},
+		{"1.2", "1.2.0", 0},
+	}
+	for _, c := range cases {
+		if got := cmpVersions(c.a, c.b); got != c.want {
+			t.Fatalf("cmpVersions(%q,%q) = %d; want %d", c.a, c.b, got, c.want)
+		}
+	}
+}

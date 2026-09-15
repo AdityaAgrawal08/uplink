@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -453,9 +454,14 @@ type chatScreen struct {
 // confirmation can swap it in place (or mark failure) without ambiguity.
 type pendingSend struct {
 	lineIdx int
-	text    string
-	conv    string // conversation the optimistic echo belongs to
-	to      string // recipient ("": broadcast) - needed to reconstruct on settle
+	// localIdx pins the optimistic echo row in localLines (set once at
+	// dispatch). Settle removes/annotates exactly this row instead of
+	// scanning for "last of conv", which breaks when other lines land
+	// while a send is in flight.
+	localIdx int
+	text     string
+	conv     string // conversation the optimistic echo belongs to
+	to       string // recipient ("": broadcast) - needed to reconstruct on settle
 }
 
 // localLineKind distinguishes plain text lines from styled file attachment cards.
@@ -541,8 +547,14 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		default:
 		}
 	}
-	eng := newEngine(me, id, sig, engineCallbacks{
-		onChat:      func(c engineChat) { push(netChatMsg{chat: c}) },
+	var eng *engine
+	eng = newEngine(me, id, sig, engineCallbacks{
+		onChat: func(c engineChat) {
+			// Ack at receipt, not at paint: a dropped queue slot must not
+			// silence the sender's backstop (the paint path still dedups).
+			_ = eng.sendAck(c.From, c.MsgId)
+			push(netChatMsg{chat: c})
+		},
 		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
 		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
 		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
@@ -744,6 +756,16 @@ func (c *chatScreen) addMessage(m chatMessage) {
 	c.rebuildView()
 }
 
+// historyHasSeq reports whether a display seq is already taken.
+func historyHasSeq(history []chatMessage, seq int) bool {
+	for _, h := range history {
+		if h.Seq == seq {
+			return true
+		}
+	}
+	return false
+}
+
 // peerOf extracts the OTHER participant from a canonical "a|b" pair key.
 func peerOf(me, conv string) string {
 	parts := strings.Split(conv, "|")
@@ -753,10 +775,6 @@ func peerOf(me, conv string) string {
 		}
 	}
 	return ""
-}
-
-func (c *chatScreen) appendLine(s string) {
-	c.appendLocal(generalConv, s)
 }
 
 func (c *chatScreen) appendLocal(conv, text string) {
@@ -1197,12 +1215,11 @@ func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
 			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201}
 		}
 		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "429"):
+		switch code := apiStatusCode(err); {
+		case code == 429 || (code == 0 && strings.Contains(msg, "429")):
 			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err}
-		case strings.Contains(msg, "404"),
-			strings.Contains(msg, "gone"),
-			strings.Contains(msg, "not in session"),
+		case code == 404 || code == 410 || strings.Contains(msg, "gone") ||
+			strings.Contains(msg, "not in session") ||
 			strings.Contains(msg, "Session not found"):
 			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err}
 		default:
@@ -1211,10 +1228,19 @@ func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
 	}
 }
 
+// leftSent guards the leave POST exactly-once across the in-loop leave,
+// repeat Ctrl+C presses, and the post-Run backup below.
+var leftSent atomic.Bool
+
 func (c chatScreen) doLeave() tea.Cmd {
 	return func() tea.Msg {
+		if leftSent.Swap(true) {
+			return leaveDoneMsg{}
+		}
 		c.eng.stop()
-		_, _, _ = postJSON(c.sig.endpoint("/leave"), map[string]any{}, c.sig.headers())
+		if err := c.sig.leaveRoom(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
+		}
 		return leaveDoneMsg{}
 	}
 }
@@ -1333,7 +1359,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(innerWithTs)
 	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
 	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
-	c.pending = &pendingSend{text: text, conv: conv, to: peer}
+	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
 	if target == "" && c.pending.conv == generalConv {
 		target = ""
@@ -1344,27 +1370,39 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	return c.doSend(text, target, seq)
 }
 
+// syncViewport re-derives viewport/composer geometry from the live layout.
+// Drawer open/close, status lines, and sidebar collapse all change the
+// transcript box without any resize event; without this, caches, wraps,
+// and scroll math run on stale dims until the next terminal resize.
+func (c *chatScreen) syncViewport() {
+	if c.width <= 0 || c.height <= 0 {
+		return
+	}
+	l := c.layoutFor()
+	vpW := l.vpWidth
+	if l.vpHeight > 0 && vpW > 10 {
+		vpW--
+	}
+	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
+		return
+	}
+	c.vp.Width, c.vp.Height = vpW, l.vpHeight
+	if c.input.Width != l.vpWidth-4 {
+		c.input.Width = maxInt(l.vpWidth-4, 8)
+	}
+	c.refreshViewport()
+}
+
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+	c.syncViewport() // drawer/status/sidebar changes alter geometry with no resize event
 
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
 		c.width, c.height = msg.Width, msg.Height
 		c.hoverPeer = "" // geometry changed; stale hover is meaningless
-		l := c.layoutFor()
-		// Reserve 1 column for scrollbar inside transcript.
-		vpW := l.vpWidth
-		if l.vpHeight > 0 && vpW > 10 {
-			vpW--
-		}
-		c.vp.Width = vpW
-		c.vp.Height = l.vpHeight
-		// Keep the composer inside its column: textinput pads/clips to Width.
-		if c.input.Width != l.vpWidth-4 {
-			c.input.Width = maxInt(l.vpWidth-4, 8)
-		}
-		c.refreshViewport() // re-wrap transcript to the new width
+		c.syncViewport() // re-derives vp dims + input width, re-wraps on change
 
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
@@ -1433,15 +1471,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case netChatMsg:
 		m := msg.chat
-		// Delivery receipt back to the sender for EVERY copy (best-effort;
-		// the sender's backstop retries until it hears back). Display only
-		// the first: a dropped queue slot must not silence the retries
-		// that recover it, and retries must not double-paint.
-		sender, msgId := m.From, m.MsgId
-		cmds = append(cmds, func() tea.Msg {
-			_ = c.eng.sendAck(sender, msgId)
-			return nil
-		})
+		// Receipt already acked synchronously at queue time (see onChat):
+		// display dedups here, never re-acks.
 		if c.markSeen(m.MsgId) {
 			cmds = append(cmds, c.drainNetCmd())
 			break
@@ -1471,6 +1502,15 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.received = append(c.received, receivedFile{
 			filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
 		})
+		// Live drawer: arrivals while browsing appear at once (newest
+		// first), or the "appear here automatically" notice lies.
+		if c.picker.active && c.picker.mode == modeFiles {
+			c.picker.files = append([]receivedFile{{
+				filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
+			}}, c.picker.files...)
+			c.picker.notice = ""
+			c.picker.clampCursor()
+		}
 		// Bound the drawer source: marathon sessions must not grow it
 		// without limit (oldest fall off; files stay saved on disk).
 		if len(c.received) > maxReceivedFiles {
@@ -1478,6 +1518,19 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		conv := convFor(f.From, f.To)
 		ts := time.Now()
+		// Mirror the text path: DM arrivals always bump recency; room
+		// files arriving in a thread view count room-unread instead of
+		// vanishing silently.
+		if conv != generalConv {
+			if c.lastDMAt == nil {
+				c.lastDMAt = map[string]time.Time{}
+			}
+			if peer := peerOf(c.me, conv); peer != "" {
+				c.lastDMAt[peer] = ts
+			}
+		} else if c.activeConv() != generalConv {
+			c.roomUnread++
+		}
 		c.localLines = append(c.localLines, localLine{
 			conv: conv,
 			kind: lineFileCard,
@@ -1512,7 +1565,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
-		c.appendLine(tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		c.appendLocal(c.activeConv(), tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netReadyMsg:
@@ -1527,7 +1580,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:
-		c.appendLine(tuiErrStyle.Render("* " + msg.err.Error()))
+		c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netIdleMsg:
@@ -1566,8 +1619,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
-			cmds = append(cmds, c.doLeave(), tea.Quit)
-			return c, tea.Batch(cmds...)
+			// Leave first, quit when it completes (leaveDoneMsg→Quit):
+			// quitting alongside would kill the POST mid-flight.
+			return c, c.doLeave()
 		}
 		// The file browser owns ALL keys while open (it sits where the "/"
 		// drawer paints, one mode at a time).
@@ -1654,27 +1708,34 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		pc = c.pending.conv
 	}
 
-	lastOfPending := -1
-	for i := range c.localLines {
-		if c.localLines[i].conv == pc {
-			lastOfPending = i
+	// Pin the echo row by its stored index (validated); scan only as a
+	// fallback for state predating the handle.
+	echoIdx := -1
+	if c.pending != nil && c.pending.localIdx >= 0 && c.pending.localIdx < len(c.localLines) &&
+		c.localLines[c.pending.localIdx].conv == pc {
+		echoIdx = c.pending.localIdx
+	} else {
+		for i := range c.localLines {
+			if c.localLines[i].conv == pc {
+				echoIdx = i
+			}
 		}
 	}
 
 	switch {
 	case msg.code == 429:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
 		}
 	case msg.code == 410:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
 		}
 	case msg.err != nil:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
 		} else {
-			c.appendLocal(generalConv, tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
+			c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
 		}
 	default:
 		to := ""
@@ -1692,19 +1753,16 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
+		// Inbound traffic shares the seq counter and may have taken ours
+		// while sending: reallocate instead of dropping our message.
+		for c.rendered[m.Seq] || historyHasSeq(c.history, m.Seq) {
+			c.nextSeq++
+			m.Seq = c.nextSeq
+		}
 		c.rendered[m.Seq] = true
-		known := false
-		for _, h := range c.history {
-			if h.Seq == m.Seq {
-				known = true
-				break
-			}
-		}
-		if !known {
-			c.history = append(c.history, m)
-		}
-		if lastOfPending >= 0 {
-			c.localLines = append(c.localLines[:lastOfPending], c.localLines[lastOfPending+1:]...)
+		c.history = append(c.history, m)
+		if echoIdx >= 0 {
+			c.localLines = append(c.localLines[:echoIdx], c.localLines[echoIdx+1:]...)
 		}
 	}
 
@@ -1775,11 +1833,20 @@ func (c chatScreen) peerAtY(y int, l layout) string {
 		return ""
 	}
 	row := y - l.rosterY0
-	if row < 0 || row >= l.rosterSlots {
+	if row < 0 {
 		return ""
 	}
+	// Mirror rosterBody(fill=vpHeight) exactly: title owns row -1 (above
+	// Y0), then users, then at most one "… +N more" overflow row which is
+	// not a user. The old slots/16-cap math disagreed with the render and
+	// sent clicks to hidden users (or nowhere on tall terminals).
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
-	if row >= len(online) {
+	bodySlots := maxInt(l.vpHeight-2, 0)
+	n := len(online)
+	if n > bodySlots {
+		n = bodySlots
+	}
+	if row >= n {
 		return ""
 	}
 	return online[row]
@@ -1939,7 +2006,12 @@ func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 		os.Exit(1)
 	}
 	scr.eng.stop()
-	_, _, _ = postJSON(scr.sig.endpoint("/leave"), map[string]any{}, scr.sig.headers())
+	if !leftSent.Load() {
+		// Backup for abnormal exits where doLeave never ran; normally a no-op.
+		if err := scr.sig.leaveRoom(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
+		}
+	}
 	fmt.Printf("\nYou left session %s.\n", key)
 }
 

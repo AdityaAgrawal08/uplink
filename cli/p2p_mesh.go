@@ -65,9 +65,10 @@ func resolveStunURLs(explicit []string) []string {
 }
 
 type meshCallbacks struct {
-	onBytes    func(peer string, raw []byte) // inbound data-channel payload
-	onPeerUp   func(peer string)             // channel open, ready to send
-	onPeerDown func(peer string)             // failed/closed/timed-out
+	onBytes    func(peer string, raw []byte)
+	onPeerUp   func(peer string)
+	onPeerDown func(peer string)
+	onError    func(err error) // loud setup failures (e.g. oversize SDP)
 }
 
 type meshPeer struct {
@@ -168,6 +169,21 @@ func (m *mesh) bufferedAmount(peer string) uint64 {
 		return 0
 	}
 	return dc.BufferedAmount()
+}
+
+// isOpen reports a fully open channel (mirrors the send gate).
+func (m *mesh) isOpen(peer string) bool {
+	m.mu.Lock()
+	mp, ok := m.peers[peer]
+	var dc *webrtc.DataChannel
+	var pc *webrtc.PeerConnection
+	if ok {
+		dc, pc = mp.dc, mp.pc
+	}
+	m.mu.Unlock()
+	return ok && dc != nil && pc != nil &&
+		dc.ReadyState() == webrtc.DataChannelStateOpen &&
+		pc.ConnectionState() == webrtc.PeerConnectionStateConnected
 }
 
 // deliver routes a drained offer/answer note to the setup goroutine for
@@ -444,6 +460,13 @@ func (m *mesh) setupOfferer(ctx context.Context, mp *meshPeer, pc *webrtc.PeerCo
 	if local == nil {
 		return fmt.Errorf("no local description")
 	}
+	if signalPayloadTooBig(local.SDP) {
+		err := fmt.Errorf("offer SDP %d bytes exceeds signaling cap — set UPLINK_STUN to trim candidates", len(local.SDP))
+		if m.cb.onError != nil {
+			m.cb.onError(err) // deterministic and actionable: never transient, never quiet
+		}
+		return err
+	}
 	if err := m.sig.signalSend(peer, "offer", local.SDP); err != nil {
 		return err
 	}
@@ -509,6 +532,13 @@ func (m *mesh) setupAnswerer(ctx context.Context, mp *meshPeer, pc *webrtc.PeerC
 			local := pc.LocalDescription()
 			if local == nil {
 				return fmt.Errorf("no local description")
+			}
+			if signalPayloadTooBig(local.SDP) {
+				err := fmt.Errorf("answer SDP %d bytes exceeds signaling cap — set UPLINK_STUN to trim candidates", len(local.SDP))
+				if m.cb.onError != nil {
+					m.cb.onError(err)
+				}
+				return err
 			}
 			return m.sig.signalSend(peer, "answer", local.SDP)
 		}

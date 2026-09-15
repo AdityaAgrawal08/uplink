@@ -101,8 +101,12 @@ func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 		eng.setRoster(roster)
 	}
 	eng.start()
-	defer eng.stop()
-	defer sig.leaveRoom()
+	defer func() {
+		if err := sig.leaveRoom(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
+		}
+	}() // registered first → runs second (engine already down)
+	defer eng.stop()      // registered second → runs first
 
 	fmt.Printf("Connected to session %s as '%s'. Type /exit to leave.\n", key, me)
 

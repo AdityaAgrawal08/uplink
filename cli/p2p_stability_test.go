@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -919,10 +921,10 @@ func TestBackpressureNoPeer(t *testing.T) {
 	if n := e.mesh.bufferedAmount("ghost"); n != 0 {
 		t.Fatalf("unknown peer buffered = %d; want 0", n)
 	}
-	if err := e.awaitDrain("ghost"); err != nil {
+	if err := e.awaitDrain(context.Background(), "ghost"); err != nil {
 		t.Fatalf("drain with no backlog must pass: %v", err)
 	}
-	if err := e.awaitDrain(""); err != nil {
+	if err := e.awaitDrain(context.Background(), ""); err != nil {
 		t.Fatalf("broadcast drain with empty roster must pass: %v", err)
 	}
 }
@@ -956,25 +958,40 @@ func TestTuiDedupsRetriedChatButAcksBoth(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(40, 10)
 	wireTestEngine(t, c, srv, "bob", "alice")
+	// Production wiring: ack synchronously at receipt, push lossily.
+	c.eng.cb = engineCallbacks{
+		onChat: func(ec engineChat) {
+			_ = c.eng.sendAck(ec.From, ec.MsgId)
+			select {
+			case c.netCh <- netChatMsg{chat: ec}:
+			default:
+			}
+		},
+	}
 
-	dup := netChatMsg{chat: engineChat{MsgId: "dup-9", From: "alice", To: "", Text: "hi again"}}
-	c1, cmd1 := step(c, dup)
-	drainCmds(cmd1)
-	c2, cmd2 := step(c1, dup)
-	drainCmds(cmd2)
+	dup := newFrame(frameChat, "dup-9", "alice", "bob")
+	dup.Data = "hi again"
+	c.eng.dispatch(dup)
+	c.eng.dispatch(dup) // same frame twice: retry/redelivery
+	// Both copies acked synchronously at receipt (distinct ack ids), so a
+	// dropped queue slot still graduates the sender.
+	if n := inboxDeposits(fs, "alice"); n != 2 {
+		t.Fatalf("ack deposits for alice = %d; want 2 (one per copy)", n)
+	}
+	for i := 0; i < 2; i++ {
+		msg := c.drainNetCmd()()
+		nm, _ := c.Update(msg)
+		*c = nm.(chatScreen)
+	}
 
 	rows := 0
-	for _, h := range c2.history {
+	for _, h := range c.history {
 		if h.MsgId == "dup-9" {
 			rows++
 		}
 	}
 	if rows != 1 {
 		t.Fatalf("retried chat painted %d rows; want exactly 1", rows)
-	}
-	// Both copies acked (distinct ack ids) so the sender graduates.
-	if n := inboxDeposits(fs, "alice"); n != 2 {
-		t.Fatalf("ack deposits for alice = %d; want 2 (one per copy)", n)
 	}
 }
 
@@ -1094,4 +1111,249 @@ func TestHeaderShowsVersion(t *testing.T) {
 	if !strings.Contains(sc.headerView(), "v"+normVersion(version)) {
 		t.Fatalf("header lacks version: %q", sc.headerView())
 	}
+}
+
+// Fast join-chat race: responder learns the newcomer from live traffic
+// (not just beats), with no false KEY SWAP alarm.
+func TestUnknownHandshakeNoteRefreshesSilently(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var errs []string
+	var mu sync.Mutex
+	ea := newEngine("alice", ida, sigA, engineCallbacks{
+		onError: func(err error) {
+			mu.Lock()
+			errs = append(errs, err.Error())
+			mu.Unlock()
+		},
+	})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+
+	// noise1 from a peer my snapshot never learned.
+	psB, m1, err := beginNoise(idb, "alice", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = psB
+	ea.onHandshakeNote(signalNote{From: "bob", Type: noiseSig1, Payload: wrapHs(7, m1)})
+	ea.mu.Lock()
+	_, known := ea.roster["bob"]
+	ea.mu.Unlock()
+	if !known {
+		t.Fatal("live handshake traffic must refresh a stale roster immediately")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, e := range errs {
+		if strings.Contains(e, "KEY SWAP") {
+			t.Fatalf("false attack alarm on a routine join: %s", e)
+		}
+	}
+}
+
+// verifyReady with a valid handshake for a not-yet-known peer refreshes
+// silently instead of crying attack.
+func TestVerifyReadyUnknownPeerNoAlert(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	var errs []string
+	var mu sync.Mutex
+	ea := newEngine("alice", ida, sigA, engineCallbacks{
+		onError: func(err error) {
+			mu.Lock()
+			errs = append(errs, err.Error())
+			mu.Unlock()
+		},
+	})
+	defer ea.stop()
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+
+	// Locally completed handshake against the real key, roster still stale.
+	psA, m1, err := beginNoise(ida, "bob", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	psB, _, err := beginNoise(idb, "alice", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, err := psB.stepNoise(m1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m3, err := psA.stepNoise(m2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := psB.stepNoise(m3); err != nil {
+		t.Fatal(err)
+	}
+	ea.trackHs("bob", psA, 42)
+	ea.verifyReady("bob", psA)
+	mu.Lock()
+	defer mu.Unlock()
+	for _, e := range errs {
+		if strings.Contains(e, "KEY SWAP") {
+			t.Fatalf("false attack alarm: %s", e)
+		}
+	}
+	ea.mu.Lock()
+	_, known := ea.roster["bob"]
+	_, penalized := ea.lastFail["bob"]
+	ea.mu.Unlock()
+	if !known {
+		t.Fatal("verifyReady should have refreshed the stale roster")
+	}
+	if penalized {
+		t.Fatal("unknown peer must not carry a retry penalty")
+	}
+	// The refresh learned bob through setRoster-added, which must have
+	// re-initiated the dropped handshake (transport was never torn down).
+	ea.mu.Lock()
+	_, hs := ea.hs["bob"]
+	ea.mu.Unlock()
+	if !hs {
+		t.Fatal("no re-handshake started after the roster learned bob")
+	}
+}
+
+// Unknown-sender inbox boxes trigger a refresh and deliver at once.
+func TestUnknownInboxSenderRefreshesAndDelivers(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	p := newEngineProbe()
+	ea := newEngine("alice", ida, sigA, p.callbacks())
+	defer ea.stop()
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+
+	f := newFrame(frameChat, "first-1", "bob", "alice")
+	f.Data = "hey first"
+	raw, _ := encodeFrame(f)
+	rawPubB, _ := base64.StdEncoding.DecodeString(pubB)
+	_ = rawPubB
+	box, err := sealBox(idb, ida.publicKey(), raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sigB.inboxSend("alice", "first-1", "p2p", box); err != nil {
+		t.Fatal(err)
+	}
+	ea.inboxOnce()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.chats) != 1 || p.chats[0].Text != "hey first" {
+		t.Fatalf("first message from unknown sender not delivered: %+v", p.chats)
+	}
+}
+
+func TestSignalPayloadTooBig(t *testing.T) {
+	if signalPayloadTooBig(strings.Repeat("x", 16*1024)) {
+		t.Fatal("exactly at cap must pass")
+	}
+	if !signalPayloadTooBig(strings.Repeat("x", 16*1024+1)) {
+		t.Fatal("over cap must trip")
+	}
+}
+
+// Peer learned after its channel is already open must still handshake:
+// setRoster-added re-initiates instead of waiting for a flap.
+func TestRosterLearnedAfterOpenStillHandshakes(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	members := []rosterMember{
+		{Username: "alice", Pubkey: pubA, Online: true},
+		{Username: "bob", Pubkey: pubB, Online: true},
+	}
+	pa, pb := newEngineProbe(), newEngineProbe()
+	ea := newEngineWithStun("alice", ida, sigA, pa.callbacks(), []string{})
+	eb := newEngineWithStun("bob", idb, sigB, pb.callbacks(), []string{})
+	defer ea.stop()
+	defer eb.stop()
+
+	// Alice's snapshot is stale (beat predates Bob); transport setup runs
+	// ahead of roster knowledge, exactly the fast join-chat race.
+	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
+	eb.setRoster(members)
+	ea.start()
+	eb.start()
+	ea.mesh.ensurePeer("bob")
+
+	// The beat learns Bob; the handshake must start now, not on next flap.
+	deadline := time.Now().Add(15 * time.Second)
+	learned := false
+	for time.Now().Before(deadline) {
+		ea.beatOnce()
+		ea.mu.Lock()
+		_, hs := ea.hs["bob"]
+		_, live := ea.noise["bob"]
+		ea.mu.Unlock()
+		if hs || live {
+			learned = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !learned {
+		t.Fatal("no handshake started after the roster learned bob")
+	}
+	waitReady(t, pa, "bob")
+	waitReady(t, pb, "alice")
 }

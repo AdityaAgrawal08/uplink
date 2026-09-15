@@ -305,7 +305,7 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		}
 		hint := "* Commands: " + strings.Join(names, " · ") +
 			" · type / for the picker · Ctrl+C leaves the session"
-		c.appendLine(tuiSystemStyle.Render(hint))
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render(hint))
 		return nil
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser

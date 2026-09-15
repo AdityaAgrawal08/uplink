@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"net/http/httptest"
 	"os"
@@ -171,7 +172,7 @@ func TestEngineEndToEnd(t *testing.T) {
 	}
 	// point downloads at temp dir via HOME override is complex; instead
 	// assert via callback path existence under real ~/Downloads and clean up
-	disp, size, err := ea.sendFile("bob", src, "note.txt", nil)
+	disp, size, err := ea.sendFile(context.Background(), "bob", src, "note.txt", nil)
 	if err != nil {
 		t.Fatalf("sendFile: %v", err)
 	}
@@ -233,7 +234,7 @@ func TestEngineBigFileFallbackRefused(t *testing.T) {
 	if err := os.WriteFile(src, big, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := ea.sendFile("bob", src, "big.bin", nil); err == nil {
+	if _, _, err := ea.sendFile(context.Background(), "bob", src, "big.bin", nil); err == nil {
 		t.Fatal("oversize fallback file must fail fast")
 	}
 }

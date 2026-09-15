@@ -24,8 +24,8 @@ export const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 export const ROOM_CODE_RE = /^[0-9]{6}$/;
 
 export const ROOM_TTL_SEC = 24 * 3600; // sliding safety net; rooms die on empty, not time
-export const SIG_TTL_SEC = 5 * 60; // connection notes live minutes
-export const INBOX_TTL_SEC = 60 * 60; // frozen spec: undelivered boxes evaporate after 1h
+export const SIG_TTL_SEC = 5 * 60; // key-level sliding TTL, refreshed per deposit
+export const INBOX_TTL_SEC = 60 * 60; // key-level sliding TTL: refreshed per deposit, so a trickling inbox outlives idle boxes
 export const PRESENCE_TIMEOUT_MS = 20 * 1000; // ~4 missed 5s heartbeats = offline (fast join/leave visibility; beats are cheap pipelined reads)
 
 export const MAX_SIG_QUEUE = 50; // signaling notes queued per user
@@ -37,7 +37,7 @@ export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
 export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox sends per IP per 5 min
 export const SEND_WINDOW_SEC = 5 * 60;
 export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
-export const READ_LIMIT_PER_WINDOW = 600; // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
+export const READ_LIMIT_PER_WINDOW = 1200; // two same-user tabs + ack overhead stay under budget // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
 
 export class RoomError extends Error {
   status: number;
@@ -94,6 +94,20 @@ export function assertUsername(username: unknown): asserts username is string {
   if (typeof username !== "string" || !USERNAME_RE.test(username)) {
     throw new RoomError(400, "Username must be 3-20 alphanumeric/underscore characters");
   }
+}
+
+// assertUsernameHeader validates the identity header BEFORE it is used for
+// rate-budget keying: raw headers are attacker-chosen, and each distinct
+// value would otherwise mint a fresh budget bucket (Sybil-able throttles).
+export function assertUsernameHeader(v: unknown): asserts v is string {
+  assertUsername(v);
+}
+
+// isEmptyRecord normalizes the Mock-vs-Upstash hgetall shape at pipelined
+// call sites: missing keys yield null (Mock) or {} (Upstash). Bare truthy
+// checks read ghosts as live rooms on real Redis.
+function isEmptyRecord(o: Record<string, string> | null | undefined): o is null {
+  return !o || Object.keys(o).length === 0;
 }
 
 export function assertRoomCode(code: unknown): asserts code is string {
@@ -258,9 +272,10 @@ export async function createRoom(
       { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     ])) as [number, unknown, unknown];
     if (claimed === 0) {
-      // Vanishingly unlikely (fresh code, same username raced itself);
-      // roll back and retry with a new code.
-      await redis.del(roomKey(code));
+      await redis.pipeline([
+        { cmd: "del", key: roomKey(code), args: [] },
+        { cmd: "hdel", key: membersKey(code), args: [username] },
+      ]);
       continue;
     }
     await indexRoom(code);
@@ -286,6 +301,11 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
     { cmd: "hgetall", key: membersKey(code), args: [] },
   ])) as [number, unknown, unknown, Record<string, string> | null];
   if (claimed === 0) {
+    const existing = await redis.hget(membersKey(code), username);
+    if (existing && !parseMember(username, existing)) {
+      await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: Date.now() }));
+      return rosterFrom(await hgetall(membersKey(code)));
+    }
     throw new RoomError(409, "Username already taken");
   }
   return rosterFrom(rosterRaw);
@@ -338,11 +358,12 @@ export async function heartbeat(
     { cmd: "hgetall", key: roomKey(code), args: [] },
     { cmd: "hgetall", key: membersKey(code), args: [] },
   ])) as [Record<string, string> | null, Record<string, string> | null];
-  if (!roomRaw) {
+  if (isEmptyRecord(roomRaw)) {
     throw new RoomError(404, "Session not found");
   }
   if (!membersRaw || !membersRaw[username]) throw new RoomError(403, "Not in this session");
   const current = parseMember(username, membersRaw[username]);
+  if (!current) throw new RoomError(403, "Session state corrupt — rejoining");
   const entry: Record<string, unknown> = {
     pubkey: current?.pubkey ?? "",
     beat: Date.now(),
@@ -382,6 +403,7 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
   let ended = false;
   if (remaining === 0) {
     await destroyRoom(code);
+    await unindexRoom(code);
     ended = true;
   } else {
     await touchRoom(code);
@@ -423,7 +445,7 @@ export async function depositSignal(
     { cmd: "hgetall", key: membersKey(code), args: [] },
     { cmd: "llen", key: sigKey(code, to), args: [] },
   ])) as [Record<string, string> | null, number];
-  if (!membersRaw) throw new RoomError(404, "Session not found");
+  if (isEmptyRecord(membersRaw)) throw new RoomError(404, "Session not found");
   if (!membersRaw[from]) throw new RoomError(403, "Not in this session");
   if (!membersRaw[to]) throw new RoomError(404, "Recipient is not in this session");
   if (depth >= MAX_SIG_QUEUE) {
@@ -437,18 +459,22 @@ export async function depositSignal(
   ]);
 }
 
-// Drain (fetch-and-clear) my signaling queue. At-least-once duplicates are
-// possible under races; receivers dedup by (from, type, ts).
+// Drain my signaling queue with one atomic pop per note. The old
+// LRANGE+DEL pipeline dropped notes deposited between the read and the
+// clear; pops are atomic, so concurrent deposits stay queued for the next
+// drain instead of vanishing. RPOP yields newest-first: reversed back to
+// send order. Bounded iterations; leftovers wait for the next poll.
 export async function drainSignals(code: string, username: string): Promise<SignalNote[]> {
   assertRoomCode(code);
   assertUsername(username);
   await requireMember(code, username);
-  // Read-and-clear in one round trip (ordered server-side). Duplicates
-  // under races are safe: receivers dedup by (from, type, ts).
-  const [raw] = (await redis.pipeline([
-    { cmd: "lrange", key: sigKey(code, username), args: [0, -1] },
-    { cmd: "del", key: sigKey(code, username), args: [] },
-  ])) as [string[], unknown];
+  const raw: string[] = [];
+  for (let i = 0; i < MAX_SIG_QUEUE + 16; i++) {
+    const item = await redis.rpop(sigKey(code, username));
+    if (item == null) break;
+    raw.push(item);
+  }
+  raw.reverse();
   if (raw.length === 0) return [];
   const out: SignalNote[] = [];
   for (const item of raw) {
@@ -484,15 +510,21 @@ export async function depositBox(
     throw new RoomError(400, `payload must be 1-${MAX_BOX_PAYLOAD} chars`);
   }
   if (from === to) throw new RoomError(400, "Cannot box a message to yourself");
-  // Recipient check + inbox depth in one round trip.
-  const [membersRaw, depth] = (await redis.pipeline([
+  // Recipient check + inbox depth + existing-field read in one round trip.
+  const [membersRaw, depth, existing] = (await redis.pipeline([
     { cmd: "hgetall", key: membersKey(code), args: [] },
     { cmd: "hlen", key: inboxKey(code, to), args: [] },
-  ])) as [Record<string, string> | null, number];
-  if (!membersRaw) throw new RoomError(404, "Session not found");
+    { cmd: "hget", key: inboxKey(code, to), args: [msgId] },
+  ])) as [Record<string, string> | null, number, string | null];
+  if (isEmptyRecord(membersRaw)) throw new RoomError(404, "Session not found");
   if (!membersRaw[from]) throw new RoomError(403, "Not in this session");
   if (!membersRaw[to]) throw new RoomError(404, "Recipient is not in this session");
-  if (depth >= MAX_INBOX) {
+  if (existing) {
+    const prev = parseStored<{ from?: unknown }>(existing);
+    if (!prev || prev.from !== from) throw new RoomError(409, "Message ID already claimed by another sender");
+    // Idempotent retry of the same box: bypass the depth check (it counts
+    // fields, which this write does not grow) or retries can never succeed.
+  } else if (depth >= MAX_INBOX) {
     throw new RoomError(429, "Recipient inbox is full. Try again later.");
   }
   // HSET is idempotent on msgId: retries never duplicate. One round trip
@@ -505,6 +537,7 @@ export async function depositBox(
   ]);
 }
 
+const FETCH_BOX_CAP = 50; // one fetch never exceeds ~50 boxes; remainder self-paginates next poll
 export async function fetchBoxes(code: string, username: string): Promise<InboxBox[]> {
   assertRoomCode(code);
   assertUsername(username);
@@ -512,21 +545,24 @@ export async function fetchBoxes(code: string, username: string): Promise<InboxB
   const all = await hgetall(inboxKey(code, username));
   if (!all) return [];
   const out: InboxBox[] = [];
-  for (const raw of Object.values(all)) {
+  const corrupt: string[] = [];
+  for (const [field, raw] of Object.entries(all)) {
     const b = parseStored<InboxBox>(raw);
     if (b && typeof b.msgId === "string" && typeof b.from === "string" && typeof b.payload === "string") {
       out.push(b);
+    } else {
+      corrupt.push(field); // reap: unparseable fields would squat cap slots forever
     }
-    // else: skip corrupt entries
   }
+  if (corrupt.length > 0) await redis.hdel(inboxKey(code, username), ...corrupt).catch(() => 0);
   out.sort((a, b) => a.ts - b.ts);
-  return out;
+  return out.slice(0, FETCH_BOX_CAP);
 }
 
 // Explicit ACK: delete exactly the acknowledged boxes. Fetch-then-ACK (not
 // fetch-and-clear) so a client crash between fetch and processing loses
 // nothing — unacked boxes are simply returned again.
-export async function ackBoxes(code: string, username: string, ids: unknown): Promise<{ removed: number }> {
+export async function ackBoxes(code: string, username: string, ids: unknown): Promise<{ removed: number; skipped: number }> {
   assertRoomCode(code);
   assertUsername(username);
   if (!Array.isArray(ids) || ids.length === 0 || ids.length > 500) {
@@ -536,7 +572,7 @@ export async function ackBoxes(code: string, username: string, ids: unknown): Pr
   if (clean.length === 0) throw new RoomError(400, "No valid message IDs");
   await requireMember(code, username);
   const removed = await redis.hdel(inboxKey(code, username), ...clean);
-  return { removed };
+  return { removed, skipped: ids.length - clean.length };
 }
 
 // Sweep: drop members whose heartbeat lapsed, destroy emptied rooms. Runs
@@ -556,10 +592,7 @@ export async function indexRoom(code: string): Promise<void> {
 }
 
 async function unindexRoom(code: string): Promise<void> {
-  const all = await redis.lrange(ROOM_INDEX, 0, -1);
-  const kept = all.filter((c) => c !== code);
-  await redis.del(ROOM_INDEX);
-  if (kept.length > 0) await redis.rpush(ROOM_INDEX, ...kept);
+  await redis.lrem(ROOM_INDEX, 0, code); // atomic; the read-modify-write it replaces wiped concurrent indexRoom pushes
 }
 
 export async function sweepRooms(): Promise<{ processed: number; prunedMembers: number; destroyed: number }> {
@@ -583,7 +616,7 @@ export async function sweepRooms(): Promise<{ processed: number; prunedMembers: 
         { cmd: "hgetall", key: roomKey(code), args: [] },
         { cmd: "hgetall", key: membersKey(code), args: [] },
       ])) as [Record<string, string> | null, Record<string, string> | null];
-      if (!meta) {
+      if (isEmptyRecord(meta)) {
         await unindexRoom(code); // room key gone (TTL) — drop index entry
         continue;
       }
