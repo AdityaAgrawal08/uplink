@@ -330,6 +330,16 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	}
 }
 
+// lastRxAt reports when a peer's datagrams last arrived (watchdog input).
+func (m *mediaTransport) lastRxAt(peer string) time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.peers[peer]; ok {
+		return p.lastRx
+	}
+	return time.Time{}
+}
+
 // sendMedia seals one media payload as a datagram. Fails fast without a
 // live session — callers fall back or report, never block.
 func (m *mediaTransport) sendMedia(peer string, kind byte, payload []byte) error {
