@@ -154,7 +154,8 @@ type layout struct {
 	sidebarOn       bool // false on narrow terminals — panel collapses
 	rosterX         int  // leftmost column of the sidebar
 	rosterY0        int  // first terminal row inside the sidebar that holds a user
-	rosterSlots     int  // how many roster rows fit under the current vpHeight
+	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
+	videoRows       int  // outer rows of the top video box (0 = off); rosterY0 sits below it
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
@@ -454,6 +455,7 @@ type chatScreen struct {
 	call         *callManager
 	callLevel    float64 // mic loudness for the header meter
 	videoLines   []string
+	videoVp      viewport.Model // scrollable remote-video pane (wheel)
 	vp           viewport.Model
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
@@ -557,6 +559,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
+	videoVp := viewport.New(40, 10)
 	netCh := make(chan tea.Msg, 256)
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	// Engine callbacks only ever push into netCh (never touch the screen:
@@ -572,9 +575,9 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
 		nil, // roster bound below once eng exists
 		callCallbacks{
-			onRinging: func(peer string) { push(callRingMsg{peer: peer}) },
-			onState:   func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
-			onLevel:   func(level float64) { push(callLevelMsg{level: level}) },
+			onRinging:    func(peer string) { push(callRingMsg{peer: peer}) },
+			onState:      func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
+			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
 			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
 		})
 	var eng *engine
@@ -602,6 +605,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		key:         key,
 		me:          me,
 		vp:          vp,
+		videoVp:     videoVp,
 		input:       ti,
 		netCh:       netCh,
 		rendered:    map[int]bool{},
@@ -1562,6 +1566,12 @@ func (c *chatScreen) syncViewport() {
 	if l.vpHeight > 0 && vpW > 10 {
 		vpW--
 	}
+	// Remote-video pane tracks the sidebar split independently of the
+	// transcript early-out below.
+	if l.videoRows >= 2 {
+		c.videoVp.Width = maxInt(c.sidebarInnerWidth()-2, 8)
+		c.videoVp.Height = maxInt(l.videoRows-2, 1)
+	}
 	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
 		return
 	}
@@ -1759,6 +1769,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case netVideoMsg:
 		c.videoLines = msg.lines
+		c.videoVp.SetContent(strings.Join(msg.lines, "\n"))
+		c.syncViewport()
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -2039,7 +2051,7 @@ func (c chatScreen) peerAtY(y int, l layout) string {
 	// not a user. The old slots/16-cap math disagreed with the render and
 	// sent clicks to hidden users (or nowhere on tall terminals).
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
-	bodySlots := maxInt(l.vpHeight-2, 0)
+	bodySlots := maxInt(l.vpHeight-l.videoRows-2, 0)
 	n := len(online)
 	if n > bodySlots {
 		n = bodySlots
@@ -2056,6 +2068,23 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	l := c.layoutFor()
 
 	switch msg.Type {
+	case tea.MouseWheelUp, tea.MouseWheelDown:
+		if c.width == 0 || c.height == 0 || !l.sidebarOn || l.videoRows == 0 {
+			return nil
+		}
+		inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
+		// Video box occupies [rosterY0-videoRows, rosterY0): wheel there
+		// scrolls the remote frame instead of hitting roster rows.
+		if inColumn && msg.Y >= l.rosterY0-l.videoRows && msg.Y < l.rosterY0 {
+			if msg.Type == tea.MouseWheelUp {
+				c.videoVp.LineUp(3)
+			} else {
+				c.videoVp.LineDown(3)
+			}
+			return nil
+		}
+		return nil
+
 	case tea.MouseMotion:
 		c.hoverPeer = "" // default: outside every row
 		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
@@ -2137,14 +2166,31 @@ func (c chatScreen) View() string {
 	}
 
 	if l.sidebarOn && body != "" {
-		// Sidebar height forced to match the transcript column exactly; its
-		// content truncates to l.rosterSlots so it can never inflate the row.
-		sidebar := tuiRosterBoxStyle.
+		// Sidebar column: video box on top (when streaming), roster below.
+		// Column height stays vpHeight so the height invariant holds.
+		var col string
+		rosterH := l.vpHeight - l.videoRows
+		if l.videoRows > 0 {
+			// VIDEO/AUDIO panel above the roster (mockup): title row plus
+			// the scrollable remote frame; wheel over it scrolls.
+			videoContent := tuiSectionTitleStyle.Render("VIDEO") + "\n" + c.videoVp.View()
+			col = tuiRosterBoxStyle.
+				Width(c.sidebarInnerWidth()).
+				Height(l.videoRows).
+				MaxHeight(l.videoRows).
+				Render(videoContent)
+		}
+		roster := tuiRosterBoxStyle.
 			Width(c.sidebarInnerWidth()).
-			Height(l.vpHeight). // interior rows; border completes the column
-			MaxHeight(l.vpHeight).
-			Render(c.rosterBody(l.vpHeight))
-		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", sidebar)
+			Height(rosterH). // interior rows; border completes the column
+			MaxHeight(rosterH).
+			Render(c.rosterBody(rosterH))
+		if col == "" {
+			col = roster
+		} else {
+			col = lipgloss.JoinVertical(lipgloss.Left, col, roster)
+		}
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", col)
 	}
 
 	rows := make([]string, 0, 5)

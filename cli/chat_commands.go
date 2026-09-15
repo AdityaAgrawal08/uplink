@@ -157,9 +157,6 @@ func (c chatScreen) paletteRows() int {
 	if c.picker.isActive() {
 		return c.pickerRows()
 	}
-	if len(c.videoLines) > 0 && c.videoActive() {
-		return 1 + min(len(c.videoLines)+1, videoPaneRows+1) + 2 // spacer + hint + frame rows + border
-	}
 	if !c.palette.visible() {
 		return 0
 	}
@@ -177,41 +174,37 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	return computeLayoutWithPalette(c.width, c.height, c.status != "", c.paletteRows())
+	l := computeLayoutWithPalette(c.width, c.height, c.status != "", c.paletteRows())
+	// Video box claims the top of the sidebar column (mockup: VIDEO/AUDIO
+	// above ONLINE). Bounded to half the column so the roster never starves;
+	// collapsed entirely when too short to be useful.
+	l.videoRows = 0
+	if l.sidebarOn && c.videoActive() && len(c.videoLines) > 0 {
+		want := len(c.videoLines) + 1 + 2 // hint + frame rows + border
+		l.videoRows = min(want, l.vpHeight/2)
+		if l.videoRows < 6 {
+			l.videoRows = 0
+		}
+	}
+	l.rosterY0 += l.videoRows
+	return l
 }
 
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot: the file browser
-// (picker), live video, or the "/" command list.
+// (picker) or the "/" command list. (Remote video lives in the sidebar, not
+// here.)
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
-	if len(c.videoLines) > 0 && c.videoActive() {
-		return c.videoView(maxW)
-	}
 	return c.paletteView(maxW)
 }
 
-// videoActive reports whether remote video should paint (streaming call;
-// picker wins the slot when open).
+// videoActive reports whether remote video should paint in the sidebar.
 func (c chatScreen) videoActive() bool {
 	return c.call != nil && c.call.VideoOn()
-}
-
-// videoView renders the latest decoded ASCII frame in the drawer slot.
-func (c chatScreen) videoView(maxW int) string {
-	inner := maxW - 2
-	rows := make([]string, 0, len(c.videoLines)+1)
-	rows = append(rows, tuiPaletteHintStyle.Render("live video — /hangup ends the call"))
-	for _, ln := range c.videoLines {
-		if lipgloss.Width(ln) > inner {
-			ln = lipgloss.NewStyle().MaxWidth(inner).Render(ln)
-		}
-		rows = append(rows, ln)
-	}
-	return tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW

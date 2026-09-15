@@ -341,22 +341,43 @@ func (identityDecoder) decode(frame []byte) ([]byte, error) {
 
 func (identityDecoder) close() {}
 
-func TestVideoDrawerShowsFrames(t *testing.T) {
-	c := newFilterScreen("bob", "")
+func TestVideoSidebarSplitAndScroll(t *testing.T) {
+	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
-	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 	sc := m.(chatScreen)
 	sc.call = &callManager{videoOn: true}
-	m2, _ := sc.Update(netVideoMsg{lines: []string{"██", "░░"}})
+	lines := make([]string, 0, videoPaneRows)
+	for i := 0; i < videoPaneRows; i++ {
+		lines = append(lines, "row")
+	}
+	m2, _ := sc.Update(netVideoMsg{lines: lines})
 	sc = m2.(chatScreen)
-	if len(sc.videoLines) != 2 {
-		t.Fatal("video lines not stored")
+	l := sc.layoutFor()
+	if l.videoRows == 0 {
+		t.Fatal("video box must claim rows while streaming")
 	}
-	if got := sc.drawerView(100); !strings.Contains(got, "██") {
-		t.Fatalf("drawer missing video frame: %q", got)
+	if got := sc.peerAtY(l.rosterY0+1, l); got != "carol" {
+		t.Fatalf("roster row below the video box mapped to %q; want carol", got)
 	}
+	// Wheel over the video box is swallowed (scrolls video), never selects.
+	m3, _ := sc.Update(tea.MouseMsg{X: l.rosterX + 1, Y: l.rosterY0 - 1, Type: tea.MouseWheelDown})
+	sc = m3.(chatScreen)
+	if sc.targetUser != "" {
+		t.Fatal("wheel over video must not open a thread")
+	}
+	// Video box present in painted output above the roster title.
+	if got := sc.View(); !strings.Contains(got, "VIDEO") || !strings.Contains(got, "ONLINE") {
+		t.Fatal("sidebar must show VIDEO above ONLINE")
+	}
+	// Video box present in painted output above the roster title.
+	if got := sc.View(); !strings.Contains(got, "VIDEO") || !strings.Contains(got, "ONLINE") {
+		t.Fatal("sidebar must show VIDEO above ONLINE")
+	}
+	// Video off collapses the split cleanly.
 	sc.call = &callManager{videoOn: false}
-	if got := sc.drawerView(100); strings.Contains(got, "██") {
-		t.Fatal("drawer must hide video when off")
+	l2 := sc.layoutFor()
+	if l2.videoRows != 0 || l2.rosterY0 >= l.rosterY0 {
+		t.Fatal("video collapse must return rows to the roster")
 	}
 }
