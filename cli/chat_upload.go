@@ -42,6 +42,7 @@ type uploadJob struct {
 type uploadState struct {
 	queue   []uploadJob
 	active  bool
+	gen     int // queue generation: stale completions drop (see settleUploadDone)
 	cancel  context.CancelFunc
 	progCh  chan uploadProgressMsg
 	name    string // display name of the in-flight job
@@ -67,6 +68,7 @@ type uploadDoneMsg struct {
 	display string
 	size    int64
 	err     error
+	gen     int // queue generation: stale completions (cancelled jobs) drop
 }
 
 // ---- queue control ---------------------------------------------------------------
@@ -97,6 +99,9 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 
 	c.uploadQ.active = true
 	c.uploadQ.name = display
+	c.uploadQ.lineIdx = -1 // fresh row per job; zero value 0 is a valid row
+	c.uploadQ.gen++        // invalidates any late completion from before
+	gen := c.uploadQ.gen   // captured now: the async run must not re-read
 	// job.To is a raw recipient username ("" = room broadcast); the card
 	// paints into the matching conversation bucket.
 	conv := convFor(c.me, job.To)
@@ -107,7 +112,7 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 	run := func() tea.Msg {
 		defer close(progCh)
 		disp, size, err := runSessionUpload(ctx, c.eng, job, progCh)
-		return uploadDoneMsg{display: disp, size: size, err: err}
+		return uploadDoneMsg{display: disp, size: size, err: err, gen: gen}
 	}
 
 	return tea.Batch(
@@ -151,6 +156,9 @@ func (c *chatScreen) paintUploadLine(text string, conv string) {
 
 // settleUploadDone annotates the finished transfer and promotes the next job.
 func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
+	if msg.gen != c.uploadQ.gen {
+		return nil // stale completion from a cancelled job: ignore fully
+	}
 	c.uploadQ.active = false
 	c.uploadQ.cancel = nil
 	conv := c.uploadQ.conv
@@ -199,6 +207,7 @@ func (c *chatScreen) cancelUploads() {
 	if c.uploadQ.cancel != nil {
 		c.uploadQ.cancel()
 	}
+	c.uploadQ.gen++ // late completion from the killed job drops on arrival
 	name := c.uploadQ.name
 	conv := c.uploadQ.conv
 	if conv == "" {
@@ -258,7 +267,7 @@ func runSessionUpload(ctx context.Context, eng *engine, job uploadJob, prog chan
 
 	// job.To is a raw recipient username ("" = broadcast); the engine
 	// encrypts for exactly that audience.
-	return eng.sendFile(job.To, path, display, prog)
+	return eng.sendFile(ctx, job.To, path, display, prog)
 }
 
 // tarballDir packs dir into a temp <name>.tar.gz preserving the full

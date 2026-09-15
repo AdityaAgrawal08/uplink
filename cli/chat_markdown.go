@@ -8,10 +8,10 @@ import (
 )
 
 var (
-	mdBoldRe   = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	mdCodeRe   = regexp.MustCompile("`([^`]+)`")
-	mdBlockRe  = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
-	mdLinkRe   = regexp.MustCompile(`\[(.+?)\]\((.+?)\)`)
+	mdBoldRe  = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	mdCodeRe  = regexp.MustCompile("`([^`]+)`")
+	mdBlockRe = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
+	mdLinkRe  = regexp.MustCompile(`\[(.+?)\]\((.+?)\)`)
 )
 
 var (

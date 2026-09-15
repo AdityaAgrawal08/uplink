@@ -112,12 +112,16 @@ func main() {
 		}
 		if lm, ok := fm.(landingModel); ok && lm.result != nil {
 			r := lm.result
-			// transition directly into chat (identity reloads inside;
-			// same device key the landing flow just advertised)
-			id, err := loadOrCreateIdentity()
-			if err != nil {
-				fmt.Printf("device identity unavailable: %v\n", err)
-				os.Exit(1)
+			// Reuse the device key the landing flow advertised; reload
+			// only as fallback so chat can never run on a different key.
+			id := r.ID
+			if id == nil {
+				var err error
+				id, err = loadOrCreateIdentity()
+				if err != nil {
+					fmt.Printf("device identity unavailable: %v\n", err)
+					os.Exit(1)
+				}
 			}
 			runChat(serverURL, r.Key, r.Username, id, r.Password)
 			return
@@ -253,13 +257,6 @@ func sanitizeFilename(name string) string {
 		return "file"
 	}
 	return base
-}
-
-func getServerDefault() string {
-	if val := os.Getenv("UPLINK_SERVER"); val != "" {
-		return strings.TrimRight(val, "/")
-	}
-	return "https://uplink-delta-xi.vercel.app"
 }
 
 func sanitizeServerUrl(serverUrl string) string {

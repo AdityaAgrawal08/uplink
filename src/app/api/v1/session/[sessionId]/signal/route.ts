@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
+export const dynamic = "force-dynamic"; // GET drains+deletes: never cacheable
+
 import {
   RoomError,
   depositSignal,
@@ -8,6 +10,7 @@ import {
   checkSendLimit,
   checkReadLimit,
   scopedBudgetKey,
+  assertUsernameHeader,
 } from "@/lib/rooms";
 
 // WebRTC rendezvous: members exchange SDP offers/answers and ICE candidates
@@ -23,6 +26,7 @@ export async function POST(
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    assertUsernameHeader(username); // validate before budget keying (outer catch maps 400)
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
@@ -43,6 +47,7 @@ export async function GET(
   props: { params: Promise<{ sessionId: string }> }
 ) {
   try {
+    validateSignalingEnv();
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);

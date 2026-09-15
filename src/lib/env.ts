@@ -1,3 +1,5 @@
+import { RoomError } from "./rooms";
+
 const requiredVars = [
   "MONGODB_URI",
   "R2_ACCESS_KEY_ID",
@@ -33,7 +35,7 @@ function check(vars: string[]): void {
   }
   const missing = vars.filter(v => !process.env[v]);
   if (missing.length > 0) {
-    throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
+    throw new RoomError(503, `Backend not configured (missing: ${missing.join(", ")})`);
   }
 }
 

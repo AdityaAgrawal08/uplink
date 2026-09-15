@@ -5,6 +5,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -361,6 +362,20 @@ type netLostMsg struct{ user string }
 type netErrMsg struct{ err error }
 type rosterTickMsg struct{}
 
+// unconfirmedAfter is how long an own message may sit without a delivery
+// ack before the status line warns. Churn windows (re-handshake + 3 inbox
+// retries) legitimately take ~10-15s; past 30s something is wrong enough
+// to say so out loud instead of showing false confidence.
+const unconfirmedAfter = 30 * time.Second
+
+// receiptExpiry forgets an unacked own message (dimming lifts). Past this
+// point the engine's retries are over; a still-missing ack is far likelier
+// a lost ack frame than a lost message, so nagging forever would cry wolf.
+const receiptExpiry = 5 * time.Minute
+
+// netDeliveredMsg arrives when the peer acked one of our messages.
+type netDeliveredMsg struct{ msgId string }
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -406,12 +421,22 @@ type chatScreen struct {
 	// message content). Without them every new message re-renders and
 	// re-measures the entire transcript (grapheme segmentation dominates
 	// profiles) — O(n) per message, ~90ms at 5000 lines.
-	renderCache  map[int]string
-	tsCache      map[int]time.Time
-	wrapCache    map[string]string
-	cacheWidth   int
-	pending      *pendingSend // single in-flight send (nil = idle)
-	outbox       []queuedLine // queued sends waiting for the in-flight one
+	renderCache map[int]string
+	tsCache     map[int]time.Time
+	wrapCache   map[string]string
+	cacheWidth  int
+	pending     *pendingSend // single in-flight send (nil = idle)
+	outbox      []queuedLine // queued sends waiting for the in-flight one
+	// unackedUI tracks own confirmed sends awaiting a delivery ack
+	// (msgId -> send time). Own bubbles render dimmed until the ack lands;
+	// entries older than unconfirmedAfter raise the status warning below.
+	// The engine owns retry/expiry — this map is display state only.
+	unackedUI map[string]time.Time
+	// roomUnread counts room broadcasts that arrived while a DM thread is
+	// in view (broadcasts otherwise paint nowhere and badge nothing — a
+	// message can sit in history looking "missing"). Cleared on return to
+	// the room. DM unreads keep using the per-peer map.
+	roomUnread   int
 	users        []string
 	vp           viewport.Model
 	input        textinput.Model
@@ -429,9 +454,14 @@ type chatScreen struct {
 // confirmation can swap it in place (or mark failure) without ambiguity.
 type pendingSend struct {
 	lineIdx int
-	text    string
-	conv    string // conversation the optimistic echo belongs to
-	to      string // recipient ("": broadcast) - needed to reconstruct on settle
+	// localIdx pins the optimistic echo row in localLines (set once at
+	// dispatch). Settle removes/annotates exactly this row instead of
+	// scanning for "last of conv", which breaks when other lines land
+	// while a send is in flight.
+	localIdx int
+	text     string
+	conv     string // conversation the optimistic echo belongs to
+	to       string // recipient ("": broadcast) - needed to reconstruct on settle
 }
 
 // localLineKind distinguishes plain text lines from styled file attachment cards.
@@ -498,6 +528,11 @@ const maxReceivedFiles = 200
 // scrollback falls off first).
 const maxHistory = 5000
 
+// maxLocalLines bounds transient echo/note/card rows likewise. Echoes and
+// progress rows are removed in place; error/help rows would otherwise grow
+// without limit. Dropped file cards stay reachable in the files drawer.
+const maxLocalLines = 500
+
 func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
@@ -517,12 +552,19 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		default:
 		}
 	}
-	eng := newEngine(me, id, sig, engineCallbacks{
-		onChat:      func(c engineChat) { push(netChatMsg{chat: c}) },
+	var eng *engine
+	eng = newEngine(me, id, sig, engineCallbacks{
+		onChat: func(c engineChat) {
+			// Ack at receipt, not at paint: a dropped queue slot must not
+			// silence the sender's backstop (the paint path still dedups).
+			_ = eng.sendAck(c.From, c.MsgId)
+			push(netChatMsg{chat: c})
+		},
 		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
 		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
 		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
 		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
+		onDelivered: func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
 		onError:     func(err error) { push(netErrMsg{err: err}) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
@@ -658,6 +700,12 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	var style lipgloss.Style
 	if isOwn {
 		style = tuiOwnBubbleStyle
+		// Unconfirmed own message (sent, no delivery ack yet): render dim
+		// so "sent" is never confused with "received". The ack
+		// (netDeliveredMsg) restores full brightness.
+		if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
+			style = style.Faint(true)
+		}
 	} else {
 		style = tuiOtherBubbleStyle
 	}
@@ -691,6 +739,13 @@ func (c *chatScreen) addMessage(m chatMessage) {
 			}
 		}
 	}
+	// Room broadcasts arriving while a DM thread is in view get no paint
+	// and no badge by the rules above — count them so the header can say
+	// "N new in room" instead of looking like loss. (Empty ConvID is a
+	// legacy room message, same as shouldRender treats it.)
+	if (m.ConvID == generalConv || m.ConvID == "") && m.Username != c.me && c.activeConv() != generalConv {
+		c.roomUnread++
+	}
 	c.history = append(c.history, m)
 	// Bound the transcript: marathon sessions must not grow it without
 	// limit. Oldest scrollback falls off first (rendered flags for dropped
@@ -706,6 +761,16 @@ func (c *chatScreen) addMessage(m chatMessage) {
 	c.rebuildView()
 }
 
+// historyHasSeq reports whether a display seq is already taken.
+func historyHasSeq(history []chatMessage, seq int) bool {
+	for _, h := range history {
+		if h.Seq == seq {
+			return true
+		}
+	}
+	return false
+}
+
 // peerOf extracts the OTHER participant from a canonical "a|b" pair key.
 func peerOf(me, conv string) string {
 	parts := strings.Split(conv, "|")
@@ -717,13 +782,31 @@ func peerOf(me, conv string) string {
 	return ""
 }
 
-func (c *chatScreen) appendLine(s string) {
-	c.appendLocal(generalConv, s)
+func (c *chatScreen) appendLocal(conv, text string) {
+	c.pushLocalLine(localLine{conv: conv, text: text, kind: lineText})
+	c.rebuildView()
 }
 
-func (c *chatScreen) appendLocal(conv, text string) {
-	c.localLines = append(c.localLines, localLine{conv: conv, text: text, kind: lineText})
-	c.rebuildView()
+// pushLocalLine appends a transcript row, enforcing the cap. Dropping head
+// rows shifts stored indices (in-flight echo, upload progress): adjust them
+// so later lookups still hit their row, invalidating ones that fell off.
+func (c *chatScreen) pushLocalLine(ll localLine) {
+	c.localLines = append(c.localLines, ll)
+	if overflow := len(c.localLines) - maxLocalLines; overflow > 0 {
+		c.localLines = append([]localLine(nil), c.localLines[overflow:]...)
+		if c.pending != nil {
+			c.pending.localIdx -= overflow
+			if c.pending.localIdx < 0 {
+				c.pending.localIdx = -1
+			}
+		}
+		if c.uploadQ.lineIdx >= 0 {
+			c.uploadQ.lineIdx -= overflow
+			if c.uploadQ.lineIdx < 0 {
+				c.uploadQ.lineIdx = -1
+			}
+		}
+	}
 }
 
 // rebuildView derives the painted transcript from raw history + local lines,
@@ -750,6 +833,19 @@ func (c *chatScreen) cacheForWidth(w int) {
 		c.tsCache = map[int]time.Time{}
 		c.wrapCache = map[string]string{}
 		c.cacheWidth = w
+	}
+}
+
+// evictRenderCache drops the memoized bubble for one msgId (dim state
+// changed), so the next rebuild repaints it instead of reusing stale art.
+func (c *chatScreen) evictRenderCache(msgId string) {
+	if msgId == "" || len(c.renderCache) == 0 {
+		return
+	}
+	for _, h := range c.history {
+		if h.MsgId == msgId {
+			delete(c.renderCache, h.Seq)
+		}
 	}
 }
 
@@ -967,9 +1063,14 @@ func (c chatScreen) headerView() string {
 	mode := ""
 	if c.targetUser != "" {
 		mode = fmt.Sprintf(" · private with %s · ESC = general", c.targetUser)
+		if c.roomUnread > 0 {
+			mode += fmt.Sprintf(" · %d new in room", c.roomUnread)
+		}
 	}
-	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online%s ",
-		c.key, c.me, len(c.users), mode)
+	// Binary version in the banner: screenshots become self-identifying
+	// (which build each side runs is otherwise unknowable in bug reports).
+	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s ",
+		c.key, c.me, len(c.users), normVersion(version), mode)
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
@@ -1141,12 +1242,11 @@ func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
 			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201}
 		}
 		msg := err.Error()
-		switch {
-		case strings.Contains(msg, "429"):
+		switch code := apiStatusCode(err); {
+		case code == 429 || (code == 0 && strings.Contains(msg, "429")):
 			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err}
-		case strings.Contains(msg, "404"),
-			strings.Contains(msg, "gone"),
-			strings.Contains(msg, "not in session"),
+		case code == 404 || code == 410 || strings.Contains(msg, "gone") ||
+			strings.Contains(msg, "not in session") ||
 			strings.Contains(msg, "Session not found"):
 			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err}
 		default:
@@ -1155,10 +1255,19 @@ func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
 	}
 }
 
+// leftSent guards the leave POST exactly-once across the in-loop leave,
+// repeat Ctrl+C presses, and the post-Run backup below.
+var leftSent atomic.Bool
+
 func (c chatScreen) doLeave() tea.Cmd {
 	return func() tea.Msg {
+		if leftSent.Swap(true) {
+			return leaveDoneMsg{}
+		}
 		c.eng.stop()
-		_, _, _ = postJSON(c.sig.endpoint("/leave"), map[string]any{}, c.sig.headers())
+		if err := c.sig.leaveRoom(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
+		}
 		return leaveDoneMsg{}
 	}
 }
@@ -1206,6 +1315,7 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.palette.close()
+	c.roomUnread = 0 // back in the room: everything is visible again
 	c.rebuildView()
 }
 
@@ -1275,8 +1385,8 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	}
 	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(innerWithTs)
 	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
-	c.localLines = append(c.localLines, localLine{conv: conv, text: echo})
-	c.pending = &pendingSend{text: text, conv: conv, to: peer}
+	c.pushLocalLine(localLine{conv: conv, text: echo})
+	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
 	if target == "" && c.pending.conv == generalConv {
 		target = ""
@@ -1287,27 +1397,39 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	return c.doSend(text, target, seq)
 }
 
+// syncViewport re-derives viewport/composer geometry from the live layout.
+// Drawer open/close, status lines, and sidebar collapse all change the
+// transcript box without any resize event; without this, caches, wraps,
+// and scroll math run on stale dims until the next terminal resize.
+func (c *chatScreen) syncViewport() {
+	if c.width <= 0 || c.height <= 0 {
+		return
+	}
+	l := c.layoutFor()
+	vpW := l.vpWidth
+	if l.vpHeight > 0 && vpW > 10 {
+		vpW--
+	}
+	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
+		return
+	}
+	c.vp.Width, c.vp.Height = vpW, l.vpHeight
+	if c.input.Width != l.vpWidth-4 {
+		c.input.Width = maxInt(l.vpWidth-4, 8)
+	}
+	c.refreshViewport()
+}
+
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+	c.syncViewport() // drawer/status/sidebar changes alter geometry with no resize event
 
 	switch msg := msg.(type) {
 
 	case tea.WindowSizeMsg:
 		c.width, c.height = msg.Width, msg.Height
 		c.hoverPeer = "" // geometry changed; stale hover is meaningless
-		l := c.layoutFor()
-		// Reserve 1 column for scrollbar inside transcript.
-		vpW := l.vpWidth
-		if l.vpHeight > 0 && vpW > 10 {
-			vpW--
-		}
-		c.vp.Width = vpW
-		c.vp.Height = l.vpHeight
-		// Keep the composer inside its column: textinput pads/clips to Width.
-		if c.input.Width != l.vpWidth-4 {
-			c.input.Width = maxInt(l.vpWidth-4, 8)
-		}
-		c.refreshViewport() // re-wrap transcript to the new width
+		c.syncViewport() // re-derives vp dims + input width, re-wraps on change
 
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
@@ -1348,19 +1470,36 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if changed {
 			c.rebuildView() // repaint the sidebar NOW, not on the next message
 		}
+		// Delivery-receipt sweep: warn on messages unacked past
+		// unconfirmedAfter; forget entries past receiptExpiry (the engine's
+		// own retries are long over by then — most likely a lost ack frame,
+		// not a lost message). Evict repaints so dimming lifts.
+		if len(c.unackedUI) > 0 {
+			now := time.Now()
+			stale := 0
+			for id, at := range c.unackedUI {
+				age := now.Sub(at)
+				if age > receiptExpiry {
+					delete(c.unackedUI, id)
+					c.evictRenderCache(id)
+				} else if age > unconfirmedAfter {
+					stale++
+				}
+			}
+			if stale > 0 {
+				c.status = fmt.Sprintf("* %d message(s) unconfirmed — still retrying", stale)
+			} else if strings.HasPrefix(c.status, "* ") && strings.Contains(c.status, "unconfirmed") {
+				c.status = ""
+			}
+		} else if strings.HasPrefix(c.status, "* ") && strings.Contains(c.status, "unconfirmed") {
+			c.status = ""
+		}
 		cmds = append(cmds, scheduleRoster())
 
 	case netChatMsg:
 		m := msg.chat
-		// Delivery receipt back to the sender for EVERY copy (best-effort;
-		// the sender's backstop retries until it hears back). Display only
-		// the first: a dropped queue slot must not silence the retries
-		// that recover it, and retries must not double-paint.
-		sender, msgId := m.From, m.MsgId
-		cmds = append(cmds, func() tea.Msg {
-			_ = c.eng.sendAck(sender, msgId)
-			return nil
-		})
+		// Receipt already acked synchronously at queue time (see onChat):
+		// display dedups here, never re-acks.
 		if c.markSeen(m.MsgId) {
 			cmds = append(cmds, c.drainNetCmd())
 			break
@@ -1390,6 +1529,15 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.received = append(c.received, receivedFile{
 			filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
 		})
+		// Live drawer: arrivals while browsing appear at once (newest
+		// first), or the "appear here automatically" notice lies.
+		if c.picker.active && c.picker.mode == modeFiles {
+			c.picker.files = append([]receivedFile{{
+				filename: f.Filename, from: f.From, size: f.Size, path: f.Path, at: time.Now(),
+			}}, c.picker.files...)
+			c.picker.notice = ""
+			c.picker.clampCursor()
+		}
 		// Bound the drawer source: marathon sessions must not grow it
 		// without limit (oldest fall off; files stay saved on disk).
 		if len(c.received) > maxReceivedFiles {
@@ -1397,7 +1545,20 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		conv := convFor(f.From, f.To)
 		ts := time.Now()
-		c.localLines = append(c.localLines, localLine{
+		// Mirror the text path: DM arrivals always bump recency; room
+		// files arriving in a thread view count room-unread instead of
+		// vanishing silently.
+		if conv != generalConv {
+			if c.lastDMAt == nil {
+				c.lastDMAt = map[string]time.Time{}
+			}
+			if peer := peerOf(c.me, conv); peer != "" {
+				c.lastDMAt[peer] = ts
+			}
+		} else if c.activeConv() != generalConv {
+			c.roomUnread++
+		}
+		c.pushLocalLine(localLine{
 			conv: conv,
 			kind: lineFileCard,
 			fileData: &fileCardData{
@@ -1418,8 +1579,20 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
+	case netDeliveredMsg:
+		// Peer acked one of ours: full confidence, undim the bubble.
+		// (Acks are best-effort frames themselves; a lost ack just leaves
+		// the bubble dimmed until the expiry sweep below.) Evict the
+		// cached bubble or the dimmed paint would stick.
+		if c.unackedUI != nil {
+			delete(c.unackedUI, msg.msgId)
+		}
+		c.evictRenderCache(msg.msgId)
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
 	case netFileErrMsg:
-		c.appendLine(tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		c.appendLocal(c.activeConv(), tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netReadyMsg:
@@ -1434,7 +1607,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:
-		c.appendLine(tuiErrStyle.Render("* " + msg.err.Error()))
+		c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netIdleMsg:
@@ -1473,8 +1646,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
-			cmds = append(cmds, c.doLeave(), tea.Quit)
-			return c, tea.Batch(cmds...)
+			// Leave first, quit when it completes (leaveDoneMsg→Quit):
+			// quitting alongside would kill the POST mid-flight.
+			return c, c.doLeave()
 		}
 		// The file browser owns ALL keys while open (it sits where the "/"
 		// drawer paints, one mode at a time).
@@ -1561,27 +1735,34 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 		pc = c.pending.conv
 	}
 
-	lastOfPending := -1
-	for i := range c.localLines {
-		if c.localLines[i].conv == pc {
-			lastOfPending = i
+	// Pin the echo row by its stored index (validated); scan only as a
+	// fallback for state predating the handle.
+	echoIdx := -1
+	if c.pending != nil && c.pending.localIdx >= 0 && c.pending.localIdx < len(c.localLines) &&
+		c.localLines[c.pending.localIdx].conv == pc {
+		echoIdx = c.pending.localIdx
+	} else {
+		for i := range c.localLines {
+			if c.localLines[i].conv == pc {
+				echoIdx = i
+			}
 		}
 	}
 
 	switch {
 	case msg.code == 429:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
 		}
 	case msg.code == 410:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
 		}
 	case msg.err != nil:
-		if lastOfPending >= 0 {
-			c.localLines[lastOfPending] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
+		if echoIdx >= 0 {
+			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
 		} else {
-			c.appendLocal(generalConv, tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
+			c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
 		}
 	default:
 		to := ""
@@ -1599,23 +1780,29 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
 		}
+		// Inbound traffic shares the seq counter and may have taken ours
+		// while sending: reallocate instead of dropping our message.
+		for c.rendered[m.Seq] || historyHasSeq(c.history, m.Seq) {
+			c.nextSeq++
+			m.Seq = c.nextSeq
+		}
 		c.rendered[m.Seq] = true
-		known := false
-		for _, h := range c.history {
-			if h.Seq == m.Seq {
-				known = true
-				break
-			}
-		}
-		if !known {
-			c.history = append(c.history, m)
-		}
-		if lastOfPending >= 0 {
-			c.localLines = append(c.localLines[:lastOfPending], c.localLines[lastOfPending+1:]...)
+		c.history = append(c.history, m)
+		if echoIdx >= 0 {
+			c.localLines = append(c.localLines[:echoIdx], c.localLines[echoIdx+1:]...)
 		}
 	}
 
 	c.pending = nil
+	// Track the confirmed send for delivery receipts: the bubble stays
+	// dimmed until the peer's ack arrives (netDeliveredMsg). Failures
+	// (429/410/500 + errors) keep their annotations instead.
+	if msg.err == nil && msg.code == 201 && msg.msgId != "" {
+		if c.unackedUI == nil {
+			c.unackedUI = map[string]time.Time{}
+		}
+		c.unackedUI[msg.msgId] = time.Now()
+	}
 	c.rebuildView()
 
 	if msg.code == 410 {
@@ -1673,11 +1860,20 @@ func (c chatScreen) peerAtY(y int, l layout) string {
 		return ""
 	}
 	row := y - l.rosterY0
-	if row < 0 || row >= l.rosterSlots {
+	if row < 0 {
 		return ""
 	}
+	// Mirror rosterBody(fill=vpHeight) exactly: title owns row -1 (above
+	// Y0), then users, then at most one "… +N more" overflow row which is
+	// not a user. The old slots/16-cap math disagreed with the render and
+	// sent clicks to hidden users (or nowhere on tall terminals).
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
-	if row >= len(online) {
+	bodySlots := maxInt(l.vpHeight-2, 0)
+	n := len(online)
+	if n > bodySlots {
+		n = bodySlots
+	}
+	if row >= n {
 		return ""
 	}
 	return online[row]
@@ -1837,7 +2033,12 @@ func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 		os.Exit(1)
 	}
 	scr.eng.stop()
-	_, _, _ = postJSON(scr.sig.endpoint("/leave"), map[string]any{}, scr.sig.headers())
+	if !leftSent.Load() {
+		// Backup for abnormal exits where doLeave never ran; normally a no-op.
+		if err := scr.sig.leaveRoom(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
+		}
+	}
 	fmt.Printf("\nYou left session %s.\n", key)
 }
 

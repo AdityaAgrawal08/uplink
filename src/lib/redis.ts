@@ -9,11 +9,14 @@ export interface IRedisClient {
   // Hash ops (rooms, members, inboxes). All values are strings.
   hsetnx(key: string, field: string, value: string): Promise<number>;
   hset(key: string, field: string, value: string): Promise<number>;
+  hget(key: string, field: string): Promise<string | null>;
   hgetall(key: string): Promise<Record<string, string> | null>;
   hdel(key: string, ...fields: string[]): Promise<number>;
   hlen(key: string): Promise<number>;
   // List ops (signaling queues).
   rpush(key: string, ...values: string[]): Promise<number>;
+  rpop(key: string): Promise<string | null>;
+  lrem(key: string, count: number, value: string): Promise<number>;
   lrange(key: string, start: number, stop: number): Promise<string[]>;
   ltrim(key: string, start: number, stop: number): Promise<string>;
   llen(key: string): Promise<number>;
@@ -25,7 +28,7 @@ export interface IRedisClient {
 // Results come back positionally; a failing command throws (fail-fast),
 // matching sequential semantics where the error would surface inline.
 export interface PipeOp {
-  cmd: "hsetnx" | "hset" | "expire" | "rpush" | "ltrim" | "del" | "hgetall" | "hdel" | "lrange" | "llen" | "hlen" | "incr";
+  cmd: "hsetnx" | "hset" | "hget" | "expire" | "rpush" | "rpop" | "lrem" | "ltrim" | "del" | "hgetall" | "hdel" | "lrange" | "llen" | "hlen" | "incr";
   key: string;
   args: Array<string | number>;
 }
@@ -88,16 +91,18 @@ export class MockRedis implements IRedisClient {
   async incr(key: string): Promise<number> {
     const item = this.store.get(key);
     let val = 0;
+    let expiry: number | null = null;
     if (item) {
       if (item.expiry && Date.now() > item.expiry) {
-        this.store.delete(key);
+        this.store.delete(key); // window rolled: fresh counter, fresh TTL
       } else {
         val = parseInt(item.value as string, 10);
         if (isNaN(val)) val = 0;
+        expiry = item.expiry;
       }
     }
     val += 1;
-    this.store.set(key, { value: String(val), expiry: item?.expiry || null, isObject: false });
+    this.store.set(key, { value: String(val), expiry, isObject: false });
     return val;
   }
 
@@ -178,6 +183,11 @@ export class MockRedis implements IRedisClient {
     return this.hashes.get(key)!.fields.size;
   }
 
+  async hget(key: string, field: string): Promise<string | null> {
+    if (this.expired(this.hashes, key)) return null;
+    return this.hashes.get(key)!.fields.get(field) ?? null;
+  }
+
   // ---- lists ----
 
   async rpush(key: string, ...values: string[]): Promise<number> {
@@ -194,6 +204,35 @@ export class MockRedis implements IRedisClient {
     const items = this.lists.get(key)!.items;
     const end = stop < 0 ? items.length + stop + 1 : stop + 1;
     return items.slice(Math.max(0, start), Math.max(0, end));
+  }
+
+  async rpop(key: string): Promise<string | null> {
+    if (this.expired(this.lists, key)) return null;
+    return this.lists.get(key)!.items.pop() ?? null;
+  }
+
+  async lrem(key: string, count: number, value: string): Promise<number> {
+    if (this.expired(this.lists, key)) return 0;
+    const items = this.lists.get(key)!.items;
+    let removed = 0;
+    if (count >= 0) {
+      for (let i = items.length - 1; i >= 0 && (count === 0 || removed < count); i--) {
+        if (items[i] === value) {
+          items.splice(i, 1);
+          removed++;
+        }
+      }
+    } else {
+      for (let i = 0; i < items.length && removed < -count; ) {
+        if (items[i] === value) {
+          items.splice(i, 1);
+          removed++;
+        } else {
+          i++;
+        }
+      }
+    }
+    return removed;
   }
 
   async ltrim(key: string, start: number, stop: number): Promise<string> {
@@ -218,8 +257,11 @@ export class MockRedis implements IRedisClient {
       switch (op.cmd) {
         case "hsetnx": out.push(await this.hsetnx(op.key, String(op.args[0]), String(op.args[1]))); break;
         case "hset": out.push(await this.hset(op.key, String(op.args[0]), String(op.args[1]))); break;
+        case "hget": out.push(await this.hget(op.key, String(op.args[0]))); break;
         case "expire": out.push(await this.expire(op.key, Number(op.args[0]))); break;
         case "rpush": out.push(await this.rpush(op.key, ...op.args.map(String))); break;
+        case "rpop": out.push(await this.rpop(op.key)); break;
+        case "lrem": out.push(await this.lrem(op.key, Number(op.args[0]), String(op.args[1]))); break;
         case "ltrim": out.push(await this.ltrim(op.key, Number(op.args[0]), Number(op.args[1]))); break;
         case "del": out.push(await this.del(op.key)); break;
         case "hgetall": out.push(await this.hgetall(op.key)); break;
@@ -381,12 +423,24 @@ export class LazyRedisClient implements IRedisClient {
     return this.executeWithFallback(c => c.hdel(key, ...fields));
   }
 
+  async hget(key: string, field: string): Promise<string | null> {
+    return this.executeWithFallback(c => c.hget(key, field));
+  }
+
   async hlen(key: string): Promise<number> {
     return this.executeWithFallback(c => c.hlen(key));
   }
 
   async rpush(key: string, ...values: string[]): Promise<number> {
     return this.executeWithFallback(c => c.rpush(key, ...values));
+  }
+
+  async rpop(key: string): Promise<string | null> {
+    return this.executeWithFallback(c => c.rpop(key));
+  }
+
+  async lrem(key: string, count: number, value: string): Promise<number> {
+    return this.executeWithFallback(c => c.lrem(key, count, value));
   }
 
   async lrange(key: string, start: number, stop: number): Promise<string[]> {

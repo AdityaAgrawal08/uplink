@@ -6,6 +6,8 @@ import { sweepRooms } from "@/lib/rooms";
 // Cron + opportunistic trigger: prune lapsed heartbeats, destroy emptied
 // rooms, drop vanished index entries. Per-room isolation inside sweepRooms;
 // this handler only maps the outcome to HTTP.
+export const dynamic = "force-dynamic"; // sweeping on GET must never be cached away
+
 export async function GET() {
   return performSessionCleanup();
 }

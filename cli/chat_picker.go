@@ -477,10 +477,12 @@ func (c *chatScreen) pickerConfirm() tea.Cmd {
 	for _, abs := range c.picker.buffered {
 		jobs = append(jobs, uploadJob{Path: abs, To: to})
 	}
-	// Clear persistent buffer — files are being sent.
+	// Clear persistent buffer — files are being sent. Close first: it
+	// syncs the buffer back from the picker, which would resurrect the
+	// just-cleared slice on reopen (duplicate re-upload).
+	c.closePicker(restore)
 	c.uploadBuf = nil
 	c.uploadBufSet = map[string]bool{}
-	c.closePicker(restore)
 	if len(jobs) == 0 {
 		return nil
 	}

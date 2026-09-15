@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 )
@@ -58,14 +59,33 @@ func (c *signalClient) headers() map[string]string {
 }
 
 // apiError extracts a server error message or falls back to status text.
+// Typed as *apiStatusError so callers can branch on status codes without
+// substring-matching formatted strings.
 func apiErr(code int, body []byte) error {
 	var r struct {
 		Error string `json:"error"`
 	}
 	if err := json.Unmarshal(body, &r); err == nil && r.Error != "" {
-		return fmt.Errorf("status %d: %s", code, r.Error)
+		return &apiStatusError{Code: code, Msg: r.Error}
 	}
-	return fmt.Errorf("status %d: %s", code, truncateStringPlain(string(body), 120))
+	return &apiStatusError{Code: code, Msg: truncateStringPlain(string(body), 120)}
+}
+
+// apiStatusError carries an HTTP status through the error chain.
+type apiStatusError struct {
+	Code int
+	Msg  string
+}
+
+func (e *apiStatusError) Error() string { return fmt.Sprintf("status %d: %s", e.Code, e.Msg) }
+
+// apiStatusCode unwraps the HTTP status (0 when unknown/transient).
+func apiStatusCode(err error) int {
+	var se *apiStatusError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	return 0
 }
 
 // createRoom mints a session code. password empty = open room.

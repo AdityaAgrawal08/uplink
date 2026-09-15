@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 var configKeys = map[string]string{
@@ -122,6 +123,13 @@ func handleConfigSet(args []string) {
 		}
 		m[key] = v
 	default:
+		if key == "server" {
+			if strings.TrimSpace(valStr) == "" {
+				fmt.Println("✗ server must not be empty")
+				os.Exit(1)
+			}
+			valStr = sanitizeServerUrl(valStr)
+		}
 		m[key] = valStr
 	}
 

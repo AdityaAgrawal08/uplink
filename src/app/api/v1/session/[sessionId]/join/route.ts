@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, clientIpHash } from "@/lib/rooms";
+import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, clientIpHash, assertRoomCode } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -12,6 +12,7 @@ export async function POST(
     validateSignalingEnv(); // fail fast without Redis env (no silent MockRedis split-brain)
     await checkJoinLimit(clientIpHash(req)); // membership mutations are Redis-op faucets
     const { sessionId } = await props.params;
+    assertRoomCode(sessionId); // malformed codes are 400, not "not found"
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { username, pubkey, password } = parsed.body;
