@@ -166,8 +166,10 @@ func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, pay
 	}
 }
 
+// openMicFrames resolves the capture chain (fallback candidates + status
+// name) and adapts it to the manager's micSrc signature.
 func openMicFrames() (<-chan []int16, func(), error) {
-	mc, err := openMic()
+	frames, stop, err := micSource()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -179,7 +181,7 @@ func openMicFrames() (<-chan []int16, func(), error) {
 			select {
 			case <-done:
 				return
-			case f, ok := <-mc.frames:
+			case f, ok := <-frames:
 				if !ok {
 					return
 				}
@@ -191,7 +193,7 @@ func openMicFrames() (<-chan []int16, func(), error) {
 			}
 		}
 	}()
-	return out, func() { close(done); mc.stop() }, nil
+	return out, func() { close(done); stop() }, nil
 }
 
 func openPlaySink() (func([]int16), func(), error) {
@@ -1128,44 +1130,91 @@ func (m *mediaManager) startMicTx() {
 	m.txVoice = txVoice
 	m.mu.Unlock()
 
+	source := ""
+	if v, ok := lastMicSource.Load().(string); ok {
+		source = v
+	}
+	if source != "" {
+		m.emit("mic source: " + source)
+	}
+
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
 		var seq uint16
 		var ts uint32
-		for {
-			select {
-			case <-stop:
+		for restart := 0; ; restart++ {
+			switch m.micRun(stop, txVoice, &seq, &ts, &frames) {
+			case micStopped:
 				return
-			case f, ok := <-frames:
-				if !ok {
+			case micSourceDied:
+				if restart >= 2 {
+					m.emit("mic capture ended — restart attempts exhausted; /audio off + on to retry")
 					return
 				}
-				pkt, err := txVoice.encode(f)
+				m.emit(fmt.Sprintf("mic capture ended — restarting (%d/3)", restart+2))
+				newFrames, newStop, err := m.micSrc()
 				if err != nil {
-					continue
-				}
-				seq++
-				ts += voiceFrameLen
-				m.mu.Lock()
-				t := m.transport
-				m.mu.Unlock()
-				if t == nil {
+					m.emit("mic restart failed: " + err.Error())
 					return
 				}
-				ap := encodeAudioPacket(seq, ts, pkt)
-				for _, peer := range t.readyPeers() {
-					m.mu.Lock()
-					inScope := m.audioTo[peer]
-					m.mu.Unlock()
-					if !inScope {
-						continue
-					}
-					_ = t.sendMedia(peer, mediaKindAudio, ap)
+				m.mu.Lock()
+				prev := m.stopMic
+				m.stopMic = newStop
+				m.mu.Unlock()
+				if prev != nil {
+					prev()
 				}
+				frames = newFrames
+				continue
 			}
 		}
 	}()
+}
+
+// micEnd distinguishes deliberate shutdown from a dead capture source.
+type micEnd int
+
+const (
+	micStopped micEnd = iota
+	micSourceDied
+)
+
+// micRun drives one capture-to-send loop until the source dies or the mic
+// stops. seq/ts continue across source restarts (RTP continuity).
+func (m *mediaManager) micRun(stop chan struct{}, txVoice *opusVoice, seq *uint16, ts *uint32, frames *<-chan []int16) micEnd {
+	for {
+		select {
+		case <-stop:
+			return micStopped
+		case f, ok := <-*frames:
+			if !ok {
+				return micSourceDied
+			}
+			pkt, err := txVoice.encode(f)
+			if err != nil {
+				continue
+			}
+			*seq++
+			*ts += voiceFrameLen
+			m.mu.Lock()
+			t := m.transport
+			m.mu.Unlock()
+			if t == nil {
+				return micSourceDied
+			}
+			ap := encodeAudioPacket(*seq, *ts, pkt)
+			for _, peer := range t.readyPeers() {
+				m.mu.Lock()
+				inScope := m.audioTo[peer]
+				m.mu.Unlock()
+				if !inScope {
+					continue
+				}
+				_ = t.sendMedia(peer, mediaKindAudio, ap)
+			}
+		}
+	}
 }
 
 // ensureAudioRx builds (once) the playout pipeline: 20ms tick over the

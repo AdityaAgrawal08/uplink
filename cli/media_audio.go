@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/tphakala/go-opus/opus"
 )
@@ -171,23 +173,128 @@ func testMic() bool {
 	return d == "test" || strings.HasPrefix(d, "test:")
 }
 
-// micCapture abstracts Linux pure-Go capture vs ffmpeg fallback.
+// micCapture abstracts a capture source (name feeds status lines).
 type micCapture struct {
+	name   string
 	frames chan []int16
 	stop   func()
 }
 
-func openMic() (*micCapture, error) {
+// micCandidate is one capture backend tried in order until one actually
+// produces frames (opening successfully is NOT enough: HDMI/webcam inputs
+// open fine and then read silence forever).
+type micCandidate struct {
+	name string
+	open func() (*micCapture, error)
+}
+
+func micCandidates() []micCandidate {
 	dev := micDevice()
+	var cands []micCandidate
 	if testMic() {
-		return openTestMic()
+		cands = append(cands, micCandidate{"test-sine", openTestMic})
+		return cands
 	}
 	if runtime.GOOS == "linux" {
-		if mc, err := openAlsaMic(dev); err == nil {
-			return mc, nil
+		cands = append(cands, micCandidate{"alsa:" + firstNonEmpty(dev, "auto"), func() (*micCapture, error) {
+			return openAlsaMic(dev)
+		}})
+	}
+	if dev != "" {
+		// An explicit device skips defaults: one ffmpeg attempt.
+		cands = append(cands, micCandidate{"ffmpeg:" + dev, openFFmpegMic})
+	} else {
+		cands = append(cands, micCandidate{"ffmpeg:default", openFFmpegMic})
+	}
+	return cands
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
+}
+
+// micFrameTimeout bounds the first-frame wait per candidate: an input that
+// opens but produces nothing must not stall the fallback chain.
+const micFrameTimeout = 2500 * time.Millisecond
+
+// lastMicSource records the capture backend that was actually selected
+// (startMicTx surfaces it in the "mic live" status line).
+var lastMicSource atomic.Value // string
+
+// openMicResilient tries every capture backend in order and keeps the
+// first one that actually yields frames. Emitted name lands in the
+// "mic live" status line so dead-device failures are visible.
+func openMicResilient() (*micCapture, string, error) {
+	var tried []string
+	for _, cand := range micCandidates() {
+		mc, err := cand.open()
+		if err != nil {
+			tried = append(tried, cand.name+" ("+err.Error()+")")
+			continue
+		}
+		select {
+		case _, ok := <-mc.frames:
+			if !ok {
+				tried = append(tried, cand.name+" (closed)")
+				continue
+			}
+			// Feed the frame back: the TX loop consumes it next.
+			fwd := &frameForwarder{in: mc.frames}
+			refill := fwd.start()
+			return &micCapture{name: cand.name, frames: refill,
+				stop: func() { fwd.stop(); mc.stop() }}, cand.name, nil
+		case <-time.After(micFrameTimeout):
+			mc.stop()
+			tried = append(tried, cand.name+" (no frames)")
 		}
 	}
-	return openFFmpegMic()
+	return nil, "", fmt.Errorf("no capture device produced audio — tried: %s", strings.Join(tried, "; "))
+}
+
+// frameForwarder relays frames into a fresh channel after the first-frame
+// probe consumed one (single close guaranteed).
+type frameForwarder struct {
+	in   <-chan []int16
+	out  chan []int16
+	done chan struct{}
+	once sync.Once
+}
+
+func (f *frameForwarder) start() chan []int16 {
+	f.out = make(chan []int16, 64)
+	f.done = make(chan struct{})
+	go func() {
+		defer close(f.out)
+		for {
+			select {
+			case <-f.done:
+				return
+			case g, ok := <-f.in:
+				if !ok {
+					return
+				}
+				select {
+				case f.out <- g:
+				case <-f.done:
+					return
+				}
+			}
+		}
+	}()
+	return f.out
+}
+
+func (f *frameForwarder) stop() { f.once.Do(func() { close(f.done) }) }
+
+// micSource is the manager-facing wrapper: selects the backend and records
+// its name for status lines.
+func micSource() (<-chan []int16, func(), error) {
+	mc, name, err := openMicResilient()
+	lastMicSource.Store(name)
+	return mc.frames, mc.stop, err
 }
 
 // openTestMic synthesizes a 440Hz sine at 48kHz mono (UPLINK_MIC=test):
@@ -312,11 +419,34 @@ func speakerArgs() []string {
 		"-f", "s16le", "-ar", "48000", "-ac", "1", "-i", "pipe:0"}
 }
 
+// openPaplay pipes raw PCM through paplay with explicit wire format.
+func openPaplay() (*speaker, error) {
+	cmd := exec.Command("paplay", "--raw",
+		"--format=s16le", "--rate=48000", "--channels=1")
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stdout, cmd.Stderr = nil, nil
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return newSpeaker(in, cmd), nil
+}
+
 func openSpeaker() (*speaker, error) {
 	// Test hook: UPLINK_SPEAKER_OUT writes raw s16le to a file (loopback
 	// verification without a sound device).
 	if path := os.Getenv("UPLINK_SPEAKER_OUT"); path != "" {
 		return openFileSpeaker(path)
+	}
+	// paplay first: native PulseAudio/PipeWire playback — low latency, no
+	// buffering surprises (ffplay's pipe buffering was a plausible audio
+	// killer on Linux desktops). ffplay is the portable fallback.
+	if _, err := exec.LookPath("paplay"); err == nil {
+		if s, err := openPaplay(); err == nil {
+			return s, nil
+		}
 	}
 	cmd := exec.Command("ffplay", speakerArgs()...)
 	in, err := cmd.StdinPipe()

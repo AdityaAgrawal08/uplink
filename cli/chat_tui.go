@@ -408,16 +408,17 @@ type netVideoMsg struct{ lines []string }
 // netSelfVideoMsg carries one local-camera preview frame.
 type netSelfVideoMsg struct{ lines []string }
 
-// paneContent stacks remote video over the local preview ("you"), each
-// labeled; either half may be absent.
+// paneContent paints ONE feed: the remote publisher's video. The local
+// self-view shows only when nobody else is publishing (it never stacks
+// under a remote feed — two pictures in one small pane read as a glitch).
 func (c *chatScreen) paneContent() []string {
-	var out []string
-	out = append(out, c.videoLines...)
-	if len(c.selfLines) > 0 {
-		out = append(out, tuiPaletteHintStyle.Render("— you —"))
-		out = append(out, c.selfLines...)
+	if len(c.videoLines) > 0 {
+		return append([]string(nil), c.videoLines...)
 	}
-	return out
+	if len(c.selfLines) == 0 {
+		return nil
+	}
+	return append([]string{tuiPaletteHintStyle.Render("— you —")}, c.selfLines...)
 }
 
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either

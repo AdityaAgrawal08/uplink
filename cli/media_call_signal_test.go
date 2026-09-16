@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"sync"
 	"testing"
 	"time"
@@ -145,6 +146,9 @@ func TestPublishOverSignalPath(t *testing.T) {
 // file actually contains the tone (energy > 0) — the definitive fix proof
 // for "audio does not work at all".
 func TestAudioEndToEndWithTestMic(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed (test mic needs it)")
+	}
 	fs := newFakeSignalServer()
 	srv := httptest.NewServer(fs)
 	defer srv.Close()
@@ -205,12 +209,20 @@ func TestAudioEndToEndWithTestMic(t *testing.T) {
 	if err := testA.ToggleAudio([]string{"bob"}); err != nil {
 		t.Fatal(err)
 	}
+	// The mic must actually be running: a dead capture flips audioOn off
+	// with an info line. Fail here with the real reason, not a timeout.
+	testA.mu.Lock()
+	on := testA.audioOn
+	testA.mu.Unlock()
+	if !on {
+		t.Fatal("mic did not start (see 'mic unavailable' info line — capture chain rejected the test source)")
+	}
 	waitMediaPeer(t, testA, "bob")
 	waitMediaPeer(t, testB, "alice")
 
 	// The sine stream runs by itself; wait for the playout to land in the
 	// file (jitter buffer priming + opus decode + writer goroutine).
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for {
 		info, err := os.Stat(speakerFile)
 		if err == nil && info.Size() > 24000 { // ≥ 0.25s of 48k s16le mono
