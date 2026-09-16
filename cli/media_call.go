@@ -516,7 +516,11 @@ func (m *mediaManager) publishAnnounce() error {
 }
 
 // PublishTo announces to scope members missed earlier (late joiners) and
-// prunes leavers. Streams whose scope empties stop themselves.
+// prunes leavers. Live scope members join the send scope for every kind
+// that is on: announcing without admitting them would complete the
+// handshake yet never send them a frame (late joiners saw "media
+// secured" and then silence forever). Streams whose scope empties stop
+// themselves.
 func (m *mediaManager) PublishTo(scope []string) {
 	m.mu.Lock()
 	if !m.videoOn && !m.audioOn {
@@ -541,6 +545,16 @@ func (m *mediaManager) PublishTo(scope []string) {
 			delete(m.audioTo, p)
 			delete(m.replied, p)
 			m.maybeForgetJoinLocked(p)
+		}
+	}
+	if m.videoOn {
+		for p := range live {
+			m.videoTo[p] = true
+		}
+	}
+	if m.audioOn {
+		for p := range live {
+			m.audioTo[p] = true
 		}
 	}
 	var fresh []string
