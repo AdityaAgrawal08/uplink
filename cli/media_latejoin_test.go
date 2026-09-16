@@ -108,20 +108,18 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 			onInfo:       func(i string) { fmt.Println("C:", i) },
 			onVideoFrame: func(lines []string) { rendered <- lines },
 		})
-	mcPlaySink := mc.playSink
 	mc.playSink = func() (*speaker, error) {
-		sp, err := mcPlaySink()
+		// File speaker, not the default device sink: CI runners have no
+		// ffplay/paplay, and the assertion is playout delivery (counted
+		// frames), not audible sound.
+		sp, err := openFileSpeaker(t.TempDir() + "/carol.pcm")
 		if err != nil {
 			return nil, err
 		}
-		inner := sp.onPlay
 		sp.onPlay = func(pcm []int16) {
 			heardMu.Lock()
 			heard++
 			heardMu.Unlock()
-			if inner != nil {
-				inner(pcm)
-			}
 		}
 		return sp, nil
 	}
