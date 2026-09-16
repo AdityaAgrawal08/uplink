@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/tphakala/go-opus/opus"
@@ -156,6 +158,19 @@ func rmsLevel(pcm []int16) float64 {
 	return math.Sqrt(sum / float64(len(pcm)))
 }
 
+// micDevice resolves the capture device from UPLINK_MIC:
+//   - unset/empty → system default (ALSA enumeration on Linux)
+//   - "test"      → synthetic sine (full-chain self-test without a mic)
+//   - otherwise   → exact device name for ALSA/ffmpeg
+func micDevice() string {
+	return os.Getenv("UPLINK_MIC")
+}
+
+func testMic() bool {
+	d := micDevice()
+	return d == "test" || strings.HasPrefix(d, "test:")
+}
+
 // micCapture abstracts Linux pure-Go capture vs ffmpeg fallback.
 type micCapture struct {
 	frames chan []int16
@@ -163,23 +178,81 @@ type micCapture struct {
 }
 
 func openMic() (*micCapture, error) {
+	dev := micDevice()
+	if testMic() {
+		return openTestMic()
+	}
 	if runtime.GOOS == "linux" {
-		if mc, err := openAlsaMic(); err == nil {
+		if mc, err := openAlsaMic(dev); err == nil {
 			return mc, nil
 		}
 	}
 	return openFFmpegMic()
 }
 
+// openTestMic synthesizes a 440Hz sine at 48kHz mono (UPLINK_MIC=test):
+// proves capture → Opus → UDP → jitter → playout end to end with zero
+// hardware, and lets a user verify the app path in one tab.
+func openTestMic() (*micCapture, error) {
+	if err := requireFFmpeg("test mic"); err != nil {
+		return nil, err
+	}
+	cmd := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:sample_rate=%d", voiceRate),
+		"-f", "s16le", "-ac", "1", "-ar", fmt.Sprint(voiceRate), "pipe:1")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start test mic: %w", err)
+	}
+	out := make(chan []int16, 50)
+	done := make(chan struct{})
+	go func() {
+		defer close(out)
+		defer cmd.Process.Kill()
+		chunker := &frameChunker{}
+		buf := make([]byte, voiceFrameLen*2*4)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := io.ReadFull(stdout, buf)
+			if err != nil {
+				return
+			}
+			for _, f := range chunker.push(bytesToS16(buf[:n])) {
+				select {
+				case out <- f:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return &micCapture{frames: out, stop: func() { close(done) }}, nil
+}
+
 func openFFmpegMic() (*micCapture, error) {
 	var args []string
+	dev := micDevice()
 	switch runtime.GOOS {
 	case "darwin":
-		args = []string{"-f", "avfoundation", "-i", ":0", "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
+		args = []string{"-f", "avfoundation", "-i", ":" + dev, "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
 	case "windows":
-		args = []string{"-f", "dshow", "-i", "audio=default", "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
+		if dev == "" {
+			dev = "audio=default"
+		}
+		args = []string{"-f", "dshow", "-i", dev, "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
 	default:
-		args = []string{"-f", "alsa", "-i", "default", "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
+		if dev == "" {
+			dev = "default"
+		}
+		args = []string{"-f", "alsa", "-i", dev, "-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
 	}
 	cmd := exec.Command("ffmpeg", args...)
 	stdout, err := cmd.StdoutPipe()
@@ -220,14 +293,32 @@ func openFFmpegMic() (*micCapture, error) {
 }
 
 // speaker plays PCM frames through ffplay (ships with ffmpeg, every OS).
+// Writes happen on a dedicated goroutine with drop-oldest semantics: a
+// stalled ffplay must shed audio, never stall the 20ms playout ticker
+// (a blocking write there silently killed audio in the field).
 type speaker struct {
-	mu  sync.Mutex
-	in  io.WriteCloser
-	cmd *exec.Cmd
+	mu     sync.Mutex
+	in     io.WriteCloser
+	cmd    *exec.Cmd
+	queue  chan []int16
+	done   chan struct{}
+	once   sync.Once
+	closed chan struct{}
+}
+
+func speakerArgs() []string {
+	return []string{"-nodisp", "-autoexit",
+		"-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32",
+		"-f", "s16le", "-ar", "48000", "-ac", "1", "-i", "pipe:0"}
 }
 
 func openSpeaker() (*speaker, error) {
-	cmd := exec.Command("ffplay", "-nodisp", "-autoexit", "-f", "s16le", "-ar", "48000", "-ac", "1", "-i", "pipe:0")
+	// Test hook: UPLINK_SPEAKER_OUT writes raw s16le to a file (loopback
+	// verification without a sound device).
+	if path := os.Getenv("UPLINK_SPEAKER_OUT"); path != "" {
+		return openFileSpeaker(path)
+	}
+	cmd := exec.Command("ffplay", speakerArgs()...)
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -236,17 +327,67 @@ func openSpeaker() (*speaker, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start ffplay (is ffmpeg installed?): %w", err)
 	}
-	return &speaker{in: in, cmd: cmd}, nil
+	return newSpeaker(in, cmd), nil
+}
+
+// openFileSpeaker is the deterministic sink used by tests and the
+// UPLINK_SPEAKER_OUT hook: frames append verbatim to a raw PCM file.
+func openFileSpeaker(path string) (*speaker, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, err
+	}
+	return newSpeaker(f, nil), nil
+}
+
+func newSpeaker(in io.WriteCloser, cmd *exec.Cmd) *speaker {
+	s := &speaker{
+		in:     in,
+		cmd:    cmd,
+		queue:  make(chan []int16, 16),
+		done:   make(chan struct{}),
+		closed: make(chan struct{}),
+	}
+	go s.writer()
+	return s
+}
+
+func (s *speaker) writer() {
+	defer close(s.closed)
+	for {
+		select {
+		case <-s.done:
+			return
+		case pcm := <-s.queue:
+			if _, err := s.in.Write(s16ToBytes(pcm)); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (s *speaker) play(pcm []int16) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, _ = s.in.Write(s16ToBytes(pcm))
+	// Drop-if-full: gaps beat a stalled playout loop (the ticker must
+	// advance or the jitter clock desyncs and audio dies).
+	select {
+	case s.queue <- pcm:
+	default:
+	}
 }
 
 func (s *speaker) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	select {
+	case <-s.done:
+		return
+	default:
+	}
+	close(s.done)
+	<-s.closed
 	s.in.Close()
-	s.cmd.Process.Kill()
-	_ = s.cmd.Wait()
+	if s.cmd != nil {
+		s.cmd.Process.Kill()
+		_ = s.cmd.Wait()
+	}
 }

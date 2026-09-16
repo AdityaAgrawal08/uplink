@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"net/http/httptest"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -135,4 +136,109 @@ func TestPublishOverSignalPath(t *testing.T) {
 	}
 	ma.stopAll()
 	mb.stopAll()
+}
+
+// TestAudioEndToEndWithTestMic proves the whole audio chain with real
+// capture and real playout: UPLINK_MIC=test (synthetic sine → real
+// frameChunker → real Opus) on the publisher, UPLINK_SPEAKER_OUT (raw
+// PCM file sink replacing ffplay) on the receiver. Asserts the receiver's
+// file actually contains the tone (energy > 0) — the definitive fix proof
+// for "audio does not work at all".
+func TestAudioEndToEndWithTestMic(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sid, err := sigA.createRoom("alice", base64.StdEncoding.EncodeToString(ida.publicKey()), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	if _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Synthetic capture: the sine source feeds the real pipeline.
+	testA := newMediaManager("alice", ida,
+		func(to, typ, payload string) error { return sigA.signalSend(to, typ, payload) },
+		func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} },
+		mediaUICallbacks{})
+	speakerFile := t.TempDir() + "/bob.pcm"
+	testB := newMediaManager("bob", idb,
+		func(to, typ, payload string) error { return sigB.signalSend(to, typ, payload) },
+		func() map[string][]byte { return map[string][]byte{"alice": ida.publicKey()} },
+		mediaUICallbacks{})
+	for _, m := range []*mediaManager{testA, testB} {
+		m.dialIP = "127.0.0.1"
+	}
+	testA.micSrc = func() (<-chan []int16, func(), error) {
+		mc, err := openTestMic()
+		if err != nil {
+			return nil, nil, err
+		}
+		return mc.frames, mc.stop, nil
+	}
+	var sp *speaker
+	testB.playSink = func() (func([]int16), func(), error) {
+		s, err := openFileSpeaker(speakerFile)
+		if err != nil {
+			t.Fatalf("file speaker: %v", err)
+		}
+		sp = s
+		return s.play, s.close, nil
+	}
+
+	ea := newEngineWithStun("alice", ida, sigA, engineCallbacks{
+		onSignalNote: func(n signalNote) { testA.onSignalNote(n) },
+	}, []string{})
+	eb := newEngineWithStun("bob", idb, sigB, engineCallbacks{
+		onSignalNote: func(n signalNote) { testB.onSignalNote(n) },
+	}, []string{})
+	ea.start()
+	eb.start()
+	defer ea.stop()
+	defer eb.stop()
+
+	if err := testA.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	waitMediaPeer(t, testA, "bob")
+	waitMediaPeer(t, testB, "alice")
+
+	// The sine stream runs by itself; wait for the playout to land in the
+	// file (jitter buffer priming + opus decode + writer goroutine).
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		info, err := os.Stat(speakerFile)
+		if err == nil && info.Size() > 24000 { // ≥ 0.25s of 48k s16le mono
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no playout landed in the speaker file (size=%v)", info)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// Energy check: a sine must dominate silence.
+	raw, err := os.ReadFile(speakerFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	energy := 0
+	for i := 0; i+1 < len(raw); i += 2 {
+		v := int(int16(uint16(raw[i]) | uint16(raw[i+1])<<8))
+		energy += v * v / 65536
+	}
+	if energy < 1000 {
+		t.Fatalf("playout file has no signal (energy=%d)", energy)
+	}
+	// Stop: the file speaker closes cleanly (no hang).
+	if err := testA.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	testA.stopAll()
+	testB.stopAll()
+	_ = sp
 }

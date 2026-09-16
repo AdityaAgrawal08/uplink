@@ -25,12 +25,12 @@ import (
 // VP8 pipeline. On a LAN the larger frame size is irrelevant.
 
 const (
-	videoWidth   = 320
-	videoHeight  = 240
+	videoWidth   = 480
+	videoHeight  = 360
 	videoFPS     = 15
-	videoQuality = 5 // -q:v: 2=best, 31=worst; 5 ≈ 25–40KB @ 320x240
+	videoQuality = 3 // -q:v: 2=best, 31=worst; 3 ≈ sharp faces at 480x360
 
-	videoAssembleMaxFrags = 64
+	videoAssembleMaxFrags = 96
 	videoAssembleTTL      = 5 * time.Second
 )
 

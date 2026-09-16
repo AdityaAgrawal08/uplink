@@ -6,6 +6,6 @@ import "fmt"
 
 // openAlsaMic is Linux-only upstream; other platforms use the ffmpeg
 // fallback in openMic.
-func openAlsaMic() (*micCapture, error) {
+func openAlsaMic(string) (*micCapture, error) {
 	return nil, fmt.Errorf("ALSA capture is Linux-only")
 }

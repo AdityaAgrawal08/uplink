@@ -135,23 +135,34 @@ type mediaManager struct {
 	// path healing
 	lastHeal  map[string]time.Time
 	healTries int
+	// Session establishment with retries: one lost probe or one lost
+	// announce must never permanently strand a peer (the old join ran
+	// exactly once — intermittent "works for some users" came from this).
+	peerAnn     map[string]mediaAnnouncePayload // last announce per publisher (re-join coords)
+	joinTries   map[string]int
+	lastJoinAt  map[string]time.Time
+	joinVerdict map[string]bool // honest "unreachable" line already shown
 }
 
 func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb mediaUICallbacks) *mediaManager {
 	return &mediaManager{
 		me: me, id: id, sendNote: sendNote, roster: roster, cb: cb,
-		lanIPs:     localLANIPs,
-		micSrc:     openMicFrames,
-		playSink:   openPlaySink,
-		videoTo:    map[string]bool{},
-		audioTo:    map[string]bool{},
-		pubVideo:   map[string]bool{},
-		pubAudio:   map[string]bool{},
-		replied:    map[string]bool{},
-		rxJbs:      map[string]*jitterBuffer{},
-		lastHeal:   map[string]time.Time{},
-		renderCols: videoPaneDefaultCols,
-		renderRows: videoPaneDefaultRows,
+		lanIPs:      localLANIPs,
+		micSrc:      openMicFrames,
+		playSink:    openPlaySink,
+		videoTo:     map[string]bool{},
+		audioTo:     map[string]bool{},
+		pubVideo:    map[string]bool{},
+		pubAudio:    map[string]bool{},
+		replied:     map[string]bool{},
+		rxJbs:       map[string]*jitterBuffer{},
+		lastHeal:    map[string]time.Time{},
+		peerAnn:     map[string]mediaAnnouncePayload{},
+		joinTries:   map[string]int{},
+		lastJoinAt:  map[string]time.Time{},
+		joinVerdict: map[string]bool{},
+		renderCols:  videoPaneDefaultCols,
+		renderRows:  videoPaneDefaultRows,
 	}
 }
 
@@ -500,12 +511,14 @@ func (m *mediaManager) PublishTo(scope []string) {
 		if !live[p] {
 			delete(m.videoTo, p)
 			delete(m.replied, p)
+			m.maybeForgetJoinLocked(p)
 		}
 	}
 	for p := range m.audioTo {
 		if !live[p] {
 			delete(m.audioTo, p)
 			delete(m.replied, p)
+			m.maybeForgetJoinLocked(p)
 		}
 	}
 	var fresh []string
@@ -530,6 +543,18 @@ func (m *mediaManager) PublishTo(scope []string) {
 		m.replied[to] = true
 		m.mu.Unlock()
 	}
+}
+
+// maybeForgetJoinLocked drops join-retry state when a peer is no longer
+// either side of a media relationship. Runs under m.mu.
+func (m *mediaManager) maybeForgetJoinLocked(p string) {
+	if m.pubVideo[p] || m.pubAudio[p] {
+		return
+	}
+	delete(m.peerAnn, p)
+	delete(m.joinTries, p)
+	delete(m.lastJoinAt, p)
+	delete(m.joinVerdict, p)
 }
 
 // sendAnnounce posts our UDP coords + mask to one peer.
@@ -689,6 +714,14 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 		if needReply {
 			m.replied[n.From] = true
 		}
+		// Fresh announce coordinates + retry budget reset: re-announces
+		// are the recovery signal for both sides.
+		if ann.Live && (ann.Video || ann.Audio) {
+			m.peerAnn[n.From] = ann
+			m.joinTries[n.From] = 0
+			m.joinVerdict[n.From] = false
+			delete(m.lastJoinAt, n.From)
+		}
 		m.mu.Unlock()
 		if needReply {
 			// Watcher join-reply carries our coords for the publisher's
@@ -717,6 +750,12 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 		}
 		nowVideo := m.pubVideo[n.From]
 		nowAudio := m.pubAudio[n.From]
+		if !nowVideo && !nowAudio {
+			delete(m.peerAnn, n.From)
+			delete(m.joinTries, n.From)
+			delete(m.lastJoinAt, n.From)
+			delete(m.joinVerdict, n.From)
+		}
 		if !nowVideo && m.rxPinned == n.From {
 			m.rxPinned = ""
 		}
@@ -770,6 +809,12 @@ func (m *mediaManager) mediaCB() mediaCallbacks {
 		onAudio: m.onRemoteAudio,
 		onVideo: m.onVideoFrag,
 		onReady: func(peer, code string) {
+			m.mu.Lock()
+			m.lastHeal[peer] = time.Now() // fresh session: full heal window
+			delete(m.joinVerdict, peer)
+			delete(m.joinTries, peer)
+			delete(m.lastJoinAt, peer)
+			m.mu.Unlock()
 			m.emit("media secured with " + peer)
 		},
 		onLost:  func(peer string) { m.emit("media line lost to " + peer + " — rejoining on traffic") },
@@ -1333,6 +1378,7 @@ func (m *mediaManager) stopAll() {
 	m.pubVideo, m.pubAudio, m.replied = map[string]bool{}, map[string]bool{}, map[string]bool{}
 	m.rxPinned, m.audioPinned = "", ""
 	m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
+	m.peerAnn, m.joinTries, m.lastJoinAt, m.joinVerdict = map[string]mediaAnnouncePayload{}, map[string]int{}, map[string]time.Time{}, map[string]bool{}
 	m.started = false
 	scope := sortedKeys(m.videoTo)
 	audioScope := sortedKeys(m.audioTo)
@@ -1426,12 +1472,22 @@ func (m *mediaManager) expectedPeers() []string {
 	for p := range m.pubAudio {
 		add(p)
 	}
+	for p := range m.peerAnn {
+		add(p)
+	}
 	return out
 }
 
-// healthCheck re-probes expected-but-silent peers (a blackholed route
-// after DHCP renew / AP roam / wrong candidate). Throttled per peer; every
-// outcome gets one honest verdict line.
+const (
+	joinRetryEvery  = 3 * time.Second
+	maxJoinTries    = 10
+	publishRenotify = 6 * time.Second
+)
+
+// healthCheck is the maintenance tick: it both retries session
+// establishment (a lost probe or announce must not strand a peer forever —
+// the old fire-once join is why media "worked for some users") and heals
+// live-but-silent sessions.
 func (m *mediaManager) healthCheck() {
 	expected := m.expectedPeers()
 	if len(expected) == 0 {
@@ -1443,39 +1499,97 @@ func (m *mediaManager) healthCheck() {
 	if t == nil {
 		return
 	}
+	now := time.Now()
 	for _, p := range expected {
-		d := t.diagPeer(p)
-		if !d.Ready || d.LastRxAge <= callWatchdogAfter {
-			continue
-		}
+		// Still relevant? (stops and leavers clear the sets before this.)
 		m.mu.Lock()
-		if time.Since(m.lastHeal[p]) < healEvery {
+		weSend := m.videoTo[p] || m.audioTo[p]
+		theySend := m.pubVideo[p] || m.pubAudio[p]
+		ann, haveAnn := m.peerAnn[p]
+		if !weSend && !theySend {
+			delete(m.peerAnn, p)
+			delete(m.joinTries, p)
+			delete(m.lastJoinAt, p)
+			delete(m.joinVerdict, p)
 			m.mu.Unlock()
 			continue
 		}
-		m.lastHeal[p] = time.Now()
-		m.healTries++
+		tries := m.joinTries[p]
+		lastJoin := m.lastJoinAt[p]
+		verdictShown := m.joinVerdict[p]
 		m.mu.Unlock()
-		m.healPeer(p)
+
+		d := t.diagPeer(p)
+		switch {
+		case !d.Ready:
+			// Session never formed: retry the join, both directions.
+			if time.Since(lastJoin) < joinRetryEvery || tries >= maxJoinTries {
+				if tries >= maxJoinTries && !verdictShown {
+					m.mu.Lock()
+					m.joinVerdict[p] = true
+					m.mu.Unlock()
+					m.emit("media to " + p + " not reachable after " +
+						fmt.Sprint(maxJoinTries) + " join attempts — AP isolation or firewall likely")
+				}
+				continue
+			}
+			m.mu.Lock()
+			m.joinTries[p]++
+			m.lastJoinAt[p] = now
+			m.mu.Unlock()
+			if weSend {
+				// Re-announce: fresh coords, watcher re-joins us.
+				_ = m.sendAnnounce(p, true)
+			}
+			if theySend && haveAnn {
+				// Re-join from the stored announce + re-reply so the
+				// publisher can also re-dial us.
+				m.joinPeer(p, ann)
+				_ = m.sendAnnounce(p, false)
+			}
+		case d.LastRxAge > callWatchdogAfter:
+			// Live session gone quiet: heal the path (bounded).
+			m.mu.Lock()
+			if time.Since(m.lastHeal[p]) < healEvery {
+				m.mu.Unlock()
+				continue
+			}
+			m.lastHeal[p] = now
+			m.healTries++
+			m.mu.Unlock()
+			m.healPeer(p)
+		}
 	}
 }
 
-// healPeer re-checks a silent peer's route and asks for a fresh handshake.
-// The peer's own announce (roster tick) re-supplies a moved port.
+// emitJoinInfo is intentionally unused: retries are silent, outcomes are
+// loud ("media secured with X" / the unreachable verdict line).
+
+// healPeer re-checks a silent peer's route from BOTH sides: restart the
+// handshake and, when the route may have moved, exchange fresh announce
+// coords (publisher re-announces; watcher re-joins from stored coords).
 func (m *mediaManager) healPeer(peer string) {
 	m.mu.Lock()
 	t := m.transport
+	weSend := m.videoTo[peer] || m.audioTo[peer]
+	ann, haveAnn := m.peerAnn[peer]
 	m.mu.Unlock()
 	if t == nil {
 		return
 	}
 	if d := t.diagPeer(peer); d.Addr == "" {
-		return // no route yet; joinPeer handles first contact
+		return // no route yet; the join retry handles first contact
 	}
 	if t.lastRxAt(peer).After(time.Now().Add(-callWatchdogAfter)) {
 		return // traffic resumed while we scheduled
 	}
 	t.sendRestart(peer)
+	if weSend {
+		_ = m.sendAnnounce(peer, true)
+	}
+	if haveAnn {
+		m.joinPeer(peer, ann)
+	}
 	m.emit("media to " + peer + " silent " + callWatchdogAfter.String() + "+ — re-probing path")
 }
 

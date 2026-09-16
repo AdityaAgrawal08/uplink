@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -265,14 +264,21 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	}
 	c.users = users
 
-	// Full slots: deterministic height, overflow indicator present.
+	// Overflow: the list SCROLLS (scrollbar thumb paints) instead of a
+	// "+N more" row — every user stays reachable by scrolling.
 	out := c.rosterBody(rosterMaxVisible + 1) // fill = title + N slots
 	rows := strings.Split(out, "\n")
 	if len(rows) != rosterMaxVisible+1 {
 		t.Fatalf("full roster height = %d rows; want %d", len(rows), rosterMaxVisible+1)
 	}
-	if !strings.Contains(out, "+") || !strings.Contains(out, "more") {
-		t.Error("overflow indicator missing")
+	if !strings.Contains(out, "█") {
+		t.Error("scrollbar thumb missing on overflow")
+	}
+	// Every user stays reachable by scrolling: the synced viewport content
+	// covers all users.
+	c.syncRosterVp()
+	if c.rosterVp.TotalLineCount() != len(users) {
+		t.Errorf("scroll content must cover all users: %d != %d", c.rosterVp.TotalLineCount(), len(users))
 	}
 
 	// Fewer slots than users: panel SHRINKS (never inflates short frames).
@@ -281,15 +287,15 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	if len(shrunkRows) != 4 {
 		t.Fatalf("shrunken roster height = %d; want 4", len(rows))
 	}
-	if !regexp.MustCompile(`\+\d+ more`).MatchString(shrunk) {
-		t.Errorf("overflow indicator missing in tight column:\n%s", shrunk)
+	if !strings.Contains(shrunk, "█") {
+		t.Errorf("scrollbar missing in tight column:\n%s", shrunk)
 	}
 
-	// More slots than users: padded, no overflow marker.
+	// More slots than users: padded, no scrollbar thumb.
 	c2 := &chatScreen{me: "me", users: []string{"me", "alice"}}
 	sparse := c2.rosterBody(8)
-	if strings.Contains(sparse, "more") {
-		t.Errorf("overflow indicator shown despite fitting: %q", sparse)
+	if strings.Contains(sparse, "█") {
+		t.Errorf("scrollbar thumb shown despite fitting: %q", sparse)
 	}
 	if rows := strings.Split(sparse, "\n"); len(rows) != 8 {
 		t.Fatalf("sparse roster height = %d; want 8", len(rows))
@@ -330,7 +336,9 @@ func TestRefreshViewportWrapsToWidth(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func mouseAt(x, y int) tea.MouseMsg {
-	return tea.MouseMsg{Type: tea.MouseLeft, X: x, Y: y}
+	// Legacy field sets are normalized by handleMouse (Type MouseLeft +
+	// unset Action/Button = left press).
+	return tea.MouseMsg{Type: tea.MouseLeft, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: x, Y: y}
 }
 
 func TestHandleMouseHitTest(t *testing.T) {
