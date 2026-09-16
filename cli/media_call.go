@@ -86,7 +86,7 @@ type mediaManager struct {
 	sendNote func(to, noteType, payload string) error
 	roster   func() map[string][]byte
 	micSrc   func() (<-chan []int16, func(), error)
-	playSink func() (func([]int16), func(), error)
+	playSink func() (*speaker, error)
 	cb       mediaUICallbacks
 	lanIPs   func() []string
 	dialIP   string // test hook: pins advertised coords to loopback
@@ -111,6 +111,7 @@ type mediaManager struct {
 	// camera live-cycle (nil unless streaming)
 	cameraStop    chan struct{}
 	stopCameraSrc func()
+	cameraGen     uint64        // TX loop generation: stale loops exit (M2)
 	previewQ      chan vidFrame // self-view queue (bounded, drop-oldest)
 	videoOnFlag   bool          // camera loop running (videoOn is the toggle)
 	videoFeeds    map[string]*videoFeed
@@ -157,6 +158,9 @@ type mediaManager struct {
 	annRxAt      map[string]time.Time // last mediaLive received
 	lastWantSent map[string]time.Time // last media-want sent
 	lastRenotify time.Time            // last scope-wide re-announce
+	// absentTicks counts consecutive roster ticks a scope member has been
+	// missing (prune grace against heartbeat flaps; see pruneGraceTicks).
+	absentTicks map[string]int
 }
 
 func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb mediaUICallbacks) *mediaManager {
@@ -181,6 +185,7 @@ func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, pay
 		joinVerdict:  map[string]bool{},
 		annRxAt:      map[string]time.Time{},
 		lastWantSent: map[string]time.Time{},
+		absentTicks:  map[string]int{},
 		renderCols:   videoPaneDefaultCols,
 		renderRows:   videoPaneDefaultRows,
 	}
@@ -216,12 +221,8 @@ func openMicFrames() (<-chan []int16, func(), error) {
 	return out, func() { close(done); stop() }, nil
 }
 
-func openPlaySink() (func([]int16), func(), error) {
-	sp, err := openSpeaker()
-	if err != nil {
-		return nil, nil, err
-	}
-	return sp.play, sp.close, nil
+func openPlaySink() (*speaker, error) {
+	return openSpeaker()
 }
 
 // localLANIPs returns usable local IPv4s, best first: skip virtual/docker/
@@ -450,7 +451,21 @@ func (m *mediaManager) ToggleVideo(scope []string) error {
 	if err := m.publishAnnounce(); err != nil {
 		return err
 	}
-	return m.startCameraTx()
+	if err := m.startCameraTx(); err != nil {
+		// Camera failed AFTER the announce: withdraw so watchers don't
+		// complete handshakes and wait on a stream that will never come
+		// (heal-loop "silent" churn against a dead publisher).
+		m.mu.Lock()
+		scope := sortedKeys(m.videoTo)
+		m.videoTo = map[string]bool{}
+		m.videoOn = false
+		m.mu.Unlock()
+		for _, to := range scope {
+			m.sendStop(to, true, false)
+		}
+		return err
+	}
+	return nil
 }
 
 // ToggleAudio turns the mic on (announce to scope) or off (media-stop).
@@ -533,16 +548,23 @@ func (m *mediaManager) PublishTo(scope []string) {
 			live[p] = true
 		}
 	}
-	for p := range m.videoTo {
-		if !live[p] {
-			delete(m.videoTo, p)
-			delete(m.replied, p)
-			m.maybeForgetJoinLocked(p)
-		}
-	}
-	for p := range m.audioTo {
-		if !live[p] {
-			delete(m.audioTo, p)
+	// Prune grace: a scope member missing from one tick is usually a
+	// flapped heartbeat, not a leaver. Count consecutive absences and
+	// prune only past the grace window; presence clears the count.
+	// Without this, one missed 5s beat on a 2s tick tore down live
+	// streams (camera loops, sessions, ffmpeg respawns).
+	for _, set := range []map[string]bool{m.videoTo, m.audioTo} {
+		for p := range set {
+			if live[p] {
+				delete(m.absentTicks, p)
+				continue
+			}
+			m.absentTicks[p]++
+			if m.absentTicks[p] < pruneGraceTicks {
+				continue
+			}
+			delete(m.absentTicks, p)
+			delete(set, p)
 			delete(m.replied, p)
 			m.maybeForgetJoinLocked(p)
 		}
@@ -564,12 +586,19 @@ func (m *mediaManager) PublishTo(scope []string) {
 		}
 	}
 	videoOn, audioOn := len(m.videoTo) > 0, len(m.audioTo) > 0
+	wasPublishing := m.videoOn || m.audioOn
 	m.mu.Unlock()
 	if m.videoOn && !videoOn {
 		m.stopVideoPublish()
 	}
 	if m.audioOn && !audioOn {
 		m.stopAudioPublish()
+	}
+	// Scope-shift line: the publish continues but to a different set than
+	// the toggle described (DM↔room move, joiners, leavers past grace).
+	// Without this the header chips are the only clue and toasts get lost.
+	if wasPublishing && (len(fresh) > 0 || !videoOn || !audioOn) {
+		m.emit("sharing now covers: " + describeScope(m.currentSendScope()))
 	}
 	for _, to := range fresh {
 		if err := m.sendAnnounce(to, true); err != nil {
@@ -580,6 +609,26 @@ func (m *mediaManager) PublishTo(scope []string) {
 		m.mu.Unlock()
 	}
 }
+
+// currentSendScope unions both send scopes for status lines.
+func (m *mediaManager) currentSendScope() map[string]bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := map[string]bool{}
+	for p := range m.videoTo {
+		out[p] = true
+	}
+	for p := range m.audioTo {
+		out[p] = true
+	}
+	return out
+}
+
+// pruneGraceTicks is how many consecutive 2s roster ticks a scope member
+// may be absent before PublishTo prunes them. Heartbeats run every 5s, so
+// a single missed beat must never kill a live stream (flapping roster =
+// stop/restart churn, torn-down camera loops, ffmpeg respawns).
+const pruneGraceTicks = 3
 
 // maybeForgetJoinLocked drops join-retry state when a peer is no longer
 // either side of a media relationship. Runs under m.mu.
@@ -920,6 +969,8 @@ func (m *mediaManager) startCameraTx() error {
 	m.mu.Lock()
 	m.cameraStop = stop
 	m.stopCameraSrc = stopSrc
+	m.cameraGen++
+	gen := m.cameraGen
 	if m.previewQ == nil {
 		m.previewQ = make(chan vidFrame, 4)
 	}
@@ -930,11 +981,29 @@ func (m *mediaManager) startCameraTx() error {
 		defer m.wg.Done()
 		defer func() {
 			m.mu.Lock()
-			m.videoOnFlag = false
+			// Only the current generation clears the flag: a stale
+			// loop exiting late must not mark a fresh stream dead.
+			if m.cameraGen == gen {
+				m.videoOnFlag = false
+			}
 			m.mu.Unlock()
 		}()
 		var n uint64
 		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Generation gate: a loop superseded by a fast off→on
+			// toggle exits instead of double-sending on the new frames
+			// channel (duplicate seq/ts traffic + double preview).
+			m.mu.Lock()
+			stale := m.cameraGen != gen
+			m.mu.Unlock()
+			if stale {
+				return
+			}
 			select {
 			case <-stop:
 				return
@@ -1302,18 +1371,28 @@ func (m *mediaManager) startMicTx() {
 	}
 	frames, stopMic, err := m.micSrc()
 	if err != nil {
+		scope := sortedKeys(m.audioTo)
 		m.audioOn = false
 		m.audioTo = map[string]bool{}
 		m.mu.Unlock()
+		// Announce already went out in ToggleAudio: withdraw it, or
+		// watchers handshake and wait on silence (heal churn).
+		for _, to := range scope {
+			m.sendStop(to, false, true)
+		}
 		m.emit("mic unavailable: " + err.Error())
 		return
 	}
 	txVoice, err := newOpusVoice()
 	if err != nil {
 		stopMic()
+		scope := sortedKeys(m.audioTo)
 		m.audioOn = false
 		m.audioTo = map[string]bool{}
 		m.mu.Unlock()
+		for _, to := range scope {
+			m.sendStop(to, false, true)
+		}
 		m.emit("opus init failed: " + err.Error())
 		return
 	}
@@ -1464,12 +1543,13 @@ func (m *mediaManager) ensureAudioRx() {
 		m.mu.Unlock()
 		return
 	}
-	play, stopPlay, err := m.playSink()
+	sp, err := m.playSink()
 	if err != nil {
 		m.mu.Unlock()
 		m.emit("speaker unavailable: " + err.Error())
 		return
 	}
+	play, stopPlay := sp.play, sp.close
 	rxVoice, err := newOpusVoice()
 	if err != nil {
 		stopPlay()
@@ -1501,12 +1581,26 @@ func (m *mediaManager) ensureAudioRx() {
 		}()
 		ticker := time.NewTicker(20 * time.Millisecond)
 		defer ticker.Stop()
+		speakerDead := false
 		last := map[string][]byte{}
+		fecStreak := map[string]int{}
+		// fecMaxStreak caps PLC extrapolation per talker: Opus in-band
+		// FEC is only valid for the packet immediately after the
+		// reference. Repeating FEC from the same stale packet every tick
+		// synthesizes a robotic hum forever; after the cap the talker
+		// contributes silence until real packets resume.
+		const fecMaxStreak = 8
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
+				// Speaker death surfaces once (paplay/ffplay killed
+				// externally reads as permanent silence otherwise).
+				if !speakerDead && sp.Dead() {
+					speakerDead = true
+					m.emit("speaker output failed (device unplugged?) — toggling /audio re-arms playout")
+				}
 				m.mu.Lock()
 				anyPublisher := len(m.pubAudio) > 0
 				rxV := m.rxVoice
@@ -1545,13 +1639,15 @@ func (m *mediaManager) ensureAudioRx() {
 					pkt, gap := tk.jb.pop()
 					var pcm []int16
 					if gap {
-						if ref, ok := last[tk.peer]; ok {
+						if ref, ok := last[tk.peer]; ok && fecStreak[tk.peer] < fecMaxStreak {
 							if fec, err := tk.dec.decodeFEC(ref); err == nil {
 								pcm = fec
+								fecStreak[tk.peer]++
 							}
 						}
 					} else {
 						last[tk.peer] = pkt.Opus
+						fecStreak[tk.peer] = 0
 						if d, err := tk.dec.decode(pkt.Opus); err == nil {
 							pcm = d
 						}
@@ -1571,18 +1667,27 @@ func (m *mediaManager) ensureAudioRx() {
 					continue
 				}
 				mixed := make([]int16, voiceFrameLen)
-				for i, s := range acc {
-					// Soft clip: linear near zero, saturating at full
-					// scale no matter how many talkers overlap.
-					f := float64(s) / 32768.0
-					f = f / (1 + absF(f)/float64(active))
-					if f > 1 {
-						f = 1
+				// Normalize only on actual clip: a lone talker passes
+				// through bit-transparent (the old always-on soft curve
+				// halved single-speaker peaks); overlap scales to fit.
+				var peak int32
+				for _, s := range acc {
+					if s < 0 {
+						s = -s
 					}
-					if f < -1 {
-						f = -1
+					if s > peak {
+						peak = s
 					}
-					mixed[i] = int16(f * 32767)
+				}
+				if peak <= 32767 {
+					for i, s := range acc {
+						mixed[i] = int16(s)
+					}
+				} else {
+					gain := float64(32767) / float64(peak)
+					for i, s := range acc {
+						mixed[i] = int16(float64(s) * gain)
+					}
 				}
 				play(mixed)
 			}
@@ -1621,13 +1726,6 @@ func (m *mediaManager) onRemoteAudio(peer string, pkt audioPacket) {
 	}
 	m.mu.Unlock()
 	jb.push(pkt)
-}
-
-func absF(f float64) float64 {
-	if f < 0 {
-		return -f
-	}
-	return f
 }
 
 // ─── Stops ──────────────────────────────────────────────────────────────────
@@ -1910,8 +2008,10 @@ func (m *mediaManager) healthCheck() {
 			}
 			if theySend && haveAnn {
 				// Re-join from the stored announce + re-reply so the
-				// publisher can also re-dial us.
-				m.joinPeer(p, ann)
+				// publisher can also re-dial us. Async: nominate blocks
+				// up to 600ms and must never stall the 2s health tick
+				// (with N peers the tick would drift seconds behind).
+				go m.joinPeer(p, ann)
 				_ = m.sendAnnounce(p, false)
 			}
 			// They publish (or published) but their last announce is
@@ -1953,9 +2053,13 @@ func (m *mediaManager) healthCheck() {
 	}
 	m.mu.Unlock()
 	if renotify {
-		for _, to := range scope {
-			_ = m.sendAnnounce(to, true)
-		}
+		// Async: signalSend is an HTTP POST per peer; the 2s tick must
+		// not wait on the network.
+		go func(targets []string) {
+			for _, to := range targets {
+				_ = m.sendAnnounce(to, true)
+			}
+		}(scope)
 	}
 }
 

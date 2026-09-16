@@ -502,6 +502,8 @@ type speaker struct {
 	done   chan struct{}
 	once   sync.Once
 	closed chan struct{}
+	dead   atomic.Bool   // writer hit a write error (device gone)
+	onPlay func([]int16) // test hook: observes frames before queueing
 }
 
 func speakerArgs() []string {
@@ -581,15 +583,22 @@ func (s *speaker) writer() {
 			return
 		case pcm := <-s.queue:
 			if _, err := s.in.Write(s16ToBytes(pcm)); err != nil {
+				s.dead.Store(true)
 				return
 			}
 		}
 	}
 }
 
+// Dead reports whether the output device failed (write error).
+func (s *speaker) Dead() bool { return s.dead.Load() }
+
 func (s *speaker) play(pcm []int16) {
 	// Drop-if-full: gaps beat a stalled playout loop (the ticker must
 	// advance or the jitter clock desyncs and audio dies).
+	if s.onPlay != nil {
+		s.onPlay(pcm)
+	}
 	select {
 	case s.queue <- pcm:
 	default:

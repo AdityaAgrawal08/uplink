@@ -14,6 +14,21 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+// testSpeaker builds a file-backed speaker (writer goroutine drains to a
+// temp file, never blocks playout) with an optional play counter.
+func testSpeaker(t *testing.T, mu *sync.Mutex, heard *int) (*speaker, error) {
+	t.Helper()
+	sp, err := openFileSpeaker(t.TempDir() + "/speaker.pcm")
+	if err != nil {
+		return nil, err
+	}
+	if mu != nil && heard != nil {
+		sp.onPlay = func([]int16) { mu.Lock(); *heard++; mu.Unlock() }
+	}
+	t.Cleanup(sp.close)
+	return sp, nil
+}
+
 // publishPair wires two managers note-to-note (no server, no hardware):
 // synthetic mic + camera, counted playback, drained state/info lines.
 type publishPair struct {
@@ -69,10 +84,8 @@ func newPublishPair(t *testing.T) *publishPair {
 	ma.dialIP, mb.dialIP = "127.0.0.1", "127.0.0.1"
 	ma.micSrc = func() (<-chan []int16, func(), error) { return p.feedA, func() {}, nil }
 	mb.micSrc = func() (<-chan []int16, func(), error) { return nil, func() {}, nil }
-	ma.playSink = func() (func([]int16), func(), error) { return func([]int16) {}, func() {}, nil }
-	mb.playSink = func() (func([]int16), func(), error) {
-		return func([]int16) { mu.Lock(); heard++; mu.Unlock() }, func() {}, nil
-	}
+	ma.playSink = func() (*speaker, error) { return testSpeaker(t, nil, nil) }
+	mb.playSink = func() (*speaker, error) { return testSpeaker(t, &mu, &heard) }
 	ma.videoSrcFn = func() (<-chan vidFrame, func(), error) { return p.cameraA, func() {}, nil }
 	ma.SetRoster(func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} })
 	mb.SetRoster(func() map[string][]byte { return map[string][]byte{"alice": ida.publicKey()} })
