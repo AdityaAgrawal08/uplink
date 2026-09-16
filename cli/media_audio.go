@@ -225,6 +225,12 @@ const micFrameTimeout = 2500 * time.Millisecond
 // (startMicTx surfaces it in the "mic live" status line).
 var lastMicSource atomic.Value // string
 
+// micSilenceFloor is the peak amplitude below which a probe window counts
+// as digital silence. A live mic's noise floor (room, fan, hiss) virtually
+// always exceeds this; a dead HDMI/monitor input reads exact zeros. Kept
+// low so a quiet room never rejects a working mic.
+const micSilenceFloor = 64
+
 // openMicResilient tries every capture backend in order and keeps the
 // first one that actually yields frames. Emitted name lands in the
 // "mic live" status line so dead-device failures are visible.
@@ -236,23 +242,57 @@ func openMicResilient() (*micCapture, string, error) {
 			tried = append(tried, cand.name+" ("+err.Error()+")")
 			continue
 		}
-		select {
-		case _, ok := <-mc.frames:
-			if !ok {
-				tried = append(tried, cand.name+" (closed)")
-				continue
-			}
-			// Feed the frame back: the TX loop consumes it next.
-			fwd := &frameForwarder{in: mc.frames}
-			refill := fwd.start()
-			return &micCapture{name: cand.name, frames: refill,
-				stop: func() { fwd.stop(); mc.stop() }}, cand.name, nil
-		case <-time.After(micFrameTimeout):
+		// Energy-gated probe: opening is not enough (dead inputs open
+		// fine and read silence forever). Accept only a candidate whose
+		// window peak clears the digital-silence floor.
+		peak, ok := probeMicPeak(mc.frames)
+		if !ok {
 			mc.stop()
-			tried = append(tried, cand.name+" (no frames)")
+			tried = append(tried, cand.name+" (closed)")
+			continue
 		}
+		if peak < micSilenceFloor {
+			mc.stop()
+			tried = append(tried, cand.name+" (silent)")
+			continue
+		}
+		// Feed frames back: the TX loop consumes from here on.
+		fwd := &frameForwarder{in: mc.frames}
+		refill := fwd.start()
+		return &micCapture{name: cand.name, frames: refill,
+			stop: func() { fwd.stop(); mc.stop() }}, cand.name, nil
 	}
 	return nil, "", fmt.Errorf("no capture device produced audio — tried: %s", strings.Join(tried, "; "))
+}
+
+// probeMicPeak drains the probe window and returns its peak amplitude.
+// ok=false only when the channel closes with zero frames. Early-accepts
+// on a loud frame so a live mic doesn't stall the toggle for the full
+// window; quiet-but-alive inputs use the whole window to prove it.
+func probeMicPeak(frames <-chan []int16) (peak int, ok bool) {
+	deadline := time.After(micFrameTimeout)
+	for {
+		select {
+		case f, alive := <-frames:
+			if !alive {
+				return peak, peak > 0
+			}
+			for _, v := range f {
+				a := int(v)
+				if a < 0 {
+					a = -a
+				}
+				if a > peak {
+					peak = a
+				}
+			}
+			if peak >= 512 {
+				return peak, true
+			}
+		case <-deadline:
+			return peak, true
+		}
+	}
 }
 
 // frameForwarder relays frames into a fresh channel after the first-frame

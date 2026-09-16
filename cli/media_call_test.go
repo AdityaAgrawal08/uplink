@@ -7,6 +7,7 @@ import (
 	"image/jpeg"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -266,7 +267,48 @@ func mkVideoFrags(t *testing.T, f vidFrame, ts uint32) []videoFrag {
 	return out
 }
 
-func TestVideoPinSecondSender(t *testing.T) {
+func TestVideoTwoPublishersBothPaint(t *testing.T) {
+	m := newMediaManager("alice", nil, nil, nil, mediaUICallbacks{})
+	rendered := make(chan []string, 8)
+	m.cb.onVideoFrame = func(lines []string) { rendered <- lines }
+	m.mu.Lock()
+	m.pubVideo["bob"] = true
+	m.pubVideo["carol"] = true
+	m.mu.Unlock()
+	fb := jpegFrame(t, 10, 200, 10)
+	fc := jpegFrame(t, 200, 10, 10)
+	for _, fr := range mkVideoFrags(t, fb, 1001) {
+		m.onVideoFrag("bob", fr)
+	}
+	for _, fr := range mkVideoFrags(t, fc, 2002) {
+		m.onVideoFrag("carol", fr)
+	}
+	// Both feeds must hold independent RX state (no shared pin/assembler).
+	m.mu.Lock()
+	_, hasB := m.videoFeeds["bob"]
+	_, hasC := m.videoFeeds["carol"]
+	m.mu.Unlock()
+	if !hasB || !hasC {
+		t.Fatal("both publishers must hold independent feeds")
+	}
+	// The grid must paint BOTH peers' tiles (not just one pinned feed).
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case lines := <-rendered:
+			joined := strings.Join(lines, "\n")
+			if strings.Contains(joined, "bob") && strings.Contains(joined, "carol") {
+				return // both tiles painted
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("grid never painted both publishers' tiles")
+		}
+	}
+}
+
+func TestVideoStopOneKeepsSurvivor(t *testing.T) {
 	m := newMediaManager("alice", nil, nil, nil, mediaUICallbacks{})
 	rendered := make(chan []string, 8)
 	m.cb.onVideoFrame = func(lines []string) { rendered <- lines }
@@ -278,90 +320,116 @@ func TestVideoPinSecondSender(t *testing.T) {
 	for _, fr := range mkVideoFrags(t, f, 1001) {
 		m.onVideoFrag("bob", fr)
 	}
-	m.mu.Lock()
-	pinned := m.rxPinned
-	m.mu.Unlock()
-	if pinned != "bob" {
-		t.Fatalf("first sender must pin; pinned=%q", pinned)
-	}
-	select {
-	case lines := <-rendered:
-		if len(lines) == 0 {
-			t.Fatal("empty render")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("pinned frame never rendered")
-	}
-	// Let the paint throttle window pass before the re-pin assertions.
-	time.Sleep(videoRenderMinInterval + 40*time.Millisecond)
-	// Second sender while pinned: ignored entirely.
 	for _, fr := range mkVideoFrags(t, f, 2002) {
 		m.onVideoFrag("carol", fr)
 	}
-	select {
-	case lines := <-rendered:
-		t.Fatalf("second sender must not render while pinned (%d lines)", len(lines))
-	default:
+	// Drain until both paint, then stop bob: carol must survive without
+	// shared-pipeline teardown.
+	deadline := time.Now().Add(2 * time.Second)
+both:
+	for {
+		select {
+		case lines := <-rendered:
+			joined := strings.Join(lines, "\n")
+			if strings.Contains(joined, "bob") && strings.Contains(joined, "carol") {
+				break both
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("grid never painted both tiles before stop")
+		}
 	}
-	// After silence, the pin yields to the new sender.
+	m.onSignalNote(signalNote{From: "bob", Type: mediaStop, Payload: `{"video":true}`})
 	m.mu.Lock()
-	m.rxPinAt = time.Now().Add(-videoPinTimeout - time.Second)
+	_, hasB := m.videoFeeds["bob"]
+	_, hasC := m.videoFeeds["carol"]
 	m.mu.Unlock()
-	for _, fr := range mkVideoFrags(t, f, 3003) {
-		m.onVideoFrag("carol", fr)
+	if hasB {
+		t.Fatal("stopped publisher's feed must be dropped")
 	}
-	m.mu.Lock()
-	pinned = m.rxPinned
-	m.mu.Unlock()
-	if pinned != "carol" {
-		t.Fatalf("pin must yield after silence; pinned=%q", pinned)
+	if !hasC {
+		t.Fatal("survivor's feed must persist across another's stop")
 	}
-	// The paint throttle (70ms) may shed this frame; wait past it.
-	deadline := time.Now().Add(time.Second)
-	for len(rendered) == 0 && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	select {
-	case <-rendered:
-	case <-time.After(time.Second):
-		t.Fatal("unpinned frame never rendered")
+	// Carol alone must still paint.
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		select {
+		case lines := <-rendered:
+			if strings.Contains(strings.Join(lines, "\n"), "carol") {
+				return
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("survivor stopped painting after peer stop")
+		}
 	}
 }
 
-func TestAudioPinSwitchesSpeakers(t *testing.T) {
+func TestRenderGridLayout(t *testing.T) {
+	f := jpegFrame(t, 10, 200, 10)
+	one := renderGrid([]namedFrame{{"bob", f}}, 40, 12)
+	if len(one) == 0 {
+		t.Fatal("single tile must render")
+	}
+	if !strings.Contains(one[0], "bob") {
+		t.Fatalf("first row must label the peer; got %q", one[0])
+	}
+	if got := ansiWidth(stripANSIGrid(one[0])); got != 40 {
+		t.Fatalf("tile row width %d; want 40", got)
+	}
+	two := renderGrid([]namedFrame{{"a", f}, {"b", f}, {"c", f}, {"d", f}}, 40, 16)
+	if len(two) == 0 {
+		t.Fatal("2x2 grid must render")
+	}
+	joined := strings.Join(two, "\n")
+	for _, p := range []string{"a", "b", "c", "d"} {
+		if !strings.Contains(joined, p) {
+			t.Fatalf("grid missing tile %q", p)
+		}
+	}
+	if got := renderGrid(nil, 40, 12); got != nil {
+		t.Fatal("empty grid must be nil")
+	}
+}
+
+func stripANSIGrid(s string) string {
+	var sb strings.Builder
+	inEsc := false
+	for _, r := range s {
+		if r == 0x1b {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEsc = false
+			}
+			continue
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
+}
+
+func TestAudioBothTalkersDecoded(t *testing.T) {
 	m := newMediaManager("alice", nil, nil, nil, mediaUICallbacks{})
 	m.mu.Lock()
 	m.pubAudio["bob"] = true
 	m.pubAudio["carol"] = true
 	m.mu.Unlock()
-	pkt := audioPacket{}
-	for i := 0; i < 5; i++ {
-		m.onRemoteAudio("bob", pkt)
-	}
-	m.mu.Lock()
-	pinned := m.audioPinned
-	m.mu.Unlock()
-	if pinned != "bob" {
-		t.Fatalf("first talker must pin; pinned=%q", pinned)
-	}
-	// Carol talks while bob still active: bob keeps the speaker.
+	pkt := audioPacket{Opus: []byte{0x01}}
+	m.onRemoteAudio("bob", pkt)
 	m.onRemoteAudio("carol", pkt)
+	// Each talker owns a decoder: no shared state, no pin.
 	m.mu.Lock()
-	pinned = m.audioPinned
+	_, hasB := m.rxDecs["bob"]
+	_, hasC := m.rxDecs["carol"]
+	_, hasJB := m.rxJbs["bob"]
 	m.mu.Unlock()
-	if pinned != "bob" {
-		t.Fatalf("active talker must hold the pin; pinned=%q", pinned)
-	}
-	// After 2s of silence, carol takes over.
-	m.mu.Lock()
-	m.audioPinAt = time.Now().Add(-audioPinTimeout - time.Second)
-	m.mu.Unlock()
-	m.onRemoteAudio("carol", pkt)
-	m.mu.Lock()
-	pinned = m.audioPinned
-	m.mu.Unlock()
-	if pinned != "carol" {
-		t.Fatalf("pin must switch after silence; pinned=%q", pinned)
+	if !hasB || !hasC || !hasJB {
+		t.Fatal("both talkers need decoders + jitter buffers")
 	}
 }
 
@@ -410,5 +478,140 @@ func TestVideoSidebarSplitAndScroll(t *testing.T) {
 	l2 := sc.layoutFor()
 	if l2.videoRows != 0 || l2.rosterY0 >= l.rosterY0 {
 		t.Fatal("video collapse must return rows to the roster")
+	}
+}
+
+func TestKeepaliveOnStalledMic(t *testing.T) {
+	p := newPublishPair(t)
+	// Mic source that never yields (stalled capture): the keepalive
+	// ticker must still hold the session open.
+	stalled := make(chan []int16)
+	p.a.micSrc = func() (<-chan []int16, func(), error) { return stalled, func() {}, nil }
+	if err := p.a.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	waitMediaPeer(t, p.a, "bob")
+	waitMediaPeer(t, p.b, "alice")
+	// 3s of total mic silence: keepalive pings (1/s) must keep lastRx
+	// fresh, so no heal verdict fires and the session stays Ready.
+	time.Sleep(3 * time.Second)
+	if d := p.b.transport.diagPeer("alice"); d.LastRxAge > 3*time.Second {
+		t.Fatalf("keepalive failed: lastRx age %v", d.LastRxAge)
+	}
+	if !p.a.transport.peerReady("bob") || !p.b.transport.peerReady("alice") {
+		t.Fatal("session must survive a stalled mic")
+	}
+	select {
+	case s := <-p.states:
+		if strings.Contains(s, "silent") || strings.Contains(s, "re-probing") {
+			t.Fatalf("no heal verdict may fire on a ping-held path: %q", s)
+		}
+	default:
+	}
+}
+
+func TestProbeMicPeakGatesSilence(t *testing.T) {
+	quiet := make(chan []int16, 4)
+	loud := make(chan []int16, 4)
+	silent := make([]int16, voiceFrameLen) // exact digital zeros
+	tone := make([]int16, voiceFrameLen)
+	for i := range tone {
+		tone[i] = 4000
+	}
+	quiet <- silent
+	loud <- tone
+	if peak, ok := probeMicPeak(quiet); !ok || peak >= micSilenceFloor {
+		t.Fatalf("silent input must probe below floor: peak=%d ok=%v", peak, ok)
+	}
+	if peak, ok := probeMicPeak(loud); !ok || peak < micSilenceFloor {
+		t.Fatalf("live input must clear the floor: peak=%d ok=%v", peak, ok)
+	}
+	closed := make(chan []int16)
+	close(closed)
+	if _, ok := probeMicPeak(closed); ok {
+		t.Fatal("closed channel must report not-ok")
+	}
+}
+
+func TestLateJoinerSeesRunningPublisher(t *testing.T) {
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	var mbRef atomic.Value // *mediaManager, set when bob joins late
+	sendToBob := func(to, typ, payload string) error {
+		if to != "bob" {
+			return nil
+		}
+		if mb, ok := mbRef.Load().(*mediaManager); ok && mb != nil {
+			mb.onSignalNote(signalNote{From: "alice", Type: typ, Payload: payload})
+		}
+		return nil // bob absent: note lost (the late-joiner hole)
+	}
+	ma := newMediaManager("alice", ida, sendToBob,
+		func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} },
+		mediaUICallbacks{})
+	ma.dialIP = "127.0.0.1"
+	frames := make(chan vidFrame, 8)
+	ma.videoSrcFn = func() (<-chan vidFrame, func(), error) { return frames, func() {}, nil }
+	feed := make(chan []int16, 64)
+	ma.micSrc = func() (<-chan []int16, func(), error) { return feed, func() {}, nil }
+	t.Cleanup(ma.stopAll)
+	if err := ma.ToggleVideo([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ma.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	// Bob joins LATE, after both streams run: no announce is in flight.
+	mb := newMediaManager("bob", idb,
+		func(to, typ, payload string) error {
+			ma.onSignalNote(signalNote{From: "bob", Type: typ, Payload: payload})
+			return nil
+		},
+		func() map[string][]byte { return map[string][]byte{"alice": ida.publicKey()} },
+		mediaUICallbacks{})
+	mb.dialIP = "127.0.0.1"
+	mbRef.Store(mb)
+	t.Cleanup(mb.stopAll)
+	rendered := make(chan []string, 8)
+	mb.cb.onVideoFrame = func(lines []string) { rendered <- lines }
+	// Force the scope-wide re-announce (normally every 6s via healthCheck).
+	ma.mu.Lock()
+	ma.lastRenotify = time.Now().Add(-10 * time.Second)
+	ma.mu.Unlock()
+	ma.healthCheck()
+	// Bob must learn, join, and render without any toggle from alice.
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		mb.mu.Lock()
+		watching := len(mb.pubVideo) > 0
+		mb.mu.Unlock()
+		if watching {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("late joiner never learned the running publisher")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitMediaPeer(t, ma, "bob")
+	waitMediaPeer(t, mb, "alice")
+	go func() {
+		f := jpegFrame(t, 10, 200, 10)
+		for {
+			select {
+			case frames <- f:
+				time.Sleep(66 * time.Millisecond)
+			case <-time.After(20 * time.Second):
+				return
+			}
+		}
+	}()
+	select {
+	case lines := <-rendered:
+		if len(lines) == 0 {
+			t.Fatal("empty late-join render")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("late joiner never rendered the running stream")
 	}
 }

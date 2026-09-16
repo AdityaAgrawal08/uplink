@@ -209,7 +209,10 @@ func (m *mediaTransport) beatOnce() {
 		}
 		if p.verifyPending && p.hs != nil {
 			// Roster may have learned the peer since: bounded retries.
-			if p.hsTries >= 3 {
+			// Late joiners routinely miss the first roster snapshots, so
+			// the window is generous — a completed handshake is expensive
+			// to throw away and the manager re-joins anyway.
+			if p.hsTries >= 6 {
 				p.hs = nil
 				p.verifyPending = false
 				delete(m.hsEpoch, username)
