@@ -63,6 +63,10 @@ type engineCallbacks struct {
 	onPeerReady func(username, safetyCode string)
 	onPeerLost  func(username string)
 	onError     func(err error)
+	// onSignalNote receives non-chat signal types (call control, media
+	// handshake). The engine owns the only signal drain; consumers of
+	// other note types subscribe here instead of polling.
+	onSignalNote func(note signalNote)
 }
 
 type fileAssembly struct {
@@ -521,6 +525,10 @@ func (e *engine) onNote(n signalNote) {
 		e.mesh.deliver(n)
 	case noiseSig1, noiseSig2, noiseSig3:
 		e.onHandshakeNote(n)
+	default:
+		if e.cb.onSignalNote != nil {
+			e.cb.onSignalNote(n)
+		}
 	}
 }
 

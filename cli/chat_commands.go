@@ -27,6 +27,8 @@ var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
+	{Name: "/video", Desc: "toggle camera to your DM peer / the room"},
+	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -168,18 +170,73 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	return computeLayoutWithPalette(c.width, c.height, c.status != "", c.paletteRows())
+	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), c.videoActive())
+	// Video box claims the top of the sidebar column (mockup: VIDEO/AUDIO
+	// above ONLINE). Bounded to half the column so the roster never starves;
+	// collapsed entirely when too short to be useful.
+	l.videoRows = 0
+	if l.sidebarOn && c.videoActive() {
+		cols, frameRows, streams := videoPaneGeom(c, l)
+		pane := streams*frameRows + (streams - 1) // frames + divider
+		want := pane + 1 + 2                      // title + border
+		if len(c.videoLines) == 0 && len(c.selfLines) == 0 {
+			want = 1 + 3 + 2 // hint + "waiting" placeholder rows + border
+		}
+		l.videoRows = min(want, l.vpHeight/2)
+		if l.videoRows < 6 {
+			l.videoRows = 0
+		}
+		_ = cols
+	}
+	l.rosterY0 += l.videoRows
+	return l
+}
+
+// videoPaneGeom is the single source of truth for the ASCII picture size:
+// the picture tracks the pane's real width (the old fixed-56-col render
+// inside a ~20-col viewport cropped ~40% of every frame), with rows from
+// the 4:3 aspect at the cell dot ratio (braille 2px×4px, half-block 1px×2px
+// — both 3/8 rows per column), capped by the sidebar's half-height budget.
+// Uses l.sidebarWidth, never sidebarInnerWidth (which re-derives the
+// layout — infinite recursion).
+func videoPaneGeom(c chatScreen, l layout) (cols, frameRows, streams int) {
+	cols = l.sidebarWidth - 2
+	streams = 1
+	if len(c.selfLines) > 0 {
+		streams = 2
+	}
+	frameRows = cols * 3 / 8
+	budget := (l.vpHeight/2 - 4) / streams
+	if frameRows > budget {
+		frameRows = budget
+	}
+	if frameRows < 3 {
+		frameRows = 3
+	}
+	return cols, frameRows, streams
 }
 
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot: the file browser
-// (picker) or the "/" command list.
+// (picker) or the "/" command list. (Remote video lives in the sidebar, not
+// here.)
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
 	return c.paletteView(maxW)
+}
+
+// videoActive reports whether the video pane should paint: publishing,
+// receiving, or waiting for the first frame (the pane itself is the proof
+// the UI path works — it must never stay invisible while video is on).
+// Stale frames alone don't hold the split: flags own the layout.
+func (c chatScreen) videoActive() bool {
+	if c.call == nil {
+		return false
+	}
+	return c.call.VideoOn() || c.call.RxOn() || c.call.Watching()
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -311,6 +368,10 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
+	case "/video":
+		return c.toggleVideo()
+	case "/audio":
+		return c.toggleAudio()
 	default:
 		return nil
 	}

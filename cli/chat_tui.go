@@ -113,6 +113,9 @@ const (
 
 // sidebarWidthFor picks a comfortable reading column that grows with the
 // terminal ("font size" adaptation for terminals happens via density).
+// videoOn widens the column while the camera streams: the ASCII video
+// pane lives there, and a 24-cell picture is unreadable (the old 56-in-20
+// crop bug came from ignoring this).
 func sidebarWidthFor(termW int) int {
 	switch {
 	case termW >= 130:
@@ -122,6 +125,18 @@ func sidebarWidthFor(termW int) int {
 	default:
 		return rosterTotalWidth
 	}
+}
+
+// videoSidebarWidthFor is the boosted column while video streams (room for
+// a ~40-cell braille picture; roster still fits beneath).
+const videoSidebarWidth = 44
+
+func sidebarWidthVideo(termW int, videoOn bool) int {
+	w := sidebarWidthFor(termW)
+	if videoOn && termW >= 100 {
+		return videoSidebarWidth
+	}
+	return w
 }
 
 // composerRowsFor gives the message box breathing room on tall screens and
@@ -154,7 +169,8 @@ type layout struct {
 	sidebarOn       bool // false on narrow terminals — panel collapses
 	rosterX         int  // leftmost column of the sidebar
 	rosterY0        int  // first terminal row inside the sidebar that holds a user
-	rosterSlots     int  // how many roster rows fit under the current vpHeight
+	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
+	videoRows       int  // outer rows of the top video box (0 = off); rosterY0 sits below it
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
@@ -205,6 +221,12 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 //
 // Pure function => trivially unit-testable.
 func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int) layout {
+	return computeLayoutMedia(termW, termH, showStatus, paletteRows, false)
+}
+
+// computeLayoutMedia is the full layout: videoOn widens the sidebar column
+// so the ASCII video pane gets a picture-width that matches its viewport.
+func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, videoOn bool) layout {
 	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
@@ -218,7 +240,7 @@ func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int
 	l.boxedTranscript = true
 	l.frameOn = termH >= 12 // below this the shell cannot fit its own border
 	l.composerRows = composerRowsFor(termH)
-	l.sidebarWidth = sidebarWidthFor(termW)
+	l.sidebarWidth = sidebarWidthVideo(termW, videoOn)
 
 	innerW := termW - frameChrome
 	if !l.frameOn {
@@ -376,6 +398,29 @@ const receiptExpiry = 5 * time.Minute
 // netDeliveredMsg arrives when the peer acked one of our messages.
 type netDeliveredMsg struct{ msgId string }
 
+// Media UI messages: publish status lines + VU level.
+type mediaInfoMsg struct{ info string }
+type callLevelMsg struct{ level float64 }
+
+// netVideoMsg carries one decoded ASCII video frame for the drawer pane.
+type netVideoMsg struct{ lines []string }
+
+// netSelfVideoMsg carries one local-camera preview frame.
+type netSelfVideoMsg struct{ lines []string }
+
+// paneContent paints ONE feed: the remote publisher's video. The local
+// self-view shows only when nobody else is publishing (it never stacks
+// under a remote feed — two pictures in one small pane read as a glitch).
+func (c *chatScreen) paneContent() []string {
+	if len(c.videoLines) > 0 {
+		return append([]string(nil), c.videoLines...)
+	}
+	if len(c.selfLines) == 0 {
+		return nil
+	}
+	return append([]string{tuiPaletteHintStyle.Render("— you —")}, c.selfLines...)
+}
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -436,9 +481,17 @@ type chatScreen struct {
 	// in view (broadcasts otherwise paint nowhere and badge nothing — a
 	// message can sit in history looking "missing"). Cleared on return to
 	// the room. DM unreads keep using the per-peer map.
-	roomUnread   int
-	users        []string
+	roomUnread int
+	users      []string
+	// call owns the media lifecycle (publish/subscribe; nil-safe).
+	call         *mediaManager
+	callLevel    float64 // mic loudness for the status meter
+	videoLines   []string
+	selfLines    []string
+	videoVp      viewport.Model // scrollable video pane (wheel + scrollbar)
+	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
 	vp           viewport.Model
+	drag         barDrag // scrollbar drag state (any of the three panes)
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
 	picker       pickerState     // file-browser mode of that drawer (/upload)
@@ -448,6 +501,31 @@ type chatScreen struct {
 	received     []receivedFile  // files arrived this session (for /download)
 	status       string
 	targetUser   string // private-chat peer; "" = general room
+}
+
+// scrollSection identifies one independently scrollable pane.
+type scrollSection int
+
+const (
+	secChat scrollSection = iota
+	secVideo
+	secRoster
+)
+
+// barGeom is one scrollbar's track geometry in terminal coordinates
+// (paint-verified: see TestScrollbarDragGeometry). x is the scrollbar
+// column, trackY0 the first track row (below the up-arrow), trackH the
+// draggable track length.
+type barGeom struct {
+	x, trackY0, trackH int
+	thumbTop, thumbH   int
+}
+
+// barDrag is an in-progress scrollbar drag.
+type barDrag struct {
+	active  bool
+	sec     scrollSection
+	grabOff int // msg.Y - (trackY0 + thumbTop) at grab time
 }
 
 // pendingSend tracks the optimistic echo line for the in-flight send so the
@@ -541,6 +619,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
+	videoVp := viewport.New(40, 10)
 	netCh := make(chan tea.Msg, 256)
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	// Engine callbacks only ever push into netCh (never touch the screen:
@@ -553,6 +632,15 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		}
 	}
 	var eng *engine
+	callMgr := newMediaManager(me, id,
+		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
+		nil, // roster bound below once eng exists
+		mediaUICallbacks{
+			onInfo:       func(info string) { push(mediaInfoMsg{info: info}) },
+			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
+			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
+			onSelfFrame:  func(lines []string) { push(netSelfVideoMsg{lines: lines}) },
+		})
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
 			// Ack at receipt, not at paint: a dropped queue slot must not
@@ -560,20 +648,24 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 			_ = eng.sendAck(c.From, c.MsgId)
 			push(netChatMsg{chat: c})
 		},
-		onFile:      func(f engineFile) { push(netFileMsg{file: f}) },
-		onFileErr:   func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
-		onPeerReady: func(user, code string) { push(netReadyMsg{user: user, code: code}) },
-		onPeerLost:  func(user string) { push(netLostMsg{user: user}) },
-		onDelivered: func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
-		onError:     func(err error) { push(netErrMsg{err: err}) },
+		onFile:       func(f engineFile) { push(netFileMsg{file: f}) },
+		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
+		onPeerReady:  func(user, code string) { push(netReadyMsg{user: user, code: code}) },
+		onPeerLost:   func(user string) { push(netLostMsg{user: user}) },
+		onDelivered:  func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
+		onError:      func(err error) { push(netErrMsg{err: err}) },
+		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
+	callMgr.SetRoster(func() map[string][]byte { return rosterMap(eng.peers()) })
 	return chatScreen{
 		sig:         sig,
 		eng:         eng,
+		call:        callMgr,
 		key:         key,
 		me:          me,
 		vp:          vp,
+		videoVp:     videoVp,
 		input:       ti,
 		netCh:       netCh,
 		rendered:    map[int]bool{},
@@ -956,6 +1048,7 @@ func (c *chatScreen) rebuildView() {
 	for _, ll := range pinned {
 		c.lines = append(c.lines, ll.text)
 	}
+	c.syncRosterVp() // users list content lives with the screen, not the copy
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
 		c.pending.lineIdx = len(c.lines) - 1 // pending echo is last local of its conv
 	}
@@ -1005,58 +1098,59 @@ func (c *chatScreen) refreshViewport() {
 // Height h includes the border interior rows. Uses ScrollPercent() to position
 // the thumb proportionally. Returns a single-column string of height h.
 func (c chatScreen) scrollbarView(h int) string {
+	bar, _, _, _, _ := scrollbarBar(c.vp.TotalLineCount(), c.vp.Height, c.vp.YOffset, h)
+	return bar
+}
+
+// scrollbarBar renders one scrollbar column for total/visible/offset state
+// and reports the thumb geometry for drag hit-tests. Shared by all three
+// independently scrollable panes.
+func scrollbarBar(total, visible, offset, h int) (bar string, thumbTop, thumbH, trackH int, hasArrows bool) {
 	if h <= 0 {
-		return ""
+		return "", 0, 0, 0, false
 	}
-	total := c.vp.TotalLineCount()
-	if total <= 0 {
-		total = len(c.lines)
-	}
-	visible := c.vp.Height
-	if visible <= 0 {
-		visible = h
-	}
-	// No scrolling needed: draw empty track.
-	if total <= visible {
+	// No scrolling needed: draw an empty track.
+	if total <= visible || total <= 0 {
 		rows := make([]string, h)
 		for i := range rows {
 			rows[i] = tuiScrollbarStyle.Render("│")
 		}
-		return strings.Join(rows, "\n")
+		return strings.Join(rows, "\n"), 0, 0, h, false
 	}
-	// Reserve top/bottom arrows.
-	trackH := h
-	hasArrows := h >= 3
+	trackH = h
+	hasArrows = h >= 3
 	if hasArrows {
 		trackH = h - 2
 	}
-	thumbH := trackH * visible / total
+	thumbH = trackH * visible / total
 	if thumbH < 1 {
 		thumbH = 1
 	}
 	if thumbH > trackH {
 		thumbH = trackH
 	}
-	pct := c.vp.ScrollPercent() // 0.0 - 1.0
-	if pct < 0 {
-		pct = 0
+	// Thumb travel maps content scroll: top at offset 0, bottom at offset
+	// total-visible (bottom-stuck), independent of the percent rounding.
+	maxOff := total - visible
+	if maxOff <= 0 {
+		maxOff = 0
 	}
-	if pct > 1 {
-		pct = 1
+	thumbTop = 0
+	if maxOff > 0 {
+		thumbTop = int(float64(trackH-thumbH) * float64(offset) / float64(maxOff))
 	}
-	thumbPos := int(float64(trackH-thumbH) * pct)
-	if thumbPos < 0 {
-		thumbPos = 0
+	if thumbTop < 0 {
+		thumbTop = 0
 	}
-	if thumbPos+thumbH > trackH {
-		thumbPos = trackH - thumbH
+	if thumbTop+thumbH > trackH {
+		thumbTop = trackH - thumbH
 	}
 	var rows []string
 	if hasArrows {
 		rows = append(rows, tuiScrollbarStyle.Render("▲"))
 	}
 	for i := 0; i < trackH; i++ {
-		if i >= thumbPos && i < thumbPos+thumbH {
+		if i >= thumbTop && i < thumbTop+thumbH {
 			rows = append(rows, tuiScrollbarThumbStyle.Render("█"))
 		} else {
 			rows = append(rows, tuiScrollbarStyle.Render("│"))
@@ -1065,7 +1159,14 @@ func (c chatScreen) scrollbarView(h int) string {
 	if hasArrows {
 		rows = append(rows, tuiScrollbarStyle.Render("▼"))
 	}
-	return strings.Join(rows, "\n")
+	return strings.Join(rows, "\n"), thumbTop, thumbH, trackH, hasArrows
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (c chatScreen) headerView() string {
@@ -1078,8 +1179,8 @@ func (c chatScreen) headerView() string {
 	}
 	// Binary version in the banner: screenshots become self-identifying
 	// (which build each side runs is otherwise unknowable in bug reports).
-	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s ",
-		c.key, c.me, len(c.users), normVersion(version), mode)
+	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s%s ",
+		c.key, c.me, len(c.users), normVersion(shortVersion(version)), mode, c.mediaStatus())
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
@@ -1127,18 +1228,9 @@ func (c chatScreen) unreadBadge(peer string) string {
 	return tuiUnreadStyle.Render(circledNum(n))
 }
 
-// rosterBody renders the bordered sidebar with EXACTLY slots content rows
-// (title + users), so its height always matches the transcript column. The
-// overflow indicator replaces the final slot when participants overflow.
-// sidebarBody renders the right column: an ONLINE section with presence dots
-// and a full-row highlight on the selected peer. The transcript itself is
-// the single source of conversation context, so no thread list is shown.
-// Height is deterministic: exactly `fill` content rows (+border in View).
+// rosterBody paints the users list: title row, then the SCROLLABLE roster
+// viewport with its own scrollbar column. fill = interior rows of the box.
 func (c chatScreen) rosterBody(fill int) string {
-	if fill < 1 {
-		fill = 1 // always show the section header
-	}
-	slots := fill - 1 // title owns the first row
 	inner := c.sidebarInnerWidth()
 	trunc := func(t string) string {
 		r := []rune(t)
@@ -1147,68 +1239,132 @@ func (c chatScreen) rosterBody(fill int) string {
 		}
 		return t
 	}
-	rows := make([]string, 0, slots+1)
-	addPlain := func(text string) {
-		if len(rows)-1 >= slots { // never exceed the slot budget
-			return
-		}
-		rows = append(rows, " "+text)
-	}
-
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
-	title := fmt.Sprintf("ONLINE — %d", len(online))
-	rows = append(rows, tuiSectionTitleStyle.Render(trunc(title)))
-	bodySlots := maxInt(slots-1, 0)
-
-	shown := 0
+	title := tuiSectionTitleStyle.Render(trunc(fmt.Sprintf("ONLINE — %d", len(online))))
+	if fill < 2 {
+		return title // title only; border lives in View
+	}
+	bodyH := fill - 1 // title owns the first row
+	barW := 0
+	if len(online) > bodyH {
+		barW = 1 // users overflow: the list scrolls, scrollbar joins
+	}
+	if barW == 0 {
+		rows := make([]string, 0, fill)
+		rows = append(rows, title)
+		for _, u := range online {
+			if len(rows) >= fill {
+				break
+			}
+			rows = append(rows, " "+c.rosterRow(u, inner, trunc))
+		}
+		for len(rows) < fill {
+			rows = append(rows, "")
+		}
+		return strings.Join(rows, "\n")
+	}
+	// Overflow: the users list scrolls inside its own viewport; the bar
+	// column rides beside it.
+	vp := c.rosterVp
+	vp.Width = maxInt(inner-barW, 8)
+	vp.Height = bodyH
+	content := make([]string, 0, len(online))
 	for _, u := range online {
-		if shown == bodySlots && len(online) > bodySlots {
-			more := len(online) - shown
-			addPlain(tuiDimStyle.Render(fmt.Sprintf("… +%d more", more)))
-			shown++
-			break
+		content = append(content, " "+c.rosterRow(u, inner-1, trunc))
+	}
+	vp.SetContent(strings.Join(content, "\n"))
+	bar, _, _, _, _ := scrollbarBar(len(online), bodyH, vp.YOffset, bodyH)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
+	return strings.Join(append([]string{title}, body), "\n")
+}
+
+// syncRosterVp bakes the (scrollable) users list into the roster viewport
+// so wheel + scrollbar drags operate on live content. Content is rebuilt
+// on hover/rebuild/roster changes — few rows, cheap.
+func (c *chatScreen) syncRosterVp() {
+	if len(c.users) == 0 {
+		return
+	}
+	inner := c.sidebarInnerWidth() - 1
+	trunc := func(t string) string {
+		r := []rune(t)
+		if len(r) > inner {
+			return string(r[:maxInt(inner-1, 0)]) + "…"
 		}
-		dot := "○"
-		switch u {
-		case c.me:
-			dot = "●"
-		case c.targetUser:
-			dot = "●"
-		}
-		name := u
+		return t
+	}
+	content := make([]string, 0, len(c.users))
+	for _, u := range orderedUsers(c.users, c.me, c.lastDMAt) {
+		content = append(content, " "+c.rosterRow(u, inner, trunc))
+	}
+	y := c.rosterVp.YOffset
+	c.rosterVp.SetContent(strings.Join(content, "\n"))
+	if y < c.rosterVp.TotalLineCount()-c.rosterVp.Height {
+		c.rosterVp.SetYOffset(y) // preserve scroll across roster churn
+	}
+}
+
+// rosterRow paints one users-list row: presence dot, name, media badges,
+// unread chip, hover highlight. Extracted so the scrollable viewport and
+// the hit-test (peerAtY) read the same truth.
+func (c chatScreen) rosterRow(u string, inner int, trunc func(string) string) string {
+	dot := "○"
+	switch u {
+	case c.me:
+		dot = "●"
+	case c.targetUser:
+		dot = "●"
+	}
+	name := u
+	if u == c.me {
+		name += " (you)"
+	}
+	line := dot + " " + name
+
+	// Media badges: publishing state at a glance — my row shows what
+	// I send (▶ camera, ♪ mic), others' rows show what they share.
+	if c.call != nil {
+		mark := ""
 		if u == c.me {
-			name += " (you)"
-		}
-		line := dot + " " + name
-
-		if badge := c.unreadBadge(u); badge != "" {
-			// Right-align the chip with a guaranteed gap from the name.
-			bw := lipgloss.Width(badge)
-			nameW := lipgloss.Width(line)
-			gap := inner - nameW - bw - 1
-			if gap < 2 {
-				gap = 2 // minimum distance even on narrow columns
+			if c.call.VideoOn() {
+				mark += " ▶"
 			}
-			if nameW+gap+bw > inner {
-				line = trunc(line[:maxInt(inner-bw-gap, 1)]) // hard clip name
+			if c.call.AudioOn() {
+				mark += " ♪"
 			}
-			line += strings.Repeat(" ", gap) + badge
+		} else {
+			for _, p := range c.call.VideoPublishers() {
+				if p == u {
+					mark += " ▶"
+				}
+			}
+			for _, p := range c.call.AudioPublishers() {
+				if p == u {
+					mark += " ♪"
+				}
+			}
 		}
+		line += tuiPaletteHintStyle.Render(mark)
+	}
 
-		if u == c.hoverPeer {
-			line = tuiHoverStyle.Render(line) // pink on THIS row only
+	if badge := c.unreadBadge(u); badge != "" {
+		// Right-align the chip with a guaranteed gap from the name.
+		bw := lipgloss.Width(badge)
+		nameW := lipgloss.Width(line)
+		gap := inner - nameW - bw - 1
+		if gap < 2 {
+			gap = 2 // minimum distance even on narrow columns
 		}
-		addPlain(line)
-		shown++
+		if nameW+gap+bw > inner {
+			line = trunc(line[:maxInt(inner-bw-gap, 1)]) // hard clip name
+		}
+		line += strings.Repeat(" ", gap) + badge
 	}
 
-	for len(rows) < fill {
-		rows = append(rows, "")
+	if u == c.hoverPeer {
+		line = tuiHoverStyle.Render(line) // pink on THIS row only
 	}
-	if len(rows) > fill {
-		rows = rows[:fill]
-	}
-	return strings.Join(rows, "\n")
+	return line
 }
 
 // sidebarInnerWidth is the writable width inside the sidebar border.
@@ -1273,6 +1429,9 @@ func (c chatScreen) doLeave() tea.Cmd {
 		if leftSent.Swap(true) {
 			return leaveDoneMsg{}
 		}
+		if c.call != nil {
+			c.call.stopAll() // withdraw publish announces + close the socket
+		}
 		c.eng.stop()
 		if err := c.sig.leaveRoom(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
@@ -1307,6 +1466,91 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
+// ---- media publishing (/video + /audio) --------------------------------------
+
+// currentScope resolves "wherever the user is": their DM peer, or the
+// room's online members.
+func (c *chatScreen) currentScope() []string {
+	if c.call == nil {
+		return nil
+	}
+	var room []string
+	if c.targetUser == "" && c.eng != nil {
+		room = onlineNames(c.eng.peers(), c.me)
+	}
+	return c.call.scopeFor(c.targetUser, room)
+}
+
+// toggleVideo runs the /video command: publish/stop camera to the scope.
+func (c *chatScreen) toggleVideo() tea.Cmd {
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
+		return nil
+	}
+	if err := c.call.ToggleVideo(c.currentScope()); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
+	}
+	return nil
+}
+
+// toggleAudio runs the /audio command: publish/stop mic to the scope.
+func (c *chatScreen) toggleAudio() tea.Cmd {
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
+		return nil
+	}
+	if err := c.call.ToggleAudio(c.currentScope()); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio failed: "+err.Error()))
+	}
+	return nil
+}
+
+// mediaStatus renders the header chips for active media ("" when idle).
+func (c *chatScreen) mediaStatus() string {
+	if c.call == nil {
+		return ""
+	}
+	var parts []string
+	if scope := c.call.VideoScope(); scope != "" {
+		parts = append(parts, "● VID → "+scope)
+	}
+	if c.call.Watching() {
+		parts = append(parts, "● VID ← "+strings.Join(c.call.VideoPublishers(), ","))
+	}
+	if scope := c.call.AudioScope(); scope != "" {
+		parts = append(parts, "● MIC → "+scope)
+	}
+	if c.call.Hearing() {
+		parts = append(parts, "● MIC ← "+strings.Join(c.call.AudioPublishers(), ","))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	s := " · " + strings.Join(parts, " · ")
+	if c.call.AudioOn() && c.callLevel > 0.02 {
+		s += " " + vuBar(c.callLevel)
+	}
+	return s
+}
+
+func vuBar(level float64) string {
+	n := int(level*8 + 0.5)
+	if n < 0 {
+		n = 0
+	}
+	if n > 8 {
+		n = 8
+	}
+	full, empty := "", ""
+	for i := 0; i < n; i++ {
+		full += "▂"
+	}
+	for i := n; i < 8; i++ {
+		empty += "·"
+	}
+	return full + empty
+}
+
 // enterPrivate switches to a 1:1 thread. There is no server history to
 // deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
@@ -1335,6 +1579,13 @@ func (c *chatScreen) exitPrivate() {
 // typed "/help" behaves exactly like one picked from the palette.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
 	t := strings.ToLower(strings.TrimSpace(text))
+	// /video + /audio take no username (publish to the current scope):
+	// trailing words are ignored, never sent as chat.
+	for _, name := range []string{"/video", "/audio"} {
+		if t == name || strings.HasPrefix(t, name+" ") {
+			return c.runCommand(name)
+		}
+	}
 	for _, cmd := range slashCommands {
 		if t == cmd.Name {
 			return c.runCommand(t)
@@ -1418,6 +1669,23 @@ func (c *chatScreen) syncViewport() {
 	if l.vpHeight > 0 && vpW > 10 {
 		vpW--
 	}
+	// Remote-video pane tracks the sidebar split independently of the
+	// transcript early-out below, and pushes the TRUE pane geometry into
+	// the manager so frames render at the pane's real size (no crop).
+	if l.videoRows >= 2 {
+		c.videoVp.Width = maxInt(c.sidebarInnerWidth()-2, 8)
+		c.videoVp.Height = maxInt(l.videoRows-2, 1)
+		if _, frameRows, _ := videoPaneGeom(*c, l); c.call != nil {
+			c.call.SetVideoSize(c.videoVp.Width, frameRows)
+		}
+	}
+	// Users list gets its own viewport (scrollable like chat and video);
+	// the title row lives outside the viewport.
+	if l.sidebarOn {
+		rosterH := l.vpHeight - l.videoRows
+		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
+		c.rosterVp.Height = maxInt(rosterH-1, 1)              // title row
+	}
 	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
 		return
 	}
@@ -1461,6 +1729,15 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		live := map[string]bool{c.me: true}
 		for _, u := range users {
 			live[u] = true
+		}
+		// Publish catch-up: late joiners get our announce; leavers get
+		// pruned (streams with an emptied scope stop themselves).
+		if c.call != nil {
+			room := users
+			if c.targetUser != "" {
+				room = []string{c.targetUser}
+			}
+			c.call.PublishTo(room)
 		}
 		for peer := range c.unread {
 			if !live[peer] {
@@ -1595,6 +1872,31 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			delete(c.unackedUI, msg.msgId)
 		}
 		c.evictRenderCache(msg.msgId)
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case mediaInfoMsg:
+		if msg.info != "" {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.info))
+		}
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case callLevelMsg:
+		c.callLevel = msg.level
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netVideoMsg:
+		c.videoLines = msg.lines
+		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
+		c.syncViewport()
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netSelfVideoMsg:
+		c.selfLines = msg.lines
+		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
+		c.syncViewport()
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -1870,48 +2172,120 @@ func (c chatScreen) peerAtY(y int, l layout) string {
 	if row < 0 {
 		return ""
 	}
-	// Mirror rosterBody(fill=vpHeight) exactly: title owns row -1 (above
-	// Y0), then users, then at most one "… +N more" overflow row which is
-	// not a user. The old slots/16-cap math disagreed with the render and
-	// sent clicks to hidden users (or nowhere on tall terminals).
+	// The users list SCROLLS: hit-testing maps the visible row through the
+	// roster viewport's scroll offset (same content rosterBody paints).
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
-	bodySlots := maxInt(l.vpHeight-2, 0)
-	n := len(online)
-	if n > bodySlots {
-		n = bodySlots
-	}
-	if row >= n {
+	idx := row + c.rosterVp.YOffset
+	if idx >= len(online) {
 		return ""
 	}
-	return online[row]
+	return online[idx]
 }
 
-// handleMouse routes hover motion and clicks. Hovering paints exactly one
-// pink row; clicking opens that peer's thread.
+// scrollBarGeoms is the paint-verified track geometry for all three
+// scrollbars (constants validated against View() by TestScrollbarDrag).
+func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
+	chat = barGeom{x: l.vpWidth + 1, trackY0: 4, trackH: maxInt(l.vpHeight-2, 0)}
+	// y0=3 is the transcript interior top (frame 0 + header 1 + border 2);
+	// the track starts one row below the up-arrow.
+	if l.videoRows > 0 {
+		video = barGeom{
+			x:       l.rosterX + l.sidebarWidth - 2,
+			trackY0: l.rosterY0 - l.videoRows + 1,
+			trackH:  maxInt(l.videoRows-4, 0),
+		}
+	}
+	if l.sidebarOn {
+		rosterH := l.vpHeight - l.videoRows
+		roster = barGeom{
+			x:       l.rosterX + l.sidebarWidth - 2,
+			trackY0: l.rosterY0 + 1,
+			trackH:  maxInt(rosterH-3, 0),
+		}
+	}
+	return chat, video, roster
+}
+
+// thumbFor computes the thumb position for one pane's scrollbar.
+func (c chatScreen) thumbFor(sec scrollSection, g barGeom) barGeom {
+	switch sec {
+	case secChat:
+		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.vp.TotalLineCount(), c.vp.Height, c.vp.YOffset, g.trackH+2)
+	case secVideo:
+		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.videoVp.TotalLineCount(), c.videoVp.Height, c.videoVp.YOffset, g.trackH+2)
+	case secRoster:
+		g.thumbTop, g.thumbH, _, _ = thumbGeom(len(c.users), c.rosterVp.Height, c.rosterVp.YOffset, g.trackH+2)
+	}
+	return g
+}
+
+// thumbGeom reports thumb placement inside a track for total/visible/offset.
+func thumbGeom(total, visible, offset, h int) (thumbTop, thumbH, trackH int, hasArrows bool) {
+	trackH = h
+	hasArrows = h >= 3
+	if hasArrows {
+		trackH = h - 2
+	}
+	if trackH <= 0 || total <= visible || total <= 0 {
+		return 0, trackH, trackH, hasArrows
+	}
+	thumbH = trackH * visible / total
+	if thumbH < 1 {
+		thumbH = 1
+	}
+	if thumbH > trackH {
+		thumbH = trackH
+	}
+	maxOff := total - visible
+	if maxOff <= 0 {
+		return 0, thumbH, trackH, hasArrows
+	}
+	thumbTop = int(float64(trackH-thumbH) * float64(offset) / float64(maxOff))
+	if thumbTop < 0 {
+		thumbTop = 0
+	}
+	if thumbTop+thumbH > trackH {
+		thumbTop = trackH - thumbH
+	}
+	return thumbTop, thumbH, trackH, hasArrows
+}
+
+// handleMouse routes wheel scrolling per pane, scrollbar drags, hover and
+// row selection. Wheel/drag on one section never moves the others.
 func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	l := c.layoutFor()
+	// Legacy-typed motion messages (tests, X10 paths) carry Action=0.
+	action := msg.Action
+	if action == tea.MouseActionPress && msg.Type == tea.MouseMotion {
+		action = tea.MouseActionMotion
+	}
 
-	switch msg.Type {
-	case tea.MouseMotion:
-		c.hoverPeer = "" // default: outside every row
-		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
-			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
-			if inColumn && l.sidebarOn {
-				c.hoverPeer = c.peerAtY(msg.Y, l)
+	switch action {
+	case tea.MouseActionPress:
+		if msg.Button != tea.MouseButtonLeft || c.width == 0 || c.height == 0 || !l.sidebarOn {
+			break
+		}
+		chatG, videoG, rosterG := c.scrollBarGeoms(l)
+		chatG = c.thumbFor(secChat, chatG)
+		videoG = c.thumbFor(secVideo, videoG)
+		rosterG = c.thumbFor(secRoster, rosterG)
+		for _, g := range []struct {
+			sec scrollSection
+			b   barGeom
+		}{{secChat, chatG}, {secVideo, videoG}, {secRoster, rosterG}} {
+			if g.b.trackH <= 0 {
+				continue
+			}
+			if msg.X == g.b.x && msg.Y >= g.b.trackY0 && msg.Y < g.b.trackY0+g.b.trackH {
+				c.drag = barDrag{active: true, sec: g.sec, grabOff: msg.Y - (g.b.trackY0 + g.b.thumbTop)}
+				c.dragTo(g.sec, msg.Y, g.b, l)
+				return nil
 			}
 		}
-		return nil
-
-	case tea.MouseLeft:
-		if c.width == 0 || c.height == 0 {
+		// Roster row selection (never on the scrollbar column).
+		barCol := l.rosterX + l.sidebarWidth - 2
+		if msg.X == barCol {
 			return nil
-		}
-		// Reject coordinates outside the painted terminal area entirely.
-		if msg.X < 0 || msg.X >= c.width || msg.Y < 0 || msg.Y >= c.height {
-			return nil
-		}
-		if !l.sidebarOn {
-			return nil // sidebar collapsed on narrow terminals
 		}
 		inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
 		if !inColumn {
@@ -1925,8 +2299,118 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil // already chatting privately with them
 		}
 		c.enterPrivate(u)
+		return nil
+
+	case tea.MouseActionMotion:
+		if c.drag.active {
+			_, videoG, rosterG := c.scrollBarGeoms(l)
+			chatG, _, _ := c.scrollBarGeoms(l)
+			switch c.drag.sec {
+			case secChat:
+				c.dragTo(secChat, msg.Y, c.thumbFor(secChat, chatG), l)
+			case secVideo:
+				c.dragTo(secVideo, msg.Y, c.thumbFor(secVideo, videoG), l)
+			case secRoster:
+				c.dragTo(secRoster, msg.Y, c.thumbFor(secRoster, rosterG), l)
+			}
+			return nil
+		}
+		c.hoverPeer = "" // default: outside every row
+		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
+			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
+			if inColumn && l.sidebarOn && msg.X != l.rosterX+l.sidebarWidth-2 {
+				if c.peerAtY(msg.Y, l) != c.hoverPeer {
+					c.hoverPeer = c.peerAtY(msg.Y, l)
+					c.syncRosterVp() // hover repaint lives in the scroll content
+				}
+			}
+		}
+		return nil
+
+	case tea.MouseActionRelease:
+		if c.drag.active {
+			c.drag.active = false
+			return nil
+		}
+	}
+
+	switch msg.Type {
+	case tea.MouseWheelUp, tea.MouseWheelDown:
+		if c.width == 0 || c.height == 0 {
+			return nil
+		}
+		by := 3
+		if msg.Type == tea.MouseWheelUp {
+			by = -3
+		}
+		// Route by pane: video box, roster box, transcript — each scrolls
+		// only itself.
+		if l.sidebarOn {
+			videoTop := l.rosterY0 - l.videoRows - 1
+			if l.videoRows > 0 && msg.X >= l.rosterX && msg.Y >= videoTop && msg.Y < l.rosterY0-1 {
+				if by < 0 {
+					c.videoVp.LineUp(3)
+				} else {
+					c.videoVp.LineDown(3)
+				}
+				return nil
+			}
+			if msg.X >= l.rosterX && msg.Y >= l.rosterY0-1 {
+				if by < 0 {
+					c.rosterVp.LineUp(3)
+				} else {
+					c.rosterVp.LineDown(3)
+				}
+				return nil
+			}
+		}
+		// Transcript area (everything left of the sidebar).
+		if !l.sidebarOn || msg.X < l.rosterX {
+			if by < 0 {
+				c.vp.LineUp(3)
+			} else {
+				c.vp.LineDown(3)
+			}
+		}
+		return nil
 	}
 	return nil
+}
+
+// dragTo maps a dragged thumb row to the pane's scroll offset.
+func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
+	if g.trackH <= 0 {
+		return
+	}
+	newTop := y - c.drag.grabOff - g.trackY0
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > g.trackH-g.thumbH {
+		newTop = g.trackH - g.thumbH
+	}
+	frac := float64(newTop) / float64(maxInt(g.trackH-g.thumbH, 1))
+	var vp *viewport.Model
+	total := 0
+	switch sec {
+	case secChat:
+		vp = &c.vp
+		total = c.vp.TotalLineCount()
+	case secVideo:
+		vp = &c.videoVp
+		total = c.videoVp.TotalLineCount()
+	case secRoster:
+		vp = &c.rosterVp
+		total = len(c.users)
+	}
+	if vp == nil {
+		return
+	}
+	maxOff := total - vp.Height
+	if maxOff <= 0 {
+		return
+	}
+	vp.SetYOffset(int(float64(maxOff) * frac))
 }
 
 func (c chatScreen) View() string {
@@ -1973,16 +2457,49 @@ func (c chatScreen) View() string {
 	}
 
 	if l.sidebarOn && body != "" {
-		// Sidebar height forced to match the transcript column exactly; its
-		// content truncates to l.rosterSlots so it can never inflate the row.
-		sidebar := tuiRosterBoxStyle.
+		// Sidebar column: video box on top (when streaming), roster below.
+		// Column height stays vpHeight so the height invariant holds.
+		// Both boxes own their own scrollbar (video pane + users list);
+		// scrolling one never moves the others.
+		var col string
+		rosterH := l.vpHeight - l.videoRows
+		if l.videoRows > 0 {
+			// VIDEO panel above the roster: title row plus the scrollable
+			// pane with its own scrollbar. The publisher's self-view
+			// paints here before any peer connects — "waiting" must
+			// never cover it.
+			vp := c.videoVp
+			if len(c.videoLines) == 0 && len(c.selfLines) == 0 {
+				vp.SetContent(tuiPaletteHintStyle.Render("waiting for remote video…"))
+			}
+			feedW := c.sidebarInnerWidth() - 1 // scrollbar column joins
+			vp.Width = maxInt(feedW, 8)
+			feedRows := l.videoRows - 1 // title owns the first interior row
+			if feedRows < 1 {
+				feedRows = 1
+			}
+			vp.Height = feedRows
+			bar, _, _, _, _ := scrollbarBar(vp.TotalLineCount(), vp.Height, vp.YOffset, feedRows)
+			feedCol := lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
+			videoContent := tuiSectionTitleStyle.Render("VIDEO") + "\n" + feedCol
+			col = tuiRosterBoxStyle.
+				Width(c.sidebarInnerWidth()).
+				Height(l.videoRows).
+				MaxHeight(l.videoRows).
+				Render(videoContent)
+		}
+		roster := tuiRosterBoxStyle.
 			Width(c.sidebarInnerWidth()).
-			Height(l.vpHeight). // interior rows; border completes the column
-			MaxHeight(l.vpHeight).
-			Render(c.rosterBody(l.vpHeight))
-		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", sidebar)
+			Height(rosterH). // interior rows; border completes the column
+			MaxHeight(rosterH).
+			Render(c.rosterBody(rosterH))
+		if col == "" {
+			col = roster
+		} else {
+			col = lipgloss.JoinVertical(lipgloss.Left, col, roster)
+		}
+		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", col)
 	}
-
 	rows := make([]string, 0, 5)
 	if l.showHeader {
 		rows = append(rows, c.headerView())

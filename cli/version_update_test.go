@@ -184,3 +184,15 @@ func TestAuthedGetSendsToken(t *testing.T) {
 		t.Fatalf("anonymous request carried auth: %q", gotNoAuth)
 	}
 }
+
+func TestShortVersion(t *testing.T) {
+	if got := shortVersion("v0.0.2"); got != "v0.0.2" {
+		t.Fatalf("release tag mangled: %q", got)
+	}
+	if got := shortVersion("v0.0.2-dev+599cae8deadbeef"); got != "v0.0.2-dev+599cae8" {
+		t.Fatalf("dev hash not trimmed: %q", got)
+	}
+	if got := shortVersion("0.0.1"); got != "0.0.1" {
+		t.Fatalf("bare version mangled: %q", got)
+	}
+}

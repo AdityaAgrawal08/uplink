@@ -28,7 +28,7 @@ export const SIG_TTL_SEC = 5 * 60; // key-level sliding TTL, refreshed per depos
 export const INBOX_TTL_SEC = 60 * 60; // key-level sliding TTL: refreshed per deposit, so a trickling inbox outlives idle boxes
 export const PRESENCE_TIMEOUT_MS = 20 * 1000; // ~4 missed 5s heartbeats = offline (fast join/leave visibility; beats are cheap pipelined reads)
 
-export const MAX_SIG_QUEUE = 50; // signaling notes queued per user
+export const MAX_SIG_QUEUE = 150; // signaling notes queued per user (media sessions fan out: announce + 3-way handshake + healing retries per peer — 50 dropped chat notes under a room video)
 export const MAX_INBOX = 200; // undelivered boxes held per user
 export const MAX_SIG_PAYLOAD = 16 * 1024; // SDP/ICE notes are small
 export const MAX_BOX_PAYLOAD = 256 * 1024; // fallback relay: text + small files only
