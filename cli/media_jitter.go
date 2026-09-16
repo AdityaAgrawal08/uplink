@@ -20,6 +20,7 @@ type jitterBuffer struct {
 	base   uint16 // next sequence due for playout
 	maxSeq uint16 // highest sequence seen (wraparound-aware)
 	hasSeq bool
+	primed bool // pre-roll complete: safe to advance the clock
 	target int
 }
 
@@ -46,14 +47,38 @@ func (j *jitterBuffer) push(pkt audioPacket) {
 }
 
 // pop returns the next due frame: (packet, gap=false) on time, (zero, gap)
-// when base is missing (caller repairs via FEC). The clock advances either
-// way — stalling on loss would wedge playout behind one dropped datagram.
+// when base is missing (caller repairs via FEC). Pre-roll: the first
+// target frames are HELD so the queue primes before playout starts —
+// popping immediately on packet #1 would starve the buffer (every pop is
+// a gap, in-band FEC never has a reference, and the receiver hears
+// nothing at all: exactly the field symptom). The clock advances once we
+// start; stalling on loss would wedge playout behind one dropped datagram.
 // Frames behind base are orphaned by the advance, reclaimed by the cap.
 func (j *jitterBuffer) pop() (audioPacket, bool) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.hasSeq {
 		return audioPacket{}, true
+	}
+	if !j.primed {
+		if len(j.buf) < j.target {
+			return audioPacket{}, true // priming: hold, clock does NOT advance
+		}
+		j.primed = true
+	}
+	// Opportunistic catch-up: real networks idle at exactly the target
+	// depth, so a standing queue deeper than target+1 is a clock that fell
+	// behind (stall, GC pause, scheduling gap). Skip forward ONE frame per
+	// pop instead of resync-dropping the whole backlog at the ceiling —
+	// the old behavior played a burst of stale audio as noise. The skip
+	// never jumps past the newest packet minus the target window: we
+	// re-base to (maxSeq - target), keeping the freshest target frames.
+	for len(j.buf) > j.target+1 {
+		if fwd(j.base, j.maxSeq) <= uint16(j.target) {
+			break // base is already inside the fresh window: stop
+		}
+		delete(j.buf, j.base)
+		j.base++
 	}
 	pkt, ok := j.buf[j.base]
 	delete(j.buf, j.base)
@@ -91,6 +116,7 @@ func (j *jitterBuffer) resyncLocked() {
 	}
 	j.base = j.maxSeq - uint16(keep) + 1
 	j.hasSeq = true
+	j.primed = false
 }
 
 func (j *jitterBuffer) pending() int {

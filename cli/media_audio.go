@@ -196,6 +196,7 @@ func micCandidates() []micCandidate {
 		return cands
 	}
 	if runtime.GOOS == "linux" {
+		cands = append(cands, micCandidate{"pulse:default", openPulseMic})
 		cands = append(cands, micCandidate{"alsa:" + firstNonEmpty(dev, "auto"), func() (*micCapture, error) {
 			return openAlsaMic(dev)
 		}})
@@ -314,6 +315,56 @@ func openTestMic() (*micCapture, error) {
 	cmd.Stderr = nil
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start test mic: %w", err)
+	}
+	out := make(chan []int16, 50)
+	done := make(chan struct{})
+	go func() {
+		defer close(out)
+		defer cmd.Process.Kill()
+		chunker := &frameChunker{}
+		buf := make([]byte, voiceFrameLen*2*4)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := io.ReadFull(stdout, buf)
+			if err != nil {
+				return
+			}
+			for _, f := range chunker.push(bytesToS16(buf[:n])) {
+				select {
+				case out <- f:
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return &micCapture{frames: out, stop: func() { close(done) }}, nil
+}
+
+// openPulseMic captures the PipeWire/PulseAudio DEFAULT source via ffmpeg
+// (the source the desktop actually routes: USB mic, laptop DMIC — whatever
+// the user selected). This runs FIRST on Linux: raw ALSA hw devices bypass
+// the sound server and routinely land on a silent/unrouted input (the top
+// cause of dead-but-"working" audio in the field).
+func openPulseMic() (*micCapture, error) {
+	args := []string{"-hide_banner", "-loglevel", "error",
+		"-f", "pulse", "-i", "default",
+		"-ar", "48000", "-ac", "1", "-f", "s16le", "pipe:1"}
+	if dev := micDevice(); dev != "" {
+		args[4] = dev
+	}
+	cmd := exec.Command("ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start ffmpeg pulse mic: %w", err)
 	}
 	out := make(chan []int16, 50)
 	done := make(chan struct{})

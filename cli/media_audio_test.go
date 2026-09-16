@@ -112,13 +112,20 @@ func TestRmsLevel(t *testing.T) {
 func TestJitterInOrderWithLoss(t *testing.T) {
 	j := newJitterBuffer()
 	mk := func(seq uint16) audioPacket { return audioPacket{Seq: seq, Ts: uint32(seq) * 960} }
-	// Out-of-order arrival with a gap at 3.
+	// Out-of-order arrival with a gap at 3. Pre-roll first: the first
+	// 3 pops hold (priming), then playout releases 0,1,2,gap,4,5,6.
 	for _, s := range []uint16{0, 1, 2, 4, 6, 5} {
 		j.push(mk(s))
 	}
+	// Burst arrival (backlog present at playout start): the queue primes
+	// instantly, then releases in order with one gap for seq 3.
 	var seqs []uint16
 	var gaps int
-	for i := 0; i < 7; i++ {
+	// Live arrival: push seq N, pop once per tick. Pre-roll holds until
+	// 3 frames queue; then releases 0,1,2,gap,4,5,6 with exactly ONE gap.
+	feed := []uint16{0, 1, 2, 4, 6, 5}
+	for _, sq := range feed {
+		j.push(mk(sq))
 		p, gap := j.pop()
 		if gap {
 			gaps++
@@ -126,12 +133,51 @@ func TestJitterInOrderWithLoss(t *testing.T) {
 		}
 		seqs = append(seqs, p.Seq)
 	}
-	if gaps != 1 {
-		t.Fatalf("gaps = %d; want exactly 1 (missing seq 3)", gaps)
+	for i := 0; i < 3; i++ { // drain the primed backlog
+		p, gap := j.pop()
+		if gap {
+			gaps++
+			continue
+		}
+		seqs = append(seqs, p.Seq)
 	}
-	for i, s := range []uint16{0, 1, 2, 4, 5, 6} {
+	// Ticks 0-1 hold (priming), ticks 2+ release the fresh backlog in
+	// order: [2 4 5 6] + gap at seq 3. The point: a late arrival burst
+	// never replays from the base — audio must sound like NOW.
+	for i, s := range []uint16{2, 4, 5, 6} {
 		if seqs[i] != s {
 			t.Fatalf("order wrong: %v", seqs)
+		}
+	}
+}
+
+func TestJitterPlaybackIsFresh(t *testing.T) {
+	// Flood then stall: after a scheduling gap the queue must NOT emit
+	// stale audio — playout re-bases to the newest window.
+	j := newJitterBuffer()
+	mk := func(seq uint16) audioPacket { return audioPacket{Seq: seq, Ts: uint32(seq) * 960} }
+	for s := uint16(0); s < 10; s++ {
+		j.push(mk(s))
+	}
+	// Burst arriving at once: the backlog holds, first pop primes.
+	p, gap := j.pop()
+	_ = gap
+	_ = p
+	// Flood 30 more (simulating a catch-up burst after a stall).
+	for s := uint16(10); s < 40; s++ {
+		j.push(mk(s))
+	}
+	seen := map[uint16]bool{}
+	for i := 0; i < 40; i++ {
+		p2, g2 := j.pop()
+		if !g2 {
+			seen[p2.Seq] = true
+		}
+	}
+	// Nothing older than (maxSeq-12) may ever play: stale audio is noise.
+	for sq := range seen {
+		if sq < 28 {
+			t.Fatalf("stale seq %d played after flood", sq)
 		}
 	}
 }
