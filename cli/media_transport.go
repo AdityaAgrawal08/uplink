@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/flynn/noise"
@@ -130,6 +131,8 @@ type mediaTransport struct {
 	completedEpoch map[string]int64
 	prePongs       map[uint64]chan *net.UDPAddr
 	restartedAt    map[string]time.Time
+	sentDgrams     atomic.Uint64 // all outbound datagrams (any kind/peer)
+	recvDgrams     atomic.Uint64 // all inbound, pre-session probes included
 	closed         bool
 	stopCh         chan struct{}
 	wg             sync.WaitGroup
@@ -313,7 +316,9 @@ func (m *mediaTransport) nominate(ips []string, port int) *net.UDPAddr {
 	}()
 	pkt := append([]byte{mediaVer, mediaKindPingPre}, cookieB[:]...)
 	for _, t := range targets {
-		_, _ = m.conn.WriteToUDP(pkt, t)
+		if _, err := m.conn.WriteToUDP(pkt, t); err == nil {
+			m.sentDgrams.Add(1)
+		}
 	}
 	select {
 	case winner := <-ch:
@@ -554,7 +559,46 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	}
 }
 
-// peerReady reports whether the media session to peer is live.
+// peerDiag is a lock-free snapshot for diagnostics (/mediastats).
+type peerDiag struct {
+	HasEntry      bool
+	Ready         bool
+	HasHs         bool
+	HsAge         time.Duration
+	HsTries       int
+	VerifyPending bool
+	Addr          string
+	LastRxAge     time.Duration
+	Sent          uint64
+	Recv          uint64
+	LocalAddr     string
+}
+
+func (m *mediaTransport) diagPeer(peer string) peerDiag {
+	d := peerDiag{Sent: m.sentDgrams.Load(), Recv: m.recvDgrams.Load()}
+	if a := m.localAddr(); a != nil {
+		d.LocalAddr = a.String()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if p, ok := m.peers[peer]; ok {
+		d.HasEntry = true
+		d.Ready = p.ready
+		d.HasHs = p.hs != nil
+		if !p.hsAt.IsZero() {
+			d.HsAge = time.Since(p.hsAt).Round(time.Second)
+		}
+		d.HsTries = p.hsTries
+		d.VerifyPending = p.verifyPending
+		if p.addr != nil {
+			d.Addr = p.addr.String()
+		}
+		if !p.lastRx.IsZero() {
+			d.LastRxAge = time.Since(p.lastRx).Round(time.Second)
+		}
+	}
+	return d
+}
 func (m *mediaTransport) peerReady(peer string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -597,6 +641,9 @@ func (m *mediaTransport) sendMedia(peer string, kind byte, payload []byte) error
 	raw = append(raw, nb[:]...)
 	raw = append(raw, ct...)
 	_, err = m.conn.WriteToUDP(raw, addr)
+	if err == nil {
+		m.sentDgrams.Add(1)
+	}
 	return err
 }
 
@@ -621,6 +668,7 @@ func (m *mediaTransport) onDatagram(src *net.UDPAddr, raw []byte) {
 	if len(raw) < mediaHeaderLen || raw[0] != mediaVer {
 		return
 	}
+	m.recvDgrams.Add(1)
 	kind := raw[1]
 	// Pre-handshake path probes (unencrypted, cookie-matched): nominate a
 	// reachable address before any session exists.

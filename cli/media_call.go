@@ -677,6 +677,37 @@ func (c *callManager) startAudio(peer string) {
 	}()
 }
 
+// diagLines renders call diagnostics for /mediastats: everything needed
+// to tell signaling failure apart from UDP blackholes.
+func (c *callManager) diagLines() []string {
+	st, peer := c.State()
+	lines := []string{
+		fmt.Sprintf("call state=%s peer=%q muted=%v", st, peer, c.Muted()),
+		fmt.Sprintf("offered IPs: %v", localLANIPs()),
+	}
+	if peer == "" {
+		return lines
+	}
+	c.mu.Lock()
+	t := c.transport
+	known := false
+	if _, ok := c.roster()[peer]; ok {
+		known = true
+	}
+	c.mu.Unlock()
+	lines = append(lines, fmt.Sprintf("roster knows peer: %v", known))
+	if t == nil {
+		return append(lines, "transport: none")
+	}
+	d := t.diagPeer(peer)
+	lines = append(lines,
+		fmt.Sprintf("transport local=%s peer=%s", d.LocalAddr, d.Addr),
+		fmt.Sprintf("session ready=%v hs=%v hsAge=%v tries=%d verifyPending=%v", d.Ready, d.HasHs, d.HsAge, d.HsTries, d.VerifyPending),
+		fmt.Sprintf("datagrams sent=%d recv=%d lastRx=%v ago", d.Sent, d.Recv, d.LastRxAge),
+	)
+	return lines
+}
+
 // State reports the call state snapshot for UI rendering.
 func (c *callManager) State() (callState, string) {
 	c.mu.Lock()
@@ -864,6 +895,13 @@ func (c *callManager) VideoOn() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.videoOn
+}
+
+// RxOn reports whether remote video has arrived at least once.
+func (c *callManager) RxOn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.rxOn
 }
 
 func defaultVideoSrc() (<-chan []byte, func(), error) {

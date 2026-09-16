@@ -1390,6 +1390,17 @@ func (c *chatScreen) callHangup() tea.Cmd {
 	return nil
 }
 
+func (c *chatScreen) callDiag() tea.Cmd {
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* no call active"))
+		return nil
+	}
+	for _, ln := range c.call.diagLines() {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+ln))
+	}
+	return nil
+}
+
 func (c *chatScreen) callMute() tea.Cmd {
 	if c.call == nil {
 		return nil
@@ -2172,8 +2183,14 @@ func (c chatScreen) View() string {
 		rosterH := l.vpHeight - l.videoRows
 		if l.videoRows > 0 {
 			// VIDEO/AUDIO panel above the roster (mockup): title row plus
-			// the scrollable remote frame; wheel over it scrolls.
-			videoContent := tuiSectionTitleStyle.Render("VIDEO") + "\n" + c.videoVp.View()
+			// the scrollable remote frame. Empty pane shows a waiter, never
+			// blank — a missing box means the UI path broke, a waiter means
+			// media hasn't arrived yet.
+			feed := c.videoVp.View()
+			if len(c.videoLines) == 0 {
+				feed = tuiPaletteHintStyle.Render("waiting for remote video…")
+			}
+			videoContent := tuiSectionTitleStyle.Render("VIDEO") + "\n" + feed
 			col = tuiRosterBoxStyle.
 				Width(c.sidebarInnerWidth()).
 				Height(l.videoRows).

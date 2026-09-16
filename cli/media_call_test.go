@@ -401,3 +401,64 @@ func TestVideoSidebarSplitAndScroll(t *testing.T) {
 		t.Fatal("video collapse must return rows to the roster")
 	}
 }
+
+func TestCallDiagLines(t *testing.T) {
+	ma, _, _, _, _, _, _ := callPair(t)
+	lines := ma.diagLines()
+	joined := ""
+	for _, l := range lines {
+		joined += l + "\n"
+	}
+	for _, want := range []string{"call state=idle", "offered IPs:"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("diag missing %q:\n%s", want, joined)
+		}
+	}
+	if err := ma.Call("bob"); err != nil {
+		t.Fatal(err)
+	}
+	joined = ""
+	for _, l := range ma.diagLines() {
+		joined += l + "\n"
+	}
+	if !strings.Contains(joined, "roster knows peer:") {
+		t.Fatalf("in-call diag must cover roster:\n%s", joined)
+	}
+	_ = ma.Hangup()
+}
+
+func TestMediastatsCommand(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	sc := m.(chatScreen)
+	sc.call = &callManager{}
+	before := len(sc.localLines)
+	sc.runCommand("/mediastats")
+	if len(sc.localLines) <= before {
+		t.Fatal("/mediastats must print diagnostics")
+	}
+	last := sc.localLines[len(sc.localLines)-1].text
+	_ = last
+	found := false
+	for _, l := range sc.localLines[before:] {
+		if strings.Contains(l.text, "call state=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("mediastats output missing call state line")
+	}
+}
+
+func TestVideoPlaceholderPane(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	sc := m.(chatScreen)
+	sc.call = &callManager{videoOn: true}
+	l := sc.layoutFor()
+	if l.videoRows == 0 {
+		t.Fatal("pane must claim rows while video is on, even with no frames yet")
+	}
+}

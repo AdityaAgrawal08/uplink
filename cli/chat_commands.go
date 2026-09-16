@@ -33,6 +33,7 @@ var slashCommands = []slashCommand{
 	{Name: "/hangup", Desc: "end the current call"},
 	{Name: "/mute", Desc: "mute/unmute your mic"},
 	{Name: "/video", Desc: "start camera video in a live call"},
+	{Name: "/mediastats", Desc: "diagnose the call path (addrs, handshake, packets)"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -179,8 +180,11 @@ func (c chatScreen) layoutFor() layout {
 	// above ONLINE). Bounded to half the column so the roster never starves;
 	// collapsed entirely when too short to be useful.
 	l.videoRows = 0
-	if l.sidebarOn && c.videoActive() && len(c.videoLines) > 0 {
+	if l.sidebarOn && c.videoActive() {
 		want := len(c.videoLines) + 1 + 2 // hint + frame rows + border
+		if len(c.videoLines) == 0 {
+			want = 1 + 3 + 2 // hint + "waiting" placeholder rows + border
+		}
 		l.videoRows = min(want, l.vpHeight/2)
 		if l.videoRows < 6 {
 			l.videoRows = 0
@@ -202,9 +206,15 @@ func (c chatScreen) drawerView(maxW int) string {
 	return c.paletteView(maxW)
 }
 
-// videoActive reports whether remote video should paint in the sidebar.
+// videoActive reports whether the video pane should paint: publishing,
+// receiving, or waiting for the first frame (the pane itself is the proof
+// the UI path works — it must never stay invisible while video is on).
+// Stale frames alone don't hold the split: flags own the layout.
 func (c chatScreen) videoActive() bool {
-	return c.call != nil && c.call.VideoOn()
+	if c.call == nil {
+		return false
+	}
+	return c.call.VideoOn() || c.call.RxOn()
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -348,6 +358,8 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return c.callMute()
 	case "/video":
 		return c.callVideo()
+	case "/mediastats":
+		return c.callDiag()
 	default:
 		return nil
 	}
