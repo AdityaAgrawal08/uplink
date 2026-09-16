@@ -2,35 +2,35 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
+	"bytes"
 	"fmt"
-	"io"
+	"image"
+	_ "image/jpeg" // MJPEG frame decode (pure Go, no cgo)
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/pion/rtp/codecs"
 )
 
-// ─── Video (LAN calls, 1:1) ─────────────────────────────────────────────────
+// ─── Camera video (LAN publish, MJPEG) ──────────────────────────────────────
 //
-// Camera → ffmpeg (VP8 encode, IVF) → fragment (FU-A via pion/rtp) → Noise
-// datagrams. Reverse: reassemble → ffmpeg (VP8 decode, RGB24) → terminal
-// renderer. Keyframes every ~2s (-g 30) bound error propagation without any
-// keyframe-request round trip. Env UPLINK_CAMERA overrides the capture
-// device; ffmpeg missing fails loud with install help.
+// Camera → ffmpeg (MJPEG, native passthrough when the webcam supports it,
+// else re-encode) → concatenated JPEGs on stdout (self-delimiting: SOI…
+// EOI, no container) → frag → Noise datagrams. Reverse: reassemble →
+// image/jpeg in-process (no child process, no priming delay) → ASCII pane.
+// MJPEG is intra-only: a lost frame never corrupts the next 30, and there
+// is no GOP/keyframe wait — the two biggest latency sources of the old
+// VP8 pipeline. On a LAN the larger frame size is irrelevant.
 
 const (
-	videoWidth   = 640
-	videoHeight  = 480
+	videoWidth   = 320
+	videoHeight  = 240
 	videoFPS     = 15
-	videoBitrate = "500k"
-	videoFragMTU = 1200 // room for Noise tag + headers under typical MTU
+	videoQuality = 5 // -q:v: 2=best, 31=worst; 5 ≈ 25–40KB @ 320x240
 
-	videoAssembleMaxFrags = 256
+	videoAssembleMaxFrags = 64
 	videoAssembleTTL      = 5 * time.Second
 )
 
@@ -57,214 +57,270 @@ func cameraDevice() string {
 
 // testCamera reports whether device selects the synthetic test pattern
 // (no camera needed: verifies the whole pipeline end to end).
-func testCamera(device string) (w, h, fps int, ok bool) {
-	if device != "test" && !strings.HasPrefix(device, "test:") {
-		return 0, 0, 0, false
-	}
-	return videoWidth, videoHeight, videoFPS, true
+func testCamera(device string) (ok bool) {
+	return device == "test" || strings.HasPrefix(device, "test:")
 }
 
-func videoEncodeArgs(device string) []string {
-	size := fmt.Sprintf("%dx%d", videoWidth, videoHeight)
+// videoEncodeArgs builds the zero-latency MJPEG encoder command. Native
+// UVC passthrough is tried first (many webcams emit MJPEG themselves:
+// zero encode cost); the caller falls back to a re-encode if the device
+// rejects the format (watchdog in cameraFrames).
+func videoEncodeArgs(device string, native bool) []string {
 	rate := fmt.Sprintf("%d", videoFPS)
-	if _, _, _, ok := testCamera(device); ok {
-		return []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc=size=%s:rate=%s", size, rate),
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
+	in := func(extra ...string) []string {
+		a := append([]string{"-hide_banner", "-loglevel", "error",
+			"-fflags", "nobuffer", "-flags", "low_delay",
+			"-probesize", "32", "-analyzeduration", "0"}, extra...)
+		return append(a,
+			"-vf", fmt.Sprintf("scale=%d:%d", videoWidth, videoHeight),
+			"-r", rate,
+			"-c:v", "mjpeg", "-q:v", fmt.Sprint(videoQuality),
+			"-an",
+			"-f", "mjpeg", "pipe:1")
+	}
+	if testCamera(device) {
+		return in("-f", "lavfi", "-i", fmt.Sprintf("testsrc=size=%dx%d:rate=%s", videoWidth, videoHeight, rate))
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		return []string{"-f", "avfoundation", "-framerate", rate, "-i", device + ":",
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
+		return in("-f", "avfoundation", "-framerate", rate, "-capture_cursor", "0", "-i", device+":")
 	case "windows":
-		return []string{"-f", "dshow", "-i", device,
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
+		if native {
+			return in("-f", "dshow", "-vcodec", "mjpeg", "-i", device)
+		}
+		return in("-f", "dshow", "-i", device)
 	default:
-		return []string{"-f", "v4l2", "-i", device,
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
-	}
-}
-
-// oggCRC is the Ogg checksum (CRC-32/ISO-HDLC variant: init 0, no
-// reflection, no xor-out). Verified byte-exact against ffmpeg output.
-var oggCRCtable [256]uint32
-
-func init() {
-	for i := range oggCRCtable {
-		r := uint32(i) << 24
-		for j := 0; j < 8; j++ {
-			if r&0x80000000 != 0 {
-				r = (r << 1) ^ 0x04C11DB7
-			} else {
-				r <<= 1
-			}
+		if native {
+			return in("-f", "v4l2", "-input_format", "mjpeg", "-i", device)
 		}
-		oggCRCtable[i] = r
+		return in("-f", "v4l2", "-i", device)
 	}
 }
 
-func oggCRC(data []byte) uint32 {
-	var crc uint32
-	for _, b := range data {
-		crc = (crc << 8) ^ oggCRCtable[byte(crc>>24)^b]
+func spawnEncoder(native bool) (*videoEncoder, error) {
+	args := videoEncodeArgs(cameraDevice(), native)
+	cmd := exec.Command("ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
 	}
-	return crc
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &videoEncoder{cmd: cmd, out: bufio.NewReaderSize(stdout, 1<<20)}, nil
 }
 
-// oggDemux splits an Ogg VP8 stream into packets (skipping the 2 header
-// packets): Ogg pages self-sync, so this streams live — unlike IVF, whose
-// demuxer buffers to EOF on pipes.
-type oggDemux struct {
-	r       *bufio.Reader
-	headers int
-	carry   []byte // continued packet across pages
+func startVideoEncoder() (*videoEncoder, error) {
+	if err := requireFFmpeg("video capture"); err != nil {
+		return nil, err
+	}
+	return spawnEncoder(true)
 }
 
-func newOggDemux(r *bufio.Reader) *oggDemux { return &oggDemux{r: r} }
+// videoEncoder spawns the ffmpeg camera capture; frames() yields JPEGs.
+type videoEncoder struct {
+	cmd *exec.Cmd
+	out *bufio.Reader
+}
 
-// packet returns the next complete packet (headers first: identification,
-// comment, then VP8 frames).
-func (d *oggDemux) packet() ([]byte, error) {
+func (v *videoEncoder) stop() {
+	v.cmd.Process.Kill()
+	_ = v.cmd.Wait()
+}
+
+// jpegSplitter reassembles concatenated MJPEG bytes into single JPEGs
+// (SOI 0xFFD8 … EOI 0xFFD9). Self-delimiting, so no container is needed;
+// a stray marker inside entropy data cannot false-positive because EOI is
+// only matched outside an entropy run (JPEGLS/rare markers aside, real
+// encoders terminate scans with EOI; we additionally bound the frame size).
+type jpegSplitter struct {
+	buf []byte
+}
+
+// maxJpegFrame bounds memory against a hostile/broken stream.
+const maxJpegFrame = 512 * 1024
+
+func (s *jpegSplitter) feed(chunk []byte) [][]byte {
+	s.buf = append(s.buf, chunk...)
+	var frames [][]byte
 	for {
-		page, err := d.page()
-		if err != nil {
-			return nil, err
+		start := bytes.Index(s.buf, []byte{0xFF, 0xD8})
+		if start < 0 {
+			// No SOI: drop the garbage (bounded).
+			if len(s.buf) > maxJpegFrame {
+				s.buf = nil
+			}
+			return frames
 		}
-		for _, seg := range page {
-			d.carry = append(d.carry, seg...)
-			if len(seg) < 255 {
-				pkt := d.carry
-				d.carry = nil
-				return pkt, nil
+		if start > 0 {
+			s.buf = s.buf[start:]
+		}
+		end := bytes.Index(s.buf, []byte{0xFF, 0xD9})
+		if end < 4 { // need at least SOI + some body
+			if len(s.buf) > maxJpegFrame {
+				s.buf = nil // oversized garbage: reset
+			}
+			return frames
+		}
+		frames = append(frames, s.buf[:end+2])
+		s.buf = s.buf[end+2:]
+	}
+}
+
+// jpegToRGB decodes one JPEG frame with the stdlib (pure Go, ~2-5ms at
+// 320x240 — no child process, no priming delay). Returns the RGB render
+// copy plus the wire JPEG; the renderer re-sizes arbitrarily.
+func jpegToRGB(jpeg []byte) (vidFrame, error) {
+	img, _, err := image.Decode(bytes.NewReader(jpeg))
+	if err != nil {
+		return vidFrame{}, err
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	rgb := make([]byte, w*h*3)
+	// Render into packed RGB24 (image/jpeg decodes YCbCr; convert per px).
+	// image.YCbCr fast path dominates real frames; generic fallback keeps
+	// arbitrary sub-sampling modes honest.
+	switch ycbcr := img.(type) {
+	case *image.YCbCr:
+		rowOff := 0
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				xi := b.Min.X + x
+				yi := b.Min.Y + y
+				yiOff := ycbcr.YOffset(xi, yi)
+				ciOff := ycbcr.COffset(xi, yi)
+				yy := int(ycbcr.Y[yiOff])
+				cb := int(ycbcr.Cb[ciOff]) - 128
+				cr := int(ycbcr.Cr[ciOff]) - 128
+				o := rowOff + x*3
+				r := yy + 918*cr/1000
+				g := yy - 186*cb/1000 - 454*cr/1000
+				bb := yy + 1214*cb/1000
+				rgb[o] = clamp255(r)
+				rgb[o+1] = clamp255(g)
+				rgb[o+2] = clamp255(bb)
+			}
+			rowOff += w * 3
+		}
+	default:
+		rowOff := 0
+		for y := 0; y < h; y++ {
+			for x := 0; x < w; x++ {
+				r, g, bb, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+				o := rowOff + x*3
+				rgb[o] = byte(r >> 8)
+				rgb[o+1] = byte(g >> 8)
+				rgb[o+2] = byte(bb >> 8)
+			}
+			rowOff += w * 3
+		}
+	}
+	return vidFrame{Jpeg: append([]byte(nil), jpeg...), RGB: rgb, Width: w, Height: h}, nil
+}
+
+func clamp255(v int) byte {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return byte(v)
+}
+
+// videoSrcStage turns the encoder stream into decoded frames (channel of
+// vidFrame), splitting JPEGs and dropping undecodable ones. Native MJPEG
+// passthrough gets a 4s watchdog: a device that rejects -input_format
+// mjpeg produces no bytes, so we respawn with a plain v4l2 re-encode.
+func cameraFrames() (<-chan vidFrame, func(), error) {
+	if err := requireFFmpeg("video capture"); err != nil {
+		return nil, nil, err
+	}
+	enc, err := spawnEncoder(true)
+	if err != nil {
+		return nil, nil, err
+	}
+	out := make(chan vidFrame, 4)
+	done := make(chan struct{})
+	go func() {
+		defer close(out)
+		defer enc.stop()
+		split := &jpegSplitter{}
+		buf := make([]byte, 64*1024)
+		native := true
+		deadline := time.Now().Add(4 * time.Second)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			n, err := enc.out.Read(buf)
+			if n > 0 {
+				for _, jf := range split.feed(buf[:n]) {
+					f, derr := jpegToRGB(jf)
+					if derr != nil {
+						continue
+					}
+					deadline = time.Now().Add(10 * time.Second) // frames flow; disarm fallback
+					select {
+					case out <- f:
+					case <-done:
+						return
+					}
+				}
+			}
+			if native && !testCamera(cameraDevice()) && time.Now().After(deadline) {
+				// Native capture produced nothing (device rejected the
+				// format): fall back to a plain re-encode, once.
+				enc.stop()
+				enc2, eerr := spawnEncoder(false)
+				if eerr != nil {
+					return
+				}
+				enc = enc2
+				native = false
+				split = &jpegSplitter{}
+				deadline = time.Now().Add(6 * time.Second)
+				continue
+			}
+			if err != nil {
+				return
 			}
 		}
-	}
+	}()
+	return out, func() { close(done) }, nil
 }
 
-// page reads one Ogg page, returning its payload segments.
-func (d *oggDemux) page() ([][]byte, error) {
-	hdr := make([]byte, 27)
-	if _, err := io.ReadFull(d.r, hdr); err != nil {
-		return nil, err
+// ─── Fragmentation + reassembly ─────────────────────────────────────────────
+
+// fragVideoFrame splits one JPEG into wire-sized chunks. The frame is
+// self-delimiting (SOI/EOI), so chunks are raw payload — no container.
+func fragVideoFrame(jpeg []byte) ([][]byte, error) {
+	if len(jpeg) == 0 {
+		return nil, fmt.Errorf("empty jpeg frame")
 	}
-	if string(hdr[0:4]) != "OggS" {
-		return nil, fmt.Errorf("not an Ogg stream")
+	if len(jpeg) > maxJpegFrame {
+		return nil, fmt.Errorf("jpeg frame too large (%d)", len(jpeg))
 	}
-	nseg := int(hdr[26])
-	if nseg == 0 {
-		return nil, fmt.Errorf("empty Ogg page")
-	}
-	tab := make([]byte, nseg)
-	if _, err := io.ReadFull(d.r, tab); err != nil {
-		return nil, err
-	}
-	var segs [][]byte
-	for _, n := range tab {
-		seg := make([]byte, int(n))
-		if _, err := io.ReadFull(d.r, seg); err != nil {
-			return nil, err
+	var out [][]byte
+	for off := 0; off < len(jpeg); off += videoFragMTU {
+		end := off + videoFragMTU
+		if end > len(jpeg) {
+			end = len(jpeg)
 		}
-		segs = append(segs, seg)
-	}
-	return segs, nil
-}
-
-// oggMux re-wraps VP8 frames into an Ogg stream for the decoder. Headers
-// use fixed templates (identification patched with dimensions); the
-// comment block is informational metadata the decoder ignores.
-type oggMux struct {
-	w        io.Writer
-	serial   uint32
-	seqno    uint64
-	sentHdrs bool
-}
-
-func newOggMux(w io.Writer, serial uint32) *oggMux {
-	return &oggMux{w: w, serial: serial}
-}
-
-var oggCommentPacket = []byte{
-	'O', 'V', 'P', '8', 0x30, 0x02, 0x20, 0x0c, 0x00, 0x00, 0x00, 0x4c,
-	0x61, 0x76, 0x66, 0x36, 0x33, 0x2e, 0x31, 0x2e, 0x31, 0x30, 0x31, 0x01,
-	0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x65, 0x6e, 0x63, 0x6f, 0x64,
-	0x65, 0x72, 0x3d, 0x4c, 0x61, 0x76, 0x63, 0x36, 0x33, 0x2e, 0x31, 0x2e,
-	0x31, 0x30, 0x31, 0x20, 0x6c, 0x69, 0x62, 0x76, 0x70, 0x78,
-}
-
-func (m *oggMux) writePage(packet []byte, first, last bool, granule uint64) error {
-	var hdr [27]byte
-	copy(hdr[0:4], "OggS")
-	if first {
-		hdr[5] |= 0x02
-	}
-	if last {
-		hdr[5] |= 0x04
-	}
-	binary.LittleEndian.PutUint64(hdr[6:14], granule)
-	binary.LittleEndian.PutUint32(hdr[14:18], m.serial)
-	binary.LittleEndian.PutUint32(hdr[18:22], uint32(m.seqno))
-	m.seqno++
-	// Lacing: 255-byte segments, remainder terminates the packet.
-	rest := len(packet)
-	nseg := rest/255 + 1
-	if nseg > 255 {
-		return fmt.Errorf("packet too large for one page")
-	}
-	hdr[26] = byte(nseg)
-	tab := make([]byte, 0, nseg)
-	for rest > 0 {
-		n := rest
-		if n > 255 {
-			n = 255
-		}
-		tab = append(tab, byte(n))
-		rest -= n
-	}
-	page := append(hdr[:], tab...)
-	page = append(page, packet...)
-	crc := oggCRC(page)
-	page[22], page[23], page[24], page[25] = byte(crc), byte(crc>>8), byte(crc>>16), byte(crc>>24)
-	_, err := m.w.Write(page)
-	return err
-}
-
-func (m *oggMux) writeHeaders(width, height int) error {
-	ident := []byte{
-		'O', 'V', 'P', '8', 0x30, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
-		0x00, 0x01,
-	}
-	binary.BigEndian.PutUint16(ident[8:10], uint16(width))
-	binary.BigEndian.PutUint16(ident[10:12], uint16(height))
-	if err := m.writePage(ident, true, false, 0); err != nil {
-		return err
-	}
-	return m.writePage(oggCommentPacket, false, false, 0)
-}
-
-func (m *oggMux) writeFrame(frame []byte, granule uint64) error {
-	return m.writePage(frame, false, false, granule)
-}
-
-// vp8KeyFrame reports the VP8 frame type bit (bit 0 clear = keyframe).
-func vp8KeyFrame(frame []byte) bool {
-	return len(frame) >= 1 && frame[0]&0x01 == 0
-}
-
-// fragVP8 splits one VP8 frame into FU-A payloads via pion/rtp.
-func fragVP8(frame []byte) ([][]byte, error) {
-	p := &codecs.VP8Payloader{}
-	out := p.Payload(videoFragMTU, frame)
-	if len(out) == 0 {
-		return nil, fmt.Errorf("payloader produced no packets")
+		out = append(out, jpeg[off:end])
 	}
 	return out, nil
 }
 
-// fragAssembler rebuilds frames from frags keyed by timestamp.
+// videoFragMTU keeps frag + Noise tag + datagram headers under typical
+// LAN MTUs (reduces fragmentation loss).
+const videoFragMTU = 1200
+
+// fragAssembler rebuilds JPEG frames from frags keyed by timestamp.
 type fragAssembler struct {
 	mu     sync.Mutex
 	frames map[uint32]*fragBuild
@@ -280,7 +336,7 @@ func newFragAssembler() *fragAssembler {
 	return &fragAssembler{frames: map[uint32]*fragBuild{}}
 }
 
-// push returns the complete frame when the last frag lands (nil otherwise).
+// push returns the complete JPEG when the last frag lands (nil otherwise).
 // Duplicates collapse; absurd totals and stale builds drop.
 func (a *fragAssembler) push(f videoFrag) []byte {
 	a.mu.Lock()
@@ -317,172 +373,11 @@ func (a *fragAssembler) push(f videoFrag) []byte {
 	return out
 }
 
-// videoEncoder spawns ffmpeg camera capture; Frames yields IVF frames.
-type videoEncoder struct {
-	cmd *exec.Cmd
-	out *bufio.Reader
-}
-
-func startVideoEncoder() (*videoEncoder, error) {
-	if err := requireFFmpeg("video capture"); err != nil {
-		return nil, err
+// videoStyle selects the ASCII cell renderer: braille (default, 4x the
+// detail) or half-blocks via UPLINK_VIDEO_STYLE=half.
+func videoStyle() string {
+	if strings.EqualFold(os.Getenv("UPLINK_VIDEO_STYLE"), "half") {
+		return "half"
 	}
-	cmd := exec.Command("ffmpeg", videoEncodeArgs(cameraDevice())...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return &videoEncoder{cmd: cmd, out: bufio.NewReaderSize(stdout, 1<<20)}, nil
-}
-
-func (v *videoEncoder) stop() {
-	v.cmd.Process.Kill()
-	_ = v.cmd.Wait()
-}
-
-// videoDecoder spawns ffmpeg VP8→RGB24; Frames are w*h*3 bytes each.
-type videoDecoder struct {
-	cmd *exec.Cmd
-	in  io.WriteCloser
-	out *bufio.Reader
-}
-
-func startVideoDecoder() (*videoDecoder, error) {
-	if err := requireFFmpeg("video decode"); err != nil {
-		return nil, err
-	}
-	size := fmt.Sprintf("%dx%d", videoWidth, videoHeight)
-	cmd := exec.Command("ffmpeg", "-f", "ogg", "-i", "pipe:0",
-		"-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "pipe:1")
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, err
-	}
-	cmd.Stderr = nil
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-	return &videoDecoder{cmd: cmd, in: stdin,
-		out: bufio.NewReaderSize(stdout, videoWidth*videoHeight*3+1024)}, nil
-}
-
-func (v *videoDecoder) stop() {
-	v.in.Close()
-	v.cmd.Process.Kill()
-	_ = v.cmd.Wait()
-}
-
-// frameDecoder turns reassembled VP8 frames into RGB24 videoWidth*videoHeight.
-// Streaming design: piped ffmpeg only emits once primed, so frames go in
-// one end continuously and pictures come out the other — never
-// request/response (which stalls forever on the first frame).
-type frameDecoder interface {
-	submit(frame []byte) bool // false when full (caller drops, never blocks)
-	results() <-chan []byte
-	close()
-}
-
-// ffmpegDecoder implements frameDecoder via an ffmpeg child process.
-type ffmpegDecoder struct {
-	dec  *videoDecoder
-	mux  *oggMux
-	inQ  chan []byte
-	outQ chan []byte
-	done chan struct{}
-	wg   sync.WaitGroup
-	once sync.Once
-}
-
-func newFFmpegDecoder() (*ffmpegDecoder, error) {
-	dec, err := startVideoDecoder()
-	if err != nil {
-		return nil, err
-	}
-	d := &ffmpegDecoder{
-		dec:  dec,
-		mux:  newOggMux(dec.in, 0x75706c6b),
-		inQ:  make(chan []byte, 8),
-		outQ: make(chan []byte, 4),
-		done: make(chan struct{}),
-	}
-	if err := d.mux.writeHeaders(videoWidth, videoHeight); err != nil {
-		dec.stop()
-		return nil, err
-	}
-	d.wg.Add(2)
-	go d.writePump()
-	go d.readPump()
-	return d, nil
-}
-
-func (d *ffmpegDecoder) writePump() {
-	defer d.wg.Done()
-	var n uint64
-	for {
-		select {
-		case <-d.done:
-			return
-		case f, ok := <-d.inQ:
-			if !ok {
-				return
-			}
-			n++
-			if err := d.mux.writeFrame(f, n); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (d *ffmpegDecoder) readPump() {
-	defer d.wg.Done()
-	for {
-		out := make([]byte, videoWidth*videoHeight*3)
-		if _, err := io.ReadFull(d.dec.out, out); err != nil {
-			return
-		}
-		// Drop-oldest, never block: a slow UI must shed load, not stall
-		// ffmpeg's stdout (a full queue there backpressures the encoder
-		// and lag grows without bound).
-		select {
-		case d.outQ <- out:
-		default:
-			select {
-			case <-d.outQ:
-			default:
-			}
-			select {
-			case d.outQ <- out:
-			case <-d.done:
-				return
-			}
-		}
-	}
-}
-
-func (d *ffmpegDecoder) submit(frame []byte) bool {
-	select {
-	case d.inQ <- frame:
-		return true
-	case <-d.done:
-		return false
-	default:
-		return false
-	}
-}
-
-func (d *ffmpegDecoder) results() <-chan []byte { return d.outQ }
-
-func (d *ffmpegDecoder) close() {
-	d.once.Do(func() { close(d.done) })
-	d.dec.stop() // kill first: unblocks ReadFull/write before wg.Wait
-	d.wg.Wait()
+	return "braille"
 }

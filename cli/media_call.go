@@ -5,153 +5,122 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"github.com/pion/rtp/codecs"
 )
 
-// ─── Voice calls (LAN, 1:1) ─────────────────────────────────────────────────
+// ─── Media publishing (/video + /audio, no calls) ───────────────────────────
 //
-// Call control rides the existing signal queue (offer/accept/decline/end —
-// tiny, rare, no budget impact); media flows direct UDP via mediaTransport.
-// One call at a time: a second incoming offer is auto-declined (busy).
+// One model: publish. /video and /audio toggle what THIS machine sends to
+// its current scope (the DM peer, or every online room member); receivers
+// dial the publisher back over per-peer Noise_XX UDP sessions and render
+// or play. There is no ringing, no accepting, no busy: announces are
+// idempotent, watchers reply with their own coords so the publisher can
+// dial back, and handshake roles follow the username glare rule (the same
+// rule that made calls converge, so concurrent publishers never deadlock).
+//
+// Signaling (rides the existing signal queue, tiny + rare):
+//   media-live {ip, ips, port, video, audio} — "I am sending X to you"
+//   media-stop {video, audio}                — "I stopped sending X"
+// A Live=false announce is a watcher's join reply (coords for the
+// publisher's fan-out; never rendered, never re-replied).
+//
+// One video feed is shown and one speaker heard at a time (pin model):
+// interleaved frames or mixed voice from two publishers cannot be
+// un-corrupted, so the pin holds until 5s (video) / 2s (audio) of silence.
+//
+// Path healing: every 2s the manager checks every expected peer (we send
+// to them or they send to us); a session silent >10s is re-probed at most
+// once per 30s, with one honest verdict line per outcome.
 
 const (
-	callOffer   = "call-offer"
-	callAccept  = "call-accept"
-	callDecline = "call-decline"
-	callEnd     = "call-end"
+	mediaLive = "media-live"
+	mediaStop = "media-stop"
 
-	callOfferTTL      = 30 * time.Second
 	callWatchdogAfter = 10 * time.Second
+	healCheckEvery    = 2 * time.Second
+	healEvery         = 30 * time.Second
+	videoPinTimeout   = 5 * time.Second
+	audioPinTimeout   = 2 * time.Second
+	// videoRenderMinInterval bounds paint cost: decode runs full-rate,
+	// the TUI sheds (~14fps at this interval is smooth for ASCII).
+	videoRenderMinInterval = 70 * time.Millisecond
 )
 
-// Room video publish rides the same signal queue + Noise UDP sessions as
-// calls, but needs no call: video-live announces camera coords to a scope
-// (DM peer or room members), video-stop withdraws. Receivers dial back and
-// render; a Live=false announce is a watcher's join reply (coords for the
-// publisher's fan-out, never rendered, never re-replied).
-const (
-	videoLive = "video-live"
-	videoStop = "video-stop"
-
-	// videoRenderMinInterval bounds UI cost: decode runs full-rate, paint
-	// sheds (8fps/side is plenty for a 56x16 ASCII pane).
-	videoRenderMinInterval = 125 * time.Millisecond
-	// videoPinTimeout re-pins the single remote renderer after silence
-	// (one decoder, so one sender at a time; see onVideoFrag).
-	videoPinTimeout = 5 * time.Second
-	// healEvery bounds watchdog re-probes of a blackholed UDP path.
-	healEvery = 30 * time.Second
-)
-
-type videoAnnouncePayload struct {
-	IP   string   `json:"ip"`
-	Ips  []string `json:"ips,omitempty"`
-	Port int      `json:"port"`
-	Live bool     `json:"live"`
+type mediaAnnouncePayload struct {
+	IP    string   `json:"ip"`
+	Ips   []string `json:"ips,omitempty"`
+	Port  int      `json:"port"`
+	Live  bool     `json:"live"`
+	Video bool     `json:"video"`
+	Audio bool     `json:"audio"`
 }
 
-type callOfferPayload struct {
-	IP   string   `json:"ip"`
-	Ips  []string `json:"ips,omitempty"`
-	Port int      `json:"port"`
-	Ts   int64    `json:"ts"`
+// mediaUICallbacks is the manager → UI surface (never called from the
+// network path without a snapshot).
+type mediaUICallbacks struct {
+	onInfo       func(info string)    // one-line status/errors for the transcript
+	onLevel      func(level float64)  // mic loudness 0..1 (throttled)
+	onVideoFrame func(lines []string) // decoded remote ASCII frame
+	onSelfFrame  func(lines []string) // local camera preview
 }
 
-type callAnswerPayload struct {
-	IP     string   `json:"ip"`
-	Ips    []string `json:"ips,omitempty"`
-	Port   int      `json:"port"`
-	Accept bool     `json:"accept"`
-}
-
-type callState int
-
-const (
-	callIdle callState = iota
-	callOutgoing
-	callRinging
-	callLive
-)
-
-func (s callState) String() string {
-	switch s {
-	case callOutgoing:
-		return "calling"
-	case callRinging:
-		return "ringing"
-	case callLive:
-		return "live"
-	default:
-		return "idle"
-	}
-}
-
-type callCallbacks struct {
-	onRinging    func(peer string)                               // incoming offer worth showing
-	onState      func(state callState, peer string, info string) // transitions + errors
-	onLevel      func(level float64)                             // mic loudness 0..1 (throttled)
-	onVideoFrame func(lines []string)                            // decoded remote ASCII frame
-	onSelfFrame  func(lines []string)                            // local camera preview
-}
-
-type callManager struct {
+type mediaManager struct {
 	me       string
 	id       *identityKey
 	sendNote func(to, noteType, payload string) error
 	roster   func() map[string][]byte
 	micSrc   func() (<-chan []int16, func(), error)
 	playSink func() (func([]int16), func(), error)
-	cb       callCallbacks
+	cb       mediaUICallbacks
+	lanIPs   func() []string
+	dialIP   string // test hook: pins advertised coords to loopback
 
-	mu        sync.Mutex
-	state     callState
-	peer      string
+	mu sync.Mutex
+	// Publish state: what we send, and to whom (scope locked at toggle;
+	// roster ticks top up fresh joiners and prune leavers).
+	videoOn bool
+	audioOn bool
+	videoTo map[string]bool
+	audioTo map[string]bool
+	// Watch state: who sends to us.
+	pubVideo map[string]bool
+	pubAudio map[string]bool
+	replied  map[string]bool // announced/replied peers (no note storms)
+
 	transport *mediaTransport
+	started   bool
+	healStop  chan struct{}
+	wg        sync.WaitGroup
+
+	// camera live-cycle (nil unless streaming)
+	cameraStop    chan struct{}
+	stopCameraSrc func()
+	previewQ      chan vidFrame // self-view queue (bounded, drop-oldest)
+	videoOnFlag   bool          // camera loop running (videoOn is the toggle)
+	videoAsm      *fragAssembler
+	rxFramesQ     chan vidFrame // remote decoded frames (bounded, drop-oldest)
+	rxDone        chan struct{}
+	rxPump        bool
+	rxOnFlag      bool
+	videoSrcFn    func() (<-chan vidFrame, func(), error)
+	videoSeq      uint16
+	videoTs       uint32
+
 	// audio live-cycle
-	audioStop     chan struct{}
-	audioWg       sync.WaitGroup
-	stopMic       func()
-	stopPlay      func()
-	rxJb          *jitterBuffer
-	muted         atomic.Bool
-	offer         callOfferPayload
-	offerFrom     string
-	warnedNoMedia bool
-	rxOn          bool
-	// mediaReadyAt anchors the no-media watchdog: silence before the Noise
-	// session exists is handshake timing (~3 polls), not a fault.
-	mediaReadyAt time.Time
-	// dialIP overrides localLANIP (tests pin loopback).
-	dialIP string
-	// lanIPs lists advertised addresses (tests pin loopback).
-	lanIPs func() []string
-	// video live-cycle (nil unless streaming).
-	videoStop    chan struct{}
-	stopVideoSrc func()
-	previewDec   frameDecoder // local monitor decode (self-view, TX side)
-	videoAsm     *fragAssembler
-	videoDec     frameDecoder
-	rxDone       chan struct{}
-	rxPump       bool
-	videoSrc     func() (<-chan []byte, func(), error)
-	videoDecFn   func() (frameDecoder, error)
-	videoOn      bool
-	videoSeq     uint16
-	videoTs      uint32
-	// Room publish (no call needed): TX fans out to every ready session.
-	publishing bool
-	pubTargets map[string]bool // announced scope (for stop notes + top-up)
-	pubLive    map[string]bool // peers currently publishing (watch set)
-	pubMuted   map[string]bool // sent video-stop: keep session, skip fan-out
-	pubReplied map[string]bool // watcher-reply already sent (no storms)
-	watching   bool
-	peerAns    callAnswerPayload // caller-side coords for watchdog re-probe
-	// Single remote renderer: pinned sender + render throttle + counters.
+	audioStop   chan struct{}
+	audioRxStop chan struct{}
+	stopMic     func()
+	stopPlayFn  func()
+	txVoice     *opusVoice
+	rxVoice     *opusVoice
+	rxJbs       map[string]*jitterBuffer
+	audioPinned string
+	audioPinAt  time.Time
+
+	// render geometry + throttle + counters (diagnostics on toggle lines)
 	rxPinned       string
 	rxPinAt        time.Time
 	lastRemoteShow time.Time
@@ -160,17 +129,29 @@ type callManager struct {
 	rxFrames       uint64
 	remoteShows    uint64
 	selfShows      uint64
-	// Watchdog path healing (call mode): re-nominate a blackholed route.
-	lastHeal  time.Time
+	renderCols     int
+	renderRows     int
+
+	// path healing
+	lastHeal  map[string]time.Time
 	healTries int
 }
 
-func newCallManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb callCallbacks) *callManager {
-	return &callManager{
+func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb mediaUICallbacks) *mediaManager {
+	return &mediaManager{
 		me: me, id: id, sendNote: sendNote, roster: roster, cb: cb,
-		lanIPs:   localLANIPs,
-		micSrc:   openMicFrames,
-		playSink: openPlaySink,
+		lanIPs:     localLANIPs,
+		micSrc:     openMicFrames,
+		playSink:   openPlaySink,
+		videoTo:    map[string]bool{},
+		audioTo:    map[string]bool{},
+		pubVideo:   map[string]bool{},
+		pubAudio:   map[string]bool{},
+		replied:    map[string]bool{},
+		rxJbs:      map[string]*jitterBuffer{},
+		lastHeal:   map[string]time.Time{},
+		renderCols: videoPaneDefaultCols,
+		renderRows: videoPaneDefaultRows,
 	}
 }
 
@@ -212,8 +193,8 @@ func openPlaySink() (func([]int16), func(), error) {
 
 // localLANIPs returns usable local IPv4s, best first: skip virtual/docker/
 // VPN interfaces, prefer RFC1918. A single wrong pick (docker bridge, VPN)
-// blackholes all media with perfect signaling — so offers carry the whole
-// list and the peer nominates by provable reachability.
+// blackholes all media with perfect signaling — so announces carry the
+// whole list and the peer nominates by provable reachability.
 func localLANIPs() []string {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -255,915 +236,6 @@ func localLANIPs() []string {
 	return append(preferred, fallback...)
 }
 
-// localLANIP returns the best single guess (first of the ranked list).
-func localLANIP() (string, error) {
-	ips := localLANIPs()
-	if len(ips) == 0 {
-		return "", fmt.Errorf("no LAN IPv4 found")
-	}
-	return ips[0], nil
-}
-
-// callbacks snapshots the callback table: tests rewire callbacks mid-run
-// while transport goroutines invoke them, so every read takes the lock.
-func (c *callManager) callbacks() callCallbacks {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.cb
-}
-
-func (c *callManager) emitState(info string) {
-	c.mu.Lock()
-	st, peer := c.state, c.peer
-	c.mu.Unlock()
-	if cb := c.callbacks().onState; cb != nil {
-		cb(st, peer, info)
-	}
-}
-
-// Call starts an outgoing call: fresh transport (ephemeral port), offer sent.
-func (c *callManager) Call(peer string) error {
-	c.mu.Lock()
-	if c.state != callIdle {
-		st := c.state
-		c.mu.Unlock()
-		return fmt.Errorf("already in a call (%s)", st)
-	}
-	c.mu.Unlock()
-	t, err := newMediaTransport(c.me, c.id, c.sendNote, c.roster, c.mediaCB())
-	if err != nil {
-		return err
-	}
-	ips := localLANIPs()
-	if c.lanIPs != nil {
-		ips = c.lanIPs()
-	}
-	ip := ""
-	if len(ips) > 0 {
-		ip = ips[0]
-	}
-	if c.dialIP != "" {
-		ip, ips = c.dialIP, []string{c.dialIP}
-	}
-	if ip == "" {
-		return fmt.Errorf("no LAN IPv4 found")
-	}
-	raw, _ := json.Marshal(callOfferPayload{IP: ip, Ips: ips, Port: t.localAddr().Port, Ts: time.Now().Unix()})
-	c.mu.Lock()
-	c.transport, c.state, c.peer = t, callOutgoing, peer
-	c.mu.Unlock()
-	t.start()
-	if err := c.sendNote(peer, callOffer, string(raw)); err != nil {
-		c.teardownLocked("offer failed")
-		return err
-	}
-	c.emitState("ringing " + peer)
-	return nil
-}
-
-// Accept answers a ringing offer and starts media.
-func (c *callManager) Accept() error {
-	c.mu.Lock()
-	if c.state != callRinging {
-		st := c.state
-		c.mu.Unlock()
-		return fmt.Errorf("no incoming call (state %s)", st)
-	}
-	peer, offer := c.peer, c.offer
-	c.mu.Unlock()
-	t, err := newMediaTransport(c.me, c.id, c.sendNote, c.roster, c.mediaCB())
-	if err != nil {
-		return err
-	}
-	// Start the socket loop BEFORE nominating: pong replies are processed
-	// by readLoop, and probing a deaf socket always yields nil.
-	t.start()
-	ips := localLANIPs()
-	if c.lanIPs != nil {
-		ips = c.lanIPs()
-	}
-	ip := ""
-	if len(ips) > 0 {
-		ip = ips[0]
-	}
-	if c.dialIP != "" {
-		ip, ips = c.dialIP, []string{c.dialIP}
-	}
-	if ip == "" {
-		return fmt.Errorf("no LAN IPv4 found")
-	}
-	// Nominate a provably reachable address from the peer's candidates
-	// (plus their primary) instead of blindly trusting one IP.
-	cands := append(append([]string{}, offer.Ips...), offer.IP)
-	winner := t.nominate(cands, offer.Port)
-	if winner == nil {
-		return fmt.Errorf("no reachable address for %s (tried %d candidate(s))", peer, len(cands))
-	}
-	if err := t.dialPeer(peer, winner.IP.String(), winner.Port); err != nil {
-		return err
-	}
-	raw, _ := json.Marshal(callAnswerPayload{IP: ip, Ips: ips, Port: t.localAddr().Port, Accept: true})
-	c.mu.Lock()
-	c.transport = t
-	c.mu.Unlock()
-	if err := c.sendNote(peer, callAccept, string(raw)); err != nil {
-		c.teardownLocked("accept failed")
-		return err
-	}
-	t.beginHandshake(peer)
-	c.setLiveLocked(peer)
-	return nil
-}
-
-// Decline refuses a ringing offer.
-func (c *callManager) Decline() error {
-	c.mu.Lock()
-	if c.state != callRinging {
-		c.mu.Unlock()
-		return fmt.Errorf("no incoming call")
-	}
-	peer := c.peer
-	c.state, c.peer = callIdle, ""
-	c.mu.Unlock()
-	raw, _ := json.Marshal(callAnswerPayload{Accept: false})
-	_ = c.sendNote(peer, callAccept, string(raw))
-	c.emitState("declined " + peer)
-	return nil
-}
-
-// Hangup ends the live call (notifies the peer best-effort). With no call
-// it still leaves room video / watch state ("not in a call" only when
-// there is truly no media activity at all).
-func (c *callManager) Hangup() error {
-	c.mu.Lock()
-	inCall := c.state == callLive || c.state == callOutgoing
-	mediaActive := c.videoOn || c.publishing || c.watching || c.transport != nil
-	peer := c.peer
-	c.mu.Unlock()
-	if !inCall && !mediaActive {
-		return fmt.Errorf("not in a call")
-	}
-	if inCall {
-		_ = c.sendNote(peer, callEnd, "{}")
-	}
-	c.teardownLocked("hung up")
-	return nil
-}
-
-func (c *callManager) Mute(muted bool) {
-	c.muted.Store(muted)
-}
-
-func (c *callManager) setLiveLocked(peer string) {
-	c.mu.Lock()
-	c.state = callLive
-	c.mu.Unlock()
-	c.emitState("live with " + peer)
-	// Audio starts on transport ready, not here: the media handshake still
-	// needs ~3 signal polls, and starting early only burns mic frames and
-	// trips the no-media watchdog before any datagram could exist.
-	c.maybeStartAudio(peer)
-}
-
-// onTransportReady fires when the Noise session goes live: anchor the
-// no-media watchdog and start audio if the call is already live (otherwise
-// setLiveLocked picks it up — handshake and call-state race either order
-// depending on note timing).
-func (c *callManager) onTransportReady(peer string) {
-	c.mu.Lock()
-	c.mediaReadyAt = time.Now()
-	c.mu.Unlock()
-	c.maybeStartAudio(peer)
-	c.emitState("media secured with " + peer)
-}
-
-// maybeStartAudio starts the audio pipeline once the call is live AND the
-// transport is ready, whichever comes last. Safe to call from both paths.
-func (c *callManager) maybeStartAudio(peer string) {
-	c.mu.Lock()
-	if c.state != callLive || c.audioStop != nil {
-		c.mu.Unlock()
-		return
-	}
-	var ready bool
-	if c.transport != nil {
-		ready = c.transport.peerReady(peer)
-	}
-	c.mu.Unlock()
-	if ready {
-		c.startAudio(peer)
-	}
-}
-
-// maybeHeal re-probes a blackholed UDP route (bounded: healEvery). Runs
-// off the audio watchdog so the 20ms playout tick never blocks on the
-// 600ms nomination probe.
-func (c *callManager) maybeHeal(peer string) {
-	c.mu.Lock()
-	if c.state != callLive || time.Since(c.lastHeal) < healEvery {
-		c.mu.Unlock()
-		return
-	}
-	c.lastHeal = time.Now()
-	c.healTries++
-	c.mu.Unlock()
-	go c.healPath(peer)
-}
-
-// healPath re-nominates the peer's stored candidates and re-dials when the
-// route moved; prompts a peer-side fresh handshake too. Every outcome gets
-// one honest state line (healed / moved / still blocked).
-func (c *callManager) healPath(peer string) {
-	c.mu.Lock()
-	if c.state != callLive || c.peer != peer {
-		c.mu.Unlock()
-		return
-	}
-	t := c.transport
-	var cands []string
-	var port int
-	if c.offerFrom == peer {
-		cands, port = append(append([]string{}, c.offer.Ips...), c.offer.IP), c.offer.Port
-	} else {
-		cands, port = append(append([]string{}, c.peerAns.Ips...), c.peerAns.IP), c.peerAns.Port
-	}
-	var cur string
-	if t != nil {
-		cur = t.diagPeer(peer).Addr
-		lastRx := t.lastRxAt(peer)
-		if time.Since(lastRx) <= callWatchdogAfter {
-			c.mu.Unlock()
-			return // traffic resumed while we scheduled
-		}
-	}
-	c.mu.Unlock()
-	if t == nil || len(cands) == 0 || port == 0 {
-		return
-	}
-	winner := t.nominate(cands, port)
-	if winner == nil {
-		c.emitState("path re-probe: no reachable address — AP isolation or firewall likely")
-		t.sendRestart(peer)
-		return
-	}
-	if winner.String() != cur {
-		_ = t.dialPeer(peer, winner.IP.String(), winner.Port)
-		c.emitState("path re-nominated to " + winner.String() + " — healing")
-		t.sendRestart(peer)
-		return
-	}
-	c.emitState("path re-probe: same route, still no Rx — remote silent or blocked inbound")
-	t.sendRestart(peer)
-}
-
-func (c *callManager) teardownLocked(info string) {
-	c.mu.Lock()
-	t := c.transport
-	c.transport = nil
-	c.state, c.peer = callIdle, ""
-	c.warnedNoMedia = false
-	stop := c.audioStop
-	c.audioStop = nil
-	stopMic, stopPlay := c.stopMic, c.stopPlay
-	c.stopMic, c.stopPlay = nil, nil
-	c.rxJb = nil
-	vstop, vdec := c.videoStop, c.videoDec
-	vsrcStop := c.stopVideoSrc
-	pdec := c.previewDec
-	rdone := c.rxDone
-	wasPublishing := c.publishing
-	var pubTargets []string
-	for to := range c.pubTargets {
-		pubTargets = append(pubTargets, to)
-	}
-	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn, c.stopVideoSrc = nil, nil, nil, false, false, nil
-	c.previewDec = nil
-	c.publishing = false
-	c.pubTargets, c.pubLive, c.pubMuted, c.pubReplied = nil, nil, nil, nil
-	c.watching = false
-	c.rxPinned = ""
-	c.rxDone, c.rxPump = nil, false
-	c.mu.Unlock()
-	if wasPublishing {
-		for _, to := range pubTargets {
-			_ = c.sendNote(to, videoStop, "{}")
-		}
-	}
-	if stop != nil {
-		close(stop)
-	}
-	if vstop != nil {
-		close(vstop)
-	}
-	if rdone != nil {
-		close(rdone)
-	}
-	c.audioWg.Wait()
-	if vsrcStop != nil {
-		vsrcStop()
-	}
-	if pdec != nil {
-		pdec.close()
-	}
-	if vdec != nil {
-		vdec.close()
-	}
-	if stopMic != nil {
-		stopMic()
-	}
-	if stopPlay != nil {
-		stopPlay()
-	}
-	if t != nil {
-		t.stop()
-	}
-	c.emitState(info)
-}
-
-// onSignalNote handles call control + media handshake notes.
-func (c *callManager) onSignalNote(n signalNote) {
-	switch n.Type {
-	case mediaHS1, mediaHS2, mediaHS3, mediaHSRestart:
-		c.mu.Lock()
-		t := c.transport
-		c.mu.Unlock()
-		if t == nil {
-			return
-		}
-		var env hsEnvelope
-		if err := json.Unmarshal([]byte(n.Payload), &env); err != nil {
-			return
-		}
-		_ = env
-		t.onHandshakeNote(n.From, n.Type, n.Payload)
-	case callOffer:
-		var offer callOfferPayload
-		if err := json.Unmarshal([]byte(n.Payload), &offer); err != nil {
-			return
-		}
-		if time.Since(time.Unix(offer.Ts, 0)) > callOfferTTL {
-			return // stale ring from a dead attempt
-		}
-		c.mu.Lock()
-		busy := c.state != callIdle
-		if !busy {
-			c.state, c.peer, c.offer, c.offerFrom = callRinging, n.From, offer, n.From
-		}
-		c.mu.Unlock()
-		if busy {
-			raw, _ := json.Marshal(callAnswerPayload{Accept: false})
-			_ = c.sendNote(n.From, callAccept, string(raw))
-			return
-		}
-		if cb := c.callbacks().onRinging; cb != nil {
-			cb(n.From)
-		}
-		c.emitState("incoming call from " + n.From)
-	case callAccept:
-		var ans callAnswerPayload
-		if err := json.Unmarshal([]byte(n.Payload), &ans); err != nil {
-			return
-		}
-		c.mu.Lock()
-		outgoing := c.state == callOutgoing && c.peer == n.From
-		t := c.transport
-		c.mu.Unlock()
-		if !outgoing || t == nil {
-			return
-		}
-		if !ans.Accept {
-			c.teardownLocked(n.From + " declined")
-			return
-		}
-		c.mu.Lock()
-		c.peerAns = ans // watchdog re-probe coords (path healing)
-		c.mu.Unlock()
-		cands := append(append([]string{}, ans.Ips...), ans.IP)
-		winner := t.nominate(cands, ans.Port)
-		if winner == nil {
-			c.teardownLocked("no reachable address for " + n.From)
-			return
-		}
-		if err := t.dialPeer(n.From, winner.IP.String(), winner.Port); err != nil {
-			c.teardownLocked("bad accept address")
-			return
-		}
-		t.beginHandshake(n.From)
-		c.setLiveLocked(n.From)
-	case callDecline:
-		c.mu.Lock()
-		ringing := c.state == callRinging && c.peer == n.From
-		c.mu.Unlock()
-		if ringing {
-			c.teardownLocked(n.From + " cancelled")
-		}
-	case callEnd:
-		c.mu.Lock()
-		inCall := (c.state == callLive || c.state == callRinging) && c.peer == n.From
-		c.mu.Unlock()
-		if inCall {
-			c.teardownLocked(n.From + " hung up")
-		}
-	case videoLive:
-		var ann videoAnnouncePayload
-		if err := json.Unmarshal([]byte(n.Payload), &ann); err != nil {
-			return
-		}
-		if n.From == c.me {
-			return
-		}
-		// Socket first: the watcher join-reply below needs our coords,
-		// and joinVideo needs the read loop running.
-		if _, err := c.ensureTransport(); err != nil {
-			return
-		}
-		c.mu.Lock()
-		if c.pubLive == nil {
-			c.pubLive = map[string]bool{}
-		}
-		if c.pubReplied == nil {
-			c.pubReplied = map[string]bool{}
-		}
-		// A re-announce clears a stale mute (watcher is back).
-		delete(c.pubMuted, n.From)
-		needReply := ann.Live && !c.publishing && !c.pubReplied[n.From]
-		if ann.Live {
-			c.pubLive[n.From] = true
-			c.watching = true
-		}
-		if needReply {
-			c.pubReplied[n.From] = true
-		}
-		c.mu.Unlock()
-		// Watcher join-reply carries coords for our fan-out (never
-		// rendered, never re-replied); publisher announces render.
-		if needReply {
-			_ = c.sendVideoAnnounce(n.From, false)
-		}
-		if ann.Live {
-			c.emitState(n.From + " is sharing video")
-		}
-		go c.joinVideo(n.From, ann)
-	case videoStop:
-		c.mu.Lock()
-		delete(c.pubLive, n.From)
-		delete(c.pubMuted, n.From)
-		if c.rxPinned == n.From {
-			c.rxPinned = ""
-		}
-		dropRx := false
-		if len(c.pubLive) == 0 {
-			c.watching = false
-			// Keep the shared pump while our own camera runs (self-view
-			// still needs it); drop the remote pipeline otherwise.
-			dropRx = !c.videoOn
-		}
-		var dec frameDecoder
-		var rdone chan struct{}
-		if dropRx {
-			dec = c.videoDec
-			rdone = c.rxDone
-			c.videoAsm, c.videoDec, c.rxOn = nil, nil, false
-			c.rxDone, c.rxPump = nil, false
-		}
-		c.mu.Unlock()
-		if rdone != nil {
-			close(rdone)
-		}
-		if dec != nil {
-			dec.close()
-		}
-		c.emitState(n.From + " stopped video")
-	}
-}
-
-// ensureTransport returns the live media socket, creating + starting it on
-// first use (room publish needs media without any call).
-func (c *callManager) ensureTransport() (*mediaTransport, error) {
-	c.mu.Lock()
-	if c.transport != nil {
-		t := c.transport
-		c.mu.Unlock()
-		return t, nil
-	}
-	c.mu.Unlock()
-	t, err := newMediaTransport(c.me, c.id, c.sendNote, c.roster, c.mediaCB())
-	if err != nil {
-		return nil, err
-	}
-	t.start()
-	c.mu.Lock()
-	if c.transport != nil {
-		existing := c.transport
-		c.mu.Unlock()
-		t.stop()
-		return existing, nil
-	}
-	c.transport = t
-	c.mu.Unlock()
-	return t, nil
-}
-
-// advertiseAddrs snapshots the coords peers should dial (test overrides
-// honored exactly like the call offer/answer path).
-func (c *callManager) advertiseAddrs() (ip string, ips []string) {
-	ips = localLANIPs()
-	if c.lanIPs != nil {
-		ips = c.lanIPs()
-	}
-	if len(ips) > 0 {
-		ip = ips[0]
-	}
-	if c.dialIP != "" {
-		ip, ips = c.dialIP, []string{c.dialIP}
-	}
-	return ip, ips
-}
-
-// sendVideoAnnounce posts our UDP coords (Live=true publisher, Live=false
-// watcher join-reply) to one peer.
-func (c *callManager) sendVideoAnnounce(to string, live bool) error {
-	c.mu.Lock()
-	t := c.transport
-	c.mu.Unlock()
-	if t == nil {
-		return fmt.Errorf("no media socket")
-	}
-	addr := t.localAddr()
-	if addr == nil {
-		return fmt.Errorf("no media socket")
-	}
-	ip, ips := c.advertiseAddrs()
-	raw, _ := json.Marshal(videoAnnouncePayload{IP: ip, Ips: ips, Port: addr.Port, Live: live})
-	return c.sendNote(to, videoLive, string(raw))
-}
-
-// StartPublish shares the camera with a scope (DM peer or room members)
-// with no call required. Announces coords, dials back on replies, and fans
-// out every frame to all ready sessions. Idempotent per scope via PublishTo.
-func (c *callManager) StartPublish(targets []string) error {
-	// Already streaming from a call: just widen the scope (the TX loop
-	// fans out to every ready session, so the call peer is covered).
-	c.mu.Lock()
-	attached := c.videoOn && !c.publishing && c.state == callLive
-	c.mu.Unlock()
-	if attached {
-		if err := c.PublishTo(targets); err != nil {
-			return err
-		}
-		c.mu.Lock()
-		c.publishing = true
-		c.mu.Unlock()
-		c.emitState("publishing video to the room")
-		return nil
-	}
-	c.mu.Lock()
-	if c.videoOn {
-		on := c.videoOn
-		_ = on
-		c.mu.Unlock()
-		return fmt.Errorf("video already on")
-	}
-	c.mu.Unlock()
-	t, err := c.ensureTransport()
-	if err != nil {
-		return err
-	}
-	_ = t
-	seen := map[string]bool{}
-	var scope []string
-	for _, p := range targets {
-		if p == "" || p == c.me || seen[p] {
-			continue
-		}
-		seen[p] = true
-		scope = append(scope, p)
-	}
-	for _, to := range scope {
-		if err := c.sendVideoAnnounce(to, true); err != nil {
-			continue // best-effort: roster tick tops up misses
-		}
-		c.mu.Lock()
-		if c.pubTargets == nil {
-			c.pubTargets = map[string]bool{}
-		}
-		c.pubTargets[to] = true
-		c.mu.Unlock()
-	}
-	c.mu.Lock()
-	c.publishing = true
-	if c.pubTargets == nil {
-		c.pubTargets = map[string]bool{}
-	}
-	c.mu.Unlock()
-	if err := c.startCameraTx("publishing video"); err != nil {
-		return err
-	}
-	return nil
-}
-
-// PublishTo announces to scope members missed earlier (late joiners).
-// No-op unless publishing; never restarts the camera.
-func (c *callManager) PublishTo(targets []string) error {
-	c.mu.Lock()
-	if !c.publishing {
-		c.mu.Unlock()
-		return nil
-	}
-	var fresh []string
-	seen := map[string]bool{}
-	for _, p := range targets {
-		if p == "" || p == c.me || seen[p] {
-			continue
-		}
-		seen[p] = true
-		if c.pubTargets == nil || !c.pubTargets[p] {
-			fresh = append(fresh, p)
-		}
-	}
-	c.mu.Unlock()
-	for _, to := range fresh {
-		if err := c.sendVideoAnnounce(to, true); err != nil {
-			continue
-		}
-		c.mu.Lock()
-		if c.pubTargets == nil {
-			c.pubTargets = map[string]bool{}
-		}
-		c.pubTargets[to] = true
-		c.mu.Unlock()
-	}
-	return nil
-}
-
-// joinVideo dials a video announcer (probe → dial → handshake; roles follow
-// the username glare rule, so concurrent publishers converge with no extra
-// round). Idempotent: live sessions are left alone.
-func (c *callManager) joinVideo(from string, ann videoAnnouncePayload) {
-	c.mu.Lock()
-	t := c.transport
-	ready := t != nil && t.peerReady(from)
-	c.mu.Unlock()
-	if ready {
-		return
-	}
-	if t == nil {
-		var err error
-		if t, err = c.ensureTransport(); err != nil {
-			c.emitState("video from " + from + " unreachable (no socket)")
-			return
-		}
-	}
-	cands := append(append([]string{}, ann.Ips...), ann.IP)
-	winner := t.nominate(cands, ann.Port)
-	if winner == nil {
-		c.emitState("video from " + from + " unreachable (no route — AP isolation?)")
-		return
-	}
-	if err := t.dialPeer(from, winner.IP.String(), winner.Port); err != nil {
-		return
-	}
-	t.beginHandshake(from)
-}
-
-// previewDecoder builds the self-view decoder (nil-safe: remote streaming
-// never depends on local preview).
-func (c *callManager) previewDecoder() (frameDecoder, error) {
-	c.mu.Lock()
-	decFn := c.videoDecFn
-	c.mu.Unlock()
-	if decFn == nil {
-		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
-	}
-	return decFn()
-}
-
-func (c *callManager) mediaCB() mediaCallbacks {
-	return mediaCallbacks{
-		onAudio: c.onRemoteAudio,
-		onVideo: func(peer string, frag videoFrag) { c.onVideoFrag(peer, frag) },
-		onReady: func(peer, code string) { c.onTransportReady(peer) },
-		onLost:  func(peer string) { c.emitState("media line lost — will rejoin on traffic") },
-		onError: func(err error) { c.emitState("media: " + err.Error()) },
-	}
-}
-
-func (c *callManager) onRemoteAudio(_ string, pkt audioPacket) {
-	c.mu.Lock()
-	jb := c.rxJb
-	c.mu.Unlock()
-	if jb == nil {
-		return
-	}
-	jb.push(pkt)
-}
-
-// instances per direction: the codec is stateful and not safe for sharing.
-func (c *callManager) startAudio(peer string) {
-	frames, stopMic, err := c.micSrc()
-	if err != nil {
-		c.emitState("mic unavailable: " + err.Error())
-		return
-	}
-	play, stopPlay, err := c.playSink()
-	if err != nil {
-		stopMic()
-		c.emitState("speaker unavailable: " + err.Error())
-		return
-	}
-	txVoice, err := newOpusVoice()
-	if err != nil {
-		stopMic()
-		stopPlay()
-		c.emitState("opus init failed: " + err.Error())
-		return
-	}
-	rxVoice, err := newOpusVoice()
-	if err != nil {
-		stopMic()
-		stopPlay()
-		c.emitState("opus init failed: " + err.Error())
-		return
-	}
-	jb := newJitterBuffer()
-	stop := make(chan struct{})
-	c.mu.Lock()
-	c.audioStop = stop
-	c.stopMic, c.stopPlay = stopMic, stopPlay
-	c.rxJb = jb
-	c.mu.Unlock()
-	var seq uint16
-	var ts uint32
-	// TX: mic → encode → send.
-	c.audioWg.Add(1)
-	go func() {
-		defer c.audioWg.Done()
-		tick := 0
-		for {
-			select {
-			case <-stop:
-				return
-			case f, ok := <-frames:
-				if !ok {
-					return
-				}
-				if c.muted.Load() {
-					// Muted still pings (~every 2s): keeps NAT bindings warm
-					// and tells the peer's watchdog we're alive, not gone.
-					tick++
-					if tick%100 == 0 {
-						c.mu.Lock()
-						t := c.transport
-						c.mu.Unlock()
-						if t != nil {
-							_ = t.sendMedia(peer, mediaKindPing, nil)
-						}
-					}
-					continue
-				}
-				if tick%5 == 0 {
-					if onLevel := c.callbacks().onLevel; onLevel != nil {
-						onLevel(rmsLevel(f))
-					}
-				}
-				tick++
-				pkt, err := txVoice.encode(f)
-				if err != nil {
-					continue
-				}
-				seq++
-				ts += voiceFrameLen
-				c.mu.Lock()
-				t := c.transport
-				c.mu.Unlock()
-				if t == nil {
-					return
-				}
-				_ = t.sendMedia(peer, mediaKindAudio, encodeAudioPacket(seq, ts, pkt))
-			}
-		}
-	}()
-	// RX: 20ms playout tick; gaps repaired via in-band FEC, else skipped
-	// (the clock must advance — see jitterBuffer). Also the no-path
-	// watchdog: signaling alive but zero datagrams means a blocked direct
-	// path (guest-WiFi isolation), not a quiet peer — say so once.
-	c.audioWg.Add(1)
-	go func() {
-		defer c.audioWg.Done()
-		ticker := time.NewTicker(20 * time.Millisecond)
-		defer ticker.Stop()
-		var last []byte
-		watchTick := 0
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				pkt, gap := jb.pop()
-				if gap {
-					if last != nil {
-						if fec, err := rxVoice.decodeFEC(last); err == nil {
-							play(fec)
-						}
-					}
-				} else {
-					last = pkt.Opus
-					pcm, err := rxVoice.decode(pkt.Opus)
-					if err == nil {
-						play(pcm)
-					}
-				}
-				if watchTick++; watchTick >= 100 {
-					watchTick = 0
-					c.mu.Lock()
-					t := c.transport
-					readyAt := c.mediaReadyAt
-					warned := c.warnedNoMedia
-					c.mu.Unlock()
-					var lastRx time.Time
-					if t != nil {
-						lastRx = t.lastRxAt(peer)
-					}
-					// Both clocks must agree: session live 10s+ with zero
-					// datagrams in 10s. Before the session exists (or right
-					// after it forms) silence is normal handshake timing.
-					if t != nil && !readyAt.IsZero() &&
-						time.Since(readyAt) > callWatchdogAfter &&
-						time.Since(lastRx) > callWatchdogAfter {
-						if !warned {
-							c.mu.Lock()
-							c.warnedNoMedia = true
-							c.mu.Unlock()
-							c.emitState("no media received — direct path may be blocked (guest WiFi isolation?)")
-						}
-						// Healing, not just warning: a stale nomination
-						// (DHCP renew, AP roam, wrong candidate) recovers by
-						// re-probing; hard isolation gets an honest verdict.
-						c.maybeHeal(peer)
-					}
-				}
-			}
-		}
-	}()
-}
-
-// diagLines renders call diagnostics for /mediastats: everything needed
-// to tell signaling failure apart from UDP blackholes.
-func (c *callManager) diagLines() []string {
-	st, peer := c.State()
-	lines := []string{
-		fmt.Sprintf("call state=%s peer=%q muted=%v", st, peer, c.Muted()),
-		fmt.Sprintf("offered IPs: %v", localLANIPs()),
-	}
-	c.mu.Lock()
-	videoInfo := fmt.Sprintf("video on=%v publishing=%v watching=%v rxPinned=%q txFrames=%d rxFrames=%d remoteShows=%d selfShows=%d",
-		c.videoOn, c.publishing, c.watching, c.rxPinned, c.txFrames, c.rxFrames, c.remoteShows, c.selfShows)
-	healInfo := fmt.Sprintf("heal tries=%d", c.healTries)
-	var pubList []string
-	for to := range c.pubLive {
-		pubList = append(pubList, to)
-	}
-	c.mu.Unlock()
-	lines = append(lines, videoInfo, "publishers live: "+fmt.Sprintf("%v", pubList), healInfo)
-	if peer == "" {
-		return lines
-	}
-	c.mu.Lock()
-	t := c.transport
-	known := false
-	if _, ok := c.roster()[peer]; ok {
-		known = true
-	}
-	c.mu.Unlock()
-	lines = append(lines, fmt.Sprintf("roster knows peer: %v", known))
-	if t == nil {
-		return append(lines, "transport: none")
-	}
-	d := t.diagPeer(peer)
-	lines = append(lines,
-		fmt.Sprintf("transport local=%s peer=%s", d.LocalAddr, d.Addr),
-		fmt.Sprintf("session ready=%v hs=%v hsAge=%v tries=%d verifyPending=%v", d.Ready, d.HasHs, d.HsAge, d.HsTries, d.VerifyPending),
-		fmt.Sprintf("datagrams sent=%d recv=%d lastRx=%v ago", d.Sent, d.Recv, d.LastRxAge),
-	)
-	return lines
-}
-
-// State reports the call state snapshot for UI rendering.
-func (c *callManager) State() (callState, string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state, c.peer
-}
-
-func (c *callManager) Muted() bool { return c.muted.Load() }
-
-// declinePayload is the wire bytes for refusing a call (shared with the
-// headless auto-decline path, which has no manager).
-func declinePayload() string {
-	raw, _ := json.Marshal(callAnswerPayload{Accept: false})
-	return string(raw)
-}
-
 // rosterMap converts engine roster snapshots to verify keys (skips garbage
 // instead of failing the whole map).
 func rosterMap(peers []rosterMember) map[string][]byte {
@@ -1181,69 +253,574 @@ func rosterMap(peers []rosterMember) map[string][]byte {
 	return out
 }
 
-// ─── Video live-cycle ───────────────────────────────────────────────────────
+// ─── Status accessors (TUI chips + roster badges) ───────────────────────────
 
-// StartVideo begins camera send + remote render. Live call required.
-func (c *callManager) StartVideo() error {
-	c.mu.Lock()
-	if c.state != callLive {
-		st := c.state
-		c.mu.Unlock()
-		return fmt.Errorf("no live call (state %s)", st)
-	}
-	if c.videoOn {
-		c.mu.Unlock()
-		return fmt.Errorf("video already on")
-	}
-	peer := c.peer
-	c.mu.Unlock()
-	return c.startCameraTx("video on with " + peer)
+func (m *mediaManager) VideoOn() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.videoOn
 }
 
-// startCameraTx is the single-flight camera loop shared by call-attached
-// video and room publish (one TX loop ever: videoOn guards).
-func (c *callManager) startCameraTx(info string) error {
-	c.mu.Lock()
-	srcFn := c.videoSrc
-	if srcFn == nil {
-		srcFn = defaultVideoSrc
+func (m *mediaManager) AudioOn() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.audioOn
+}
+
+func (m *mediaManager) VideoPublishers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return sortedKeys(m.pubVideo)
+}
+
+func (m *mediaManager) AudioPublishers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return sortedKeys(m.pubAudio)
+}
+
+// VideoScope describes who we show ("bob" / "the room (3 people)") or "".
+// videoStatsLine summarizes the last publish in one line (frames sent,
+// received, painted on both sides) — diagnostics without a command.
+func (m *mediaManager) videoStatsLine() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return fmt.Sprintf("sent=%d recv=%d remotePaints=%d selfPaints=%d",
+		m.txFrames, m.rxFrames, m.remoteShows, m.selfShows)
+}
+
+func (m *mediaManager) VideoScope() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.videoOn {
+		return ""
 	}
-	c.mu.Unlock()
+	return describeScope(m.videoTo)
+}
+
+func (m *mediaManager) AudioScope() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.audioOn {
+		return ""
+	}
+	return describeScope(m.audioTo)
+}
+
+// Watching reports whether any remote video feed is being rendered.
+func (m *mediaManager) Watching() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pubVideo) > 0 || m.rxOnFlag
+}
+
+// Hearing reports whether any remote audio is being played.
+func (m *mediaManager) Hearing() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pubAudio) > 0
+}
+
+// RxOn reports whether remote video has arrived at least once.
+func (m *mediaManager) RxOn() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.rxOnFlag
+}
+
+// MediaActive reports whether any media state exists (exit cleanup gate).
+func (m *mediaManager) MediaActive() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.videoOn || m.audioOn || len(m.pubVideo) > 0 || len(m.pubAudio) > 0 ||
+		m.transport != nil
+}
+
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (m *mediaManager) callbacks() mediaUICallbacks {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cb
+}
+
+func (m *mediaManager) emit(info string) {
+	if cb := m.callbacks(); cb.onInfo != nil {
+		cb.onInfo(info)
+	}
+}
+
+// ─── Scope + toggles (the two user commands) ────────────────────────────────
+
+// scopeFor resolves "wherever the user is": their DM peer, or the room.
+func (m *mediaManager) scopeFor(targetUser string, roomUsers []string) []string {
+	if targetUser != "" {
+		return []string{targetUser}
+	}
+	out := make([]string, 0, len(roomUsers))
+	for _, u := range roomUsers {
+		if u != "" && u != m.me {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func describeScope(set map[string]bool) string {
+	switch len(set) {
+	case 0:
+		return "nobody (alone here)"
+	case 1:
+		for p := range set {
+			return p
+		}
+	}
+	return fmt.Sprintf("the room (%d people)", len(set))
+}
+
+// ToggleVideo turns the camera on (announce to scope) or off (media-stop).
+// Toggling on again while on re-announces to fresh scope members only.
+func (m *mediaManager) ToggleVideo(scope []string) error {
+	m.mu.Lock()
+	if m.videoOn {
+		m.mu.Unlock()
+		m.stopVideoPublish()
+		m.emit(m.videoStatsLine() + " · camera off")
+		return nil
+	}
+	for _, p := range scope {
+		if p != "" && p != m.me {
+			m.videoTo[p] = true
+		}
+	}
+	if len(m.videoTo) == 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("nobody to show (alone here)")
+	}
+	desc := describeScope(m.videoTo)
+	m.videoOn = true
+	m.mu.Unlock()
+	if _, err := m.ensureTransport(); err != nil {
+		m.mu.Lock()
+		m.videoOn, m.videoTo = false, map[string]bool{}
+		m.mu.Unlock()
+		return err
+	}
+	m.emit("camera on — showing " + desc)
+	if err := m.publishAnnounce(); err != nil {
+		return err
+	}
+	return m.startCameraTx()
+}
+
+// ToggleAudio turns the mic on (announce to scope) or off (media-stop).
+func (m *mediaManager) ToggleAudio(scope []string) error {
+	m.mu.Lock()
+	if m.audioOn {
+		m.mu.Unlock()
+		m.stopAudioPublish()
+		m.emit("mic off")
+		return nil
+	}
+	for _, p := range scope {
+		if p != "" && p != m.me {
+			m.audioTo[p] = true
+		}
+	}
+	if len(m.audioTo) == 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("nobody to talk to (alone here)")
+	}
+	desc := describeScope(m.audioTo)
+	m.audioOn = true
+	m.mu.Unlock()
+	if _, err := m.ensureTransport(); err != nil {
+		m.mu.Lock()
+		m.audioOn, m.audioTo = false, map[string]bool{}
+		m.mu.Unlock()
+		return err
+	}
+	m.emit("mic live — talking to " + desc)
+	if err := m.publishAnnounce(); err != nil {
+		return err
+	}
+	m.startMicTx()
+	return nil
+}
+
+// publishAnnounce posts our coords + mask to every scope member we have
+// not contacted yet (fresh joiners), via the signal queue.
+func (m *mediaManager) publishAnnounce() error {
+	m.mu.Lock()
+	var targets []string
+	for p := range m.videoTo {
+		if !m.replied[p] {
+			targets = append(targets, p)
+		}
+	}
+	for p := range m.audioTo {
+		if !m.replied[p] {
+			targets = append(targets, p)
+		}
+	}
+	m.mu.Unlock()
+	for _, to := range targets {
+		if err := m.sendAnnounce(to, true); err != nil {
+			continue // the roster tick retries via PublishTo
+		}
+		m.mu.Lock()
+		m.replied[to] = true
+		m.mu.Unlock()
+	}
+	return nil
+}
+
+// PublishTo announces to scope members missed earlier (late joiners) and
+// prunes leavers. Streams whose scope empties stop themselves.
+func (m *mediaManager) PublishTo(scope []string) {
+	m.mu.Lock()
+	if !m.videoOn && !m.audioOn {
+		m.mu.Unlock()
+		return
+	}
+	live := map[string]bool{}
+	for _, p := range scope {
+		if p != "" && p != m.me {
+			live[p] = true
+		}
+	}
+	for p := range m.videoTo {
+		if !live[p] {
+			delete(m.videoTo, p)
+			delete(m.replied, p)
+		}
+	}
+	for p := range m.audioTo {
+		if !live[p] {
+			delete(m.audioTo, p)
+			delete(m.replied, p)
+		}
+	}
+	var fresh []string
+	for p := range live {
+		if !m.replied[p] {
+			fresh = append(fresh, p)
+		}
+	}
+	videoOn, audioOn := len(m.videoTo) > 0, len(m.audioTo) > 0
+	m.mu.Unlock()
+	if m.videoOn && !videoOn {
+		m.stopVideoPublish()
+	}
+	if m.audioOn && !audioOn {
+		m.stopAudioPublish()
+	}
+	for _, to := range fresh {
+		if err := m.sendAnnounce(to, true); err != nil {
+			continue
+		}
+		m.mu.Lock()
+		m.replied[to] = true
+		m.mu.Unlock()
+	}
+}
+
+// sendAnnounce posts our UDP coords + mask to one peer.
+func (m *mediaManager) sendAnnounce(to string, live bool) error {
+	m.mu.Lock()
+	t := m.transport
+	video, audio := m.videoOn, m.audioOn
+	m.mu.Unlock()
+	if t == nil {
+		return fmt.Errorf("no media socket")
+	}
+	addr := t.localAddr()
+	if addr == nil {
+		return fmt.Errorf("no media socket")
+	}
+	ip, ips := m.advertiseAddrs()
+	raw, _ := json.Marshal(mediaAnnouncePayload{IP: ip, Ips: ips, Port: addr.Port, Live: live, Video: video, Audio: audio})
+	return m.sendNote(to, mediaLive, string(raw))
+}
+
+// sendStop tells one peer we stopped a kind.
+func (m *mediaManager) sendStop(to string, video, audio bool) {
+	raw, _ := json.Marshal(mediaAnnouncePayload{Video: video, Audio: audio})
+	_ = m.sendNote(to, mediaStop, string(raw))
+}
+
+// ensureTransport returns the live media socket, creating + starting it on
+// first use (publish needs media without any call).
+func (m *mediaManager) ensureTransport() (*mediaTransport, error) {
+	m.mu.Lock()
+	if m.transport != nil {
+		t := m.transport
+		m.mu.Unlock()
+		m.startLoops()
+		return t, nil
+	}
+	m.mu.Unlock()
+	t, err := newMediaTransport(m.me, m.id, m.sendNote, m.rosterSnapshot(), m.mediaCB())
+	if err != nil {
+		return nil, err
+	}
+	t.start()
+	m.mu.Lock()
+	if m.transport != nil {
+		existing := m.transport
+		m.mu.Unlock()
+		t.stop()
+		m.startLoops()
+		return existing, nil
+	}
+	m.transport = t
+	m.mu.Unlock()
+	m.startLoops()
+	return t, nil
+}
+
+func (m *mediaManager) rosterSnapshot() func() map[string][]byte {
+	return func() map[string][]byte {
+		m.mu.Lock()
+		fn := m.roster
+		m.mu.Unlock()
+		if fn == nil {
+			return map[string][]byte{}
+		}
+		return fn()
+	}
+}
+
+// advertiseAddrs snapshots the coords peers should dial (test overrides
+// honored exactly like the old offer/answer path).
+func (m *mediaManager) advertiseAddrs() (ip string, ips []string) {
+	ips = localLANIPs()
+	if m.lanIPs != nil {
+		ips = m.lanIPs()
+	}
+	if len(ips) > 0 {
+		ip = ips[0]
+	}
+	if m.dialIP != "" {
+		ip, ips = m.dialIP, []string{m.dialIP}
+	}
+	return ip, ips
+}
+
+// joinPeer dials an announcer (probe → dial → handshake). Handshake roles
+// follow the username glare rule, so concurrent publishers converge with
+// no extra round. Idempotent: live sessions are left alone.
+func (m *mediaManager) joinPeer(from string, ann mediaAnnouncePayload) {
+	m.mu.Lock()
+	t := m.transport
+	ready := t != nil && t.peerReady(from)
+	m.mu.Unlock()
+	if ready {
+		return
+	}
+	if ann.IP == "" && len(ann.Ips) == 0 {
+		return // stop-style payload, not an announce
+	}
+	if t == nil {
+		var err error
+		if t, err = m.ensureTransport(); err != nil {
+			m.emit("media from " + from + " unreachable (no socket)")
+			return
+		}
+	}
+	cands := append(append([]string{}, ann.Ips...), ann.IP)
+	winner := t.nominate(cands, ann.Port)
+	if winner == nil {
+		m.emit("media from " + from + " unreachable (no route — AP isolation?)")
+		return
+	}
+	if err := t.dialPeer(from, winner.IP.String(), winner.Port); err != nil {
+		return
+	}
+	t.beginHandshake(from)
+}
+
+// ─── Signaling notes ────────────────────────────────────────────────────────
+
+func (m *mediaManager) onSignalNote(n signalNote) {
+	switch n.Type {
+	case mediaHS1, mediaHS2, mediaHS3, mediaHSRestart:
+		m.mu.Lock()
+		t := m.transport
+		m.mu.Unlock()
+		if t == nil {
+			return
+		}
+		t.onHandshakeNote(n.From, n.Type, n.Payload)
+
+	case mediaLive:
+		var ann mediaAnnouncePayload
+		if err := json.Unmarshal([]byte(n.Payload), &ann); err != nil {
+			return
+		}
+		if n.From == m.me {
+			return
+		}
+		// Socket first: the join-reply needs our coords, and joinPeer
+		// needs the read loop running.
+		if _, err := m.ensureTransport(); err != nil {
+			return
+		}
+		m.mu.Lock()
+		changed := ""
+		if ann.Live && ann.Video && !m.pubVideo[n.From] {
+			m.pubVideo[n.From] = true
+			changed = describePublisherChange(n.From, ann)
+		}
+		if ann.Live && ann.Audio && !m.pubAudio[n.From] {
+			m.pubAudio[n.From] = true
+			if changed == "" {
+				changed = describePublisherChange(n.From, ann)
+			}
+		}
+		needReply := ann.Live && !m.replied[n.From] && !m.videoTo[n.From] && !m.audioTo[n.From]
+		if needReply {
+			m.replied[n.From] = true
+		}
+		m.mu.Unlock()
+		if needReply {
+			// Watcher join-reply carries our coords for the publisher's
+			// fan-out (never rendered, never re-replied).
+			_ = m.sendAnnounce(n.From, false)
+		}
+		if changed != "" {
+			m.emit(changed)
+		}
+		if ann.Audio {
+			m.ensureAudioRx()
+		}
+		go m.joinPeer(n.From, ann)
+
+	case mediaStop:
+		var st mediaAnnouncePayload
+		_ = json.Unmarshal([]byte(n.Payload), &st) // bare {} = stop all
+		m.mu.Lock()
+		wasVideo := m.pubVideo[n.From]
+		wasAudio := m.pubAudio[n.From]
+		if st.Video || (!st.Video && !st.Audio) {
+			delete(m.pubVideo, n.From)
+		}
+		if st.Audio || (!st.Video && !st.Audio) {
+			delete(m.pubAudio, n.From)
+		}
+		nowVideo := m.pubVideo[n.From]
+		nowAudio := m.pubAudio[n.From]
+		if !nowVideo && m.rxPinned == n.From {
+			m.rxPinned = ""
+		}
+		if !nowAudio {
+			delete(m.rxJbs, n.From)
+			if m.audioPinned == n.From {
+				m.audioPinned = ""
+			}
+		}
+		watching := len(m.pubVideo) > 0
+		hearing := len(m.pubAudio) > 0
+		var rdone chan struct{}
+		if !watching && !m.videoOn {
+			rdone = m.rxDone
+			m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
+			m.videoAsm = nil
+		}
+		stopPlayout := !hearing && !m.audioOn && m.audioRxStop != nil
+		m.mu.Unlock()
+		if rdone != nil {
+			close(rdone)
+		}
+		if stopPlayout {
+			m.stopAudioPlayout()
+		}
+		if wasVideo && !nowVideo {
+			m.emit(n.From + " stopped video")
+		}
+		if wasAudio && !nowAudio {
+			m.emit(n.From + " stopped audio")
+		}
+	}
+}
+
+func describePublisherChange(from string, ann mediaAnnouncePayload) string {
+	switch {
+	case ann.Video && ann.Audio:
+		return from + " is sharing video + audio"
+	case ann.Video:
+		return from + " is sharing video"
+	default:
+		return from + " is sharing audio"
+	}
+}
+
+// ─── Transport dispatch ─────────────────────────────────────────────────────
+
+// mediaCB adapts manager handlers to the transport's callback table.
+func (m *mediaManager) mediaCB() mediaCallbacks {
+	return mediaCallbacks{
+		onAudio: m.onRemoteAudio,
+		onVideo: m.onVideoFrag,
+		onReady: func(peer, code string) {
+			m.emit("media secured with " + peer)
+		},
+		onLost:  func(peer string) { m.emit("media line lost to " + peer + " — rejoining on traffic") },
+		onError: func(err error) { m.emit("media: " + err.Error()) },
+	}
+}
+
+// onTransportReady anchors healing (session live ⇒ silence after this is
+// a path problem, not handshake timing).
+func (m *mediaManager) onTransportReady(peer string) {
+	m.mu.Lock()
+	m.lastHeal[peer] = time.Now() // fresh session: give it a full window
+	m.mu.Unlock()
+}
+
+// ─── Camera TX ──────────────────────────────────────────────────────────────
+
+// startCameraTx is the single-flight camera loop (cameraStop guards).
+func (m *mediaManager) startCameraTx() error {
+	m.mu.Lock()
+	if m.cameraStop != nil {
+		m.mu.Unlock()
+		return nil
+	}
+	srcFn := m.videoSrcFn
+	if srcFn == nil {
+		srcFn = cameraFrames
+	}
+	m.mu.Unlock()
 
 	frames, stopSrc, err := srcFn()
 	if err != nil {
 		return err
 	}
-	// Local monitor decode for self-view (best-effort: remote streaming
-	// must not depend on it).
-	preview, previewErr := c.previewDecoder()
 	stop := make(chan struct{})
-	c.mu.Lock()
-	c.videoStop, c.videoOn = stop, true
-	c.stopVideoSrc = stopSrc
-	c.previewDec = preview
-	// Self-view is TX-side: the pump must run even when this side never
-	// receives remote fragments (sender-only never hits ensureRxLocked).
-	if c.rxDone == nil {
-		c.rxDone = make(chan struct{})
+	m.mu.Lock()
+	m.cameraStop = stop
+	m.stopCameraSrc = stopSrc
+	if m.previewQ == nil {
+		m.previewQ = make(chan vidFrame, 4)
 	}
-	if !c.rxPump {
-		c.rxPump = true
-		c.startRenderPump()
-	}
-	c.mu.Unlock()
-	if previewErr != nil {
-		c.emitState("self-view unavailable: " + previewErr.Error())
-	}
-	c.emitState(info)
-	depay := &codecs.VP8Packet{}
-	// TX: camera frames → frag → fan-out to every ready session (call peer
-	// and/or room publish targets share one loop; per-peer Noise sessions
-	// keep it E2E). Preview subsampled: self-view at half rate halves local
-	// decode CPU for zero network effect.
-	c.audioWg.Add(1)
+	m.mu.Unlock()
+
+	m.wg.Add(1)
 	go func() {
-		defer c.audioWg.Done()
+		defer m.wg.Done()
+		defer func() {
+			m.mu.Lock()
+			m.videoOnFlag = false
+			m.mu.Unlock()
+		}()
 		var n uint64
 		for {
 			select {
@@ -1254,32 +831,39 @@ func (c *callManager) startCameraTx(info string) error {
 					return
 				}
 				n++
-				if preview != nil && n%2 == 0 {
-					preview.submit(f) // drop-if-full; send path never waits
+				// Self-view at half rate (drop-if-full queue): halves
+				// local render cost, zero network effect.
+				if n%2 == 0 {
+					select {
+					case m.previewQ <- f:
+					default:
+					}
 				}
-				payloads, err := fragVP8(f)
+				payloads, err := fragVideoFrame(f.Jpeg)
 				if err != nil {
 					continue
 				}
-				c.mu.Lock()
-				t := c.transport
-				c.videoTs++
-				ts := c.videoTs
-				c.txFrames++
-				c.mu.Unlock()
+				m.mu.Lock()
+				t := m.transport
+				m.videoTs++
+				ts := m.videoTs
+				m.txFrames++
+				m.mu.Unlock()
 				if t == nil {
 					return
 				}
 				for i, p := range payloads {
-					c.mu.Lock()
-					c.videoSeq++
-					seq := c.videoSeq
-					muted := c.pubMuted
-					c.mu.Unlock()
+					m.mu.Lock()
+					m.videoSeq++
+					seq := m.videoSeq
+					m.mu.Unlock()
 					pkt := encodeVideoFrag(seq, uint16(i), uint16(len(payloads)), ts, p)
 					for _, peer := range t.readyPeers() {
-						if muted != nil && muted[peer] {
-							continue // sent video-stop: keep session, skip frames
+						m.mu.Lock()
+						inScope := m.videoTo[peer]
+						m.mu.Unlock()
+						if !inScope {
+							continue
 						}
 						_ = t.sendMedia(peer, mediaKindVideo, pkt)
 					}
@@ -1287,153 +871,167 @@ func (c *callManager) startCameraTx(info string) error {
 			}
 		}
 	}()
-	_ = depay
+	m.mu.Lock()
+	m.videoOnFlag = true
+	if m.rxDone == nil {
+		m.rxDone = make(chan struct{})
+	}
+	if !m.rxPump {
+		m.rxPump = true
+		m.startRenderPump()
+	}
+	m.mu.Unlock()
 	return nil
 }
 
-// ensureRxLocked builds the receive pipeline on first inbound video (a
-// peer may publish while we only watch). Runs under c.mu.
-func (c *callManager) ensureRxLocked() bool {
-	if c.videoAsm != nil && c.videoDec != nil {
+// ─── Video RX ───────────────────────────────────────────────────────────────
+
+// ensureVideoRxLocked builds the receive pipeline on first expected video.
+// Runs under m.mu; returns true once the pipeline exists.
+func (m *mediaManager) ensureVideoRxLocked() bool {
+	if m.rxFramesQ != nil {
 		return true
 	}
-	// A call, our own publish, or a watched publisher all legitimize
-	// inbound video (stray frags from anyone else have no session anyway).
-	if c.state != callLive && !c.publishing && !c.watching {
-		return false
+	m.rxFramesQ = make(chan vidFrame, 4)
+	if m.rxDone == nil {
+		m.rxDone = make(chan struct{})
 	}
-	decFn := c.videoDecFn
-	if decFn == nil {
-		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
-	}
-	dec, err := decFn()
-	if err != nil {
-		return false
-	}
-	c.videoAsm = newFragAssembler()
-	c.videoDec = dec
-	if c.rxDone == nil {
-		c.rxDone = make(chan struct{})
-	}
-	if !c.rxPump {
-		c.rxPump = true
-		c.startRenderPump()
+	if !m.rxPump {
+		m.rxPump = true
+		m.startRenderPump()
 	}
 	return true
 }
 
-// onVideoFrag reassembles, decodes, and renders one remote fragment.
-// Depacketize first (FU-A descriptors are transport, not picture data),
-// then assemble by timestamp; only complete frames decode. One decoder
-// serves one sender at a time: frags pin to the first active sender and
-// anyone else is ignored until 5s of silence (interleaved timestamps from
-// two publishers would otherwise corrupt every frame).
-func (c *callManager) onVideoFrag(peer string, frag videoFrag) {
-	c.mu.Lock()
-	if !c.ensureRxLocked() {
-		c.mu.Unlock()
-		return
+// teardownVideoRxLocked drops the remote pipeline when nobody publishes
+// and our own camera is off. Runs under m.mu; returns the closeables.
+func (m *mediaManager) teardownVideoRxLocked() (rdone chan struct{}) {
+	if m.rxDone == nil {
+		return nil
+	}
+	rdone = m.rxDone
+	m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
+	m.videoAsm = nil
+	return rdone
+}
+
+// onVideoFrag reassembles + decodes + queues one remote JPEG frame. Frags
+// pin to one sender (5s silence re-pins): interleaved timestamps from two
+// publishers would corrupt every frame otherwise.
+func (m *mediaManager) onVideoFrag(peer string, frag videoFrag) {
+	m.mu.Lock()
+	if len(m.pubVideo) == 0 {
+		m.mu.Unlock()
+		return // nobody we know is publishing: ignore strays
 	}
 	now := time.Now()
-	if c.rxPinned == "" {
-		c.rxPinned, c.rxPinAt = peer, now
-	} else if peer != c.rxPinned {
-		if now.Sub(c.rxPinAt) > videoPinTimeout {
-			c.rxPinned, c.rxPinAt = peer, now
-			c.videoAsm = newFragAssembler()
-		} else {
-			c.mu.Unlock()
-			return
+	if m.rxPinned == "" || now.Sub(m.rxPinAt) > videoPinTimeout {
+		if peer != m.rxPinned {
+			m.videoAsm = newFragAssembler()
 		}
-	} else {
-		c.rxPinAt = now
-	}
-	asm := c.videoAsm
-	c.mu.Unlock()
-	payload, err := func() ([]byte, error) {
-		depay := &codecs.VP8Packet{}
-		return depay.Unmarshal(frag.Data)
-	}()
-	if err != nil {
+		m.rxPinned, m.rxPinAt = peer, now
+	} else if peer != m.rxPinned {
+		m.mu.Unlock()
 		return
+	} else {
+		m.rxPinAt = now
 	}
-	complete := asm.push(videoFrag{
-		Seq: frag.Seq, FragIdx: frag.FragIdx, FragTotal: frag.FragTotal,
-		Ts: frag.Ts, Data: payload,
-	})
+	asm := m.videoAsm
+	q := m.rxFramesQ
+	if asm == nil {
+		asm = newFragAssembler()
+		m.videoAsm = asm
+	}
+	if q == nil {
+		if m.rxDone == nil {
+			m.rxDone = make(chan struct{})
+		}
+		q = make(chan vidFrame, 4)
+		m.rxFramesQ = q
+		if !m.rxPump {
+			m.rxPump = true
+			m.startRenderPump()
+		}
+	}
+	m.mu.Unlock()
+
+	complete := asm.push(frag)
 	if complete == nil {
 		return
 	}
-	c.mu.Lock()
-	dec := c.videoDec
-	if dec != nil {
-		c.rxFrames++
-	}
-	c.mu.Unlock()
-	if dec == nil {
+	frame, err := jpegToRGB(complete)
+	if err != nil {
 		return
 	}
-	dec.submit(complete) // drop-if-full: decode keeps pace or sheds load
+	m.mu.Lock()
+	m.rxFrames++
+	m.mu.Unlock()
+	select {
+	case q <- frame:
+	default: // drop-if-full: decode keeps pace or sheds load
+	}
 }
 
-// startRenderPump relays decoded RGB (remote and self-view) to ASCII
-// rendering. Decoders are snapshotted per iteration: nil channels block
-// forever in select, so missing sides simply idle. Paint is throttled per
-// side (videoRenderMinInterval): decode runs full-rate, the TUI sheds.
-func (c *callManager) startRenderPump() {
-	c.audioWg.Add(1)
+// startRenderPump relays decoded frames (remote + self-view) to ASCII
+// painting. Queues snapshot per iteration: nil channels block forever in
+// select, so missing sides simply idle. Paint is throttled per side.
+func (m *mediaManager) startRenderPump() {
+	m.wg.Add(1)
 	go func() {
-		defer c.audioWg.Done()
+		defer m.wg.Done()
 		for {
-			c.mu.Lock()
-			var remote, preview <-chan []byte
-			if c.videoDec != nil {
-				remote = c.videoDec.results()
+			m.mu.Lock()
+			var remote, preview <-chan vidFrame
+			if m.rxFramesQ != nil {
+				remote = m.rxFramesQ
 			}
-			if c.previewDec != nil {
-				preview = c.previewDec.results()
+			if m.previewQ != nil {
+				preview = m.previewQ
 			}
-			done := c.rxDone
-			c.mu.Unlock()
+			done := m.rxDone
+			cols, rows := m.renderCols, m.renderRows
+			m.mu.Unlock()
 			if done == nil {
 				return
 			}
 			select {
 			case <-done:
 				return
-			case rgb, ok := <-remote:
+			case f, ok := <-remote:
 				if !ok {
 					return
 				}
 				now := time.Now()
-				c.mu.Lock()
-				c.rxOn = true
-				due := now.Sub(c.lastRemoteShow) >= videoRenderMinInterval
+				m.mu.Lock()
+				m.rxOnFlag = true
+				due := now.Sub(m.lastRemoteShow) >= videoRenderMinInterval
 				if due {
-					c.lastRemoteShow = now
-					c.remoteShows++
+					m.lastRemoteShow = now
+					m.remoteShows++
 				}
-				c.mu.Unlock()
+				cols, rows = m.renderCols, m.renderRows
+				m.mu.Unlock()
 				if due {
-					if cb := c.callbacks().onVideoFrame; cb != nil {
-						cb(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+					if cb := m.callbacks(); cb.onVideoFrame != nil {
+						cb.onVideoFrame(asciiFrame(f.RGB, f.Width, f.Height, cols, rows, videoStyle()))
 					}
 				}
-			case rgb, ok := <-preview:
+			case f, ok := <-preview:
 				if !ok {
 					return
 				}
 				now := time.Now()
-				c.mu.Lock()
-				due := now.Sub(c.lastSelfShow) >= videoRenderMinInterval
+				m.mu.Lock()
+				due := now.Sub(m.lastSelfShow) >= videoRenderMinInterval
 				if due {
-					c.lastSelfShow = now
-					c.selfShows++
+					m.lastSelfShow = now
+					m.selfShows++
 				}
-				c.mu.Unlock()
+				cols, rows = m.renderCols, m.renderRows
+				m.mu.Unlock()
 				if due {
-					if cb := c.callbacks().onSelfFrame; cb != nil {
-						cb(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+					if cb := m.callbacks(); cb.onSelfFrame != nil {
+						cb.onSelfFrame(asciiFrame(f.RGB, f.Width, f.Height, cols, rows, videoStyle()))
 					}
 				}
 			}
@@ -1441,53 +1039,220 @@ func (c *callManager) startRenderPump() {
 	}()
 }
 
-// rxDoneChan returns the receive-path done channel, creating it with the
-// pipeline. Render pump and decoder die with the call, never the frame.
-func (c *callManager) rxDoneChan() <-chan struct{} {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.rxDone == nil {
-		c.rxDone = make(chan struct{})
+// SetVideoSize snapshots the true pane geometry for the render pump
+// (kills the fixed-width crop: frames render at the pane's real width).
+func (m *mediaManager) SetVideoSize(cols, rows int) {
+	if cols < 10 || rows < 3 {
+		return // degenerate pane: keep the last sane geometry
 	}
-	return c.rxDone
+	m.mu.Lock()
+	m.renderCols, m.renderRows = cols, rows
+	m.mu.Unlock()
 }
 
-// StopVideo ends camera send + remote render, keeping audio up. In publish
-// mode it also withdraws the room announce (watchers keep their last frame
-// until our video-stop lands); watching others continues on the shared
-// pipeline.
-func (c *callManager) StopVideo() {
-	c.mu.Lock()
-	stop := c.videoStop
-	dec := c.videoDec
-	srcStop := c.stopVideoSrc
-	pdec := c.previewDec
-	wasPublishing := c.publishing
-	var targets []string
-	for to := range c.pubTargets {
-		targets = append(targets, to)
+// ─── Mic TX + audio RX ──────────────────────────────────────────────────────
+
+// startMicTx runs the mic → Opus → fan-out loop while audio is on. Single
+// flight (audioStop guards).
+func (m *mediaManager) startMicTx() {
+	m.mu.Lock()
+	if m.audioStop != nil {
+		m.mu.Unlock()
+		return
 	}
-	c.videoStop, c.videoOn, c.stopVideoSrc = nil, false, nil
-	c.previewDec = nil
-	c.publishing = false
-	c.pubTargets = nil
-	c.pubMuted = nil
-	keepRx := c.watching
+	frames, stopMic, err := m.micSrc()
+	if err != nil {
+		m.audioOn = false
+		m.audioTo = map[string]bool{}
+		m.mu.Unlock()
+		m.emit("mic unavailable: " + err.Error())
+		return
+	}
+	txVoice, err := newOpusVoice()
+	if err != nil {
+		stopMic()
+		m.audioOn = false
+		m.audioTo = map[string]bool{}
+		m.mu.Unlock()
+		m.emit("opus init failed: " + err.Error())
+		return
+	}
+	stop := make(chan struct{})
+	m.audioStop = stop
+	m.stopMic = stopMic
+	m.txVoice = txVoice
+	m.mu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		var seq uint16
+		var ts uint32
+		for {
+			select {
+			case <-stop:
+				return
+			case f, ok := <-frames:
+				if !ok {
+					return
+				}
+				pkt, err := txVoice.encode(f)
+				if err != nil {
+					continue
+				}
+				seq++
+				ts += voiceFrameLen
+				m.mu.Lock()
+				t := m.transport
+				m.mu.Unlock()
+				if t == nil {
+					return
+				}
+				ap := encodeAudioPacket(seq, ts, pkt)
+				for _, peer := range t.readyPeers() {
+					m.mu.Lock()
+					inScope := m.audioTo[peer]
+					m.mu.Unlock()
+					if !inScope {
+						continue
+					}
+					_ = t.sendMedia(peer, mediaKindAudio, ap)
+				}
+			}
+		}
+	}()
+}
+
+// ensureAudioRx builds (once) the playout pipeline: 20ms tick over the
+// pinned sender's jitter buffer with in-band FEC gap repair. Runs while
+// any peer publishes audio — no call involved.
+func (m *mediaManager) ensureAudioRx() {
+	m.mu.Lock()
+	if m.rxVoice != nil {
+		m.mu.Unlock()
+		return
+	}
+	play, stopPlay, err := m.playSink()
+	if err != nil {
+		m.mu.Unlock()
+		m.emit("speaker unavailable: " + err.Error())
+		return
+	}
+	rxVoice, err := newOpusVoice()
+	if err != nil {
+		stopPlay()
+		m.mu.Unlock()
+		m.emit("opus init failed: " + err.Error())
+		return
+	}
+	m.rxVoice = rxVoice
+	if m.rxJbs == nil {
+		m.rxJbs = map[string]*jitterBuffer{}
+	}
+	m.stopPlayFn = stopPlay
+	stop := make(chan struct{})
+	m.audioRxStop = stop
+	m.mu.Unlock()
+
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		defer func() {
+			m.mu.Lock()
+			m.rxVoice = nil
+			m.rxJbs = map[string]*jitterBuffer{}
+			m.audioPinned = ""
+			m.mu.Unlock()
+		}()
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		var last []byte
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				m.mu.Lock()
+				pinned := m.audioPinned
+				jb := m.rxJbs[pinned]
+				anyPublisher := len(m.pubAudio) > 0
+				rxV := m.rxVoice
+				m.mu.Unlock()
+				if !anyPublisher || jb == nil || rxV == nil {
+					continue
+				}
+				pkt, gap := jb.pop()
+				if gap {
+					if last != nil {
+						if fec, err := rxV.decodeFEC(last); err == nil {
+							play(fec)
+						}
+					}
+				} else {
+					last = pkt.Opus
+					if pcm, err := rxV.decode(pkt.Opus); err == nil {
+						play(pcm)
+					}
+				}
+			}
+		}
+	}()
+}
+
+// onRemoteAudio routes a peer's audio into their jitter buffer and elects
+// the audible sender (2s-silence re-pin: no voice mixing).
+func (m *mediaManager) onRemoteAudio(peer string, pkt audioPacket) {
+	m.mu.Lock()
+	if len(m.pubAudio) == 0 {
+		m.mu.Unlock()
+		return
+	}
+	if m.rxJbs == nil {
+		m.rxJbs = map[string]*jitterBuffer{}
+	}
+	jb := m.rxJbs[peer]
+	if jb == nil {
+		jb = newJitterBuffer()
+		m.rxJbs[peer] = jb
+	}
+	now := time.Now()
+	if m.audioPinned == "" || now.Sub(m.audioPinAt) > audioPinTimeout {
+		m.audioPinned, m.audioPinAt = peer, now
+	} else if peer == m.audioPinned {
+		m.audioPinAt = now
+	}
+	m.mu.Unlock()
+	jb.push(pkt)
+}
+
+// ─── Stops ──────────────────────────────────────────────────────────────────
+
+// stopVideoPublish: camera off — media-stop to scope; keep watching others.
+func (m *mediaManager) stopVideoPublish() {
+	m.mu.Lock()
+	scope := sortedKeys(m.videoTo)
+	m.videoTo = map[string]bool{}
+	m.videoOn = false
+	m.mu.Unlock()
+	for _, to := range scope {
+		m.sendStop(to, true, false)
+	}
+	m.stopVideoStream()
+}
+
+// stopVideoStream stops the camera loop; remote RX survives if watching.
+func (m *mediaManager) stopVideoStream() {
+	m.mu.Lock()
+	stop := m.cameraStop
+	srcStop := m.stopCameraSrc
+	m.cameraStop, m.stopCameraSrc = nil, nil
+	m.videoOnFlag = false
+	keepRx := len(m.pubVideo) > 0
 	var rdone chan struct{}
 	if !keepRx {
-		rdone = c.rxDone
-		dec = c.videoDec
-		c.videoAsm, c.videoDec, c.rxOn = nil, nil, false
-		c.rxDone, c.rxPump = nil, false
-	} else {
-		dec = nil
+		rdone = m.teardownVideoRxLocked()
 	}
-	c.mu.Unlock()
-	if wasPublishing {
-		for _, to := range targets {
-			_ = c.sendNote(to, videoStop, "{}")
-		}
-	}
+	m.mu.Unlock()
 	if stop != nil {
 		close(stop)
 	}
@@ -1497,76 +1262,226 @@ func (c *callManager) StopVideo() {
 	if srcStop != nil {
 		srcStop()
 	}
-	if pdec != nil {
-		pdec.close()
+}
+
+// stopAudioPublish: mic off — media-stop to scope; keep hearing others.
+func (m *mediaManager) stopAudioPublish() {
+	m.mu.Lock()
+	scope := sortedKeys(m.audioTo)
+	m.audioTo = map[string]bool{}
+	m.audioOn = false
+	stop := m.audioStop
+	m.audioStop = nil
+	stopMic := m.stopMic
+	m.stopMic = nil
+	m.txVoice = nil
+	keepPlayout := len(m.pubAudio) > 0
+	var stopRx chan struct{}
+	if !keepPlayout && m.audioRxStop != nil {
+		stopRx = m.audioRxStop
+		m.audioRxStop = nil
 	}
-	if dec != nil {
-		dec.close()
+	m.mu.Unlock()
+	for _, to := range scope {
+		m.sendStop(to, false, true)
+	}
+	if stop != nil {
+		close(stop)
+	}
+	if stopMic != nil {
+		stopMic()
+	}
+	if stopRx != nil {
+		close(stopRx)
 	}
 }
 
-// Publishing reports whether room video (no call) is streaming.
-func (c *callManager) Publishing() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.publishing
-}
-
-// Watching reports whether a room publisher is being watched.
-func (c *callManager) Watching() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.watching
-}
-
-// VideoOn reports whether video is streaming.
-func (c *callManager) VideoOn() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.videoOn
-}
-
-// RxOn reports whether remote video has arrived at least once.
-func (c *callManager) RxOn() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.rxOn
-}
-
-func defaultVideoSrc() (<-chan []byte, func(), error) {
-	enc, err := startVideoEncoder()
-	if err != nil {
-		return nil, nil, err
+// stopAudioPlayout stops the 20ms playout loop + speaker.
+func (m *mediaManager) stopAudioPlayout() {
+	m.mu.Lock()
+	stop := m.audioRxStop
+	m.audioRxStop = nil
+	closeFn := m.stopPlayFn
+	m.stopPlayFn = nil
+	m.rxVoice = nil
+	m.rxJbs = map[string]*jitterBuffer{}
+	m.audioPinned = ""
+	m.mu.Unlock()
+	if stop != nil {
+		close(stop)
 	}
-	out := make(chan []byte, 8)
-	done := make(chan struct{})
+	if closeFn != nil {
+		closeFn()
+	}
+}
+
+// stopAll tears everything down (session exit / Ctrl+C).
+func (m *mediaManager) stopAll() {
+	m.mu.Lock()
+	stop := m.healStop
+	m.healStop = nil
+	cameraStop := m.cameraStop
+	audioStop := m.audioStop
+	audioRxStop := m.audioRxStop
+	rdone := m.rxDone
+	stopMic := m.stopMic
+	stopPlay := m.stopPlayFn
+	m.cameraStop, m.stopCameraSrc = nil, nil
+	m.audioStop, m.audioRxStop, m.stopMic, m.stopPlayFn = nil, nil, nil, nil
+	m.videoOn, m.audioOn = false, false
+	m.videoTo, m.audioTo = map[string]bool{}, map[string]bool{}
+	m.pubVideo, m.pubAudio, m.replied = map[string]bool{}, map[string]bool{}, map[string]bool{}
+	m.rxPinned, m.audioPinned = "", ""
+	m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
+	m.started = false
+	scope := sortedKeys(m.videoTo)
+	audioScope := sortedKeys(m.audioTo)
+	m.mu.Unlock()
+	// Best-effort stop notes so watchers do not freeze on our last frame.
+	for _, to := range scope {
+		m.sendStop(to, true, false)
+	}
+	for _, to := range audioScope {
+		m.sendStop(to, false, true)
+	}
+	if stop != nil {
+		close(stop)
+	}
+	if cameraStop != nil {
+		close(cameraStop)
+	}
+	if audioStop != nil {
+		close(audioStop)
+	}
+	if audioRxStop != nil {
+		close(audioRxStop)
+	}
+	if rdone != nil {
+		close(rdone)
+	}
+	m.wg.Wait()
+	if stopMic != nil {
+		stopMic()
+	}
+	if stopPlay != nil {
+		stopPlay()
+	}
+	m.mu.Lock()
+	t := m.transport
+	m.transport = nil
+	m.mu.Unlock()
+	if t != nil {
+		t.stop()
+	}
+}
+
+// ─── Loops + healing ────────────────────────────────────────────────────────
+
+// startLoops launches the heal ticker once.
+func (m *mediaManager) startLoops() {
+	m.mu.Lock()
+	if m.started || m.healStop != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.started = true
+	stop := make(chan struct{})
+	m.healStop = stop
+	m.mu.Unlock()
+	m.wg.Add(1)
 	go func() {
-		defer close(out)
-		defer enc.stop()
-		d := newOggDemux(enc.out)
-		// Skip the 2 stream-header packets by position (never by content:
-		// video bytes could theoretically match the magic).
-		for skipped := 0; skipped < 2; skipped++ {
-			if _, err := d.packet(); err != nil {
-				return
-			}
-		}
+		defer m.wg.Done()
+		ticker := time.NewTicker(healCheckEvery)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-done:
+			case <-stop:
 				return
-			default:
-			}
-			pkt, err := d.packet()
-			if err != nil {
-				return
-			}
-			select {
-			case out <- pkt:
-			case <-done:
-				return
+			case <-ticker.C:
+				m.healthCheck()
 			}
 		}
 	}()
-	return out, func() { close(done) }, nil
+}
+
+// expectedPeers lists everyone we exchange media with right now.
+func (m *mediaManager) expectedPeers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	add := func(p string) {
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	for p := range m.videoTo {
+		add(p)
+	}
+	for p := range m.audioTo {
+		add(p)
+	}
+	for p := range m.pubVideo {
+		add(p)
+	}
+	for p := range m.pubAudio {
+		add(p)
+	}
+	return out
+}
+
+// healthCheck re-probes expected-but-silent peers (a blackholed route
+// after DHCP renew / AP roam / wrong candidate). Throttled per peer; every
+// outcome gets one honest verdict line.
+func (m *mediaManager) healthCheck() {
+	expected := m.expectedPeers()
+	if len(expected) == 0 {
+		return
+	}
+	m.mu.Lock()
+	t := m.transport
+	m.mu.Unlock()
+	if t == nil {
+		return
+	}
+	for _, p := range expected {
+		d := t.diagPeer(p)
+		if !d.Ready || d.LastRxAge <= callWatchdogAfter {
+			continue
+		}
+		m.mu.Lock()
+		if time.Since(m.lastHeal[p]) < healEvery {
+			m.mu.Unlock()
+			continue
+		}
+		m.lastHeal[p] = time.Now()
+		m.healTries++
+		m.mu.Unlock()
+		m.healPeer(p)
+	}
+}
+
+// healPeer re-checks a silent peer's route and asks for a fresh handshake.
+// The peer's own announce (roster tick) re-supplies a moved port.
+func (m *mediaManager) healPeer(peer string) {
+	m.mu.Lock()
+	t := m.transport
+	m.mu.Unlock()
+	if t == nil {
+		return
+	}
+	if d := t.diagPeer(peer); d.Addr == "" {
+		return // no route yet; joinPeer handles first contact
+	}
+	if t.lastRxAt(peer).After(time.Now().Add(-callWatchdogAfter)) {
+		return // traffic resumed while we scheduled
+	}
+	t.sendRestart(peer)
+	m.emit("media to " + peer + " silent " + callWatchdogAfter.String() + "+ — re-probing path")
+}
+
+// SetRoster binds the roster closure (engine constructed after manager).
+func (m *mediaManager) SetRoster(fn func() map[string][]byte) {
+	m.mu.Lock()
+	m.roster = fn
+	m.mu.Unlock()
 }

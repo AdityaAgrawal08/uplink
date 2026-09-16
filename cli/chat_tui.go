@@ -113,6 +113,9 @@ const (
 
 // sidebarWidthFor picks a comfortable reading column that grows with the
 // terminal ("font size" adaptation for terminals happens via density).
+// videoOn widens the column while the camera streams: the ASCII video
+// pane lives there, and a 24-cell picture is unreadable (the old 56-in-20
+// crop bug came from ignoring this).
 func sidebarWidthFor(termW int) int {
 	switch {
 	case termW >= 130:
@@ -122,6 +125,18 @@ func sidebarWidthFor(termW int) int {
 	default:
 		return rosterTotalWidth
 	}
+}
+
+// videoSidebarWidthFor is the boosted column while video streams (room for
+// a ~40-cell braille picture; roster still fits beneath).
+const videoSidebarWidth = 44
+
+func sidebarWidthVideo(termW int, videoOn bool) int {
+	w := sidebarWidthFor(termW)
+	if videoOn && termW >= 100 {
+		return videoSidebarWidth
+	}
+	return w
 }
 
 // composerRowsFor gives the message box breathing room on tall screens and
@@ -206,6 +221,12 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 //
 // Pure function => trivially unit-testable.
 func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int) layout {
+	return computeLayoutMedia(termW, termH, showStatus, paletteRows, false)
+}
+
+// computeLayoutMedia is the full layout: videoOn widens the sidebar column
+// so the ASCII video pane gets a picture-width that matches its viewport.
+func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, videoOn bool) layout {
 	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
@@ -219,7 +240,7 @@ func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int
 	l.boxedTranscript = true
 	l.frameOn = termH >= 12 // below this the shell cannot fit its own border
 	l.composerRows = composerRowsFor(termH)
-	l.sidebarWidth = sidebarWidthFor(termW)
+	l.sidebarWidth = sidebarWidthVideo(termW, videoOn)
 
 	innerW := termW - frameChrome
 	if !l.frameOn {
@@ -377,13 +398,8 @@ const receiptExpiry = 5 * time.Minute
 // netDeliveredMsg arrives when the peer acked one of our messages.
 type netDeliveredMsg struct{ msgId string }
 
-// Call UI messages (voice): ringing prompt, state transitions, VU level.
-type callRingMsg struct{ peer string }
-type callStateMsg struct {
-	state callState
-	peer  string
-	info  string
-}
+// Media UI messages: publish status lines + VU level.
+type mediaInfoMsg struct{ info string }
 type callLevelMsg struct{ level float64 }
 
 // netVideoMsg carries one decoded ASCII video frame for the drawer pane.
@@ -466,9 +482,9 @@ type chatScreen struct {
 	// the room. DM unreads keep using the per-peer map.
 	roomUnread int
 	users      []string
-	// call owns the voice-call lifecycle (nil-safe: no call ever started).
-	call         *callManager
-	callLevel    float64 // mic loudness for the header meter
+	// call owns the media lifecycle (publish/subscribe; nil-safe).
+	call         *mediaManager
+	callLevel    float64 // mic loudness for the status meter
 	videoLines   []string
 	selfLines    []string
 	videoVp      viewport.Model // scrollable remote-video pane (wheel)
@@ -587,17 +603,16 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		default:
 		}
 	}
-	callMgr := newCallManager(me, id,
+	var eng *engine
+	callMgr := newMediaManager(me, id,
 		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
 		nil, // roster bound below once eng exists
-		callCallbacks{
-			onRinging:    func(peer string) { push(callRingMsg{peer: peer}) },
-			onState:      func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
+		mediaUICallbacks{
+			onInfo:       func(info string) { push(mediaInfoMsg{info: info}) },
 			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
 			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
 			onSelfFrame:  func(lines []string) { push(netSelfVideoMsg{lines: lines}) },
 		})
-	var eng *engine
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
 			// Ack at receipt, not at paint: a dropped queue slot must not
@@ -614,7 +629,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
-	callMgr.roster = func() map[string][]byte { return rosterMap(eng.peers()) }
+	callMgr.SetRoster(func() map[string][]byte { return rosterMap(eng.peers()) })
 	return chatScreen{
 		sig:         sig,
 		eng:         eng,
@@ -1128,7 +1143,7 @@ func (c chatScreen) headerView() string {
 	// Binary version in the banner: screenshots become self-identifying
 	// (which build each side runs is otherwise unknowable in bug reports).
 	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s%s ",
-		c.key, c.me, len(c.users), normVersion(shortVersion(version)), mode, c.callStatus())
+		c.key, c.me, len(c.users), normVersion(shortVersion(version)), mode, c.mediaStatus())
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
@@ -1230,6 +1245,32 @@ func (c chatScreen) rosterBody(fill int) string {
 		}
 		line := dot + " " + name
 
+		// Media badges: publishing state at a glance — my row shows what
+		// I send (▶ camera, ♪ mic), others' rows show what they share.
+		if c.call != nil {
+			mark := ""
+			if u == c.me {
+				if c.call.VideoOn() {
+					mark += " ▶"
+				}
+				if c.call.AudioOn() {
+					mark += " ♪"
+				}
+			} else {
+				for _, p := range c.call.VideoPublishers() {
+					if p == u {
+						mark += " ▶"
+					}
+				}
+				for _, p := range c.call.AudioPublishers() {
+					if p == u {
+						mark += " ♪"
+					}
+				}
+			}
+			line += tuiPaletteHintStyle.Render(mark)
+		}
+
 		if badge := c.unreadBadge(u); badge != "" {
 			// Right-align the chip with a guaranteed gap from the name.
 			bw := lipgloss.Width(badge)
@@ -1322,6 +1363,9 @@ func (c chatScreen) doLeave() tea.Cmd {
 		if leftSent.Swap(true) {
 			return leaveDoneMsg{}
 		}
+		if c.call != nil {
+			c.call.stopAll() // withdraw publish announces + close the socket
+		}
 		c.eng.stop()
 		if err := c.sig.leaveRoom(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
@@ -1356,137 +1400,68 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// ---- voice calls -------------------------------------------------------------
+// ---- media publishing (/video + /audio) --------------------------------------
 
-// callPeer starts a call (explicit peer, else the open DM thread).
-func (c *chatScreen) callPeer(peer string) tea.Cmd {
-	if peer == "" {
-		peer = c.targetUser
-	}
-	if peer == "" {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /call <user> (or open their DM first)"))
-		return nil
-	}
+// currentScope resolves "wherever the user is": their DM peer, or the
+// room's online members.
+func (c *chatScreen) currentScope() []string {
 	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* calls unavailable here"))
 		return nil
 	}
-	if err := c.call.Call(peer); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* call failed: "+err.Error()))
+	var room []string
+	if c.targetUser == "" && c.eng != nil {
+		room = onlineNames(c.eng.peers(), c.me)
 	}
-	return nil
+	return c.call.scopeFor(c.targetUser, room)
 }
 
-func (c *chatScreen) callAccept() tea.Cmd {
+// toggleVideo runs the /video command: publish/stop camera to the scope.
+func (c *chatScreen) toggleVideo() tea.Cmd {
 	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
 		return nil
 	}
-	if err := c.call.Accept(); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
-	}
-	return nil
-}
-
-func (c *chatScreen) callDecline() tea.Cmd {
-	if c.call == nil {
-		return nil
-	}
-	if err := c.call.Decline(); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
-	}
-	return nil
-}
-
-func (c *chatScreen) callHangup() tea.Cmd {
-	if c.call == nil {
-		return nil
-	}
-	if err := c.call.Hangup(); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+err.Error()))
-	}
-	return nil
-}
-
-func (c *chatScreen) callDiag() tea.Cmd {
-	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* no call active"))
-		return nil
-	}
-	for _, ln := range c.call.diagLines() {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+ln))
-	}
-	return nil
-}
-
-func (c *chatScreen) callMute() tea.Cmd {
-	if c.call == nil {
-		return nil
-	}
-	c.call.Mute(!c.call.Muted())
-	if c.call.Muted() {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* mic muted"))
-	} else {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* mic live"))
-	}
-	return nil
-}
-
-func (c *chatScreen) callVideo() tea.Cmd {
-	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* calls unavailable here"))
-		return nil
-	}
-	// Idempotent: a second /video is reassurance, not failure (used to
-	// print "video failed: video already on").
-	if c.call.VideoOn() || c.call.Publishing() {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera already on"))
-		return nil
-	}
-	if st, _ := c.call.State(); st == callLive {
-		if err := c.call.StartVideo(); err != nil {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
-		} else {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on"))
-		}
-		return nil
-	}
-	// No call: publish to the current scope — the DM peer, or every other
-	// online member. Bare /video only; no username arg needed.
-	var scope []string
-	if c.targetUser != "" {
-		scope = []string{c.targetUser}
-	} else if c.eng != nil {
-		for _, u := range onlineNames(c.eng.peers(), c.me) {
-			if u != c.me {
-				scope = append(scope, u)
-			}
-		}
-	}
-	if err := c.call.StartPublish(scope); err != nil {
+	if err := c.call.ToggleVideo(c.currentScope()); err != nil {
 		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
-		return nil
-	}
-	if len(scope) == 0 {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on (alone here — joiners will see it)"))
-	} else {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* publishing video to "+strings.Join(scope, ", ")))
 	}
 	return nil
 }
 
-// callStatus renders the in-call header chip ("" when idle).
-func (c *chatScreen) callStatus() string {
+// toggleAudio runs the /audio command: publish/stop mic to the scope.
+func (c *chatScreen) toggleAudio() tea.Cmd {
+	if c.call == nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
+		return nil
+	}
+	if err := c.call.ToggleAudio(c.currentScope()); err != nil {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio failed: "+err.Error()))
+	}
+	return nil
+}
+
+// mediaStatus renders the header chips for active media ("" when idle).
+func (c *chatScreen) mediaStatus() string {
 	if c.call == nil {
 		return ""
 	}
-	st, peer := c.call.State()
-	if st == callIdle {
+	var parts []string
+	if scope := c.call.VideoScope(); scope != "" {
+		parts = append(parts, "● VID → "+scope)
+	}
+	if c.call.Watching() {
+		parts = append(parts, "● VID ← "+strings.Join(c.call.VideoPublishers(), ","))
+	}
+	if scope := c.call.AudioScope(); scope != "" {
+		parts = append(parts, "● MIC → "+scope)
+	}
+	if c.call.Hearing() {
+		parts = append(parts, "● MIC ← "+strings.Join(c.call.AudioPublishers(), ","))
+	}
+	if len(parts) == 0 {
 		return ""
 	}
-	s := " · ● call " + peer + " " + st.String()
-	if c.call.Muted() {
-		s += " (muted)"
-	} else if c.callLevel > 0.02 {
+	s := " · " + strings.Join(parts, " · ")
+	if c.call.AudioOn() && c.callLevel > 0.02 {
 		s += " " + vuBar(c.callLevel)
 	}
 	return s
@@ -1538,13 +1513,12 @@ func (c *chatScreen) exitPrivate() {
 // typed "/help" behaves exactly like one picked from the palette.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
 	t := strings.ToLower(strings.TrimSpace(text))
-	if rest, ok := strings.CutPrefix(strings.TrimSpace(text), "/call "); ok {
-		return c.callPeer(strings.TrimSpace(rest))
-	}
-	// /video takes no username (publishes to the current scope): trailing
-	// words are ignored, never sent as chat.
-	if t == "/video" || strings.HasPrefix(t, "/video ") {
-		return c.runCommand("/video")
+	// /video + /audio take no username (publish to the current scope):
+	// trailing words are ignored, never sent as chat.
+	for _, name := range []string{"/video", "/audio"} {
+		if t == name || strings.HasPrefix(t, name+" ") {
+			return c.runCommand(name)
+		}
 	}
 	for _, cmd := range slashCommands {
 		if t == cmd.Name {
@@ -1630,10 +1604,14 @@ func (c *chatScreen) syncViewport() {
 		vpW--
 	}
 	// Remote-video pane tracks the sidebar split independently of the
-	// transcript early-out below.
+	// transcript early-out below, and pushes the TRUE pane geometry into
+	// the manager so frames render at the pane's real size (no crop).
 	if l.videoRows >= 2 {
 		c.videoVp.Width = maxInt(c.sidebarInnerWidth()-2, 8)
 		c.videoVp.Height = maxInt(l.videoRows-2, 1)
+		if _, frameRows, _ := videoPaneGeom(*c, l); c.call != nil {
+			c.call.SetVideoSize(c.videoVp.Width, frameRows)
+		}
 	}
 	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
 		return
@@ -1679,16 +1657,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, u := range users {
 			live[u] = true
 		}
-		// Room publish catch-up: late joiners get our announce (PublishTo
-		// only announces to members outside the current scope).
-		if c.call != nil && c.call.Publishing() && c.targetUser == "" {
-			var scope []string
-			for _, u := range users {
-				if u != c.me {
-					scope = append(scope, u)
-				}
+		// Publish catch-up: late joiners get our announce; leavers get
+		// pruned (streams with an emptied scope stop themselves).
+		if c.call != nil {
+			room := users
+			if c.targetUser != "" {
+				room = []string{c.targetUser}
 			}
-			_ = c.call.PublishTo(scope)
+			c.call.PublishTo(room)
 		}
 		for peer := range c.unread {
 			if !live[peer] {
@@ -1826,13 +1802,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
-	case callRingMsg:
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render(fmt.Sprintf("* Incoming call from %s — /accept or /decline", msg.peer)))
-		cmds = append(cmds, c.drainNetCmd())
-
-	case callStateMsg:
+	case mediaInfoMsg:
 		if msg.info != "" {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* call "+msg.peer+": "+msg.info))
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.info))
 		}
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())

@@ -8,10 +8,10 @@ import (
 	"time"
 )
 
-// Full call stack over the REAL signal path (fake server, real 2s polls,
-// real timing): offer -> accept -> Noise handshake notes -> media ready.
-// The method-call loopback tests bypass all of this.
-func waitMediaPeer(t *testing.T, m *callManager, peer string) {
+// Full publish stack over the REAL signal path (fake server, real 2s
+// polls, real timing): media-live announces → Noise handshake notes →
+// media ready. No Call/Accept anywhere — publish is the whole model.
+func waitMediaPeer(t *testing.T, m *mediaManager, peer string) {
 	t.Helper()
 	deadline := time.Now().Add(45 * time.Second)
 	for {
@@ -31,7 +31,7 @@ func waitMediaPeer(t *testing.T, m *callManager, peer string) {
 	}
 }
 
-func TestCallOverSignalPath(t *testing.T) {
+func TestPublishOverSignalPath(t *testing.T) {
 	fs := newFakeSignalServer()
 	srv := httptest.NewServer(fs)
 	defer srv.Close()
@@ -50,42 +50,27 @@ func TestCallOverSignalPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	var ma, mb *mediaManager
+	var muB sync.Mutex
 	feedA := make(chan []int16, 64)
-	feedB := make(chan []int16, 64)
-	var muA, muB sync.Mutex
-	var gotA, gotB int
-
-	var ma, mb *callManager
-	ma = newCallManager("alice", ida,
+	var gotB int
+	ma = newMediaManager("alice", ida,
 		func(to, typ, payload string) error { return sigA.signalSend(to, typ, payload) },
 		func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} },
-		callCallbacks{
-			onRinging: func(peer string) {},
-			onState:   func(st callState, peer, info string) { t.Logf("a %s %s %s", st, peer, info) },
-		})
-	mb = newCallManager("bob", idb,
+		mediaUICallbacks{onInfo: func(i string) { t.Log("A:", i) }})
+	mb = newMediaManager("bob", idb,
 		func(to, typ, payload string) error { return sigB.signalSend(to, typ, payload) },
 		func() map[string][]byte { return map[string][]byte{"alice": ida.publicKey()} },
-		callCallbacks{
-			onRinging: func(peer string) {
-				if err := mb.Accept(); err != nil {
-					t.Logf("auto-accept failed: %v", err)
-				}
-			},
-			onState: func(st callState, peer, info string) { t.Logf("b %s %s %s", st, peer, info) },
-		})
-	for _, m := range []*callManager{ma, mb} {
+		mediaUICallbacks{onInfo: func(i string) { t.Log("B:", i) }})
+	for _, m := range []*mediaManager{ma, mb} {
 		m.dialIP = "127.0.0.1"
 	}
 	ma.micSrc = func() (<-chan []int16, func(), error) { return feedA, func() {}, nil }
-	mb.micSrc = func() (<-chan []int16, func(), error) { return feedB, func() {}, nil }
-	ma.playSink = func() (func([]int16), func(), error) {
-		return func(pcm []int16) { muA.Lock(); gotA++; muA.Unlock() }, func() {}, nil
-	}
 	mb.playSink = func() (func([]int16), func(), error) {
-		return func(pcm []int16) { muB.Lock(); gotB++; muB.Unlock() }, func() {}, nil
+		return func([]int16) { muB.Lock(); gotB++; muB.Unlock() }, func() {}, nil
 	}
 
+	// Engines drive the signal queue polls (real path, fake server).
 	ea := newEngineWithStun("alice", ida, sigA, engineCallbacks{
 		onSignalNote: func(n signalNote) { ma.onSignalNote(n) },
 	}, []string{})
@@ -97,7 +82,9 @@ func TestCallOverSignalPath(t *testing.T) {
 	defer ea.stop()
 	defer eb.stop()
 
-	if err := ma.Call("bob"); err != nil {
+	// Audio publish only (heavier camera pipeline is covered by the
+	// method-loopback + ffmpeg tests): alice publishes, bob hears.
+	if err := ma.ToggleAudio([]string{"bob"}); err != nil {
 		t.Fatal(err)
 	}
 	waitMediaPeer(t, ma, "bob")
@@ -107,26 +94,45 @@ func TestCallOverSignalPath(t *testing.T) {
 	for i := range tone {
 		tone[i] = 5000
 	}
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 40; i++ {
 		feedA <- append([]int16(nil), tone...)
-		feedB <- append([]int16(nil), tone...)
 	}
-	deadline := time.Now().Add(20 * time.Second)
+	deadline := time.Now().Add(25 * time.Second)
 	for {
-		muA.Lock()
-		a := gotA
-		muA.Unlock()
 		muB.Lock()
-		b := gotB
+		n := gotB
 		muB.Unlock()
-		if a >= 3 && b >= 3 {
+		if n >= 3 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("audio not flowing both ways: a=%d b=%d", a, b)
+			t.Fatalf("audio not flowing: heard=%d", n)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	_ = ma.Hangup()
-	_ = mb.Hangup()
+	if !mb.Hearing() {
+		t.Fatal("receiver must be in hearing state")
+	}
+	if !ma.AudioOn() {
+		t.Fatal("publisher must report audio on")
+	}
+	// Stop publishes: watcher stops hearing.
+	if err := ma.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(15 * time.Second)
+	for {
+		mb.mu.Lock()
+		stopped := len(mb.pubAudio) == 0
+		mb.mu.Unlock()
+		if stopped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("media-stop never landed")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	ma.stopAll()
+	mb.stopAll()
 }

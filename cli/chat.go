@@ -83,12 +83,7 @@ func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 			fmt.Printf("* %v\n", err)
 		},
 		onSignalNote: func(n signalNote) {
-			// Headless has no ringing UI: announce and decline. Voice
-			// needs an interactive peer; silent drops would ring forever.
-			if n.Type == callOffer {
-				fmt.Printf("* Incoming call from %s (headless mode: declined)\n", n.From)
-				_ = sig.signalSend(n.From, callAccept, declinePayload())
-			}
+			// Headless has no media UI: publish announces are ignored.
 		},
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune

@@ -559,7 +559,7 @@ func (m *mediaTransport) verifyReady(peer string, ps *peerSession) {
 	}
 }
 
-// peerDiag is a lock-free snapshot for diagnostics (/mediastats).
+// peerDiag is a lock-free snapshot for path diagnostics.
 type peerDiag struct {
 	HasEntry      bool
 	Ready         bool

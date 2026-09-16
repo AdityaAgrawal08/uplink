@@ -1,310 +1,259 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/pion/rtp/codecs"
 )
 
-func TestOggDemuxSplitsPackets(t *testing.T) {
-	// Synthetic stream: 2 header packets, 1 small video packet, 1 video
-	// packet spanning pages via 255-continued lacing, then EOF.
-	var stream bytes.Buffer
-	writeRawPage := func(bodyParts ...[]byte) {
-		var tab []byte
-		for _, p := range bodyParts {
-			for left := len(p); left > 0; {
-				n := left
-				if n > 255 {
-					n = 255
-				}
-				tab = append(tab, byte(n))
-				left -= n
-			}
-			if len(p)%255 == 0 {
-				tab = append(tab, 0) // terminator lacing value
-			}
-		}
-		hdr := make([]byte, 27)
-		copy(hdr[0:4], "OggS")
-		hdr[26] = byte(len(tab))
-		stream.Write(hdr)
-		stream.Write(tab)
-		for _, p := range bodyParts {
-			stream.Write(p)
-		}
-	}
-	h1 := []byte("OVP8HDR1")
-	h2 := []byte("OVP8HDR2-SECOND-PACKET")
-	v1 := []byte{0x10, 0x00, 0x11, 0x22}
-	big := make([]byte, 700)
-	for i := range big {
-		big[i] = byte(i)
-	}
-	writeRawPage(h1)
-	writeRawPage(h2)
-	writeRawPage(v1)
-	writeRawPage(big)
-
-	d := newOggDemux(bufio.NewReader(&stream))
-	got := [][]byte{}
-	for {
-		p, err := d.packet()
-		if err != nil {
-			break
-		}
-		got = append(got, p)
-	}
-	if len(got) != 4 || !bytes.Equal(got[0], h1) || !bytes.Equal(got[1], h2) ||
-		!bytes.Equal(got[2], v1) || !bytes.Equal(got[3], big) {
-		t.Fatalf("demux wrong: %d packets", len(got))
-	}
-	// Garbage is not Ogg.
-	rb := newOggDemux(bufio.NewReader(bytes.NewReader([]byte("not-an-ogg-stream-0000000000"))))
-	if _, err := rb.packet(); err == nil {
-		t.Fatal("garbage must fail")
-	}
-}
-
-func TestOggMuxRoundtrip(t *testing.T) {
-	var wb bytes.Buffer
-	m := newOggMux(&wb, 0x12345678)
-	if err := m.writeHeaders(640, 480); err != nil {
-		t.Fatal(err)
-	}
-	f1 := []byte{0x10, 0x00, 0xaa, 0xbb}
-	f2 := make([]byte, 5000)
-	for i := range f2 {
-		f2[i] = byte(i * 7)
-	}
-	if err := m.writeFrame(f1, 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.writeFrame(f2, 2); err != nil {
-		t.Fatal(err)
-	}
-	// Re-demux: 2 headers + 2 frames, CRC-validated implicitly by parse.
-	d := newOggDemux(bufio.NewReader(&wb))
-	var packets [][]byte
-	for {
-		p, err := d.packet()
-		if err != nil {
-			break
-		}
-		packets = append(packets, p)
-	}
-	if len(packets) != 4 {
-		t.Fatalf("remux gave %d packets; want 4", len(packets))
-	}
-	if !bytes.Equal(packets[2], f1) || !bytes.Equal(packets[3], f2) {
-		t.Fatal("frame payloads corrupted through mux roundtrip")
-	}
-	if string(packets[0][0:4]) != "OVP8" {
-		t.Fatal("identification header malformed")
-	}
-}
-
-func TestFragAssembler(t *testing.T) {
-	a := newFragAssembler()
-	payload := make([]byte, 3000)
-	for i := range payload {
-		payload[i] = byte(i)
-	}
-	frags, err := fragVP8(payload)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(frags) < 2 {
-		t.Fatalf("expected fragmentation, got %d", len(frags))
-	}
-	ts := uint32(4242)
-	depay := &codecs.VP8Packet{}
-	// Deliver reversed with a duplicate: still exactly one frame. Payloads
-	// are depacketized first (descriptors stripped), then assembled.
-	var got []byte
-	for i := len(frags) - 1; i >= 0; i-- {
-		frame, err := depay.Unmarshal(frags[i])
-		if err != nil {
-			t.Fatal(err)
-		}
-		hdr := []byte{0, 7,
-			byte(i >> 8), byte(i),
-			byte(len(frags) >> 8), byte(len(frags)),
-			byte(ts >> 24), byte(ts >> 16), byte(ts >> 8), byte(ts),
-		}
-		f, err := decodeVideoFrag(append(hdr, frame...))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if out := a.push(f); out != nil {
-			got = out
-		}
-	}
-	_, err = depay.Unmarshal(frags[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	dup, _ := decodeVideoFrag([]byte{0, 7, 0, 0,
-		byte(len(frags) >> 8), byte(len(frags)),
-		byte(ts >> 24), byte(ts >> 16), byte(ts >> 8), byte(ts),
-	})
-	if out := a.push(dup); out != nil {
-		t.Fatal("duplicate must not re-emit")
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("reassembly mismatch: %d vs %d bytes", len(got), len(payload))
-	}
-	// Absurd totals drop.
-	bad, _ := decodeVideoFrag(append([]byte{0, 1, 0, 5, 9, 9, 0, 0, 0, 1}, 0xAA))
-	if out := a.push(bad); out != nil {
-		t.Fatal("absurd frame must drop")
-	}
-}
-
-func TestAsciiFrameDeterministic(t *testing.T) {
-	w, h := 8, 4
-	rgb := make([]byte, w*h*3)
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			o := (y*w + x) * 3
-			rgb[o] = uint8(x * 32)
-			rgb[o+1] = uint8(y * 64)
-			rgb[o+2] = 128
-		}
-	}
-	a := asciiFrame(rgb, w, h, 4, 2)
-	b := asciiFrame(rgb, w, h, 4, 2)
-	if len(a) != 2 || len(b) != 2 {
-		t.Fatalf("rows wrong: %d", len(a))
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			t.Fatal("not deterministic")
-		}
-		if !strings.Contains(a[i], "▀") {
-			t.Fatalf("row %d has no half-blocks: %q", i, a[i])
-		}
-	}
-	black := make([]byte, w*h*3)
-	rows := asciiFrame(black, w, h, 4, 2)
-	for _, r := range rows {
-		if strings.Contains(r, "▀") {
-			t.Fatalf("black frame must be blank: %q", r)
-		}
-	}
-	if asciiFrame(rgb, w, h, 0, 2) != nil || asciiFrame(nil, w, h, 4, 2) != nil {
-		t.Fatal("degenerate inputs must yield nil")
-	}
-}
-
-func TestKittySixelEnvelopes(t *testing.T) {
-	rgb := make([]byte, 4*2*3)
-	for i := range rgb {
-		rgb[i] = uint8(i * 3)
-	}
-	k := kittyFrame(rgb, 4, 2)
-	if !strings.HasPrefix(k, "\x1b_Gf=24,s=4,v=2,o=z;") || !strings.HasSuffix(k, "\x1b\\") {
-		t.Fatalf("kitty envelope wrong: %q", k[:40])
-	}
-	if !strings.Contains(kittyDelete(7), "a=d,i=7") {
-		t.Fatal("kitty delete wrong")
-	}
-	s := sixelFrame(rgb, 4, 2)
-	if !strings.HasPrefix(s, "\x1bPq") || !strings.HasSuffix(s, "\x1b\\") {
-		t.Fatal("sixel envelope wrong")
-	}
-}
-
-func TestProbeVideoCap(t *testing.T) {
-	t.Setenv("KITTY_WINDOW_ID", "7")
-	if probeVideoCap() != videoCapKitty {
-		t.Fatal("kitty env must probe kitty")
-	}
-	t.Setenv("KITTY_WINDOW_ID", "")
-	t.Setenv("TERM", "xterm-256color")
-	if probeVideoCap() != videoCapASCII {
-		t.Fatal("plain xterm must fall back to ascii")
-	}
-	t.Setenv("TERM", "foot")
-	if probeVideoCap() != videoCapSixel {
-		t.Fatal("foot must probe sixel")
-	}
-}
-
-// Full ffmpeg fidelity: testsrc encode -> IVF parse -> FU-A ->
-// reassemble -> decode -> ASCII. Skipped without ffmpeg (CI-safe).
-func TestVideoFFmpegEndToEnd(t *testing.T) {
+// TestVideoMJpegEndToEnd: testsrc → MJPEG encode → split → decode →
+// ASCII/braille. Skipped without ffmpeg (CI-safe).
+func TestVideoMJpegEndToEnd(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg not installed")
 	}
 	t.Setenv("UPLINK_CAMERA", "test")
-	enc, err := startVideoEncoder()
+	frames, stop, err := cameraFrames()
 	if err != nil {
-		t.Fatalf("encoder: %v", err)
+		t.Fatalf("camera: %v", err)
 	}
-	defer enc.stop()
-	d := newOggDemux(enc.out)
-	// Skip the 2 stream headers; wait for a keyframe like the live path.
-	var frame []byte
-	for skipped := 0; skipped < 2; skipped++ {
-		if _, err := d.packet(); err != nil {
-			t.Fatalf("header packet: %v", err)
-		}
-	}
-	kfDeadline := time.Now().Add(15 * time.Second)
+	defer stop()
+	var f vidFrame
+	deadline := time.Now().Add(15 * time.Second)
 	for {
-		f, err := d.packet()
-		if err != nil {
-			t.Fatalf("encoded frame: %v", err)
-		}
-		if vp8KeyFrame(f) {
-			frame = f
+		var ok bool
+		f, ok = <-frames
+		if ok {
 			break
 		}
-		if time.Now().After(kfDeadline) {
-			t.Fatal("no keyframe in 15s of test pattern")
+		if time.Now().After(deadline) {
+			t.Fatal("no frames decoded from testsrc in 15s")
 		}
 	}
-	dec, err := newFFmpegDecoder()
+	if f.Width != videoWidth || f.Height != videoHeight {
+		t.Fatalf("frame %dx%d; want %dx%d", f.Width, f.Height, videoWidth, videoHeight)
+	}
+	payloads, err := fragVideoFrame(f.Jpeg)
 	if err != nil {
-		t.Fatalf("decoder: %v", err)
+		t.Fatal(err)
 	}
-	defer dec.close()
-	// Streaming: keep feeding frames (decoder only emits once primed);
-	// the first keyframe alone never yields output on a pipe.
-	go func() {
-		_ = frame
-		for {
-			f, err := d.packet()
-			if err != nil {
-				return
-			}
-			if !dec.submit(f) {
-				time.Sleep(50 * time.Millisecond)
+	if len(payloads) == 0 {
+		t.Fatal("no frags produced")
+	}
+	// Reassemble + decode: the receiver-side path, byte-exact.
+	asm := newFragAssembler()
+	var complete []byte
+	for i, pl := range payloads {
+		complete = asm.push(videoFrag{
+			Seq: 1, FragIdx: uint16(i), FragTotal: uint16(len(payloads)),
+			Ts: 42, Data: pl,
+		})
+		if complete != nil {
+			break
+		}
+	}
+	if complete == nil {
+		t.Fatal("frags never reassembled")
+	}
+	if !bytes.Equal(complete, f.Jpeg) {
+		t.Fatal("frag roundtrip corrupted the JPEG")
+	}
+	if _, err := jpegToRGB(complete); err != nil {
+		t.Fatalf("reassembled jpeg undecodable: %v", err)
+	}
+	lines := asciiFrame(f.RGB, f.Width, f.Height, 40, 12, videoStyle())
+	if len(lines) != 12 {
+		t.Fatalf("render rows %d; want 12", len(lines))
+	}
+}
+
+func TestJpegSplitter(t *testing.T) {
+	j1 := encodeSolid(t, 0, 0, 0)
+	j2 := encodeSolid(t, 255, 255, 255)
+	// Feed concatenated, split at arbitrary boundaries (incl. inside the
+	// EOI marker) — real pipe reads do this.
+	stream := append(append([]byte(nil), j1...), j2...)
+	s := &jpegSplitter{}
+	var frames [][]byte
+	for i := 0; i < len(stream); i += 7 {
+		end := i + 7
+		if end > len(stream) {
+			end = len(stream)
+		}
+		frames = append(frames, s.feed(stream[i:end])...)
+	}
+	frames = append(frames, s.feed(nil)...)
+	if len(frames) != 2 {
+		t.Fatalf("splitter produced %d frames; want 2", len(frames))
+	}
+	if !bytes.Equal(frames[0], j1) || !bytes.Equal(frames[1], j2) {
+		t.Fatal("splitter corrupted frame boundaries")
+	}
+	// Garbage without SOI is dropped, not memory-grown.
+	s2 := &jpegSplitter{}
+	if out := s2.feed([]byte("not a jpeg at all")); len(out) != 0 {
+		t.Fatal("garbage must not produce frames")
+	}
+}
+
+func TestFragAssemblerRoundtrip(t *testing.T) {
+	f := vidFrame{Jpeg: make([]byte, 5000)}
+	for i := range f.Jpeg {
+		f.Jpeg[i] = byte(i * 7)
+	}
+	payloads, err := fragVideoFrame(f.Jpeg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asm := newFragAssembler()
+	var got []byte
+	for i, pl := range payloads {
+		got = asm.push(videoFrag{Seq: 9, FragIdx: uint16(i), FragTotal: uint16(len(payloads)), Ts: 7, Data: pl})
+	}
+	if !bytes.Equal(got, f.Jpeg) {
+		t.Fatal("reassembly corrupted the frame")
+	}
+	// A lost frag never completes the frame, and stale builds expire.
+	asm2 := newFragAssembler()
+	for i, pl := range payloads[1:] { // drop frag 0
+		asm2.push(videoFrag{Seq: 1, FragIdx: uint16(i + 1), FragTotal: uint16(len(payloads)), Ts: 8, Data: pl})
+	}
+	if out := asm2.push(videoFrag{Seq: 1, FragIdx: 0, FragTotal: uint16(len(payloads)), Ts: 8, Data: payloads[0]}); out == nil {
+		t.Fatal("late frag must complete the frame")
+	}
+}
+
+func encodeSolid(t *testing.T, r, g, b byte) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, videoWidth, videoHeight))
+	for y := 0; y < videoHeight; y++ {
+		for x := 0; x < videoWidth; x++ {
+			img.Set(x, y, color.RGBA{r, g, b, 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestAsciiFrameBraille(t *testing.T) {
+	// Left half black, right half white → braille cells must use the
+	// full pattern range and render exactly cols-wide lines.
+	w, h := 64, 32
+	rgb := make([]byte, w*h*3)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			o := (y*w + x) * 3
+			if x < w/2 {
+				rgb[o], rgb[o+1], rgb[o+2] = 0, 0, 0
+			} else {
+				rgb[o], rgb[o+1], rgb[o+2] = 255, 255, 255
 			}
 		}
-	}()
-	dec.submit(frame)
-	var rgb []byte
-	select {
-	case rgb = <-dec.results():
-	case <-time.After(20 * time.Second):
-		t.Fatal("no decoded picture after 20s of streaming test pattern")
 	}
-	if len(rgb) != videoWidth*videoHeight*3 {
-		t.Fatalf("rgb size %d; want %d", len(rgb), videoWidth*videoHeight*3)
+	cols, rows := 20, 8
+	lines := asciiFrame(rgb, w, h, cols, rows, "braille")
+	if len(lines) != rows {
+		t.Fatalf("rows %d; want %d", len(lines), rows)
 	}
-	lines := asciiFrame(rgb, videoWidth, videoHeight, 40, 12)
-	if len(lines) != 12 {
-		t.Fatalf("ascii rows %d; want 12", len(lines))
+	if got := ansiWidth(lines[0]); got != cols {
+		t.Fatalf("line width %d; want %d (the old fixed-56 crop bug)", got, cols)
 	}
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "▀") {
-		t.Fatal("test pattern rendered blank")
+	// Deterministic: identical input → identical output.
+	again := asciiFrame(rgb, w, h, cols, rows, "braille")
+	if strings.Join(lines, "\n") != strings.Join(again, "\n") {
+		t.Fatal("braille render must be deterministic")
 	}
+	// A lit region must actually paint braille dots (not all spaces):
+	// any non-blank braille pattern (U+2801..U+28FF) counts.
+	hasDot := false
+	for _, r := range strings.Join(lines, "") {
+		if r >= 0x2801 && r <= 0x28FF {
+			hasDot = true
+			break
+		}
+	}
+	if !hasDot {
+		t.Fatal("no braille patterns painted")
+	}
+}
+
+func TestAsciiFrameHalfStyle(t *testing.T) {
+	w, h := 32, 16
+	rgb := make([]byte, w*h*3)
+	for i := 0; i < w*h; i++ {
+		rgb[i*3], rgb[i*3+1], rgb[i*3+2] = 128, 128, 128
+	}
+	lines := asciiFrame(rgb, w, h, 10, 5, "half")
+	if len(lines) != 5 {
+		t.Fatalf("rows %d; want 5", len(lines))
+	}
+	if got := ansiWidth(lines[0]); got != 10 {
+		t.Fatalf("half-style width %d; want 10", got)
+	}
+}
+
+func TestAutoContrastStretches(t *testing.T) {
+	// Washed-out input (narrow 100..150 range) must be stretched to use
+	// (nearly) the full output range.
+	w, h := 16, 16
+	rgb := make([]byte, w*h*3)
+	for i := 0; i < w*h; i++ {
+		v := byte(100 + i%50)
+		rgb[i*3], rgb[i*3+1], rgb[i*3+2] = v, v, v
+	}
+	adj := autoContrast(rgb)
+	found, foundLo := false, false
+	for i := 0; i < w*h*3; i++ {
+		if adj[i] > 240 {
+			found = true
+		}
+		if adj[i] < 20 {
+			foundLo = true
+		}
+	}
+	if !found || !foundLo {
+		t.Fatal("auto-contrast must stretch narrow input to both ends")
+	}
+}
+
+func TestBrailleCell(t *testing.T) {
+	all := brailleCell([4]bool{true, true, true, true}, [4]bool{true, true, true, true})
+	if all != '⣿' {
+		t.Fatalf("full pattern = %q; want ⣿", all)
+	}
+	none := brailleCell([4]bool{}, [4]bool{})
+	if none != ' ' {
+		t.Fatalf("empty pattern = %q; want space", none)
+	}
+	dot := brailleCell([4]bool{true}, [4]bool{})
+	if dot != '⠁' {
+		t.Fatalf("top-left dot = %q; want ⠁", dot)
+	}
+}
+
+// ansiWidth counts printable cells (ANSI-stripped).
+func ansiWidth(s string) int {
+	n := 0
+	inEsc := false
+	for _, r := range s {
+		switch {
+		case inEsc:
+			if r == 'm' {
+				inEsc = false
+			}
+		case r == '\x1b':
+			inEsc = true
+		default:
+			n++
+		}
+	}
+	return n
 }

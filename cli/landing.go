@@ -694,12 +694,12 @@ type landingDoneMsg struct {
 }
 type landingCreateOkMsg struct {
 	username, password, key string
-	id *identityKey // device key advertised; reuse, never reload
+	id                      *identityKey // device key advertised; reuse, never reload
 }
 
 type landingJoinOkMsg struct {
 	username, password, code string
-	id *identityKey
+	id                       *identityKey
 }
 
 func (m *landingModel) submit() tea.Cmd {
