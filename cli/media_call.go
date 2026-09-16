@@ -104,14 +104,15 @@ type callManager struct {
 	// lanIPs lists advertised addresses (tests pin loopback).
 	lanIPs func() []string
 	// video live-cycle (nil unless streaming).
-	videoStop  chan struct{}
-	videoAsm   *fragAssembler
-	videoDec   frameDecoder
-	videoSrc   func() (<-chan []byte, func(), error)
-	videoDecFn func() (frameDecoder, error)
-	videoOn    bool
-	videoSeq   uint16
-	videoTs    uint32
+	videoStop    chan struct{}
+	stopVideoSrc func()
+	videoAsm     *fragAssembler
+	videoDec     frameDecoder
+	videoSrc     func() (<-chan []byte, func(), error)
+	videoDecFn   func() (frameDecoder, error)
+	videoOn      bool
+	videoSeq     uint16
+	videoTs      uint32
 }
 
 func newCallManager(me string, id *identityKey, sendNote func(to, noteType, payload string) error, roster func() map[string][]byte, cb callCallbacks) *callManager {
@@ -403,7 +404,8 @@ func (c *callManager) teardownLocked(info string) {
 	c.stopMic, c.stopPlay = nil, nil
 	c.rxJb = nil
 	vstop, vdec := c.videoStop, c.videoDec
-	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn = nil, nil, nil, false, false
+	vsrcStop := c.stopVideoSrc
+	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn, c.stopVideoSrc = nil, nil, nil, false, false, nil
 	c.mu.Unlock()
 	if stop != nil {
 		close(stop)
@@ -412,6 +414,9 @@ func (c *callManager) teardownLocked(info string) {
 		close(vstop)
 	}
 	c.audioWg.Wait()
+	if vsrcStop != nil {
+		vsrcStop()
+	}
 	if vdec != nil {
 		vdec.close()
 	}
@@ -720,12 +725,9 @@ func (c *callManager) StartVideo() error {
 		return fmt.Errorf("video already on")
 	}
 	peer := c.peer
-	srcFn, decFn := c.videoSrc, c.videoDecFn
+	srcFn := c.videoSrc
 	if srcFn == nil {
 		srcFn = defaultVideoSrc
-	}
-	if decFn == nil {
-		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
 	}
 	c.mu.Unlock()
 
@@ -733,14 +735,10 @@ func (c *callManager) StartVideo() error {
 	if err != nil {
 		return err
 	}
-	dec, err := decFn()
-	if err != nil {
-		stopSrc()
-		return err
-	}
 	stop := make(chan struct{})
 	c.mu.Lock()
-	c.videoStop, c.videoAsm, c.videoDec, c.videoOn = stop, newFragAssembler(), dec, true
+	c.videoStop, c.videoOn = stop, true
+	c.stopVideoSrc = stopSrc
 	c.mu.Unlock()
 	c.emitState("video on with " + peer)
 	depay := &codecs.VP8Packet{}
@@ -847,10 +845,14 @@ func (c *callManager) StopVideo() {
 	c.mu.Lock()
 	stop := c.videoStop
 	dec := c.videoDec
-	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn = nil, nil, nil, false, false
+	srcStop := c.stopVideoSrc
+	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn, c.stopVideoSrc = nil, nil, nil, false, false, nil
 	c.mu.Unlock()
 	if stop != nil {
 		close(stop)
+	}
+	if srcStop != nil {
+		srcStop()
 	}
 	if dec != nil {
 		dec.close()
