@@ -489,3 +489,208 @@ func TestVideoPlaceholderPane(t *testing.T) {
 		t.Fatal("pane must claim rows while video is on, even with no frames yet")
 	}
 }
+
+func TestVideoSecondStartIsAlreadyOn(t *testing.T) {
+	ma, mb, _, _, _, _, states := callPair(t)
+	if err := ma.Call("bob"); err != nil {
+		t.Fatal(err)
+	}
+	if err := mb.Accept(); err != nil {
+		t.Fatal(err)
+	}
+	waitCallState(t, states, "a:live:bob")
+	waitCallState(t, states, "b:live:alice")
+	frames := make(chan []byte, 2)
+	ma.mu.Lock()
+	ma.videoSrc = func() (<-chan []byte, func(), error) { return frames, func() {}, nil }
+	ma.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
+	ma.mu.Unlock()
+	if err := ma.StartVideo(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ma.StartVideo(); err == nil || !strings.Contains(err.Error(), "already on") {
+		t.Fatalf("second StartVideo must report already-on, got %v", err)
+	}
+	// Publish while call-attached must not start a second TX loop: it only
+	// widens the scope (idempotent widening, same single loop).
+	if err := ma.StartPublish([]string{"carol"}); err != nil {
+		t.Fatalf("publish over call-attached video: %v", err)
+	}
+	ma.mu.Lock()
+	pub := ma.publishing
+	ma.mu.Unlock()
+	if !pub {
+		t.Fatal("StartPublish over call video must flip to publishing")
+	}
+}
+
+func TestPublishNoCall(t *testing.T) {
+	ma, mb, _, _, _, _, _ := callPair(t)
+	f1 := make([]byte, 3000)
+	for i := range f1 {
+		f1[i] = byte(i)
+	}
+	// Continuous camera: early frames (pre-handshake) drop, later ones flow.
+	frames := make(chan []byte, 8)
+	stopFeed := make(chan struct{})
+	defer close(stopFeed)
+	go func() {
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case frames <- append([]byte(nil), f1...):
+			}
+		}
+	}()
+	ma.mu.Lock()
+	ma.videoSrc = func() (<-chan []byte, func(), error) { return frames, func() {}, nil }
+	ma.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
+	ma.mu.Unlock()
+	mb.mu.Lock()
+	mb.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
+	mb.mu.Unlock()
+	rendered := make(chan []string, 8)
+	selfed := make(chan []string, 8)
+	mb.mu.Lock()
+	mb.cb.onVideoFrame = func(lines []string) { rendered <- lines }
+	mb.mu.Unlock()
+	ma.mu.Lock()
+	ma.cb.onSelfFrame = func(lines []string) { selfed <- lines }
+	ma.mu.Unlock()
+	// No call anywhere: publish straight to the DM scope.
+	if err := ma.StartPublish([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if !ma.Publishing() {
+		t.Fatal("StartPublish must set publishing without a call")
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		mb.mu.Lock()
+		w := mb.watching
+		mb.mu.Unlock()
+		if w {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("receiver never entered watching state")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitMediaPeer(t, ma, "bob")
+	waitMediaPeer(t, mb, "alice")
+	select {
+	case lines := <-rendered:
+		if len(lines) == 0 {
+			t.Fatal("empty render")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("no published frame rendered")
+	}
+	select {
+	case lines := <-selfed:
+		if len(lines) == 0 {
+			t.Fatal("empty self-view")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("no publisher self-view rendered")
+	}
+	// Re-publish is idempotent, not an error.
+	if err := ma.StartPublish([]string{"bob"}); err == nil {
+		t.Fatal("second StartPublish should report already-on")
+	}
+}
+
+func TestPublishTopUpDedupes(t *testing.T) {
+	ma, _, _, _, _, _, _ := callPair(t)
+	var mu sync.Mutex
+	announces := map[string]int{}
+	orig := ma.sendNote
+	ma.sendNote = func(to, typ, payload string) error {
+		if typ == videoLive {
+			mu.Lock()
+			announces[to]++
+			mu.Unlock()
+		}
+		return orig(to, typ, payload)
+	}
+	frames := make(chan []byte, 2)
+	ma.mu.Lock()
+	ma.videoSrc = func() (<-chan []byte, func(), error) { return frames, func() {}, nil }
+	ma.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
+	ma.mu.Unlock()
+	if err := ma.StartPublish([]string{"bob"}); err != nil {
+		t.Fatal(err)
+	}
+	// Fresh peer gets exactly one announce; repeats send none.
+	if err := ma.PublishTo([]string{"bob", "carol"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ma.PublishTo([]string{"bob", "carol"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if announces["bob"] != 1 {
+		t.Fatalf("bob announced %d times; want 1", announces["bob"])
+	}
+	if announces["carol"] != 1 {
+		t.Fatalf("carol announced %d times; want 1", announces["carol"])
+	}
+}
+
+func TestVideoPinSecondSender(t *testing.T) {
+	ma, _, _, _, _, _, _ := callPair(t)
+	ma.mu.Lock()
+	ma.publishing = true // legitimize inbound video without a call
+	ma.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
+	ma.mu.Unlock()
+	mkFrags := func(seed byte, ts uint32) []videoFrag {
+		raw := make([]byte, 3000)
+		for i := range raw {
+			raw[i] = byte(int(seed) + i)
+		}
+		payloads, err := fragVP8(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []videoFrag
+		for i, p := range payloads {
+			out = append(out, videoFrag{Seq: uint16(ts), FragIdx: uint16(i), FragTotal: uint16(len(payloads)), Ts: ts, Data: p})
+		}
+		return out
+	}
+	for _, f := range mkFrags(7, 1001) {
+		ma.onVideoFrag("bob", f)
+	}
+	ma.mu.Lock()
+	pinned, rx := ma.rxPinned, ma.rxFrames
+	ma.mu.Unlock()
+	if pinned != "bob" || rx != 1 {
+		t.Fatalf("first sender must pin (pinned=%q rx=%d)", pinned, rx)
+	}
+	// Second sender while pinned: ignored entirely.
+	for _, f := range mkFrags(9, 2002) {
+		ma.onVideoFrag("carol", f)
+	}
+	ma.mu.Lock()
+	pinned, rx = ma.rxPinned, ma.rxFrames
+	ma.mu.Unlock()
+	if pinned != "bob" || rx != 1 {
+		t.Fatalf("pinned sender must hold (pinned=%q rx=%d)", pinned, rx)
+	}
+	// After silence, the pin yields to the new sender.
+	ma.mu.Lock()
+	ma.rxPinAt = time.Now().Add(-videoPinTimeout - time.Second)
+	ma.mu.Unlock()
+	for _, f := range mkFrags(9, 2003) {
+		ma.onVideoFrag("carol", f)
+	}
+	ma.mu.Lock()
+	pinned, rx = ma.rxPinned, ma.rxFrames
+	ma.mu.Unlock()
+	if pinned != "carol" || rx != 2 {
+		t.Fatalf("pin must yield after silence (pinned=%q rx=%d)", pinned, rx)
+	}
+}

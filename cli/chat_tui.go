@@ -1433,13 +1433,43 @@ func (c *chatScreen) callMute() tea.Cmd {
 
 func (c *chatScreen) callVideo() tea.Cmd {
 	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* no call: /call <user> first"))
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* calls unavailable here"))
 		return nil
 	}
-	if err := c.call.StartVideo(); err != nil {
+	// Idempotent: a second /video is reassurance, not failure (used to
+	// print "video failed: video already on").
+	if c.call.VideoOn() || c.call.Publishing() {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera already on"))
+		return nil
+	}
+	if st, _ := c.call.State(); st == callLive {
+		if err := c.call.StartVideo(); err != nil {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
+		} else {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on"))
+		}
+		return nil
+	}
+	// No call: publish to the current scope — the DM peer, or every other
+	// online member. Bare /video only; no username arg needed.
+	var scope []string
+	if c.targetUser != "" {
+		scope = []string{c.targetUser}
+	} else if c.eng != nil {
+		for _, u := range onlineNames(c.eng.peers(), c.me) {
+			if u != c.me {
+				scope = append(scope, u)
+			}
+		}
+	}
+	if err := c.call.StartPublish(scope); err != nil {
 		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
+		return nil
+	}
+	if len(scope) == 0 {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on (alone here — joiners will see it)"))
 	} else {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* camera on"))
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* publishing video to "+strings.Join(scope, ", ")))
 	}
 	return nil
 }
@@ -1510,6 +1540,11 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 	t := strings.ToLower(strings.TrimSpace(text))
 	if rest, ok := strings.CutPrefix(strings.TrimSpace(text), "/call "); ok {
 		return c.callPeer(strings.TrimSpace(rest))
+	}
+	// /video takes no username (publishes to the current scope): trailing
+	// words are ignored, never sent as chat.
+	if t == "/video" || strings.HasPrefix(t, "/video ") {
+		return c.runCommand("/video")
 	}
 	for _, cmd := range slashCommands {
 		if t == cmd.Name {
@@ -1643,6 +1678,17 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		live := map[string]bool{c.me: true}
 		for _, u := range users {
 			live[u] = true
+		}
+		// Room publish catch-up: late joiners get our announce (PublishTo
+		// only announces to members outside the current scope).
+		if c.call != nil && c.call.Publishing() && c.targetUser == "" {
+			var scope []string
+			for _, u := range users {
+				if u != c.me {
+					scope = append(scope, u)
+				}
+			}
+			_ = c.call.PublishTo(scope)
 		}
 		for peer := range c.unread {
 			if !live[peer] {

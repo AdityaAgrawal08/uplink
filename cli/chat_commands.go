@@ -30,9 +30,9 @@ var slashCommands = []slashCommand{
 	{Name: "/call", Desc: "voice-call a peer: /call <user> (or in their DM)"},
 	{Name: "/accept", Desc: "accept the ringing call"},
 	{Name: "/decline", Desc: "decline the ringing call"},
-	{Name: "/hangup", Desc: "end the current call"},
+	{Name: "/hangup", Desc: "end the call / stop video"},
 	{Name: "/mute", Desc: "mute/unmute your mic"},
-	{Name: "/video", Desc: "start camera video in a live call"},
+	{Name: "/video", Desc: "share camera with the call or room (no call needed)"},
 	{Name: "/mediastats", Desc: "diagnose the call path (addrs, handshake, packets)"},
 }
 
@@ -214,7 +214,7 @@ func (c chatScreen) videoActive() bool {
 	if c.call == nil {
 		return false
 	}
-	return c.call.VideoOn() || c.call.RxOn()
+	return c.call.VideoOn() || c.call.RxOn() || c.call.Watching()
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW

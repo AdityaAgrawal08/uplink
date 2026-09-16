@@ -69,21 +69,21 @@ func videoEncodeArgs(device string) []string {
 	rate := fmt.Sprintf("%d", videoFPS)
 	if _, _, _, ok := testCamera(device); ok {
 		return []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc=size=%s:rate=%s", size, rate),
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
+			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
 			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	}
 	switch runtime.GOOS {
 	case "darwin":
 		return []string{"-f", "avfoundation", "-framerate", rate, "-i", device + ":",
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
+			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
 			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	case "windows":
 		return []string{"-f", "dshow", "-i", device,
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
+			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
 			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	default:
 		return []string{"-f", "v4l2", "-i", device,
-			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
+			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "8",
 			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	}
 }
@@ -449,10 +449,21 @@ func (d *ffmpegDecoder) readPump() {
 		if _, err := io.ReadFull(d.dec.out, out); err != nil {
 			return
 		}
+		// Drop-oldest, never block: a slow UI must shed load, not stall
+		// ffmpeg's stdout (a full queue there backpressures the encoder
+		// and lag grows without bound).
 		select {
 		case d.outQ <- out:
-		case <-d.done:
-			return
+		default:
+			select {
+			case <-d.outQ:
+			default:
+			}
+			select {
+			case d.outQ <- out:
+			case <-d.done:
+				return
+			}
 		}
 	}
 }

@@ -585,7 +585,7 @@ func (m *mediaTransport) diagPeer(peer string) peerDiag {
 		d.HasEntry = true
 		d.Ready = p.ready
 		d.HasHs = p.hs != nil
-		if !p.hsAt.IsZero() {
+		if p.hs != nil && !p.hsAt.IsZero() {
 			d.HsAge = time.Since(p.hsAt).Round(time.Second)
 		}
 		d.HsTries = p.hsTries
@@ -604,6 +604,19 @@ func (m *mediaTransport) peerReady(peer string) bool {
 	defer m.mu.Unlock()
 	p, ok := m.peers[peer]
 	return ok && p.ready
+}
+
+// readyPeers lists usernames with a live session (room video fan-out set).
+func (m *mediaTransport) readyPeers() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for name, p := range m.peers {
+		if p.ready && p.addr != nil && p.send != nil {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // lastRxAt reports when a peer's datagrams last arrived (watchdog input).
