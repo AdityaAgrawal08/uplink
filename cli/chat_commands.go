@@ -181,8 +181,8 @@ func (c chatScreen) layoutFor() layout {
 	// collapsed entirely when too short to be useful.
 	l.videoRows = 0
 	if l.sidebarOn && c.videoActive() {
-		want := len(c.videoLines) + 1 + 2 // hint + frame rows + border
-		if len(c.videoLines) == 0 {
+		want := len(c.paneContent()) + 1 + 2 // hint + frame rows + border
+		if len(c.videoLines) == 0 && len(c.selfLines) == 0 {
 			want = 1 + 3 + 2 // hint + "waiting" placeholder rows + border
 		}
 		l.videoRows = min(want, l.vpHeight/2)

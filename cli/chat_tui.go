@@ -389,6 +389,21 @@ type callLevelMsg struct{ level float64 }
 // netVideoMsg carries one decoded ASCII video frame for the drawer pane.
 type netVideoMsg struct{ lines []string }
 
+// netSelfVideoMsg carries one local-camera preview frame.
+type netSelfVideoMsg struct{ lines []string }
+
+// paneContent stacks remote video over the local preview ("you"), each
+// labeled; either half may be absent.
+func (c *chatScreen) paneContent() []string {
+	var out []string
+	out = append(out, c.videoLines...)
+	if len(c.selfLines) > 0 {
+		out = append(out, tuiPaletteHintStyle.Render("— you —"))
+		out = append(out, c.selfLines...)
+	}
+	return out
+}
+
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -455,6 +470,7 @@ type chatScreen struct {
 	call         *callManager
 	callLevel    float64 // mic loudness for the header meter
 	videoLines   []string
+	selfLines    []string
 	videoVp      viewport.Model // scrollable remote-video pane (wheel)
 	vp           viewport.Model
 	input        textinput.Model
@@ -579,6 +595,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 			onState:      func(st callState, peer, info string) { push(callStateMsg{state: st, peer: peer, info: info}) },
 			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
 			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
+			onSelfFrame:  func(lines []string) { push(netSelfVideoMsg{lines: lines}) },
 		})
 	var eng *engine
 	eng = newEngine(me, id, sig, engineCallbacks{
@@ -1780,7 +1797,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case netVideoMsg:
 		c.videoLines = msg.lines
-		c.videoVp.SetContent(strings.Join(msg.lines, "\n"))
+		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
+		c.syncViewport()
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case netSelfVideoMsg:
+		c.selfLines = msg.lines
+		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
 		c.syncViewport()
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())

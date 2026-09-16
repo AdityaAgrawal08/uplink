@@ -69,7 +69,8 @@ type callCallbacks struct {
 	onRinging    func(peer string)                               // incoming offer worth showing
 	onState      func(state callState, peer string, info string) // transitions + errors
 	onLevel      func(level float64)                             // mic loudness 0..1 (throttled)
-	onVideoFrame func(lines []string)                            // decoded ASCII video frame
+	onVideoFrame func(lines []string)                            // decoded remote ASCII frame
+	onSelfFrame  func(lines []string)                            // local camera preview
 }
 
 type callManager struct {
@@ -106,8 +107,11 @@ type callManager struct {
 	// video live-cycle (nil unless streaming).
 	videoStop    chan struct{}
 	stopVideoSrc func()
+	previewDec   frameDecoder // local monitor decode (self-view, TX side)
 	videoAsm     *fragAssembler
 	videoDec     frameDecoder
+	rxDone       chan struct{}
+	rxPump       bool
 	videoSrc     func() (<-chan []byte, func(), error)
 	videoDecFn   func() (frameDecoder, error)
 	videoOn      bool
@@ -214,12 +218,20 @@ func localLANIP() (string, error) {
 	return ips[0], nil
 }
 
+// callbacks snapshots the callback table: tests rewire callbacks mid-run
+// while transport goroutines invoke them, so every read takes the lock.
+func (c *callManager) callbacks() callCallbacks {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cb
+}
+
 func (c *callManager) emitState(info string) {
 	c.mu.Lock()
 	st, peer := c.state, c.peer
 	c.mu.Unlock()
-	if c.cb.onState != nil {
-		c.cb.onState(st, peer, info)
+	if cb := c.callbacks().onState; cb != nil {
+		cb(st, peer, info)
 	}
 }
 
@@ -405,7 +417,11 @@ func (c *callManager) teardownLocked(info string) {
 	c.rxJb = nil
 	vstop, vdec := c.videoStop, c.videoDec
 	vsrcStop := c.stopVideoSrc
+	pdec := c.previewDec
+	rdone := c.rxDone
 	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn, c.stopVideoSrc = nil, nil, nil, false, false, nil
+	c.previewDec = nil
+	c.rxDone, c.rxPump = nil, false
 	c.mu.Unlock()
 	if stop != nil {
 		close(stop)
@@ -413,9 +429,15 @@ func (c *callManager) teardownLocked(info string) {
 	if vstop != nil {
 		close(vstop)
 	}
+	if rdone != nil {
+		close(rdone)
+	}
 	c.audioWg.Wait()
 	if vsrcStop != nil {
 		vsrcStop()
+	}
+	if pdec != nil {
+		pdec.close()
 	}
 	if vdec != nil {
 		vdec.close()
@@ -467,8 +489,8 @@ func (c *callManager) onSignalNote(n signalNote) {
 			_ = c.sendNote(n.From, callAccept, string(raw))
 			return
 		}
-		if c.cb.onRinging != nil {
-			c.cb.onRinging(n.From)
+		if cb := c.callbacks().onRinging; cb != nil {
+			cb(n.From)
 		}
 		c.emitState("incoming call from " + n.From)
 	case callAccept:
@@ -514,6 +536,18 @@ func (c *callManager) onSignalNote(n signalNote) {
 			c.teardownLocked(n.From + " hung up")
 		}
 	}
+}
+
+// previewDecoder builds the self-view decoder (nil-safe: remote streaming
+// never depends on local preview).
+func (c *callManager) previewDecoder() (frameDecoder, error) {
+	c.mu.Lock()
+	decFn := c.videoDecFn
+	c.mu.Unlock()
+	if decFn == nil {
+		decFn = func() (frameDecoder, error) { return newFFmpegDecoder() }
+	}
+	return decFn()
 }
 
 func (c *callManager) mediaCB() mediaCallbacks {
@@ -599,8 +633,10 @@ func (c *callManager) startAudio(peer string) {
 					}
 					continue
 				}
-				if tick%5 == 0 && c.cb.onLevel != nil {
-					c.cb.onLevel(rmsLevel(f))
+				if tick%5 == 0 {
+					if onLevel := c.callbacks().onLevel; onLevel != nil {
+						onLevel(rmsLevel(f))
+					}
 				}
 				tick++
 				pkt, err := txVoice.encode(f)
@@ -766,14 +802,30 @@ func (c *callManager) StartVideo() error {
 	if err != nil {
 		return err
 	}
+	// Local monitor decode for self-view (best-effort: remote streaming
+	// must not depend on it).
+	preview, previewErr := c.previewDecoder()
 	stop := make(chan struct{})
 	c.mu.Lock()
 	c.videoStop, c.videoOn = stop, true
 	c.stopVideoSrc = stopSrc
+	c.previewDec = preview
+	// Self-view is TX-side: the pump must run even when this side never
+	// receives remote fragments (sender-only never hits ensureRxLocked).
+	if c.rxDone == nil {
+		c.rxDone = make(chan struct{})
+	}
+	if !c.rxPump {
+		c.rxPump = true
+		c.startRenderPump()
+	}
 	c.mu.Unlock()
+	if previewErr != nil {
+		c.emitState("self-view unavailable: " + previewErr.Error())
+	}
 	c.emitState("video on with " + peer)
 	depay := &codecs.VP8Packet{}
-	// TX: camera frames → frag → send.
+	// TX: camera frames → frag → send (+ submit a copy for self-view).
 	c.audioWg.Add(1)
 	go func() {
 		defer c.audioWg.Done()
@@ -784,6 +836,9 @@ func (c *callManager) StartVideo() error {
 			case f, ok := <-frames:
 				if !ok {
 					return
+				}
+				if preview != nil {
+					preview.submit(f) // drop-if-full; send path never waits
 				}
 				payloads, err := fragVP8(f)
 				if err != nil {
@@ -830,6 +885,13 @@ func (c *callManager) ensureRxLocked() bool {
 	}
 	c.videoAsm = newFragAssembler()
 	c.videoDec = dec
+	if c.rxDone == nil {
+		c.rxDone = make(chan struct{})
+	}
+	if !c.rxPump {
+		c.rxPump = true
+		c.startRenderPump()
+	}
 	return true
 }
 
@@ -842,7 +904,7 @@ func (c *callManager) onVideoFrag(frag videoFrag) {
 		c.mu.Unlock()
 		return
 	}
-	asm, dec := c.videoAsm, c.videoDec
+	asm := c.videoAsm
 	c.mu.Unlock()
 	payload, err := func() ([]byte, error) {
 		depay := &codecs.VP8Packet{}
@@ -858,17 +920,70 @@ func (c *callManager) onVideoFrag(frag videoFrag) {
 	if complete == nil {
 		return
 	}
-	rgb, err := dec.decode(complete)
-	if err != nil {
+	c.mu.Lock()
+	dec := c.videoDec
+	c.mu.Unlock()
+	if dec == nil {
 		return
 	}
+	dec.submit(complete) // drop-if-full: decode keeps pace or sheds load
+}
+
+// startRenderPump relays decoded RGB (remote and self-view) to ASCII
+// rendering. Decoders are snapshotted per iteration: nil channels block
+// forever in select, so missing sides simply idle.
+func (c *callManager) startRenderPump() {
+	c.audioWg.Add(1)
+	go func() {
+		defer c.audioWg.Done()
+		for {
+			c.mu.Lock()
+			var remote, preview <-chan []byte
+			if c.videoDec != nil {
+				remote = c.videoDec.results()
+			}
+			if c.previewDec != nil {
+				preview = c.previewDec.results()
+			}
+			done := c.rxDone
+			c.mu.Unlock()
+			if done == nil {
+				return
+			}
+			select {
+			case <-done:
+				return
+			case rgb, ok := <-remote:
+				if !ok {
+					return
+				}
+				c.mu.Lock()
+				c.rxOn = true
+				c.mu.Unlock()
+				if cb := c.callbacks().onVideoFrame; cb != nil {
+					cb(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+				}
+			case rgb, ok := <-preview:
+				if !ok {
+					return
+				}
+				if cb := c.callbacks().onSelfFrame; cb != nil {
+					cb(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+				}
+			}
+		}
+	}()
+}
+
+// rxDoneChan returns the receive-path done channel, creating it with the
+// pipeline. Render pump and decoder die with the call, never the frame.
+func (c *callManager) rxDoneChan() <-chan struct{} {
 	c.mu.Lock()
-	c.rxOn = true
-	onFrame := c.cb.onVideoFrame
-	c.mu.Unlock()
-	if onFrame != nil {
-		onFrame(asciiFrame(rgb, videoWidth, videoHeight, videoPaneCols, videoPaneRows))
+	defer c.mu.Unlock()
+	if c.rxDone == nil {
+		c.rxDone = make(chan struct{})
 	}
+	return c.rxDone
 }
 
 // StopVideo ends camera send + remote render, keeping audio up.
@@ -877,13 +992,23 @@ func (c *callManager) StopVideo() {
 	stop := c.videoStop
 	dec := c.videoDec
 	srcStop := c.stopVideoSrc
+	pdec := c.previewDec
+	rdone := c.rxDone
 	c.videoStop, c.videoAsm, c.videoDec, c.videoOn, c.rxOn, c.stopVideoSrc = nil, nil, nil, false, false, nil
+	c.previewDec = nil
+	c.rxDone, c.rxPump = nil, false
 	c.mu.Unlock()
 	if stop != nil {
 		close(stop)
 	}
+	if rdone != nil {
+		close(rdone)
+	}
 	if srcStop != nil {
 		srcStop()
+	}
+	if pdec != nil {
+		pdec.close()
 	}
 	if dec != nil {
 		dec.close()
@@ -914,19 +1039,26 @@ func defaultVideoSrc() (<-chan []byte, func(), error) {
 	go func() {
 		defer close(out)
 		defer enc.stop()
-		r := newIvfReader(enc.out)
+		d := newOggDemux(enc.out)
+		// Skip the 2 stream-header packets by position (never by content:
+		// video bytes could theoretically match the magic).
+		for skipped := 0; skipped < 2; skipped++ {
+			if _, err := d.packet(); err != nil {
+				return
+			}
+		}
 		for {
 			select {
 			case <-done:
 				return
 			default:
 			}
-			f, err := r.frame()
+			pkt, err := d.packet()
 			if err != nil {
 				return
 			}
 			select {
-			case out <- f:
+			case out <- pkt:
 			case <-done:
 				return
 			}

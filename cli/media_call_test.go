@@ -318,16 +318,21 @@ func TestVideoSyntheticLoopback(t *testing.T) {
 	frames <- append([]byte(nil), f2...)
 	ma.mu.Lock()
 	ma.videoSrc = func() (<-chan []byte, func(), error) { return frames, func() {}, nil }
+	ma.videoDecFn = func() (frameDecoder, error) { return newIdentityDecoder(), nil }
 	ma.mu.Unlock()
 	mb.mu.Lock()
 	mb.videoDecFn = func() (frameDecoder, error) {
-		return &identityDecoder{}, nil
+		return newIdentityDecoder(), nil
 	}
 	mb.mu.Unlock()
 	rendered := make(chan []string, 8)
+	selfed := make(chan []string, 8)
 	mb.mu.Lock()
 	mb.cb.onVideoFrame = func(lines []string) { rendered <- lines }
 	mb.mu.Unlock()
+	ma.mu.Lock()
+	ma.cb.onSelfFrame = func(lines []string) { selfed <- lines }
+	ma.mu.Unlock()
 	if err := ma.StartVideo(); err != nil {
 		t.Fatal(err)
 	}
@@ -339,6 +344,14 @@ func TestVideoSyntheticLoopback(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("no video frame rendered loopback")
 	}
+	select {
+	case lines := <-selfed:
+		if len(lines) == 0 {
+			t.Fatal("empty self-view")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("no self-view frame rendered")
+	}
 	ma.StopVideo()
 	ma.mu.Lock()
 	on := ma.videoOn
@@ -348,18 +361,32 @@ func TestVideoSyntheticLoopback(t *testing.T) {
 	}
 }
 
-type identityDecoder struct{}
+type identityDecoder struct {
+	q    chan []byte
+	done chan struct{}
+}
 
-func (identityDecoder) decode(frame []byte) ([]byte, error) {
+func newIdentityDecoder() *identityDecoder {
+	return &identityDecoder{q: make(chan []byte, 8), done: make(chan struct{})}
+}
+
+func (d *identityDecoder) submit(frame []byte) bool {
 	_ = frame
 	rgb := make([]byte, videoWidth*videoHeight*3)
 	for i := 0; i < len(rgb); i += 3 {
 		rgb[i], rgb[i+1], rgb[i+2] = 128, 128, 128
 	}
-	return rgb, nil
+	select {
+	case d.q <- rgb:
+		return true
+	default:
+		return false
+	}
 }
 
-func (identityDecoder) close() {}
+func (d *identityDecoder) results() <-chan []byte { return d.q }
+
+func (d *identityDecoder) close() {}
 
 func TestVideoSidebarSplitAndScroll(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")

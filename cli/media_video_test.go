@@ -3,70 +3,109 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pion/rtp/codecs"
 )
 
-func synthIVF(t *testing.T, frames ...[]byte) []byte {
-	t.Helper()
-	var buf bytes.Buffer
-	hdr := make([]byte, 32)
-	copy(hdr[0:4], "DKIF")
-	copy(hdr[8:12], "VP80")
-	buf.Write(hdr)
-	for _, f := range frames {
-		fh := make([]byte, 12)
-		fh[0] = byte(len(f))
-		fh[1] = byte(len(f) >> 8)
-		fh[2] = byte(len(f) >> 16)
-		fh[3] = byte(len(f) >> 24)
-		buf.Write(fh)
-		buf.Write(f)
+func TestOggDemuxSplitsPackets(t *testing.T) {
+	// Synthetic stream: 2 header packets, 1 small video packet, 1 video
+	// packet spanning pages via 255-continued lacing, then EOF.
+	var stream bytes.Buffer
+	writeRawPage := func(bodyParts ...[]byte) {
+		var tab []byte
+		for _, p := range bodyParts {
+			for left := len(p); left > 0; {
+				n := left
+				if n > 255 {
+					n = 255
+				}
+				tab = append(tab, byte(n))
+				left -= n
+			}
+			if len(p)%255 == 0 {
+				tab = append(tab, 0) // terminator lacing value
+			}
+		}
+		hdr := make([]byte, 27)
+		copy(hdr[0:4], "OggS")
+		hdr[26] = byte(len(tab))
+		stream.Write(hdr)
+		stream.Write(tab)
+		for _, p := range bodyParts {
+			stream.Write(p)
+		}
 	}
-	return buf.Bytes()
+	h1 := []byte("OVP8HDR1")
+	h2 := []byte("OVP8HDR2-SECOND-PACKET")
+	v1 := []byte{0x10, 0x00, 0x11, 0x22}
+	big := make([]byte, 700)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	writeRawPage(h1)
+	writeRawPage(h2)
+	writeRawPage(v1)
+	writeRawPage(big)
+
+	d := newOggDemux(bufio.NewReader(&stream))
+	got := [][]byte{}
+	for {
+		p, err := d.packet()
+		if err != nil {
+			break
+		}
+		got = append(got, p)
+	}
+	if len(got) != 4 || !bytes.Equal(got[0], h1) || !bytes.Equal(got[1], h2) ||
+		!bytes.Equal(got[2], v1) || !bytes.Equal(got[3], big) {
+		t.Fatalf("demux wrong: %d packets", len(got))
+	}
+	// Garbage is not Ogg.
+	rb := newOggDemux(bufio.NewReader(bytes.NewReader([]byte("not-an-ogg-stream-0000000000"))))
+	if _, err := rb.packet(); err == nil {
+		t.Fatal("garbage must fail")
+	}
 }
 
-func TestIvfReaderWriter(t *testing.T) {
-	f1 := []byte{0x10, 0x00, 0x11, 0x22, 0x33}
-	f2 := []byte{0x20, 0x01, 0x44, 0x55}
-	r := newIvfReader(bufio.NewReader(bytes.NewReader(synthIVF(t, f1, f2))))
-	g1, err := r.frame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(g1, f1) {
-		t.Fatalf("frame1 wrong: %x", g1)
-	}
-	g2, err := r.frame()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(g2, f2) {
-		t.Fatalf("frame2 wrong: %x", g2)
-	}
-	if _, err := r.frame(); err == nil {
-		t.Fatal("EOF must error")
-	}
-	// Writer emits what the reader parses.
+func TestOggMuxRoundtrip(t *testing.T) {
 	var wb bytes.Buffer
-	w := newIvfWriter(&wb)
-	if err := w.writeFrame(f1, 640, 480); err != nil {
+	m := newOggMux(&wb, 0x12345678)
+	if err := m.writeHeaders(640, 480); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.writeFrame(f2, 640, 480); err != nil {
+	f1 := []byte{0x10, 0x00, 0xaa, 0xbb}
+	f2 := make([]byte, 5000)
+	for i := range f2 {
+		f2[i] = byte(i * 7)
+	}
+	if err := m.writeFrame(f1, 1); err != nil {
 		t.Fatal(err)
 	}
-	r2 := newIvfReader(bufio.NewReader(&wb))
-	h1, err := r2.frame()
-	if err != nil || !bytes.Equal(h1, f1) {
-		t.Fatalf("writer/reader mismatch: %x %v", h1, err)
+	if err := m.writeFrame(f2, 2); err != nil {
+		t.Fatal(err)
 	}
-	// Garbage is not IVF.
-	rb := newIvfReader(bufio.NewReader(bytes.NewReader([]byte("not-an-ivf-stream-00000000000000"))))
-	if _, err := rb.frame(); err == nil {
-		t.Fatal("garbage must fail")
+	// Re-demux: 2 headers + 2 frames, CRC-validated implicitly by parse.
+	d := newOggDemux(bufio.NewReader(&wb))
+	var packets [][]byte
+	for {
+		p, err := d.packet()
+		if err != nil {
+			break
+		}
+		packets = append(packets, p)
+	}
+	if len(packets) != 4 {
+		t.Fatalf("remux gave %d packets; want 4", len(packets))
+	}
+	if !bytes.Equal(packets[2], f1) || !bytes.Equal(packets[3], f2) {
+		t.Fatal("frame payloads corrupted through mux roundtrip")
+	}
+	if string(packets[0][0:4]) != "OVP8" {
+		t.Fatal("identification header malformed")
 	}
 }
 
@@ -194,5 +233,78 @@ func TestProbeVideoCap(t *testing.T) {
 	t.Setenv("TERM", "foot")
 	if probeVideoCap() != videoCapSixel {
 		t.Fatal("foot must probe sixel")
+	}
+}
+
+// Full ffmpeg fidelity: testsrc encode -> IVF parse -> FU-A ->
+// reassemble -> decode -> ASCII. Skipped without ffmpeg (CI-safe).
+func TestVideoFFmpegEndToEnd(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
+	t.Setenv("UPLINK_CAMERA", "test")
+	enc, err := startVideoEncoder()
+	if err != nil {
+		t.Fatalf("encoder: %v", err)
+	}
+	defer enc.stop()
+	d := newOggDemux(enc.out)
+	// Skip the 2 stream headers; wait for a keyframe like the live path.
+	var frame []byte
+	for skipped := 0; skipped < 2; skipped++ {
+		if _, err := d.packet(); err != nil {
+			t.Fatalf("header packet: %v", err)
+		}
+	}
+	kfDeadline := time.Now().Add(15 * time.Second)
+	for {
+		f, err := d.packet()
+		if err != nil {
+			t.Fatalf("encoded frame: %v", err)
+		}
+		if vp8KeyFrame(f) {
+			frame = f
+			break
+		}
+		if time.Now().After(kfDeadline) {
+			t.Fatal("no keyframe in 15s of test pattern")
+		}
+	}
+	dec, err := newFFmpegDecoder()
+	if err != nil {
+		t.Fatalf("decoder: %v", err)
+	}
+	defer dec.close()
+	// Streaming: keep feeding frames (decoder only emits once primed);
+	// the first keyframe alone never yields output on a pipe.
+	go func() {
+		_ = frame
+		for {
+			f, err := d.packet()
+			if err != nil {
+				return
+			}
+			if !dec.submit(f) {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}()
+	dec.submit(frame)
+	var rgb []byte
+	select {
+	case rgb = <-dec.results():
+	case <-time.After(20 * time.Second):
+		t.Fatal("no decoded picture after 20s of streaming test pattern")
+	}
+	if len(rgb) != videoWidth*videoHeight*3 {
+		t.Fatalf("rgb size %d; want %d", len(rgb), videoWidth*videoHeight*3)
+	}
+	lines := asciiFrame(rgb, videoWidth, videoHeight, 40, 12)
+	if len(lines) != 12 {
+		t.Fatalf("ascii rows %d; want 12", len(lines))
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "▀") {
+		t.Fatal("test pattern rendered blank")
 	}
 }

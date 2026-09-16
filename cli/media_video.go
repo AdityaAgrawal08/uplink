@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,97 +55,203 @@ func cameraDevice() string {
 	}
 }
 
+// testCamera reports whether device selects the synthetic test pattern
+// (no camera needed: verifies the whole pipeline end to end).
+func testCamera(device string) (w, h, fps int, ok bool) {
+	if device != "test" && !strings.HasPrefix(device, "test:") {
+		return 0, 0, 0, false
+	}
+	return videoWidth, videoHeight, videoFPS, true
+}
+
 func videoEncodeArgs(device string) []string {
 	size := fmt.Sprintf("%dx%d", videoWidth, videoHeight)
 	rate := fmt.Sprintf("%d", videoFPS)
+	if _, _, _, ok := testCamera(device); ok {
+		return []string{"-f", "lavfi", "-i", fmt.Sprintf("testsrc=size=%s:rate=%s", size, rate),
+			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
+			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return []string{"-f", "avfoundation", "-framerate", rate, "-i", device + ":",
 			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ivf", "pipe:1"}
+			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	case "windows":
 		return []string{"-f", "dshow", "-i", device,
 			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ivf", "pipe:1"}
+			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	default:
 		return []string{"-f", "v4l2", "-i", device,
 			"-c:v", "libvpx", "-b:v", videoBitrate, "-deadline", "realtime", "-cpu-used", "5",
-			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ivf", "pipe:1"}
+			"-vf", "scale=" + size, "-r", rate, "-g", "30", "-f", "ogg", "pipe:1"}
 	}
 }
 
-// ivfReader parses an IVF stream: one 32B file header, then 12B frame
-// headers (size + timestamp) + payload each. A fresh reader per stream.
-type ivfReader struct {
-	r     *bufio.Reader
-	first bool
+// oggCRC is the Ogg checksum (CRC-32/ISO-HDLC variant: init 0, no
+// reflection, no xor-out). Verified byte-exact against ffmpeg output.
+var oggCRCtable [256]uint32
+
+func init() {
+	for i := range oggCRCtable {
+		r := uint32(i) << 24
+		for j := 0; j < 8; j++ {
+			if r&0x80000000 != 0 {
+				r = (r << 1) ^ 0x04C11DB7
+			} else {
+				r <<= 1
+			}
+		}
+		oggCRCtable[i] = r
+	}
 }
 
-func newIvfReader(r *bufio.Reader) *ivfReader { return &ivfReader{r: r, first: true} }
+func oggCRC(data []byte) uint32 {
+	var crc uint32
+	for _, b := range data {
+		crc = (crc << 8) ^ oggCRCtable[byte(crc>>24)^b]
+	}
+	return crc
+}
 
-func (v *ivfReader) frame() ([]byte, error) {
-	if v.first {
-		v.first = false
-		fileHdr := make([]byte, 32)
-		if _, err := io.ReadFull(v.r, fileHdr); err != nil {
+// oggDemux splits an Ogg VP8 stream into packets (skipping the 2 header
+// packets): Ogg pages self-sync, so this streams live — unlike IVF, whose
+// demuxer buffers to EOF on pipes.
+type oggDemux struct {
+	r       *bufio.Reader
+	headers int
+	carry   []byte // continued packet across pages
+}
+
+func newOggDemux(r *bufio.Reader) *oggDemux { return &oggDemux{r: r} }
+
+// packet returns the next complete packet (headers first: identification,
+// comment, then VP8 frames).
+func (d *oggDemux) packet() ([]byte, error) {
+	for {
+		page, err := d.page()
+		if err != nil {
 			return nil, err
 		}
-		if string(fileHdr[0:4]) != "DKIF" {
-			return nil, fmt.Errorf("not an IVF stream")
+		for _, seg := range page {
+			d.carry = append(d.carry, seg...)
+			if len(seg) < 255 {
+				pkt := d.carry
+				d.carry = nil
+				return pkt, nil
+			}
 		}
 	}
-	fh := make([]byte, 12)
-	if _, err := io.ReadFull(v.r, fh); err != nil {
-		return nil, err
-	}
-	size := int(binary.LittleEndian.Uint32(fh[0:4]))
-	if size < 4 || size > 8<<20 {
-		return nil, fmt.Errorf("absurd IVF frame size %d", size)
-	}
-	frame := make([]byte, size)
-	if _, err := io.ReadFull(v.r, frame); err != nil {
-		return nil, err
-	}
-	return frame, nil
 }
 
-// ivfWriter emits one IVF stream (file header once, then frames) for the
-// decoder's stdin.
-type ivfWriter struct {
-	w     io.Writer
-	first bool
-}
-
-func newIvfWriter(w io.Writer) *ivfWriter { return &ivfWriter{w: w, first: true} }
-
-func (v *ivfWriter) writeFrame(frame []byte, width, height int) error {
-	if v.first {
-		v.first = false
-		hdr := make([]byte, 32)
-		copy(hdr[0:4], "DKIF")
-		binary.LittleEndian.PutUint16(hdr[4:6], 0)
-		binary.LittleEndian.PutUint16(hdr[6:8], 32)
-		copy(hdr[8:12], "VP80")
-		binary.LittleEndian.PutUint16(hdr[12:14], uint16(width))
-		binary.LittleEndian.PutUint16(hdr[14:16], uint16(height))
-		binary.LittleEndian.PutUint32(hdr[16:20], 1000000)
-		binary.LittleEndian.PutUint32(hdr[20:24], 1)
-		if _, err := v.w.Write(hdr); err != nil {
-			return err
+// page reads one Ogg page, returning its payload segments.
+func (d *oggDemux) page() ([][]byte, error) {
+	hdr := make([]byte, 27)
+	if _, err := io.ReadFull(d.r, hdr); err != nil {
+		return nil, err
+	}
+	if string(hdr[0:4]) != "OggS" {
+		return nil, fmt.Errorf("not an Ogg stream")
+	}
+	nseg := int(hdr[26])
+	if nseg == 0 {
+		return nil, fmt.Errorf("empty Ogg page")
+	}
+	tab := make([]byte, nseg)
+	if _, err := io.ReadFull(d.r, tab); err != nil {
+		return nil, err
+	}
+	var segs [][]byte
+	for _, n := range tab {
+		seg := make([]byte, int(n))
+		if _, err := io.ReadFull(d.r, seg); err != nil {
+			return nil, err
 		}
+		segs = append(segs, seg)
 	}
-	fh := make([]byte, 12)
-	binary.LittleEndian.PutUint32(fh[0:4], uint32(len(frame)))
-	if _, err := v.w.Write(fh); err != nil {
-		return err
+	return segs, nil
+}
+
+// oggMux re-wraps VP8 frames into an Ogg stream for the decoder. Headers
+// use fixed templates (identification patched with dimensions); the
+// comment block is informational metadata the decoder ignores.
+type oggMux struct {
+	w        io.Writer
+	serial   uint32
+	seqno    uint64
+	sentHdrs bool
+}
+
+func newOggMux(w io.Writer, serial uint32) *oggMux {
+	return &oggMux{w: w, serial: serial}
+}
+
+var oggCommentPacket = []byte{
+	'O', 'V', 'P', '8', 0x30, 0x02, 0x20, 0x0c, 0x00, 0x00, 0x00, 0x4c,
+	0x61, 0x76, 0x66, 0x36, 0x33, 0x2e, 0x31, 0x2e, 0x31, 0x30, 0x31, 0x01,
+	0x00, 0x00, 0x00, 0x1b, 0x00, 0x00, 0x00, 0x65, 0x6e, 0x63, 0x6f, 0x64,
+	0x65, 0x72, 0x3d, 0x4c, 0x61, 0x76, 0x63, 0x36, 0x33, 0x2e, 0x31, 0x2e,
+	0x31, 0x30, 0x31, 0x20, 0x6c, 0x69, 0x62, 0x76, 0x70, 0x78,
+}
+
+func (m *oggMux) writePage(packet []byte, first, last bool, granule uint64) error {
+	var hdr [27]byte
+	copy(hdr[0:4], "OggS")
+	if first {
+		hdr[5] |= 0x02
 	}
-	_, err := v.w.Write(frame)
+	if last {
+		hdr[5] |= 0x04
+	}
+	binary.LittleEndian.PutUint64(hdr[6:14], granule)
+	binary.LittleEndian.PutUint32(hdr[14:18], m.serial)
+	binary.LittleEndian.PutUint32(hdr[18:22], uint32(m.seqno))
+	m.seqno++
+	// Lacing: 255-byte segments, remainder terminates the packet.
+	rest := len(packet)
+	nseg := rest/255 + 1
+	if nseg > 255 {
+		return fmt.Errorf("packet too large for one page")
+	}
+	hdr[26] = byte(nseg)
+	tab := make([]byte, 0, nseg)
+	for rest > 0 {
+		n := rest
+		if n > 255 {
+			n = 255
+		}
+		tab = append(tab, byte(n))
+		rest -= n
+	}
+	page := append(hdr[:], tab...)
+	page = append(page, packet...)
+	crc := oggCRC(page)
+	page[22], page[23], page[24], page[25] = byte(crc), byte(crc>>8), byte(crc>>16), byte(crc>>24)
+	_, err := m.w.Write(page)
 	return err
 }
 
-// vp8KeyFrame reports the VP8 keyframe bit (first payload byte).
+func (m *oggMux) writeHeaders(width, height int) error {
+	ident := []byte{
+		'O', 'V', 'P', '8', 0x30, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00,
+		0x00, 0x01,
+	}
+	binary.BigEndian.PutUint16(ident[8:10], uint16(width))
+	binary.BigEndian.PutUint16(ident[10:12], uint16(height))
+	if err := m.writePage(ident, true, false, 0); err != nil {
+		return err
+	}
+	return m.writePage(oggCommentPacket, false, false, 0)
+}
+
+func (m *oggMux) writeFrame(frame []byte, granule uint64) error {
+	return m.writePage(frame, false, false, granule)
+}
+
+// vp8KeyFrame reports the VP8 frame type bit (bit 0 clear = keyframe).
 func vp8KeyFrame(frame []byte) bool {
-	return len(frame) >= 2 && frame[0] == 0x10 && frame[1] == 0x00
+	return len(frame) >= 1 && frame[0]&0x01 == 0
 }
 
 // fragVP8 splits one VP8 frame into FU-A payloads via pion/rtp.
@@ -249,7 +356,7 @@ func startVideoDecoder() (*videoDecoder, error) {
 		return nil, err
 	}
 	size := fmt.Sprintf("%dx%d", videoWidth, videoHeight)
-	cmd := exec.Command("ffmpeg", "-f", "ivf", "-i", "pipe:0",
+	cmd := exec.Command("ffmpeg", "-f", "ogg", "-i", "pipe:0",
 		"-f", "rawvideo", "-pix_fmt", "rgb24", "-s", size, "pipe:1")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -274,15 +381,24 @@ func (v *videoDecoder) stop() {
 }
 
 // frameDecoder turns reassembled VP8 frames into RGB24 videoWidth*videoHeight.
+// Streaming design: piped ffmpeg only emits once primed, so frames go in
+// one end continuously and pictures come out the other — never
+// request/response (which stalls forever on the first frame).
 type frameDecoder interface {
-	decode(frame []byte) ([]byte, error)
+	submit(frame []byte) bool // false when full (caller drops, never blocks)
+	results() <-chan []byte
 	close()
 }
 
 // ffmpegDecoder implements frameDecoder via an ffmpeg child process.
 type ffmpegDecoder struct {
-	dec *videoDecoder
-	w   *ivfWriter
+	dec  *videoDecoder
+	mux  *oggMux
+	inQ  chan []byte
+	outQ chan []byte
+	done chan struct{}
+	wg   sync.WaitGroup
+	once sync.Once
 }
 
 func newFFmpegDecoder() (*ffmpegDecoder, error) {
@@ -290,20 +406,72 @@ func newFFmpegDecoder() (*ffmpegDecoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ffmpegDecoder{dec: dec, w: newIvfWriter(dec.in)}, nil
+	d := &ffmpegDecoder{
+		dec:  dec,
+		mux:  newOggMux(dec.in, 0x75706c6b),
+		inQ:  make(chan []byte, 8),
+		outQ: make(chan []byte, 4),
+		done: make(chan struct{}),
+	}
+	if err := d.mux.writeHeaders(videoWidth, videoHeight); err != nil {
+		dec.stop()
+		return nil, err
+	}
+	d.wg.Add(2)
+	go d.writePump()
+	go d.readPump()
+	return d, nil
 }
 
-func (d *ffmpegDecoder) decode(frame []byte) ([]byte, error) {
-	if err := d.w.writeFrame(frame, videoWidth, videoHeight); err != nil {
-		return nil, err
+func (d *ffmpegDecoder) writePump() {
+	defer d.wg.Done()
+	var n uint64
+	for {
+		select {
+		case <-d.done:
+			return
+		case f, ok := <-d.inQ:
+			if !ok {
+				return
+			}
+			n++
+			if err := d.mux.writeFrame(f, n); err != nil {
+				return
+			}
+		}
 	}
-	out := make([]byte, videoWidth*videoHeight*3)
-	if _, err := io.ReadFull(d.dec.out, out); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
+
+func (d *ffmpegDecoder) readPump() {
+	defer d.wg.Done()
+	for {
+		out := make([]byte, videoWidth*videoHeight*3)
+		if _, err := io.ReadFull(d.dec.out, out); err != nil {
+			return
+		}
+		select {
+		case d.outQ <- out:
+		case <-d.done:
+			return
+		}
+	}
+}
+
+func (d *ffmpegDecoder) submit(frame []byte) bool {
+	select {
+	case d.inQ <- frame:
+		return true
+	case <-d.done:
+		return false
+	default:
+		return false
+	}
+}
+
+func (d *ffmpegDecoder) results() <-chan []byte { return d.outQ }
 
 func (d *ffmpegDecoder) close() {
-	d.dec.stop()
+	d.once.Do(func() { close(d.done) })
+	d.dec.stop() // kill first: unblocks ReadFull/write before wg.Wait
+	d.wg.Wait()
 }
