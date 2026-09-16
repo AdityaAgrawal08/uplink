@@ -109,17 +109,21 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 			onVideoFrame: func(lines []string) { rendered <- lines },
 		})
 	mcPlaySink := mc.playSink
-	mc.playSink = func() (func([]int16), func(), error) {
-		play, stop, err := mcPlaySink()
+	mc.playSink = func() (*speaker, error) {
+		sp, err := mcPlaySink()
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return func(pcm []int16) {
+		inner := sp.onPlay
+		sp.onPlay = func(pcm []int16) {
 			heardMu.Lock()
 			heard++
 			heardMu.Unlock()
-			play(pcm)
-		}, stop, nil
+			if inner != nil {
+				inner(pcm)
+			}
+		}
+		return sp, nil
 	}
 	mc.dialIP = "127.0.0.1"
 	ec := newEngineWithStun("carol", idc, sigC, engineCallbacks{

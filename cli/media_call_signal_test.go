@@ -68,8 +68,13 @@ func TestPublishOverSignalPath(t *testing.T) {
 		m.dialIP = "127.0.0.1"
 	}
 	ma.micSrc = func() (<-chan []int16, func(), error) { return feedA, func() {}, nil }
-	mb.playSink = func() (func([]int16), func(), error) {
-		return func([]int16) { muB.Lock(); gotB++; muB.Unlock() }, func() {}, nil
+	mb.playSink = func() (*speaker, error) {
+		sp, err := openFileSpeaker(t.TempDir() + "/bob.pcm")
+		if err != nil {
+			return nil, err
+		}
+		sp.onPlay = func([]int16) { muB.Lock(); gotB++; muB.Unlock() }
+		return sp, nil
 	}
 
 	// Engines drive the signal queue polls (real path, fake server).
@@ -186,13 +191,13 @@ func TestAudioEndToEndWithTestMic(t *testing.T) {
 		return mc.frames, mc.stop, nil
 	}
 	var sp *speaker
-	testB.playSink = func() (func([]int16), func(), error) {
+	testB.playSink = func() (*speaker, error) {
 		s, err := openFileSpeaker(speakerFile)
 		if err != nil {
 			t.Fatalf("file speaker: %v", err)
 		}
 		sp = s
-		return s.play, s.close, nil
+		return s, nil
 	}
 
 	ea := newEngineWithStun("alice", ida, sigA, engineCallbacks{
