@@ -36,6 +36,15 @@ func handleVersion() {
 // denote the same release.
 func normVersion(v string) string { return strings.TrimPrefix(v, "v") }
 
+// shortVersion keeps banners screenshot-readable: full tags stay intact,
+// dev hashes collapse to 7 chars ("v0.0.2-dev+599cae8").
+func shortVersion(v string) string {
+	if i := strings.Index(v, "-dev+"); i >= 0 && len(v) > i+5+7 {
+		return v[:i+5+7]
+	}
+	return v
+}
+
 // cmpVersions compares dotted numerics: -1/0/1, or -2 when unparseable
 // (caller falls back to "update available" rather than guessing).
 func cmpVersions(a, b string) int {

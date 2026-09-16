@@ -107,7 +107,8 @@ type mediaPeer struct {
 	epoch         int64
 	hsM1          []byte // initiator first message (retransmits on stall)
 	hsTries       int
-	verifyPending bool // roster-unknown at verify; beat loop retries boundedly
+	hsNudged      int64 // epoch already nudge-recovered (once per attempt)
+	verifyPending bool  // roster-unknown at verify; beat loop retries boundedly
 	lastRx        time.Time
 }
 
@@ -198,6 +199,7 @@ func (m *mediaTransport) beatOnce() {
 		hs   *peerSession
 	}
 	var reverifies []reverify
+	var nudges []string
 	for username, p := range m.peers {
 		if p.ready {
 			continue
@@ -223,9 +225,19 @@ func (m *mediaTransport) beatOnce() {
 			delete(m.hsEpoch, username)
 			continue
 		}
-		if age > 8*time.Second && p.hsTries < 3 {
+		if age > 8*time.Second && p.hsTries < 3 && len(p.hsM1) > 0 {
 			p.hsTries++
 			retries = append(retries, retry{peer: username, epoch: p.epoch, m1: p.hsM1})
+			continue
+		}
+		// Responder-side stall: our handshake waits on a note that may
+		// never come (lost in transit) while the peer believes it is done.
+		// Nudge once per attempt — smaller side restarts directly, larger
+		// side asks (only smaller may initiate).
+		if age > 15*time.Second && p.hsNudged != p.epoch {
+			p.hsNudged = p.epoch
+			nudges = append(nudges, username)
+			continue
 		}
 	}
 	m.mu.Unlock()
@@ -237,6 +249,15 @@ func (m *mediaTransport) beatOnce() {
 	}
 	for _, r := range reverifies {
 		m.verifyReady(r.peer, r.hs)
+	}
+	for _, peer := range nudges {
+		if m.me < peer {
+			// Smaller side restarts directly (fresh hs + epoch).
+			m.dropHandshake(peer)
+			m.beginHandshake(peer)
+		} else {
+			m.sendRestart(peer)
+		}
 	}
 }
 

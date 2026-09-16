@@ -381,3 +381,112 @@ func TestVerifyUnknownRecoversViaRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Responder-side stall: larger side nudges via restart-request, smaller
+// side restarts on receipt. Covers a lost final handshake note with the
+// peer already live (the one-way-media screenshot).
+func TestResponderStallNudgeRecovery(t *testing.T) {
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	var mu sync.Mutex
+	var notesA, notesB []string
+	var ma, mb *mediaTransport
+	var err error
+	ma, err = newMediaTransport("alice", ida,
+		func(to, typ, payload string) error {
+			mu.Lock()
+			notesA = append(notesA, typ)
+			mu.Unlock()
+			mb.onHandshakeNote("alice", typ, payload)
+			return nil
+		},
+		func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} },
+		mediaCallbacks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ma.stop()
+	mb, err = newMediaTransport("bob", idb,
+		func(to, typ, payload string) error {
+			mu.Lock()
+			notesB = append(notesB, typ)
+			mu.Unlock()
+			ma.onHandshakeNote("bob", typ, payload)
+			return nil
+		},
+		func() map[string][]byte { return map[string][]byte{"alice": ida.publicKey()} },
+		mediaCallbacks{})
+	if err != nil {
+		ma.stop()
+		t.Fatal(err)
+	}
+	defer mb.stop()
+	ma.start()
+	mb.start()
+	if err := ma.dialPeer("bob", "127.0.0.1", mb.localAddr().Port); err != nil {
+		t.Fatal(err)
+	}
+	if err := mb.dialPeer("alice", "127.0.0.1", ma.localAddr().Port); err != nil {
+		t.Fatal(err)
+	}
+
+	// Full handshake normally.
+	ma.beginHandshake("bob")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ma.mu.Lock()
+		aLive := ma.peers["bob"] != nil && ma.peers["bob"].ready
+		ma.mu.Unlock()
+		mb.mu.Lock()
+		bLive := mb.peers["alice"] != nil && mb.peers["alice"].ready
+		mb.mu.Unlock()
+		if aLive && bLive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("baseline handshake never completed")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Simulate responder-side stall: bob drops back to tracked-hs (as if
+	// its completion never landed), aged past the nudge threshold.
+	mb.mu.Lock()
+	pb := mb.peers["alice"]
+	psB, _, _ := beginNoise(idb, "alice", false)
+	pb.hs, pb.hsAt, pb.epoch, pb.ready, pb.hsNudged = psB, time.Now().Add(-20*time.Second), 99, false, 0
+	mb.hsEpoch["alice"] = 99
+	mb.mu.Unlock()
+	mb.beatOnce()
+	mu.Lock()
+	var restarts int
+	for _, typ := range notesB {
+		if typ == mediaHSRestart {
+			restarts++
+		}
+	}
+	mu.Unlock()
+	if restarts != 1 {
+		t.Fatalf("stalled larger responder sent %d restarts; want 1", restarts)
+	}
+	// Alice (smaller) must have re-initiated on the restart.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		ma.mu.Lock()
+		_, hasHs := ma.hsEpoch["bob"]
+		ma.mu.Unlock()
+		mb.mu.Lock()
+		bLive := mb.peers["alice"] != nil && mb.peers["alice"].ready
+		mb.mu.Unlock()
+		if bLive {
+			break
+		}
+		if hasHs {
+			// Fresh attempt in flight; allow it to converge below.
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("bob never recovered after restart nudge")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}

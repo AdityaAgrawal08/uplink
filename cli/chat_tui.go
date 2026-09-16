@@ -1111,7 +1111,7 @@ func (c chatScreen) headerView() string {
 	// Binary version in the banner: screenshots become self-identifying
 	// (which build each side runs is otherwise unknowable in bug reports).
 	text := fmt.Sprintf(" uplink chat · key %s · you are %s · %d online · v%s%s%s ",
-		c.key, c.me, len(c.users), normVersion(version), mode, c.callStatus())
+		c.key, c.me, len(c.users), normVersion(shortVersion(version)), mode, c.callStatus())
 	l := c.layoutFor()
 	w := c.width
 	if l.frameOn {
