@@ -110,26 +110,6 @@ var (
 			Background(lipgloss.Color("#05080f"))
 )
 
-// stripANSIPlain removes SGR escape sequences (production helper; the test
-// files carry their own copies for assertions).
-func stripANSIPlain(s string) string {
-	var b strings.Builder
-	inEsc := false
-	for _, r := range s {
-		switch {
-		case r == '\x1b':
-			inEsc = true
-		case inEsc:
-			if r == 'm' {
-				inEsc = false
-			}
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
-
 // avatarPalette assigns each user a stable, distinct avatar colour.
 var avatarPalette = []string{
 	"#14b8a6", "#22c55e", "#f472b6", "#f59e0b", "#8b5cf6",
@@ -439,8 +419,31 @@ func camStripOn(termW, termH int) bool {
 	return termW >= 90 && termH >= 26
 }
 
-// camStripRows is the fixed strip height (title + tile box).
-const camStripRows = 9
+// camStripRows is the fixed strip height (title + tile box). Tiles are
+// tall enough for the ASCII blur to read: header + pic + footer + border.
+const camStripRows = 12
+
+// camPicRows is the picture height inside every tile.
+const camPicRows = camStripRows - 1 - 2 - 2
+
+// camStripContentW is the full content width available to the strip.
+func camStripContentW(termW int, frameOn bool) int {
+	if frameOn {
+		return termW - frameChrome
+	}
+	return termW
+}
+
+// camTileInner derives the tile interior width shared by the painter and
+// the render-size handshake below (single source of truth: frames render
+// at exactly the width their tile paints).
+func camTileInner(contentW, nFeeds int) int {
+	if nFeeds <= 0 {
+		nFeeds = 1
+	}
+	tileW := (contentW - (nFeeds - 1)) / nFeeds
+	return maxInt(tileW-2, 8)
+}
 
 // camFeeds builds the tiles: self first, then video publishers, audio-only
 // contributors, then recent peers (camera-off placeholders) up to 4 tiles.
@@ -479,6 +482,27 @@ func (c *chatScreen) camFeeds() []camFeed {
 		}
 		seen[u] = true
 		feeds = append(feeds, camFeed{name: u})
+	}
+	// A remote feed with no listed publisher yet (transient roster) still
+	// pins to the first remote tile — live pictures never hide behind
+	// placeholders. Mirrors the old pane, which preferred videoLines.
+	if len(c.videoLines) > 0 {
+		claimed := false
+		for _, f := range feeds {
+			if !f.me && len(f.lines) > 0 {
+				claimed = true
+				break
+			}
+		}
+		if !claimed {
+			for i := range feeds {
+				if !feeds[i].me && !feeds[i].audioOnly {
+					feeds[i].lines = c.videoLines
+					feeds[i].live = true
+					break
+				}
+			}
+		}
 	}
 	if len(feeds) > 4 {
 		feeds = feeds[:4]
@@ -524,10 +548,16 @@ func tilePlaceholder(name string, w, h int) string {
 
 // renderCamTile paints one camera tile of exactly tileW (outer, incl border)
 // and camStripRows-1 rows (outer, incl border).
+//
+// Live frames paint VERBATIM: the engine renders them at exactly this tile's
+// geometry (see the SetVideoSize handshake in syncViewport) with full
+// truecolor braille. They are truncated by VISIBLE width only (SGR intact)
+// and never re-wrapped — stripping or re-wrapping is what turns the blur
+// image into monochrome dots.
 func renderCamTile(f camFeed, tileW int) string {
 	inner := maxInt(tileW-2, 8)
 	head := thCamLiveStyle.Render("●") + " " + thCamNameStyle.Render(truncateStringPlain(f.name, maxInt(inner-4, 1)))
-	picH := camStripRows - 1 - 2 - 2 // outer - border - header - footer
+	picH := camPicRows
 	if picH < 2 {
 		picH = 2
 	}
@@ -551,11 +581,10 @@ func renderCamTile(f camFeed, tileW int) string {
 		}
 		fit := make([]string, 0, picH)
 		for i := 0; i < picH-len(take); i++ {
-			fit = append(fit, "")
+			fit = append(fit, strings.Repeat(" ", inner))
 		}
-		st := lipgloss.NewStyle().Width(inner)
 		for _, ln := range take {
-			fit = append(fit, st.Render(truncateStringPlain(stripANSIPlain(ln), inner)))
+			fit = append(fit, truncateVisible(ln, inner))
 		}
 		pic = strings.Join(fit, "\n")
 	default:
@@ -575,10 +604,8 @@ func (c *chatScreen) camerasStripView(outerW int) string {
 	title := thCamTitleStyle.Render("🎥 Live Cameras ("+fmt.Sprint(len(feeds))+")") + " " +
 		thCamLiveStyle.Render("●")
 	gap := 1
-	tileW := (outerW - gap*(len(feeds)-1)) / len(feeds)
-	if tileW < 12 {
-		tileW = 12
-	}
+	inner := camTileInner(outerW, len(feeds))
+	tileW := inner + 2
 	// Horizontal join (NOT strings.Join: tiles are multi-line blocks).
 	strs := make([]string, 0, len(feeds)*2-1)
 	for i, f := range feeds {

@@ -1728,14 +1728,13 @@ func (c *chatScreen) syncViewport() {
 	if l.vpHeight > 0 && vpW > 10 {
 		vpW--
 	}
-	// Remote video lives in the bottom strip now (static tiles, no scroll
-	// pane): keep the legacy viewport harmless when the sidebar box is gone.
-	if l.videoRows >= 2 {
-		c.videoVp.Width = maxInt(c.sidebarInnerWidth()-2, 8)
-		c.videoVp.Height = maxInt(l.videoRows-2, 1)
-		if _, frameRows, _ := videoPaneGeom(*c, l); c.call != nil {
-			c.call.SetVideoSize(c.videoVp.Width, frameRows)
-		}
+	// Bottom-strip tiles own the render size now (the retired sidebar pane
+	// used to): push the TRUE tile geometry into the manager so frames
+	// render at the tile's real width with full truecolor (no crop, no
+	// downstream strip/re-wrap). Same pane-size contract as main.
+	if l.camRows > 0 && c.call != nil {
+		inner := camTileInner(camStripContentW(c.width, l.frameOn), len(c.camFeeds()))
+		c.call.SetVideoSize(inner, camPicRows)
 	}
 	// Chat list gets its own viewport (scrollable like the transcript);
 	// the search row lives outside the viewport.
