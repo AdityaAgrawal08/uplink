@@ -113,12 +113,13 @@ func truncateFilename(name string, maxLen int) string {
 }
 
 // fileAttachmentCard renders a multi-line styled card for a file upload.
-// The card layout:
+// The card layout (reference: dark tile, file glyph, name + size/mime,
+// download affordance on the right):
 //
-//	┌─ 📄 filename.docx ─────────────────────┐
-//	│  DOCX · 48 KB                    ↓ save │
-//	│                         10:30 PM         │
-//	└─────────────────────────────────────────┘
+//	┌──────────────────────────────────┐
+//	│  🖼  screenshot.png            ⤓  │
+//	│      1.4 MB · image/png           │
+//	└──────────────────────────────────┘
 func fileAttachmentCard(filename, username, sizeStr, timestamp string, width int) string {
 	ext := filepath.Ext(filename)
 	icon := fileIcon(ext)
@@ -177,31 +178,55 @@ func fileAttachmentCard(filename, username, sizeStr, timestamp string, width int
 		}
 	}
 
-	header := cardIconStyle.Render(icon+" ") + cardHeaderStyle.Render(dispName)
-	metaLeft := cardMetaStyle.Render(metaPlain)
-	action := cardActionStyle.Render(actionPlain)
+	// MIME-flavoured meta: "1.4 MB · image/png".
+	mimeMeta := fmt.Sprintf("%s · %s/%s", sizeStr, fileKindLabel(ext), strings.ToLower(label))
+	header := thFileDlStyle.Render(icon+" ") + thFileNameStyle.Render(dispName)
+	metaLeft := thFileMetaStyle.Render(mimeMeta)
+	action := thFileDlStyle.Render("⤓")
 
-	// Meta line: left meta, right action with gap
-	gap := cardInnerW - lipgloss.Width(metaPlain) - actionW
-	if gap < 2 {
-		gap = 2
+	// Name line: icon + name left, download glyph right.
+	gapH := cardInnerW - lipgloss.Width(headerPlain) - lipgloss.Width("⤓")
+	if gapH < 2 {
+		gapH = 2
 	}
-	metaLine := fmt.Sprintf("%s%s%s", metaLeft, strings.Repeat(" ", gap), action)
+	nameLine := fmt.Sprintf("%s%s%s", header, strings.Repeat(" ", gapH), action)
+
+	// Meta line: indented under the icon.
+	indent := strings.Repeat(" ", lipgloss.Width(icon+" "))
+	metaLine := indent + metaLeft
 
 	var inner string
 	if timestamp != "" {
 		tsRender := cardTimeStyle.Render(timestamp)
-		// Timestamp right-aligned on its own row
 		tsPad := cardInnerW - lipgloss.Width(timestamp)
 		if tsPad < 0 {
 			tsPad = 0
 		}
-		inner = fmt.Sprintf("%s\n%s\n%s%s", header, metaLine, strings.Repeat(" ", tsPad), tsRender)
+		inner = fmt.Sprintf("%s\n%s\n%s%s", nameLine, metaLine, strings.Repeat(" ", tsPad), tsRender)
 	} else {
-		inner = fmt.Sprintf("%s\n%s", header, metaLine)
+		inner = fmt.Sprintf("%s\n%s", nameLine, metaLine)
 	}
-	// Use fixed compact width so card doesn't stretch full viewport
-	return cardStyleCompact.Width(cardInnerW + 2).Render(inner)
+	// Fixed compact width so the card hugs content, never the viewport.
+	return thFileCardStyle.Width(cardInnerW + 2).Render(inner)
+}
+
+// fileKindLabel maps an extension onto a coarse MIME family for the card's
+// meta line (image/png, video/mp4, …).
+func fileKindLabel(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico":
+		return "image"
+	case ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm":
+		return "video"
+	case ".mp3", ".wav", ".ogg", ".flac", ".aac", ".wma":
+		return "audio"
+	case ".pdf":
+		return "document"
+	case ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz":
+		return "archive"
+	default:
+		return "file"
+	}
 }
 
 // alignRight pads s on the left so it appears right-aligned within availWidth.

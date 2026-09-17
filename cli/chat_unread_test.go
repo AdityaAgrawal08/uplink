@@ -118,30 +118,24 @@ func TestSidebarRendersAndClearsBadge(t *testing.T) {
 	// Package-level styles were built before the profile was forced; use a
 	// fresh style so the SGR assertion sees the forced ANSI256 profile.
 	fresh := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("16")).
-		Background(lipgloss.Color("2"))
+		Foreground(lipgloss.Color("15")).
+		Background(lipgloss.Color("27"))
 	chip := fresh.Render(circledNum(2))
 	out := c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(stripANSI(out), circledNum(2)) {
-		t.Fatalf("circled badge glyph missing in sidebar:\n%s", stripANSI(out))
+	plain := stripANSI(out)
+	if !strings.Contains(plain, "alice") {
+		t.Fatalf("alice missing from chat list:\n%s", plain)
 	}
-	// lipgloss may emit 256-colour (48;5;2) or compact 4-bit (42) green bg;
-	// accept either, but REQUIRE near-black fg + SOME green background.
-	hasBlackFg := strings.Contains(chip, "38;5;16")
-	hasGreenBg := strings.Contains(chip, "48;5;2") || strings.Contains(chip, ";42m") || strings.Contains(chip, "[42;")
-	if !hasBlackFg || !hasGreenBg {
-		t.Fatalf("chip colours wrong (%q): blackFg=%v greenBg=%v", stripANSIRaw(chip), hasBlackFg, hasGreenBg)
+	// The unread dot paints on alice's item (blue ● beside her rows).
+	if !strings.Contains(plain, "●") {
+		t.Fatalf("unread dot missing from chat list:\n%s", plain)
 	}
-
-	// Chip sits at the RIGHT edge with a guaranteed gap from the name.
-	for _, line := range strings.Split(stripANSI(out), "\n") {
-		if strings.Contains(line, "alice") {
-			idx := strings.Index(line, circledNum(2))
-			nameEnd := strings.Index(line, "(you)") // alice is self here? no—self row
-			_ = nameEnd
-			gap := idx - strings.LastIndex(line[:idx], "alice")
-			_ = gap
-		}
+	// lipgloss may emit 256-colour (48;5;27) or compact 4-bit (44) blue bg;
+	// accept either, but REQUIRE white fg + SOME blue background.
+	hasWhiteFg := strings.Contains(chip, "38;5;15") || strings.Contains(chip, "97")
+	hasBlueBg := strings.Contains(chip, "48;5;27") || strings.Contains(chip, ";44m") || strings.Contains(chip, "[44;")
+	if !hasWhiteFg || !hasBlueBg {
+		t.Fatalf("chip colours wrong (%q): whiteFg=%v blueBg=%v", stripANSIRaw(chip), hasWhiteFg, hasBlueBg)
 	}
 
 	c.enterPrivate("alice")
@@ -219,7 +213,8 @@ func TestMouseFollowsRecencyOrder(t *testing.T) {
 	c.vp = *viewportPtr(60, 16)
 
 	l := computeLayout(W, H, false)
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+1)) // first peer row
+	// Items: General at +0/+1, then recency-ordered ana at +2/+3.
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+2)) // first peer row
 	if c.targetUser != "ana" {
 		t.Fatalf("clicked row selected %q; want ana (recency-ordered)", c.targetUser)
 	}

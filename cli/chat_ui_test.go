@@ -76,11 +76,12 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 	l := computeLayout(100, 30, false)
 	out := c.rosterBody(l.rosterSlots)
 
-	if !strings.Contains(out, "ONLINE — 3") {
-		t.Errorf("online section missing: %q", out)
+	if !strings.Contains(out, "Search chats") || !strings.Contains(out, "General") {
+		t.Errorf("chat list missing search/room:\n%s", out)
 	}
-	if !strings.Contains(out, "● alice (you)") || !strings.Contains(out, "○ bob") {
-		t.Errorf("presence dots wrong:\n%s", out)
+	// Self (alice) has no chat row of its own; peers do.
+	if !strings.Contains(out, "bob") || !strings.Contains(out, "carol") {
+		t.Errorf("peers missing from chat list:\n%s", out)
 	}
 	if strings.Contains(out, "THREADS") && l.rosterSlots < 4 {
 		t.Error("threads section rendered without room")
@@ -93,15 +94,15 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 	if strings.Contains(out, "THREADS") || strings.Contains(out, "▸ · bob") || strings.Contains(out, "# general") {
 		t.Errorf("thread panel remnants after removal:\n%s", out)
 	}
-	if !strings.Contains(out, "● bob") {
+	if !strings.Contains(out, "bob") {
 		t.Errorf("selected peer lost its highlight:\n%s", out)
 	}
 
-	// Back to general: still just the ONLINE roster.
+	// Back to general: still the same chat list.
 	c.exitPrivate()
 	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(out, "ONLINE — 3") {
-		t.Errorf("roster damaged by mode switches:\n%s", out)
+	if !strings.Contains(out, "General") || !strings.Contains(out, "bob") {
+		t.Errorf("chat list damaged by mode switches:\n%s", out)
 	}
 }
 

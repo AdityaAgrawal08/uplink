@@ -170,25 +170,33 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), c.videoActive())
-	// Video box claims the top of the sidebar column (mockup: VIDEO/AUDIO
-	// above ONLINE). Bounded to half the column so the roster never starves;
-	// collapsed entirely when too short to be useful.
+	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), false)
+	// Sidebar video box is retired: feeds render in the bottom Live Cameras
+	// strip. The sidebar column therefore always starts at the room-header
+	// top (rosterY0 from the pure pass already accounts for that).
 	l.videoRows = 0
-	if l.sidebarOn && c.videoActive() {
-		cols, frameRows, streams := videoPaneGeom(c, l)
-		pane := streams*frameRows + (streams - 1) // frames + divider
-		want := pane + 1 + 2                      // title + border
-		if len(c.videoLines) == 0 && len(c.selfLines) == 0 {
-			want = 1 + 3 + 2 // hint + "waiting" placeholder rows + border
-		}
-		l.videoRows = min(want, l.vpHeight/2)
-		if l.videoRows < 6 {
-			l.videoRows = 0
-		}
-		_ = cols
+	// Room header above the transcript (center column only).
+	l.headRows = 0
+	if l.vpHeight > 8 {
+		l.headRows = 2
 	}
-	l.rosterY0 += l.videoRows
+	// Bottom camera strip (full width, fixed height) when it fits.
+	l.camRows = 0
+	if camStripOn(c.width, c.height) && l.vpHeight-l.headRows-camStripRows >= 3 {
+		l.camRows = camStripRows
+	}
+	l.vpHeight -= l.headRows + l.camRows
+	if l.vpHeight < 0 {
+		l.vpHeight = 0
+	}
+	// Roster adapts to the settled viewport: search row eats one slot.
+	l.rosterSlots = l.vpHeight - 1
+	if l.rosterSlots > rosterMaxVisible {
+		l.rosterSlots = rosterMaxVisible
+	}
+	if l.rosterSlots < 0 || !l.sidebarOn {
+		l.rosterSlots = 0
+	}
 	return l
 }
 

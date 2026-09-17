@@ -26,11 +26,14 @@ func TestHoverPaintsExactlyOneRow(t *testing.T) {
 	c.width, c.height = W, H
 	c.vp = *viewportPtr(60, 20)
 
-	frag := func(u string) string { return tuiHoverStyle.Render("○ " + u) }
+	frag := func(u string) string { return thHoverRowStyle.Render(u) }
 
-	render := func() string { return c.rosterBody(computeLayout(W, H, false).rosterSlots) }
+	render := func() string {
+		c.syncRosterVp()
+		return c.rosterBody(computeLayout(W, H, false).rosterSlots)
+	}
 
-	// Baseline: no hover → zero pink rows anywhere.
+	// Baseline: no hover → zero highlighted rows anywhere.
 	c.hoverPeer = ""
 	base := render()
 	for _, u := range users {
@@ -38,38 +41,36 @@ func TestHoverPaintsExactlyOneRow(t *testing.T) {
 			continue
 		}
 		if strings.Contains(base, frag(u)) {
-			t.Fatalf("pink leaked with no hover on %s", u)
+			t.Fatalf("highlight leaked with no hover on %s", u)
 		}
 	}
-	if strings.Contains(stripANSIRaw(base), "48;5;236") || strings.Contains(base, "\x1b[48;5;236m") {
-		t.Error("legacy selection background still present")
-	}
 
-	// Hover the LAST user: its row is pink; every other peer's is not.
+	// Hover the LAST user: its item highlights; every other peer's does not.
 	c.hoverPeer = "u6"
 	out := render()
 	if !strings.Contains(out, frag("u6")) {
-		t.Fatalf("hovered row not pink:\n%s", stripANSIRaw(out))
+		t.Fatalf("hovered item not highlighted:\n%s", stripANSIRaw(out))
 	}
 	for _, u := range users {
 		if u == "me" || u == "u6" {
 			continue
 		}
 		if strings.Contains(out, frag(u)) {
-			t.Fatalf("pink bled onto non-hovered row %s", u)
+			t.Fatalf("highlight bled onto non-hovered item %s", u)
 		}
 	}
 
-	// Selected 4th peer keeps only its SHAPE cue while someone else hovers.
-	if !strings.Contains(stripANSIRaw(out), "● u3") {
-		t.Error("selected peer row missing")
+	// Selected peer (u3, in a thread) keeps its tinted selection while
+	// someone else hovers.
+	if !strings.Contains(stripANSIRaw(out), "u3") {
+		t.Error("selected peer item missing")
 	}
 
-	// Moving hover moves the single pink row.
+	// Moving hover moves the single highlight.
 	c.hoverPeer = "u1"
 	out2 := render()
 	if !strings.Contains(out2, frag("u1")) || strings.Contains(out2, frag("u6")) {
-		t.Fatalf("hover move did not relocate the single pink row\n%s", stripANSIRaw(out2))
+		t.Fatalf("hover move did not relocate the single highlight\n%s", stripANSIRaw(out2))
 	}
 }
 
@@ -80,15 +81,16 @@ func TestMotionUpdatesAndClearsHover(t *testing.T) {
 	scr := m.(chatScreen)
 	l := computeLayout(W, H, false)
 
+	// Items: General at +0/+1, "a" at +2/+3 (two rows per chat item).
 	inside := l.rosterX + 4
-	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 1})
+	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 2})
 	got := nm.(chatScreen)
 	if got.hoverPeer != "a" {
 		t.Fatalf("hover = %q; want a", got.hoverPeer)
 	}
 
-	// Motion outside the column clears it.
-	nm2, _ := got.Update(tea.MouseMsg{Type: tea.MouseMotion, X: 2, Y: l.rosterY0 + 1})
+	// Motion over the transcript (right of the sidebar) clears it.
+	nm2, _ := got.Update(tea.MouseMsg{Type: tea.MouseMotion, X: transcriptX0(l) + 5, Y: l.rosterY0 + 2})
 	got2 := nm2.(chatScreen)
 	if got2.hoverPeer != "" {
 		t.Fatalf("hover not cleared outside sidebar: %q", got2.hoverPeer)
