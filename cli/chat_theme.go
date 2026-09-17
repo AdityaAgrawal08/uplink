@@ -191,11 +191,30 @@ var (
 	thFileMetaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
 	thFileDlStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
 
-	thCamTitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
-	thCamNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
-	thCamLiveStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
-	thCamMetaStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
-	thTileStyle     = lipgloss.NewStyle().
+	thTabActiveStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color(thBlue)).
+				Foreground(lipgloss.Color("#ffffff")).
+				Bold(true)
+	thTabInactiveStyle = lipgloss.NewStyle().
+				Background(lipgloss.Color("#16233d")).
+				Foreground(lipgloss.Color(thDim))
+	thTabStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color(thDim))
+
+	thCamTitleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
+	thCamNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
+	thCamLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
+	thCamMetaStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
+	thSystemBarStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
+	thSystemNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
+
+	thCallBtnOffStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#ef4444"))
+	thCallBtnDimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
+	thHangupStyle     = lipgloss.NewStyle().
+				Background(lipgloss.Color("#dc2626")).
+				Foreground(lipgloss.Color("#ffffff")).
+				Bold(true)
+	thTileStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color(thPanelEdge)).
 			Background(lipgloss.Color("#05080f"))
@@ -250,10 +269,12 @@ type chatItem struct {
 	active  bool
 	isRoom  bool
 	live    bool // peer online (room always true)
+	inCall  bool // live video/audio on this conversation
 }
 
-// itemRowsPerChat is the fixed row height of one chat item (name + preview).
-const itemRowsPerChat = 2
+// itemRowsPerChat is the comfortable row height of one chat item: name,
+// preview, and the selected-state border/bottom air.
+const itemRowsPerChat = 3
 
 // chatItems builds the sidebar order: General room first, then DM peers in
 // display (recency) order. Read-only: no model mutation.
@@ -265,11 +286,21 @@ func (c *chatScreen) chatItems() []chatItem {
 	}
 	items := make([]chatItem, 0, len(online)+1)
 	preview, ts := c.convPreview(generalConv)
+	inCall, inCallElapsed := false, ""
+	if n := c.callParties(); n > 0 {
+		members := len(c.users)
+		if members == 0 {
+			members = 1
+		}
+		preview = fmt.Sprintf("%d in call • %d members", n, members)
+		ts = time.Now().Local().Format("15:04")
+		inCall = true
+	}
 	items = append(items, chatItem{
 		peer: "", name: "General",
 		preview: preview, timeStr: ts,
 		unread: c.roomUnread, active: c.targetUser == "",
-		isRoom: true, live: true,
+		isRoom: true, live: true, inCall: inCall,
 	})
 	for _, u := range online {
 		if u == c.me {
@@ -277,11 +308,23 @@ func (c *chatScreen) chatItems() []chatItem {
 		}
 		conv := conversationKey(c.me, u)
 		pv, tm := c.convPreview(conv)
+		peerCall := c.peerInCall(u)
+		if peerCall {
+			if inCallElapsed == "" {
+				inCallElapsed = c.callElapsed()
+			}
+			if inCallElapsed == "--:--:--" {
+				pv = "In call now"
+			} else {
+				pv = "Video call • " + inCallElapsed[len("00:"):]
+			}
+			tm = time.Now().Local().Format("15:04")
+		}
 		items = append(items, chatItem{
 			peer: u, name: u,
 			preview: pv, timeStr: tm,
 			unread: c.unread[u], active: c.targetUser == u,
-			isRoom: false, live: live[u],
+			isRoom: false, live: live[u], inCall: peerCall,
 		})
 	}
 	return items
@@ -359,20 +402,19 @@ func (c *chatScreen) itemIndexFor(peer string) int {
 // when cramped.
 func topBarView(w int) string {
 	now := time.Now()
+	enc := thLockStyle.Render("🔒 End-to-End Encrypted")
 	var left, right string
 	switch {
 	case w <= 0 || w >= 110:
 		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
 			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
-		right = thSignalStyle.Render("▂▄▆") + "  " +
-			thLockStyle.Render("🔒") + "  " +
+		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarDimStyle.Render(now.Format("Mon, 02 Jan 2006")) + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
-	case w >= 75:
+	case w >= 85:
 		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
 			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
-		right = thSignalStyle.Render("▂▄▆") + "  " +
-			thLockStyle.Render("🔒") + "  " +
+		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
 	case w >= 55:
 		left = thTopbarLogoStyle.Render("◆ UPLINK")
@@ -408,6 +450,9 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 			n = 1
 		}
 		sub = fmt.Sprintf("%d members  |  Public Room", n)
+		if inCall := c.callParties(); inCall > 0 {
+			sub = fmt.Sprintf("%d members  |  %d in call  |  Public Room", n, inCall)
+		}
 		if c.key != "" {
 			sub += "  ·  key " + c.key
 		}
@@ -423,12 +468,29 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		}
 	}
 	// Width() would wrap overlong rows and break the exact-row contract, so
-	// content is hard-truncated to fit instead; the style only pads.
+	// content is hard-truncated to fit instead; the style only pads. Tabs
+	// ride the name row (short) so the long context sub never squeezes out.
 	name = truncateStringPlain(name, maxInt(outerW-lipgloss.Width(av)-4, 1))
 	line1 := av + "  " + thRoomNameStyle.Render(name)
+	line1 = roomTabsLine(outerW, line1)
 	line2 := "     " + thRoomSubStyle.Render(truncateStringPlain(sub, maxInt(outerW-6, 0)))
 	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
 	return st.Render(line1) + "\n" + st.Render(line2)
+}
+
+// roomTabsLine appends the right-aligned Chat/Files tabs + menu to the room
+// header's name row. Geometry mirrors roomTabsGeoms (hit-testing): the Chat
+// chip is 6 cells, Files 7, ⋮ 3, single-space separated.
+func roomTabsLine(outerW int, line1 string) string {
+	chat := thTabActiveStyle.Render(" Chat ")
+	files := thTabInactiveStyle.Render(" Files ")
+	more := thTabStyle.Render(" ⋮ ")
+	tabs := chat + " " + files + " " + more
+	gap := outerW - lipgloss.Width(stripForWidth(line1)) - lipgloss.Width(tabs)
+	if gap < 1 || outerW < 50 {
+		return line1 // cramped: no tabs painted, none hit-testable either
+	}
+	return line1 + strings.Repeat(" ", gap) + tabs
 }
 
 // roomHeaderCompact paints the 1-row room heading for short/narrow
@@ -443,6 +505,9 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 			n = 1
 		}
 		sub = fmt.Sprintf("%d · Public", n)
+		if inCall := c.callParties(); inCall > 0 {
+			sub = fmt.Sprintf("%d · %d in call", n, inCall)
+		}
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
@@ -493,8 +558,8 @@ func sendButtonView(boxH, sendW int) string {
 }
 
 // composerTopRows counts the terminal rows above the composer box, mirroring
-// View()'s assembly order (header, body, strip, drawer) so hit-testing stays
-// pixel-truthful even with the drawer open.
+// View()'s assembly order (header, body, strip, hints, drawer) so
+// hit-testing stays pixel-truthful even with the drawer open.
 func composerTopRows(l layout) int {
 	top := 0
 	if l.showHeader {
@@ -507,11 +572,11 @@ func composerTopRows(l layout) int {
 			bodyRows += transcriptBorder
 		}
 	}
-	bodyRows += l.headRows
+	bodyRows += l.headRows + l.callRows
 	if bodyRows > 0 {
 		top += bodyRows
 	}
-	top += l.camRows
+	top += l.camRows + l.hintRows
 	if l.paletteRows > 0 {
 		top += l.paletteRows + 1 // drawer panel + its spacer row
 	}
@@ -519,6 +584,43 @@ func composerTopRows(l layout) int {
 		top++ // frame top edge
 	}
 	return top
+}
+
+// roomTabsGeoms maps the Chat/Files/⋮ tab hit rects in terminal coords.
+// Mirrors roomTabsLine exactly: right-aligned tabs, none when cramped.
+func roomTabsGeoms(c *chatScreen, l layout) (chat, files, more tabRect, ok bool) {
+	if l.headRows < 2 || c.width == 0 || c.height == 0 {
+		return tabRect{}, tabRect{}, tabRect{}, false
+	}
+	outerW := l.vpWidth + 2
+	if outerW < 50 {
+		return tabRect{}, tabRect{}, tabRect{}, false
+	}
+	frameOff := 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	headOff := 0
+	if l.showHeader {
+		headOff = headerHeight
+	}
+	y := frameOff + headOff // first room-header row
+	tx0 := transcriptX0(l)
+	x1 := tx0 + outerW
+	more = tabRect{x0: x1 - 3, x1: x1, y: y}
+	files = tabRect{x0: x1 - 3 - 1 - 7, x1: x1 - 3 - 1, y: y}
+	chat = tabRect{x0: x1 - 3 - 1 - 7 - 1 - 6, x1: x1 - 3 - 1 - 7 - 1, y: y}
+	return chat, files, more, true
+}
+
+// tabRect is one clickable tab (x1 exclusive, single row y).
+type tabRect struct {
+	x0, x1, y int
+}
+
+// hit reports whether a terminal point lands in the tab.
+func (t tabRect) hit(x, y int) bool {
+	return y == t.y && x >= t.x0 && x < t.x1
 }
 
 // composerGeoms derives the composer hit-test geometry deterministically from
@@ -756,6 +858,173 @@ func renderCamTile(f camFeed, tileW int, pictureRows ...int) string {
 	return thTileStyle.Width(inner).Render(body)
 }
 
+// ---- right video panel ----------------------------------------------------------
+
+// callBtn is one clickable control-bank button (terminal coords, end-excl).
+type callBtn struct {
+	id         string
+	x0, x1, y0 int
+	y1         int
+	enabled    bool
+}
+
+// panelGeom is the right video column geometry. videoPanelGeom is the single
+// source of truth: rightPanelView and the mouse hit-test derive from the
+// same struct, so clicks land exactly on the painted buttons.
+type panelGeom struct {
+	on        bool
+	x0        int // terminal column of the panel box left border
+	topY      int // terminal row of the panel box top border
+	w         int // outer width (= layout vidPanelW)
+	contentH  int // interior rows (= sidebar rosterH)
+	perRow    int
+	tileInner int
+	tileH     int // outer tile height (border included)
+	picH      int
+	tileRows  int
+	shown     int // tile slots painted
+	overflow  int // feeds hidden behind the "+N more" tile
+	gridY     int // terminal row of the first grid row
+	padRows   int
+	ctrlY     int // terminal row of the controls box top
+	ctrlH     int // outer controls height
+	ctrlWide  bool
+	segW      int
+	btns      []callBtn
+	noteY     int // terminal row of the note box top (-1 when hidden)
+	noteH     int
+	fsX0      int // fullscreen glyph hit rect (header row, right end)
+	fsX1      int
+	fsY       int
+}
+
+// videoPanelGeom lays out the right video column for a settled layout.
+// Never reports off when the layout enabled the panel: it degrades
+// (compact controls, hidden note, fewer tiles) instead, so paint and layout
+// can never disagree about reserved space.
+func videoPanelGeom(c *chatScreen, l layout, feeds []camFeed) (pg panelGeom) {
+	if l.vidPanelW <= 0 {
+		return panelGeom{}
+	}
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	if l.showHeader {
+		headOff = headerHeight
+	}
+	sideW := 0
+	if l.sidebarOn {
+		sideW = l.sidebarWidth + 1
+	}
+	pg.on = true
+	pg.w = l.vidPanelW
+	pg.x0 = frameOff + sideW + (l.vpWidth + 2) + 1
+	pg.topY = frameOff + headOff
+	pg.contentH = l.headRows + l.callRows + l.vpHeight - l.videoRows
+	pw := pg.w - 2
+	// Controls: one bordered box per button (icon + key rows when wide,
+	// single inline row when narrow), joined with 1-col gaps. Exact math:
+	// 5*segW + 4 gaps == pw, each box segW wide including its border.
+	pg.ctrlWide = pw >= 42
+	pg.ctrlH = 3
+	if pg.ctrlWide {
+		pg.ctrlH = 4
+	}
+	// Privacy note is a bordered 2-line box; it yields when short.
+	pg.noteH = 0
+	if pg.contentH >= 24 {
+		pg.noteH = 4
+	}
+	// Grid tiles: 2 columns when they fit, else 1.
+	pg.perRow = 2
+	if pw < 30 {
+		pg.perRow = 1
+	}
+	pg.tileInner = maxInt((pw-(pg.perRow-1))/pg.perRow-2, 8)
+	const minTileH = 5
+	pg.shown = len(feeds)
+	if pg.shown < 1 {
+		pg.shown = 1
+	}
+	for {
+		pg.tileRows = (pg.shown + pg.perRow - 1) / pg.perRow
+		if pg.tileRows < 1 {
+			pg.tileRows = 1
+		}
+		g := pg.contentH - 1 - pg.ctrlH - pg.noteH
+		pg.tileH = 0
+		if pg.tileRows > 0 {
+			pg.tileH = g / pg.tileRows
+		}
+		if pg.tileH >= minTileH || pg.shown <= 1 {
+			break
+		}
+		pg.shown--
+	}
+	if pg.tileH < 4 {
+		pg.tileH = 4 // degenerate floor: layout gate keeps this unreachable
+	}
+	pg.picH = maxInt(pg.tileH-2, 1)
+	// Overflow collapses into a "+N more" tile in the last slot.
+	pg.overflow = 0
+	if len(feeds) > pg.shown {
+		pg.overflow = len(feeds) - pg.shown + 1
+	}
+	g := pg.contentH - 1 - pg.ctrlH - pg.noteH
+	pg.padRows = maxInt(g-pg.tileRows*pg.tileH, 0)
+	pg.gridY = pg.topY + 1 + 1
+	pg.ctrlY = pg.gridY + g
+	pg.noteY = -1
+	if pg.noteH > 0 {
+		pg.noteY = pg.ctrlY + pg.ctrlH
+	}
+	// Fullscreen glyph sits at the header row's right end (same cell the
+	// painter's right-aligned "N / M ⛶" lands on).
+	fsW := lipgloss.Width("⛶")
+	pg.fsY = pg.topY + 1
+	pg.fsX1 = pg.x0 + pg.w - 1
+	pg.fsX0 = pg.fsX1 - fsW
+	// Control-bank buttons split the inner width evenly (gaps between).
+	pg.segW = maxInt((pw-4)/5, 5)
+	bx := pg.x0 + 1
+	by0 := pg.ctrlY
+	by1 := by0 + pg.ctrlH
+	ids := []string{"M", "V", "S", "P", "X"}
+	for i, id := range ids {
+		x0 := bx + i*pg.segW
+		x1 := x0 + pg.segW
+		if i == len(ids)-1 {
+			x1 = bx + pw // last segment eats rounding
+		}
+		enabled := true
+		switch id {
+		case "S", "P":
+			enabled = false // no screen-share / people panel in this build
+		case "X":
+			enabled = c.callActive()
+		default:
+			enabled = c.call != nil
+		}
+		pg.btns = append(pg.btns, callBtn{id: id, x0: x0, x1: x1, y0: by0, y1: by1, enabled: enabled})
+	}
+	return pg
+}
+
+// videoTileGeom reports the painted tile geometry for the active video UI
+// (panel or strip): the single input to the SetVideoSize handshake.
+func (c *chatScreen) videoTileGeom(l layout, feeds []camFeed) (inner, picH int) {
+	if l.vidPanelW > 0 {
+		pg := videoPanelGeom(c, l, feeds)
+		return pg.tileInner, pg.picH
+	}
+	if l.camRows > 0 {
+		w := camStripContentW(c.width, l.frameOn)
+		return max(tileMinFor(w), camTileInner(w, len(feeds))), max(3, l.camRows-5)
+	}
+	return 0, 0
+}
+
 // camerasStripView paints the full-width bottom strip: title + tiles.
 // outerW is the full content width (inside the app frame).
 func (c *chatScreen) camerasStripView(outerW int) string {
@@ -788,4 +1057,355 @@ func (c *chatScreen) camerasStripView(outerW int) string {
 		title += thCamMetaStyle.Render("  scroll to browse")
 	}
 	return truncateByWidth(title, outerW) + "\n" + strings.Join(lines, "\n")
+}
+
+// panelTile paints one right-panel tile: border + verbatim frame rows with
+// the name chip + mic state composited onto the bottom picture row (the
+// overlay look). Exactly tileH rows × (inner+2) cols. Camera-off tiles show
+// a dim centered mark instead of live pictures; audio-only tiles a wave.
+func panelTile(chip, mic string, lines []string, inner, tileH int, active bool, audioOnly bool) string {
+	picH := maxInt(tileH-2, 1)
+	take := append([]string(nil), lines...)
+	if len(take) > picH {
+		take = take[len(take)-picH:]
+	}
+	fit := make([]string, 0, picH)
+	for i := 0; i < picH-len(take); i++ {
+		fit = append(fit, strings.Repeat(" ", inner))
+	}
+	for _, ln := range take {
+		fit = append(fit, truncateVisible(ln, inner))
+	}
+	if len(take) == 0 {
+		mid := picH / 2
+		mark := thCamMetaStyle.Render("♪ audio only")
+		if !audioOnly {
+			mark = thCamMetaStyle.Render("○")
+		}
+		fit[mid] = lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(mark)
+	}
+	// Overlay: name chip bottom-left, mic state bottom-right.
+	chipW, micW := lipgloss.Width(chip), lipgloss.Width(mic)
+	pad := inner - chipW - micW
+	if pad < 0 {
+		pad = 0
+	}
+	fit[len(fit)-1] = chip + strings.Repeat(" ", pad) + mic
+	border := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(thPanelEdge))
+	if active {
+		border = border.BorderForeground(lipgloss.Color(thGreen))
+	}
+	return border.Width(inner).Render(strings.Join(fit, "\n"))
+}
+
+// panelMoreTile is the overflow tile: "+N more" centered.
+func panelMoreTile(inner, tileH, n int) string {
+	picH := maxInt(tileH-2, 1)
+	mid := picH / 2
+	rows := make([]string, 0, picH)
+	for i := 0; i < picH; i++ {
+		if i == mid {
+			rows = append(rows, lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(thCamMetaStyle.Render(fmt.Sprintf("+%d more", n))))
+		} else {
+			rows = append(rows, "")
+		}
+	}
+	return thTileStyle.Width(inner).Render(strings.Join(rows, "\n"))
+}
+
+// interleave splices sep between items for JoinHorizontal calls.
+func interleave(items []string, sep string) []string {
+	out := make([]string, 0, len(items)*2-1)
+	for i, s := range items {
+		if i > 0 {
+			out = append(out, sep)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// padLinesTo right-pads every line of a multi-line block to exactly w
+// cells (truncateVisible is single-line only and would corrupt newlines).
+func padLinesTo(s string, w int) string {
+	lines := strings.Split(s, "\n")
+	for i, ln := range lines {
+		if lw := lipgloss.Width(ln); lw < w {
+			lines[i] = ln + strings.Repeat(" ", w-lw)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// renderSystemCard paints a transcript system line the reference way: green
+// "System" sender, then a rounded card whose text rows carry a green left
+// bar. Width hugs content (capped); every row is exactly cardW+2 cells.
+func renderSystemCard(name, tsPlain, text string, availWidth int) string {
+	sender := thSystemNameStyle.Render(name) + "  " + thMsgTimeStyle.Render(tsPlain)
+	maxW := availWidth - 2
+	if maxW < 10 {
+		maxW = 10
+	}
+	if maxW > 52 {
+		maxW = 52
+	}
+	// Wrap plain first (ANSI-safe), then dress each row with the bar.
+	words := strings.Fields(text)
+	var wrapped []string
+	cur := ""
+	for _, w := range words {
+		if cur == "" {
+			cur = w
+		} else if len([]rune(cur))+1+len([]rune(w)) <= maxW-4 {
+			cur += " " + w
+		} else {
+			wrapped = append(wrapped, cur)
+			cur = w
+		}
+	}
+	if cur != "" || len(wrapped) == 0 {
+		wrapped = append(wrapped, cur)
+	}
+	bar := thSystemBarStyle.Render("▌")
+	rows := make([]string, 0, len(wrapped))
+	widest := 0
+	for _, ln := range wrapped {
+		if w := len([]rune(ln)); w > widest {
+			widest = w
+		}
+	}
+	for _, ln := range wrapped {
+		rows = append(rows, bar+" "+tuiSystemStyle.Render(ln+strings.Repeat(" ", widest-len([]rune(ln)))))
+	}
+	cardW := widest + 4 // bar + pads
+	if cardW > maxW {
+		cardW = maxW
+	}
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(thPanelEdge)).
+		Background(lipgloss.Color(thPanel)).
+		Width(cardW).
+		Render(strings.Join(rows, "\n"))
+	return sender + "\n" + card
+}
+
+// tileChip builds the dark name tag with the per-user dot.
+func tileChip(peer, label string, inner int) string {
+	dot := lipgloss.NewStyle().Foreground(avatarColorFor(peer)).Render("●")
+	name := truncateStringPlain(label, maxInt(inner-6, 1))
+	return lipgloss.NewStyle().
+		Background(lipgloss.Color(thPanel)).
+		Foreground(lipgloss.Color(thText)).
+		Render(dot + " " + name)
+}
+
+// tileMicGlyph maps known mute state onto a width-1 glyph: white ♪ live,
+// red ✕ muted, dim ♪ unknown (camera-off placeholders).
+func tileMicGlyph(on, off bool) string {
+	switch {
+	case on:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(thText)).Render("♪")
+	case off:
+		return thCallBtnOffStyle.Render("✕")
+	default:
+		return thCamMetaStyle.Render("♪")
+	}
+}
+
+// rightPanelView paints the right video column per panelGeom: call header,
+// tile grid, control bank, privacy note. Exactly contentH+2 rows.
+func (c *chatScreen) rightPanelView(l layout, pg panelGeom, feeds []camFeed) string {
+	pw := pg.w - 2
+	// Call header: live dot + timer left, in-call/total + fullscreen right.
+	live := c.callActive()
+	dot := thCamMetaStyle.Render("○")
+	if live {
+		dot = thCamLiveStyle.Render("●")
+	}
+	members := len(c.users)
+	if members == 0 {
+		members = 1
+	}
+	title := dot + " " + thCamNameStyle.Render("Video Call") + "  " + thCamMetaStyle.Render(c.callElapsed())
+	right := thCamMetaStyle.Render(fmt.Sprintf("%d / %d ⛶", c.callParties(), members))
+	headPad := pw - lipgloss.Width(stripForWidth(title)) - lipgloss.Width(stripForWidth(right))
+	if headPad < 1 {
+		headPad = 1
+	}
+	head := title + strings.Repeat(" ", headPad) + right
+	// Grid tiles (overlay style) with overflow collapsing into +N.
+	paint := make([]string, 0, pg.shown)
+	for i := 0; i < pg.shown; i++ {
+		if pg.overflow > 0 && i == pg.shown-1 {
+			paint = append(paint, panelMoreTile(pg.tileInner, pg.tileH, pg.overflow))
+			continue
+		}
+		f := feeds[i]
+		label, peer := f.name, f.name
+		if f.me {
+			label, peer = "You", c.me
+		}
+		chip := tileChip(peer, label, pg.tileInner)
+		var mic string
+		switch {
+		case f.me:
+			mic = tileMicGlyph(c.call != nil && c.call.AudioOn(), c.call != nil && !c.call.AudioOn())
+		case c.peerAudioLive(peer):
+			mic = tileMicGlyph(true, false)
+		case len(f.lines) > 0 || f.audioOnly:
+			mic = tileMicGlyph(false, true)
+		default:
+			mic = tileMicGlyph(false, false)
+		}
+		active := false
+		if f.me {
+			active = c.call != nil && (c.call.VideoOn() || c.call.AudioOn())
+		} else if c.call != nil && c.call.Watching() {
+			if pubs := c.call.VideoPublishers(); len(pubs) > 0 && pubs[0] == peer {
+				active = true
+			}
+		}
+		paint = append(paint, panelTile(chip, mic, f.lines, pg.tileInner, pg.tileH, active, f.audioOnly))
+	}
+	// Arrange into rows (full-height blank filler keeps ragged rows exact).
+	tileW := pg.tileInner + 2
+	filler := strings.Repeat(strings.Repeat(" ", tileW)+"\n", pg.tileH)
+	filler = strings.TrimSuffix(filler, "\n")
+	grid := make([]string, 0, pg.tileRows)
+	for r := 0; r < pg.tileRows; r++ {
+		cells := make([]string, 0, pg.perRow)
+		for col := 0; col < pg.perRow; col++ {
+			idx := r*pg.perRow + col
+			if idx < len(paint) {
+				cells = append(cells, paint[idx])
+			} else {
+				cells = append(cells, filler)
+			}
+			if col < pg.perRow-1 {
+				cells = append(cells, " ")
+			}
+		}
+		row := lipgloss.JoinHorizontal(lipgloss.Top, cells...)
+		grid = append(grid, padLinesTo(row, pw))
+	}
+	// Pad rows keep bottoms aligned when tiles don't divide evenly.
+	for i := 0; i < pg.padRows; i++ {
+		grid = append(grid, strings.Repeat(" ", pw))
+	}
+	// Control bank: icon + key segments (M/V wired, X hangs up, S/P dimmed:
+	// no screen-share or people panel exists in this build).
+	micOn := c.call != nil && c.call.AudioOn()
+	vidOn := c.call != nil && c.call.VideoOn()
+	micIcon := tileMicGlyph(micOn, c.call != nil && !micOn)
+	vidIcon := thCamNameStyle.Render("▶")
+	if !vidOn {
+		vidIcon = thCallBtnOffStyle.Render("✕")
+	}
+	// One bordered box per button; borders tint by state (red = off/hangup,
+	// dim = unsupported). Widths are exact: 5 boxes + 4 gaps == pw.
+	type btnBox struct {
+		icon, key string
+		border    lipgloss.Color
+	}
+	boxes := []btnBox{
+		{icon: micIcon, key: "M", border: lipgloss.Color(thPanelEdge)},
+		{icon: vidIcon, key: "V", border: lipgloss.Color(thPanelEdge)},
+		{icon: thCallBtnDimStyle.Render("▢"), key: "S", border: lipgloss.Color(thPanelEdge)},
+		{icon: thCallBtnDimStyle.Render("○○"), key: "P", border: lipgloss.Color(thPanelEdge)},
+		{icon: thHangupStyle.Render("✕"), key: "X", border: lipgloss.Color("#dc2626")},
+	}
+	if !micOn {
+		boxes[0].border = lipgloss.Color("#ef4444")
+	}
+	if !vidOn {
+		boxes[1].border = lipgloss.Color("#ef4444")
+	}
+	btns := make([]string, 0, 5)
+	for i, b := range boxes {
+		w := pg.segW
+		if i == 4 {
+			w = pw - 4 - 4*pg.segW // last eats rounding (minus gaps)
+		}
+		st := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(b.border).
+			Width(maxInt(w-2, 1))
+		if pg.ctrlWide {
+			ic := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(b.icon)
+			ky := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(thCamMetaStyle.Render("[" + b.key + "]"))
+			btns = append(btns, st.Render(ic+"\n"+ky))
+		} else {
+			one := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(b.icon + " " + thCamMetaStyle.Render(b.key))
+			btns = append(btns, st.Render(one))
+		}
+	}
+	ctrlBlock := lipgloss.JoinHorizontal(lipgloss.Top, append([]string{}, interleave(btns, " ")...)...)
+	content := append([]string{truncateVisible(head, pw)}, grid...)
+	content = append(content, strings.Split(padLinesTo(ctrlBlock, pw), "\n")...)
+	if pg.noteH > 0 {
+		n1 := truncateStringPlain("ℹ Video is intentionally blurred for privacy.", maxInt(pw-2, 1))
+		n2 := truncateStringPlain("Focused on conversations, not identities.", maxInt(pw-2, 1))
+		noteBox := tuiRosterBoxStyle.Width(pw - 2).Render(
+			thCamMetaStyle.Render(n1) + "\n" + thCamMetaStyle.Render(n2))
+		content = append(content, strings.Split(padLinesTo(noteBox, pw), "\n")...)
+	}
+	// Exact content rows, enforced here (not via MaxHeight, which caps the
+	// total INCLUDING borders and eats the last row): pad short, cut long.
+	lines := strings.Split(strings.Join(content, "\n"), "\n")
+	for len(lines) < pg.contentH {
+		lines = append(lines, strings.Repeat(" ", pw))
+	}
+	if len(lines) > pg.contentH {
+		lines = lines[:pg.contentH]
+	}
+	return tuiRosterBoxStyle.Width(pw).Height(pg.contentH).Render(strings.Join(lines, "\n"))
+}
+
+// peerAudioLive reports whether a remote peer currently publishes audio.
+func (c *chatScreen) peerAudioLive(peer string) bool {
+	if c.call == nil {
+		return false
+	}
+	for _, p := range c.call.AudioPublishers() {
+		if p == peer {
+			return true
+		}
+	}
+	return false
+}
+
+// callCardView paints the pinned live-call status card (callCardRows rows):
+// green board, title + LIVE chip, participants + elapsed.
+func (c *chatScreen) callCardView(outerW int) string {
+	inner := maxInt(outerW-2, 10)
+	title := thCamLiveStyle.Render("●") + " " +
+		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Video call started")
+	live := thCamLiveStyle.Render("● LIVE")
+	n := c.callParties()
+	sub := fmt.Sprintf("%d participant", n)
+	if n != 1 {
+		sub += "s"
+	}
+	sub += " · " + c.callElapsed()
+	r1pad := inner - lipgloss.Width(stripForWidth(title)) - lipgloss.Width(stripForWidth(live))
+	if r1pad < 1 {
+		r1pad = 1
+	}
+	body := title + strings.Repeat(" ", r1pad) + live + "\n" +
+		thCamMetaStyle.Render(truncateStringPlain(sub, inner))
+	return thTileStyle.Width(inner).Render(body)
+}
+
+// keyHintsView paints the 1-row composer footer. Every hint names a binding
+// that actually exists: Ctrl+K drawer, Ctrl+L clear, ↑↓ scroll, Enter send.
+// Narrow transcripts get the abbreviated variant (never mid-word).
+func keyHintsView(outerW int) string {
+	hints := "Ctrl+k commands  •  Ctrl+l clear  •  ↑↓ navigate  •  Enter send"
+	if outerW < 58 {
+		hints = "Ctrl+k  •  Ctrl+l  •  ↑↓  •  Enter"
+	}
+	return thCamMetaStyle.Render(truncateByWidth(hints, maxInt(outerW, 0)))
 }

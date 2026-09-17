@@ -185,18 +185,39 @@ func (c chatScreen) layoutFor() layout {
 			l.headRows = 2
 		}
 	}
-	// Bottom camera strip (full width, fixed height) when it fits.
-	l.camRows = 0
-	if c.width >= 40 && c.height >= 24 {
-		available := l.vpHeight - l.headRows
-		l.camRows = min(max(8, c.height/3), min(24, available-4))
-		if l.camRows < 8 {
+	// The sidebar search box grows into the header zone: its rows sit above
+	// the first scroll row, so rosterY0 shifts with it (paint + hit-test).
+	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
+	// Live-call status card (pinned above the transcript while a call runs).
+	l.callRows = 0
+	if c.callActive() && l.vpHeight-l.headRows >= 12 {
+		l.callRows = callCardRows
+	}
+	// Composer key-hints footer (truthful bindings only, see keyHintsView).
+	l.hintRows = 0
+	if c.width >= 70 && l.composerRows > 0 && l.vpHeight-l.headRows-l.callRows >= 8 {
+		l.hintRows = 1
+	}
+	l.vpHeight -= l.headRows + l.callRows + l.hintRows
+	if l.vpHeight < 0 {
+		l.vpHeight = 0
+	}
+	// Video UI: right panel when wide (width split), bottom strip when
+	// narrow (height split), hidden when neither fits.
+	l.vidPanelW, l.camRows = c.videoChrome(l)
+	if l.camRows > 0 {
+		l.vpHeight -= l.camRows
+		if l.vpHeight < 0 {
+			l.vpHeight = 0
 			l.camRows = 0
 		}
 	}
-	l.vpHeight -= l.headRows + l.camRows
-	if l.vpHeight < 0 {
-		l.vpHeight = 0
+	// Right panel shrinks the transcript column (never below readable).
+	if l.vidPanelW > 0 {
+		l.vpWidth -= l.vidPanelW + 1 // panel + spacer
+		if l.vpWidth < 10 {
+			l.vpWidth = 10
+		}
 	}
 	// Roster adapts to the settled viewport: search row eats one slot.
 	l.rosterSlots = l.vpHeight - 1
@@ -207,6 +228,50 @@ func (c chatScreen) layoutFor() layout {
 		l.rosterSlots = 0
 	}
 	return l
+}
+
+// videoPanelWidth is the right video column width (0 = too narrow). Pure:
+// ~30% of the terminal, clamped to tile-usable bounds.
+func videoPanelWidth(termW int) int {
+	if termW < 120 {
+		return 0
+	}
+	w := termW * 30 / 100
+	if w < 32 {
+		w = 32
+	}
+	if w > 48 {
+		w = 48
+	}
+	return w
+}
+
+// videoChrome decides the video UI placement for a settled layout: right
+// panel (returns width, 0 strip rows) or bottom strip (0 width, rows).
+// The transcript keeps a readable floor in both modes.
+func (c chatScreen) videoChrome(l layout) (panelW, stripRows int) {
+	innerW := widthInsideFrame(c.width, l.frameOn)
+	sideW := 0
+	if l.sidebarOn {
+		sideW = l.sidebarWidth + 1
+	}
+	bodyH := l.headRows + l.vpHeight
+	if l.boxedTranscript && l.vpHeight > 0 {
+		bodyH += transcriptBorder
+	}
+	// Right panel: needs width for tiles plus a tall body column.
+	if w := videoPanelWidth(c.width); w > 0 && bodyH >= 22 {
+		if avail := innerW - sideW - (w + 1) - transcriptBorder; avail >= 48 {
+			return w, 0
+		}
+	}
+	// Bottom strip fallback (height split, transcript keeps 4+ rows).
+	if c.width >= 40 && c.height >= 24 {
+		if stripRows = min(max(8, c.height/3), min(24, l.vpHeight-4)); stripRows >= 8 {
+			return 0, stripRows
+		}
+	}
+	return 0, 0
 }
 
 // videoPaneGeom is the single source of truth for the ASCII picture size:

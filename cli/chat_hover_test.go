@@ -30,7 +30,7 @@ func TestHoverPaintsExactlyOneRow(t *testing.T) {
 
 	render := func() string {
 		c.syncRosterVp()
-		return c.rosterBody(computeLayout(W, H, false).rosterSlots)
+		return c.rosterBody(40) // generous fill: every item visible, no scroll
 	}
 
 	// Baseline: no hover → zero highlighted rows anywhere.
@@ -79,11 +79,11 @@ func TestMotionUpdatesAndClearsHover(t *testing.T) {
 	c := newFilterScreen("me", "", "me", "a", "b")
 	m, _ := c.Update(newWindowSize(W, H))
 	scr := m.(chatScreen)
-	l := computeLayout(W, H, false)
+	l := scr.layoutFor() // settled layout: search-box rows shift rosterY0
 
-	// Items: General at +0/+1, "a" at +2/+3 (two rows per chat item).
+	// Items: General at +0/+1/+2, "a" at +3/+4/+5 (three rows per item).
 	inside := l.rosterX + 4
-	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 2})
+	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 3})
 	got := nm.(chatScreen)
 	if got.hoverPeer != "a" {
 		t.Fatalf("hover = %q; want a", got.hoverPeer)

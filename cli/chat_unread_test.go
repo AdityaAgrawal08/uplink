@@ -212,9 +212,9 @@ func TestMouseFollowsRecencyOrder(t *testing.T) {
 	c.width, c.height = W, H
 	c.vp = *viewportPtr(60, 16)
 
-	l := computeLayout(W, H, false)
-	// Items: General at +0/+1, then recency-ordered ana at +2/+3.
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+2)) // first peer row
+	l := c.layoutFor()
+	// Items: General at +0/+1/+2, then recency-ordered ana at +3/+4/+5.
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+3)) // first peer row
 	if c.targetUser != "ana" {
 		t.Fatalf("clicked row selected %q; want ana (recency-ordered)", c.targetUser)
 	}

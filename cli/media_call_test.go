@@ -460,7 +460,8 @@ func TestSlashRegistryExact(t *testing.T) {
 func TestVideoBottomStripAndChatMapping(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
-	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	// 100x30: too narrow for the right panel → bottom strip mode.
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	sc := m.(chatScreen)
 	sc.call = &mediaManager{videoOn: true, renderCols: videoPaneDefaultCols, renderRows: videoPaneDefaultRows}
 	lines := make([]string, 0, videoPaneDefaultRows)
@@ -474,15 +475,25 @@ func TestVideoBottomStripAndChatMapping(t *testing.T) {
 	if l.videoRows != 0 {
 		t.Fatal("sidebar must not claim video rows; feeds live in the strip")
 	}
+	if l.vidPanelW != 0 {
+		t.Fatal("narrow terminal must not open the right panel")
+	}
 	if l.camRows == 0 {
 		t.Fatal("bottom Live Cameras strip must claim rows at this size")
 	}
-	// Items: General at +0/+1, carol at +2/+3 (two rows per chat item).
-	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
+	// Items: General at +0/+1/+2, carol at +3/+4/+5 (three rows per item).
+	if got := sc.peerAtY(l.rosterY0+3, l); got != "carol" {
 		t.Fatalf("chat row mapped to %q; want carol", got)
 	}
 	// Wheel over the camera strip never opens a thread (falls to chat).
-	stripY := l.rosterY0 + l.headRows + l.vpHeight + 3
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	if l.showHeader {
+		headOff = 1
+	}
+	stripY := frameOff + headOff + l.headRows + l.callRows + l.vpHeight + 2 + 1
 	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: stripY, Type: tea.MouseWheelDown})
 	sc = m3.(chatScreen)
 	if sc.targetUser != "" {
@@ -493,10 +504,10 @@ func TestVideoBottomStripAndChatMapping(t *testing.T) {
 		t.Fatal("view must show the Live Cameras strip")
 	}
 	// Tiny terminal collapses the strip cleanly (rows return to chat).
-	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 140, Height: 18})
+	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 18})
 	sc = m4.(chatScreen)
-	if l2 := sc.layoutFor(); l2.camRows != 0 {
-		t.Fatal("camera strip must collapse on short terminals")
+	if l2 := sc.layoutFor(); l2.camRows != 0 || l2.vidPanelW != 0 {
+		t.Fatal("video UI must collapse on short terminals")
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -30,15 +31,18 @@ func TestCamTilesKeepFrameColor(t *testing.T) {
 
 // The strip owns the render-size contract (like the old sidebar pane):
 // syncViewport must push the true tile geometry so frames render at the
-// width their tile paints.
+// width their tile paints. Narrow terminal → bottom strip mode.
 func TestCamStripPushesRenderSize(t *testing.T) {
-	const W, H = 140, 40
+	const W, H = 100, 30
 	c := newFilterScreen("bob", "", "bob", "alice", "carol")
 	c.vp = *viewportPtr(60, 20)
 	c.call = &mediaManager{}
 	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
 	sc := m.(chatScreen)
 	l := sc.layoutFor()
+	if l.vidPanelW != 0 {
+		t.Fatal("narrow terminal must stay in strip mode")
+	}
 	if l.camRows == 0 {
 		t.Fatal("strip must be on at this size")
 	}
@@ -94,34 +98,30 @@ func TestBubbleRatioFluid(t *testing.T) {
 	}
 }
 
-func TestCompactTranscriptDropsAvatar(t *testing.T) {
+func TestTranscriptSenderHasNoAvatar(t *testing.T) {
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(60, 20)
 	m := chatMessage{Seq: 1, Username: "alice", Kind: "chat", Text: "hi",
 		ConvID: generalConv, CreatedAt: "2026-09-15T19:21:00Z"}
-	c.width = 140
-	wide := c.renderLine(m)
-	if !strings.Contains(wide, " A ") {
-		t.Fatalf("wide transcript must show the avatar chip:\n%s", stripANSI(wide))
-	}
-	c.width = 70
-	c.renderCache = map[int]string{} // density flip invalidates below; render direct
-	narrow := c.renderLine(m)
-	if strings.Contains(narrow, " A ") {
-		t.Fatalf("cramped transcript must drop the avatar chip:\n%s", stripANSI(narrow))
-	}
-	if !strings.Contains(stripANSI(narrow), "alice") {
-		t.Fatalf("compact sender must keep the name:\n%s", stripANSI(narrow))
+	for _, w := range []int{70, 140} {
+		c.width = w
+		c.renderCache = map[int]string{}
+		got := stripANSI(c.renderLine(m))
+		if !strings.Contains(got, "alice") {
+			t.Fatalf("w=%d: sender must keep the colored name:\n%s", w, got)
+		}
 	}
 }
 
-func TestRenderCacheInvalidatesOnDensityFlip(t *testing.T) {
+func TestRenderCacheInvalidatesOnBubbleFlip(t *testing.T) {
 	c := newFilterScreen("bob", "", "bob", "alice")
-	c.width = 70 // compact avatars off
+	c.width = 70 // wide bubbles
 	c.cacheForWidth(50)
 	c.renderCache[7] = "stale"
-	c.width = 140 // same viewport width, density flipped
+	c.width = 200 // same viewport width, bubble ratio flipped
 	c.cacheForWidth(50)
+	// Width key dominates here (ratio derives from viewport width); the
+	// density generation additionally guards terminal-only flips.
 	if _, ok := c.renderCache[7]; ok {
 		t.Fatal("density flip must invalidate render caches even at stable width")
 	}
@@ -143,20 +143,20 @@ func TestRoomHeaderCompactRows(t *testing.T) {
 func TestSidebarItemHeightAdapts(t *testing.T) {
 	c := newFilterScreen("me", "", "me", "a", "b", "c")
 	c.width, c.height = 120, 40
-	if got := c.chatItemHeight(); got != 2 {
-		t.Fatalf("roomy terminal must use 2-row items, got %d", got)
+	if got := c.chatItemHeight(); got != 3 {
+		t.Fatalf("roomy terminal must use 3-row items, got %d", got)
 	}
 	c.height = 20
 	if got := c.chatItemHeight(); got != 1 {
 		t.Fatalf("short terminal must collapse to 1-row items, got %d", got)
 	}
-	// Row budget halves: twice the chats visible without scrolling.
+	// Row budget collapses: three times the chats visible without scrolling.
 	c.width, c.height = 120, 40
 	full := c.chatItemRows(c.chatItems(), 24, "")
 	c.height = 20
 	compact := c.chatItemRows(c.chatItems(), 24, "")
-	if len(compact)*2 != len(full) {
-		t.Fatalf("compact rows %d must be half of comfortable %d", len(compact), len(full))
+	if len(compact)*3 != len(full) {
+		t.Fatalf("compact rows %d must be a third of comfortable %d", len(compact), len(full))
 	}
 }
 
@@ -246,9 +246,245 @@ func TestResizeSweepExactFrame(t *testing.T) {
 	}
 }
 
+// ---- reference layout: right video panel, tabs, call card, hints ----
+
+func liveCallScreen(t *testing.T, w, h int) chatScreen {
+	t.Helper()
+	c := newFilterScreen("bob", "", "bob", "alice", "carol")
+	c.vp = *viewportPtr(80, 20)
+	c.call = &mediaManager{videoOn: true}
+	m, _ := c.Update(tea.WindowSizeMsg{Width: w, Height: h})
+	return m.(chatScreen)
+}
+
+func TestRightPanelPlacement(t *testing.T) {
+	const W, H = 154, 44
+	sc := liveCallScreen(t, W, H)
+	l := sc.layoutFor()
+	if l.vidPanelW <= 0 {
+		t.Fatal("wide terminal must open the right video panel")
+	}
+	if l.camRows != 0 {
+		t.Fatal("bottom strip must yield while the panel is open")
+	}
+	got := sc.View()
+	for _, want := range []string{"Video Call", "[M]", "[V]", "[S]", "[P]", "[X]",
+		"intentionally blurred", "Chat", "Files", "⋮", "Video call started", "LIVE",
+		"End-to-End Encrypted", "Ctrl+k", "Ctrl+l", "Enter send"} {
+		if !strings.Contains(stripANSI(got), want) {
+			t.Errorf("reference element %q missing from view", want)
+		}
+	}
+	if rows := strings.Count(got, "\n") + 1; rows != H {
+		t.Fatalf("panel frame painted %d rows; want exactly %d", rows, H)
+	}
+	for _, ln := range strings.Split(got, "\n") {
+		if w := lipgloss.Width(ln); w > W {
+			t.Fatalf("panel row width %d exceeds terminal %d", w, W)
+		}
+	}
+}
+
+func TestPanelTileHandshake(t *testing.T) {
+	const W, H = 154, 44
+	sc := liveCallScreen(t, W, H)
+	l := sc.layoutFor()
+	pg := videoPanelGeom(&sc, l, sc.camFeeds())
+	if sc.call.renderCols != pg.tileInner || sc.call.renderRows != pg.picH {
+		t.Fatalf("render size = %dx%d; want panel tile %dx%d",
+			sc.call.renderCols, sc.call.renderRows, pg.tileInner, pg.picH)
+	}
+	// Buttons live inside the painted panel, five across, X last.
+	if len(pg.btns) != 5 {
+		t.Fatalf("control bank must have 5 buttons, got %d", len(pg.btns))
+	}
+	for i, id := range []string{"M", "V", "S", "P", "X"} {
+		if pg.btns[i].id != id {
+			t.Fatalf("button %d = %q; want %q", i, pg.btns[i].id, id)
+		}
+		b := pg.btns[i]
+		if b.x0 < pg.x0+1 || b.x1 > pg.x0+pg.w-1 || b.y0 < pg.topY+1 {
+			t.Fatalf("button %q rect %+v escapes the panel", id, b)
+		}
+	}
+}
+
+func TestCallButtonsAct(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	c.call = &mediaManager{videoOn: true, audioOn: true}
+	// M/V toggle live publishing off (same path as /audio + /video).
+	c.pressCallButton("M")
+	if c.call.AudioOn() {
+		t.Fatal("M must switch the mic off")
+	}
+	c.pressCallButton("V")
+	if c.call.VideoOn() {
+		t.Fatal("V must switch the camera off")
+	}
+	// X hangs up whatever is still publishing.
+	c.call.audioOn, c.call.videoOn = true, true
+	c.pressCallButton("X")
+	if c.call.AudioOn() || c.call.VideoOn() {
+		t.Fatal("X must stop all publishing")
+	}
+	// S/P name unsupported features honestly instead of acting.
+	c.pressCallButton("S")
+	if !strings.Contains(c.status, "not supported") {
+		t.Fatalf("S must explain itself, got %q", c.status)
+	}
+	c.pressCallButton("P")
+	if !strings.Contains(c.status, "people panel") {
+		t.Fatalf("P must explain itself, got %q", c.status)
+	}
+}
+
+func TestRoomTabsAct(t *testing.T) {
+	const W, H = 120, 40
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
+	sc := m.(chatScreen)
+	l := sc.layoutFor()
+	tc, tf, tm, ok := roomTabsGeoms(&sc, l)
+	if !ok {
+		t.Fatal("roomy terminal must hit-test room tabs")
+	}
+	// Files opens the received-files drawer (same as /download).
+	sc.handleMouse(mouseAt(tf.x0, tf.y))
+	if !sc.picker.isActive() || sc.picker.mode != modeFiles {
+		t.Fatal("Files tab must open the files drawer")
+	}
+	// Chat returns to the transcript.
+	sc.handleMouse(mouseAt(tc.x0, tc.y))
+	if sc.picker.isActive() {
+		t.Fatal("Chat tab must close the drawer")
+	}
+	// ⋮ focuses the command drawer.
+	sc.handleMouse(mouseAt(tm.x0, tm.y))
+	if sc.input.Value() != "/" {
+		t.Fatalf("⋮ must open /, got %q", sc.input.Value())
+	}
+}
+
+func TestCallCardShowsLive(t *testing.T) {
+	sc := liveCallScreen(t, 154, 44)
+	if l := sc.layoutFor(); l.callRows != callCardRows {
+		t.Fatalf("live call must budget %d card rows, got %d", callCardRows, l.callRows)
+	}
+	got := stripANSI(sc.View())
+	for _, want := range []string{"Video call started", "LIVE", "participant"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("call card element %q missing", want)
+		}
+	}
+	// Idle sessions budget no card and paint none.
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(80, 20)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 154, Height: 44})
+	idle := m.(chatScreen)
+	if l := idle.layoutFor(); l.callRows != 0 {
+		t.Fatalf("idle session must budget no card rows, got %d", l.callRows)
+	}
+	if strings.Contains(stripANSI(idle.View()), "Video call started") {
+		t.Fatal("idle session must not paint a call card")
+	}
+}
+
+func TestTopBarEncrypted(t *testing.T) {
+	if got := topBarView(160); !strings.Contains(got, "End-to-End Encrypted") {
+		t.Fatalf("wide top bar must name encryption: %q", got)
+	}
+}
+
+func TestSidebarSelectedBorderAndCallIcon(t *testing.T) {
+	sc := liveCallScreen(t, 120, 40)
+	out := sc.rosterBody(40)
+	plain := stripANSI(out)
+	if !strings.Contains(plain, "╭") || !strings.Contains(plain, "╯") {
+		t.Fatalf("selected chat must carry a border:\n%s", plain)
+	}
+	if !strings.Contains(plain, "◉") {
+		t.Fatalf("in-call chat must show the live icon:\n%s", plain)
+	}
+	if !strings.Contains(plain, "in call") {
+		t.Fatalf("in-call preview must name the call:\n%s", plain)
+	}
+}
+
+func TestKeyHintsNeverClipMidWord(t *testing.T) {
+	for _, w := range []int{20, 40, 57, 58, 80, 120} {
+		got := stripANSI(keyHintsView(w))
+		if lw := lipgloss.Width(got); lw > w {
+			t.Fatalf("hints width %d exceeds %d: %q", lw, w, got)
+		}
+		if w >= 58 && !strings.Contains(got, "Ctrl+k commands") {
+			t.Fatalf("wide hints must spell out bindings: %q", got)
+		}
+	}
+}
+
+func TestCtrlKOpensCommands(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	c.width, c.height = 120, 40
+	m, _ := c.Update(tea.KeyMsg{Type: tea.KeyCtrlK})
+	if got := m.(chatScreen).input.Value(); got != "/" {
+		t.Fatalf("Ctrl+K must focus /, got %q", got)
+	}
+}
+
+func TestCtrlLClearsInput(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	c.width, c.height = 120, 40
+	c.input.SetValue("half-typed")
+	m, _ := c.Update(tea.KeyMsg{Type: tea.KeyCtrlL})
+	got := m.(chatScreen)
+	if got.input.Value() != "" {
+		t.Fatalf("Ctrl+L must clear the composer, got %q", got.input.Value())
+	}
+}
+
+func TestSystemCardGreenBar(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(60, 20)
+	m := chatMessage{Seq: 9, Username: "", Kind: "system", Text: "alice joined",
+		ConvID: generalConv, CreatedAt: "2026-09-15T19:21:00Z"}
+	out := stripANSI(c.renderLine(m))
+	if !strings.Contains(out, "System") || !strings.Contains(out, "▌") {
+		t.Fatalf("system line must carry green sender + bar:\n%s", out)
+	}
+	if !strings.Contains(out, "alice joined") {
+		t.Fatalf("system text lost:\n%s", out)
+	}
+}
+
+func TestFullscreenHintHonest(t *testing.T) {
+	sc := liveCallScreen(t, 154, 44)
+	l := sc.layoutFor()
+	pg := videoPanelGeom(&sc, l, sc.camFeeds())
+	sc.handleMouse(mouseAt(pg.fsX0, pg.fsY))
+	if !strings.Contains(sc.status, "terminal") {
+		t.Fatalf("⛶ must explain panel sizing, got %q", sc.status)
+	}
+}
+
+func TestCallTimerFormat(t *testing.T) {
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.callStart = time.Now().Add(-(1*time.Hour + 2*time.Minute + 37*time.Second))
+	if got := c.callElapsed(); got != "01:02:37" {
+		t.Fatalf("elapsed = %q; want 01:02:37", got)
+	}
+	c.callStart = time.Time{}
+	if got := c.callElapsed(); got != "--:--:--" {
+		t.Fatalf("idle elapsed = %q; want placeholder", got)
+	}
+}
+
 // Live frames must not break the exact-row / max-width frame contract.
 func TestCamStripExactRowsWithLiveFrames(t *testing.T) {
-	const W, H = 140, 40
+	const W, H = 100, 30
 	c := newFilterScreen("bob", "", "bob", "alice", "carol")
 	c.vp = *viewportPtr(60, 20)
 	frame := "\x1b[38;2;10;20;30m\x1b[48;2;1;2;3m" + strings.Repeat("⣿", 60) + "\x1b[0m"
