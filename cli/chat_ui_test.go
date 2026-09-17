@@ -13,19 +13,38 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestSidebarWidthDensity(t *testing.T) {
-	cases := map[int]int{70: rosterTotalWidth, 89: rosterTotalWidth, 90: 26, 129: 26, 130: 30, 200: 30}
+	// Fluid column: ~1 cell per 10 terminal columns, clamped [22,38].
+	cases := map[int]int{66: 22, 70: 22, 86: 24, 90: 24, 106: 26, 130: 28, 176: 33, 200: 35, 226: 38, 300: 38}
 	for w, want := range cases {
 		if got := sidebarWidthFor(w); got != want {
 			t.Errorf("sidebarWidthFor(%d) = %d; want %d", w, got, want)
 		}
 	}
+	// Monotonic: every wider terminal rebalances (never jumps backwards).
+	prev := 0
+	for w := 40; w <= 260; w++ {
+		if got := sidebarWidthFor(w); got < prev {
+			t.Fatalf("sidebarWidthFor(%d) = %d < %d: not monotonic", w, got, prev)
+		} else {
+			prev = got
+		}
+	}
 }
 
 func TestComposerRowsDensity(t *testing.T) {
-	cases := map[int]int{40: 3, 22: 3, 21: 2, 14: 2, 13: 1, 10: 1, 9: 0, 5: 0}
+	cases := map[int]int{40: 4, 34: 4, 33: 3, 22: 3, 21: 2, 16: 2, 15: 1, 11: 1, 10: 0, 9: 0, 5: 0}
 	for h, want := range cases {
 		if got := composerRowsFor(h); got != want {
 			t.Errorf("composerRowsFor(%d) = %d; want %d", h, got, want)
+		}
+	}
+	// Monotonic growth with height.
+	prev := -1
+	for h := 0; h <= 60; h++ {
+		if got := composerRowsFor(h); got < prev {
+			t.Fatalf("composerRowsFor(%d) = %d < %d: not monotonic", h, got, prev)
+		} else {
+			prev = got
 		}
 	}
 }

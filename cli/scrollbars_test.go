@@ -152,7 +152,7 @@ func TestRosterScrollKeepsSelection(t *testing.T) {
 	// The selected user must be the item visible at that row
 	// (offset-applied, two rows per item).
 	items := sc.chatItems()
-	want := items[sc.rosterVp.YOffset/itemRowsPerChat].peer
+	want := items[sc.rosterVp.YOffset/sc.chatItemHeight()].peer
 	if want == "" {
 		t.Fatal("scrolled top row landed on the room; test needs deeper scroll")
 	}

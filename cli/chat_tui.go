@@ -111,20 +111,19 @@ const (
 	minSidebarTermW  = 66 // below this width the sidebar collapses entirely
 )
 
-// sidebarWidthFor picks a comfortable reading column that grows with the
-// terminal ("font size" adaptation for terminals happens via density).
-// videoOn widens the column while the camera streams: the ASCII video
-// pane lives there, and a 24-cell picture is unreadable (the old 56-in-20
-// crop bug came from ignoring this).
+// sidebarWidthFor picks a reading column that grows FLUIDLY with the
+// terminal: ~1 extra cell per 10 terminal columns, clamped to a usable
+// chat list (narrow enough to leave the transcript room, wide enough for
+// avatar + name + time + preview). Every resize step visibly rebalances.
 func sidebarWidthFor(termW int) int {
-	switch {
-	case termW >= 130:
-		return 30
-	case termW >= 90:
-		return 26
-	default:
-		return rosterTotalWidth
+	w := 22 + (termW-minSidebarTermW)/10
+	if w < 22 {
+		w = 22
 	}
+	if w > 38 {
+		w = 38
+	}
+	return w
 }
 
 // videoSidebarWidthFor is the boosted column while video streams (room for
@@ -140,14 +139,17 @@ func sidebarWidthVideo(termW int, videoOn bool) int {
 }
 
 // composerRowsFor gives the message box breathing room on tall screens and
-// shrinks gracefully on small ones (0 => bare prompt, no border).
+// shrinks gracefully on small ones (0 => bare prompt, no border). Roomy
+// terminals earn a fourth row; every step rebalances the transcript.
 func composerRowsFor(termH int) int {
 	switch {
+	case termH >= 34:
+		return composerRowsMax + 1
 	case termH >= 22:
 		return composerRowsMax
-	case termH >= 14:
+	case termH >= 16:
 		return 2
-	case termH >= 10:
+	case termH >= 11:
 		return 1
 	default:
 		return 0
@@ -474,6 +476,7 @@ type chatScreen struct {
 	tsCache     map[int]time.Time
 	wrapCache   map[string]string
 	cacheWidth  int
+	cacheAdapt  int          // density generation for the render caches (see cacheForWidth)
 	pending     *pendingSend // single in-flight send (nil = idle)
 	outbox      []queuedLine // queued sends waiting for the in-flight one
 	// unackedUI tracks own confirmed sends awaiting a delivery ack
@@ -492,6 +495,9 @@ type chatScreen struct {
 	callLevel    float64 // mic loudness for the status meter
 	videoLines   []string
 	selfLines    []string
+	cameraOffset int
+	vidCols      int // last tile geometry pushed via SetVideoSize (change-gated)
+	vidRows      int
 	videoVp      viewport.Model // scrollable video pane (wheel + scrollbar)
 	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
 	vp           viewport.Model
@@ -760,9 +766,12 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if availWidth <= 0 {
 		availWidth = 60
 	}
-	maxBubbleW := int(float64(availWidth) * 0.62)
-	if maxBubbleW < 22 {
-		maxBubbleW = 22
+	// Fluid bubbles: near-full-width on narrow transcripts, tighter
+	// columns when space abounds. Pure function of width, so the width
+	// cache key stays sufficient.
+	maxBubbleW := int(float64(availWidth) * bubbleRatioFor(availWidth))
+	if maxBubbleW < 14 {
+		maxBubbleW = 14
 	}
 	if maxBubbleW > availWidth-2 {
 		maxBubbleW = availWidth - 2
@@ -808,9 +817,12 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if isOwn {
 		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
 	}
-	sender := avatarCell(m.Username) + "  " +
-		nameStyle.Render(name) + "  " +
-		thMsgTimeStyle.Render(tsPlain)
+	// Cramped transcripts drop the avatar chip; the colored name + time
+	// carry identity on one slimmer line.
+	sender := nameStyle.Render(name) + "  " + thMsgTimeStyle.Render(tsPlain)
+	if !compactTranscript(c.width) {
+		sender = avatarCell(m.Username) + "  " + sender
+	}
 
 	if isOwn {
 		// Right side: sender line + bubble both right-aligned.
@@ -927,8 +939,10 @@ func (c *chatScreen) pushLocalLine(ll localLine) {
 // behave like text messages; transient local lines (pending echo, progress)
 // stay pinned at the bottom.
 // cacheForWidth drops all render caches when the viewport width changed.
-// Rendered output depends only on (message content, width), so caches stay
-// valid across rebuilds at a stable width no matter how history grows.
+// Rendered output depends on (message content, width, density): bubbles
+// scale fluidly with width while avatar density follows the terminal, so
+// both join the cache key. Caches stay valid across rebuilds at a stable
+// size no matter how history grows.
 func (c *chatScreen) cacheForWidth(w int) {
 	if c.renderCache == nil {
 		c.renderCache = map[int]string{}
@@ -939,11 +953,16 @@ func (c *chatScreen) cacheForWidth(w int) {
 	if c.wrapCache == nil {
 		c.wrapCache = map[string]string{}
 	}
-	if c.cacheWidth != w {
+	adaptSig := 0
+	if compactTranscript(c.width) {
+		adaptSig = 1
+	}
+	if c.cacheWidth != w || c.cacheAdapt != adaptSig {
 		c.renderCache = map[int]string{}
 		c.tsCache = map[int]time.Time{}
 		c.wrapCache = map[string]string{}
 		c.cacheWidth = w
+		c.cacheAdapt = adaptSig
 	}
 }
 
@@ -1273,13 +1292,27 @@ func (c chatScreen) searchRow(inner int) string {
 	return hint + strings.Repeat(" ", gap) + slash
 }
 
-// chatItemRows renders every chat item as exactly itemRowsPerChat rows.
+// chatItemHeight is the sidebar row budget per chat: two comfortable rows
+// (name + preview) normally, one compact row (name only) when terminal
+// height is scarce — short windows fit twice the chats without scrolling.
+func (c chatScreen) chatItemHeight() int {
+	if compactItems(c.width, c.height) {
+		return 1
+	}
+	return itemRowsPerChat
+}
+
+// chatItemRows renders every chat item as exactly chatItemHeight() rows.
 // hover names the peer under the mouse ("breadcrumb" highlight).
 func (c chatScreen) chatItemRows(items []chatItem, inner int, hover string) []string {
-	rows := make([]string, 0, len(items)*itemRowsPerChat)
+	h := c.chatItemHeight()
+	rows := make([]string, 0, len(items)*h)
 	for _, it := range items {
 		l1, l2 := chatItemRow(it, inner, hover)
-		rows = append(rows, l1, l2)
+		rows = append(rows, l1)
+		if h > 1 {
+			rows = append(rows, l2)
+		}
 	}
 	return rows
 }
@@ -1732,9 +1765,16 @@ func (c *chatScreen) syncViewport() {
 	// used to): push the TRUE tile geometry into the manager so frames
 	// render at the tile's real width with full truecolor (no crop, no
 	// downstream strip/re-wrap). Same pane-size contract as main.
+	// Change-gated: re-rendering the pump on every keystroke would churn.
 	if l.camRows > 0 && c.call != nil {
-		inner := camTileInner(camStripContentW(c.width, l.frameOn), len(c.camFeeds()))
-		c.call.SetVideoSize(inner, camPicRows)
+		inner := max(tileMinFor(camStripContentW(c.width, l.frameOn)), camTileInner(camStripContentW(c.width, l.frameOn), len(c.camFeeds())))
+		rows := max(3, l.camRows-5)
+		if inner != c.vidCols || rows != c.vidRows {
+			c.call.SetVideoSize(inner, rows)
+			c.vidCols, c.vidRows = inner, rows
+		}
+	} else {
+		c.vidCols, c.vidRows = 0, 0
 	}
 	// Chat list gets its own viewport (scrollable like the transcript);
 	// the search row lives outside the viewport.
@@ -1743,18 +1783,30 @@ func (c *chatScreen) syncViewport() {
 		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
 		c.rosterVp.Height = maxInt(rosterH-1, 1)              // search row
 	}
-	if vpW == c.vp.Width && l.vpHeight == c.vp.Height {
-		return
-	}
+	atBottom := c.vp.AtBottom()
+	offset := c.vp.YOffset
+	changed := vpW != c.vp.Width || l.vpHeight != c.vp.Height
 	c.vp.Width, c.vp.Height = vpW, l.vpHeight
 	// Composer input shares its row with the Send button: shrink the field
 	// so typed text scrolls inside the box instead of under the button.
 	transcriptOuter := l.vpWidth + 2
-	inputOuter := transcriptOuter - sendBtnWidth - 1
+	inputOuter := transcriptOuter - sendBtnWidthFor(transcriptOuter) - 1
 	if want := maxInt(inputOuter-6, 1); c.input.Width != want {
 		c.input.Width = want
 	}
-	c.refreshViewport()
+	c.syncRosterVp()
+	if changed {
+		if len(c.history) > 0 || len(c.localLines) > 0 {
+			c.rebuildView()
+		} else {
+			c.refreshViewport()
+		}
+		if atBottom {
+			c.vp.GotoBottom()
+		} else {
+			c.vp.SetYOffset(offset)
+		}
+	}
 }
 
 func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -2243,9 +2295,9 @@ func (c chatScreen) itemAtY(y int, l layout) (peer string, general bool) {
 	}
 	// The chat list SCROLLS beneath the fixed search row: map the visible
 	// row through the roster viewport's scroll offset (same content
-	// rosterBody paints), two rows per item.
+	// rosterBody paints) at the live item height.
 	items := c.chatItems()
-	idx := (row + c.rosterVp.YOffset) / itemRowsPerChat
+	idx := (row + c.rosterVp.YOffset) / c.chatItemHeight()
 	if idx < 0 || idx >= len(items) {
 		return "", false
 	}
@@ -2322,7 +2374,7 @@ func (c chatScreen) thumbFor(sec scrollSection, g barGeom) barGeom {
 	case secVideo:
 		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.videoVp.TotalLineCount(), c.videoVp.Height, c.videoVp.YOffset, g.trackH+2)
 	case secRoster:
-		g.thumbTop, g.thumbH, _, _ = thumbGeom(len(c.users), c.rosterVp.Height, c.rosterVp.YOffset, g.trackH+2)
+		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.rosterVp.TotalLineCount(), c.rosterVp.Height, c.rosterVp.YOffset, g.trackH+2)
 	}
 	return g
 }
@@ -2478,26 +2530,52 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if c.width == 0 || c.height == 0 {
 			return nil
 		}
-		by := 3
-		if msg.Type == tea.MouseWheelUp {
-			by = -3
+		up := msg.Type == tea.MouseWheelUp
+		frameOffset, headerOffset := 0, 0
+		if l.frameOn {
+			frameOffset = 1
+		}
+		if l.showHeader {
+			headerOffset = headerHeight
+		}
+		cameraY := frameOffset + headerOffset + l.headRows + l.vpHeight
+		if l.boxedTranscript && l.vpHeight > 0 {
+			cameraY += transcriptBorder
+		} else if l.headRows > 0 && l.vpHeight == 0 {
+			// body holds the room header only; no transcript border
+		}
+		if l.camRows > 0 && msg.Y >= cameraY && msg.Y < cameraY+l.camRows {
+			// Wheels over an overflowing strip pan it horizontally;
+			// otherwise they fall through to the transcript.
+			width := camStripContentW(c.width, l.frameOn)
+			count := len(c.camFeeds())
+			inner := max(tileMinFor(width), camTileInner(width, count))
+			if maxOffset := max(0, count*(inner+3)-1-width); maxOffset > 0 {
+				step := wheelStepFor(l.camRows) * 4
+				if up {
+					step = -step
+				}
+				c.cameraOffset = min(maxOffset, max(0, c.cameraOffset+step))
+				return nil
+			}
 		}
 		// Route by pane: sidebar list vs transcript — each scrolls only
-		// itself. The camera strip is display-only; wheels there fall
-		// through to the transcript.
+		// itself with steps proportional to its own height.
 		if l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth &&
 			msg.Y >= l.rosterY0-1 {
-			if by < 0 {
-				c.rosterVp.LineUp(3)
+			step := wheelStepFor(c.rosterVp.Height)
+			if up {
+				c.rosterVp.LineUp(step)
 			} else {
-				c.rosterVp.LineDown(3)
+				c.rosterVp.LineDown(step)
 			}
 			return nil
 		}
-		if by < 0 {
-			c.vp.LineUp(3)
+		step := wheelStepFor(c.vp.Height)
+		if up {
+			c.vp.LineUp(step)
 		} else {
-			c.vp.LineDown(3)
+			c.vp.LineDown(step)
 		}
 		return nil
 	}
@@ -2528,7 +2606,7 @@ func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
 		total = c.videoVp.TotalLineCount()
 	case secRoster:
 		vp = &c.rosterVp
-		total = len(c.users)
+		total = c.rosterVp.TotalLineCount()
 	}
 	if vp == nil {
 		return
@@ -2585,12 +2663,19 @@ func (c chatScreen) View() string {
 		}
 	}
 
-	// Center column: room header on top of the transcript box.
+	// Center column: room header on top of the transcript box. Short or
+	// narrow terminals get the 1-row compact heading (headRows == 1).
+	roomHead := ""
+	if l.headRows == 1 {
+		roomHead = c.roomHeaderCompact(transcriptOuter)
+	} else if l.headRows >= 2 {
+		roomHead = c.roomHeaderView(transcriptOuter)
+	}
 	chatCol := transcript
-	if l.headRows > 0 && transcript != "" {
-		chatCol = c.roomHeaderView(transcriptOuter) + "\n" + transcript
-	} else if l.headRows > 0 {
-		chatCol = c.roomHeaderView(transcriptOuter)
+	if roomHead != "" && transcript != "" {
+		chatCol = roomHead + "\n" + transcript
+	} else if roomHead != "" {
+		chatCol = roomHead
 	}
 
 	body := chatCol
@@ -2620,32 +2705,39 @@ func (c chatScreen) View() string {
 		}
 		rows = append(rows, c.camerasStripView(maxInt(w, 0)))
 	}
-	// Composer row: input box + blue Send button, aligned under the
-	// transcript (sidebar-width indent keeps the left edge truthful).
-	indent := ""
-	if l.sidebarOn {
-		indent = strings.Repeat(" ", l.sidebarWidth+1)
-	}
+	// Composer row: input box + Send button (icon on narrow transcripts),
+	// aligned under the transcript (indent keeps the left edge truthful).
+	indent := strings.Repeat(" ", composerIndent(l))
 	var input string
 	switch {
 	case l.composerRows > 0:
 		boxH := l.composerRows + 2
-		inputOuter := transcriptOuter - sendBtnWidth - 1
+		sendW := sendBtnWidthFor(transcriptOuter)
+		inputOuter := transcriptOuter - sendW - 1
 		contentW := maxInt(inputOuter-2-2, 1) // border + padding, never wrap
-		field := c.input.View()
-		if lipgloss.Width(field) > contentW-lipgloss.Width("📎")-1 {
-			field = truncateByWidth(field, contentW-lipgloss.Width("📎")-1)
+		showClip := inputOuter >= 26
+		clipW := 0
+		if showClip {
+			clipW = lipgloss.Width("📎") + 1
 		}
-		clip := thClipStyle.Render("📎")
-		pad := contentW - lipgloss.Width(field) - lipgloss.Width("📎") - 1
+		field := c.input.View()
+		if lipgloss.Width(field) > contentW-clipW {
+			field = truncateByWidth(field, contentW-clipW)
+		}
+		tail := ""
+		if showClip {
+			tail = " " + thClipStyle.Render("📎")
+		}
+		pad := contentW - lipgloss.Width(field) - lipgloss.Width(tail)
 		if pad < 0 {
 			pad = 0
 		}
 		box := tuiComposerStyle.
 			Width(inputOuter - 2).
 			Height(l.composerRows).
-			Render(field + strings.Repeat(" ", pad) + clip)
-		input = indent + lipgloss.JoinHorizontal(lipgloss.Top, box, " ", sendButtonView(boxH))
+			Render(field + strings.Repeat(" ", pad) + tail)
+		input = lipgloss.JoinHorizontal(lipgloss.Top, box, " ", sendButtonView(boxH, sendW))
+		input = indent + strings.ReplaceAll(input, "\n", "\n"+indent)
 	case l.inputBoxed:
 		input = indent + tuiBorderStyle.Render(c.input.View())
 	default:

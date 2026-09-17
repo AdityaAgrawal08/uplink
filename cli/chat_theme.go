@@ -18,7 +18,98 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
+
+// ---- adaptive density ---------------------------------------------------------
+//
+// The terminal owns the true font size; the app answers with DENSITY: every
+// chrome choice below is a pure function of the live terminal size, so each
+// resize visibly rebalances chrome vs content. Thresholds are stepped, but
+// the underlying widths (sidebar, bubbles, tiles) scale fluidly between
+// them — nothing renders identically across sizes except by coincidence.
+
+// compactTranscript hides sender avatars when the transcript is too narrow
+// for chips + bubbles to coexist.
+func compactTranscript(termW int) bool { return termW > 0 && termW < 80 }
+
+// compactItems collapses sidebar chats to one row when height is scarce.
+func compactItems(termW, termH int) bool {
+	if termH <= 0 {
+		return false // unknown size: comfortable until measured
+	}
+	return termH < 28
+}
+
+// bubbleRatioFor scales message bubbles fluidly: near-full-width on narrow
+// terminals, tighter columns when space abounds.
+func bubbleRatioFor(availW int) float64 {
+	switch {
+	case availW < 60:
+		return 0.9
+	case availW < 100:
+		return 0.7
+	case availW < 150:
+		return 0.62
+	default:
+		return 0.5
+	}
+}
+
+// wheelStepFor scales wheel/drag steps to the pane height so scrolling feels
+// identical on short and tall terminals (was a fixed 3 lines everywhere).
+func wheelStepFor(paneH int) int {
+	s := paneH / 5
+	if s < 1 {
+		s = 1
+	}
+	if s > 6 {
+		s = 6
+	}
+	return s
+}
+
+// tileMinFor keeps tiles readable on wide screens but lets them shrink (with
+// horizontal scroll) instead of vanishing on narrow ones.
+func tileMinFor(outerW int) int {
+	if outerW < 90 {
+		return 16
+	}
+	return 22
+}
+
+// tilePeerTarget grows the camera strip with width: total tiles including
+// self, so more peers stay visible on wide terminals.
+func tilePeerTarget(termW int) int {
+	switch {
+	case termW <= 0:
+		return 3 // unknown size: legacy default until measured
+	case termW < 70:
+		return 2
+	case termW < 120:
+		return 3
+	case termW < 170:
+		return 4
+	default:
+		return 6
+	}
+}
+
+// tileFeedCap bounds total tiles (self + publishers + peers).
+func tileFeedCap(termW int) int {
+	if termW >= 150 {
+		return 6
+	}
+	return 4
+}
+
+// sendBtnWidthFor shrinks the Send button to an icon on narrow transcripts.
+func sendBtnWidthFor(transcriptOuter int) int {
+	if transcriptOuter < 60 {
+		return 6
+	}
+	return sendBtnWidth
+}
 
 // ---- palette --------------------------------------------------------------
 
@@ -263,15 +354,35 @@ func (c *chatScreen) itemIndexFor(peer string) int {
 // ---- top bar -----------------------------------------------------------------
 
 // topBarView paints the app banner: logo + promises left, signal/lock/clock
-// right. Pure function of width + wall clock.
+// right. Pure function of width + wall clock. Density collapses in steps:
+// full promises + date on wide, essentials in the middle, logo + time only
+// when cramped.
 func topBarView(w int) string {
-	left := thTopbarLogoStyle.Render("◆ UPLINK") + " " +
-		thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
 	now := time.Now()
-	right := thSignalStyle.Render("▂▄▆") + "  " +
-		thLockStyle.Render("🔒") + "  " +
-		thTopbarDimStyle.Render(now.Format("Mon, 02 Jan 2006")) + "  " +
-		thTopbarTimeStyle.Render(now.Format("15:04"))
+	var left, right string
+	switch {
+	case w <= 0 || w >= 110:
+		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
+			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		right = thSignalStyle.Render("▂▄▆") + "  " +
+			thLockStyle.Render("🔒") + "  " +
+			thTopbarDimStyle.Render(now.Format("Mon, 02 Jan 2006")) + "  " +
+			thTopbarTimeStyle.Render(now.Format("15:04"))
+	case w >= 75:
+		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
+			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		right = thSignalStyle.Render("▂▄▆") + "  " +
+			thLockStyle.Render("🔒") + "  " +
+			thTopbarTimeStyle.Render(now.Format("15:04"))
+	case w >= 55:
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
+		right = thSignalStyle.Render("▂▄▆") + "  " +
+			thLockStyle.Render("🔒") + "  " +
+			thTopbarTimeStyle.Render(now.Format("15:04"))
+	default:
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
+		right = thTopbarTimeStyle.Render(now.Format("15:04"))
+	}
 	lw, rw := lipgloss.Width(left), lipgloss.Width(right)
 	if w <= 0 {
 		return left + "  " + right
@@ -320,6 +431,31 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 	return st.Render(line1) + "\n" + st.Render(line2)
 }
 
+// roomHeaderCompact paints the 1-row room heading for short/narrow
+// terminals: avatar + name + context on a single line.
+func (c *chatScreen) roomHeaderCompact(outerW int) string {
+	var av, name, sub string
+	if c.targetUser == "" {
+		av = roomAvatarCell()
+		name = "General"
+		n := len(c.users)
+		if n == 0 {
+			n = 1
+		}
+		sub = fmt.Sprintf("%d · Public", n)
+	} else {
+		av = avatarCell(c.targetUser)
+		name = c.targetUser
+		sub = "Private · ESC"
+		if c.roomUnread > 0 {
+			sub += fmt.Sprintf(" · %d new", c.roomUnread)
+		}
+	}
+	line := av + "  " + thRoomNameStyle.Render(name) + "  " + thRoomSubStyle.Render(sub)
+	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
+	return st.Render(truncateByWidth(line, maxInt(outerW, 0)))
+}
+
 // ---- composer -------------------------------------------------------------------
 
 // sendBtnWidth is the fixed outer width of the Send button.
@@ -332,42 +468,57 @@ func truncateByWidth(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-	var b strings.Builder
-	used := 0
-	for _, r := range s {
-		rw := lipgloss.Width(string(r))
-		if used+rw > w {
-			break
-		}
-		b.WriteRune(r)
-		used += rw
-	}
-	out := b.String()
-	// Pad (plain spaces never overshoot) so Width(out) == w exactly.
-	if used < w {
-		out += strings.Repeat(" ", w-used)
-	}
-	return out
+	return ansi.Truncate(s, w, "")
 }
 
-// sendButtonView renders the blue Send button at exactly sendBtnWidth wide
+// sendButtonView renders the blue Send button at exactly sendW wide
 // and boxH rows tall (matches the composer box height; the style is
-// borderless so every row is button face).
-func sendButtonView(boxH int) string {
+// borderless so every row is button face). Narrow transcripts get an icon.
+func sendButtonView(boxH, sendW int) string {
 	inner := maxInt(boxH, 1)
+	label := "Send"
+	if sendW < sendBtnWidth {
+		label = "➤"
+	}
 	rows := make([]string, 0, inner)
 	mid := inner / 2
 	for i := 0; i < inner; i++ {
 		if i == mid {
-			rows = append(rows, thSendBtnStyle.Width(sendBtnWidth-2).Align(lipgloss.Center).Render("Send"))
+			rows = append(rows, thSendBtnStyle.Width(sendW-2).Align(lipgloss.Center).Render(label))
 		} else {
-			rows = append(rows, thSendBtnStyle.Width(sendBtnWidth-2).Render(" "))
+			rows = append(rows, thSendBtnStyle.Width(sendW-2).Render(" "))
 		}
 	}
-	return thSendBtnStyle.Width(sendBtnWidth).Render(strings.Join(rows, "\n"))
+	return thSendBtnStyle.Width(sendW).Render(strings.Join(rows, "\n"))
+}
+
+// composerTopRows counts the terminal rows above the composer box, mirroring
+// View()'s assembly order (header, body, strip, drawer) so hit-testing stays
+// pixel-truthful even with the drawer open.
+func composerTopRows(l layout) int {
+	top := 0
+	if l.showHeader {
+		top += headerHeight
+	}
+	bodyRows := 0
+	if l.vpHeight > 0 {
+		bodyRows = l.vpHeight
+		if l.boxedTranscript {
+			bodyRows += transcriptBorder
+		}
+	}
+	bodyRows += l.headRows
+	if bodyRows > 0 {
+		top += bodyRows
+	}
+	top += l.camRows
+	if l.paletteRows > 0 {
+		top += l.paletteRows + 1 // drawer panel + its spacer row
+	}
+	if l.frameOn {
+		top++ // frame top edge
+	}
+	return top
 }
 
 // composerGeoms derives the composer hit-test geometry deterministically from
@@ -383,24 +534,30 @@ func composerGeoms(l layout, termW, termH int) (sendX0, sendX1, y0, y1, clipX in
 	if l.frameOn {
 		frameOff = 1
 	}
-	txX0 := frameOff
-	if l.sidebarOn {
-		txX0 += l.sidebarWidth + 1
-	}
+	txX0 := frameOff + composerIndent(l)
 	transcriptOuter := l.vpWidth + 2
 	boxH := l.composerRows + 2
-	statusOff := 0
-	if l.statusRows == 1 {
-		statusOff = 1
-	}
-	y1 = termH - frameOff - statusOff
-	y0 = y1 - boxH
-	inputOuter := transcriptOuter - sendBtnWidth - 1
+	y0 = composerTopRows(l)
+	y1 = y0 + boxH
+	sendW := sendBtnWidthFor(transcriptOuter)
+	inputOuter := transcriptOuter - sendW - 1
 	sendX0 = txX0 + inputOuter + 1
-	sendX1 = sendX0 + sendBtnWidth
-	clipX = txX0 + inputOuter - 2
+	sendX1 = sendX0 + sendW
+	if inputOuter >= 26 {
+		clipX = txX0 + inputOuter - 2
+	}
 	_ = termW
+	_ = termH
 	return
+}
+
+// composerIndent is the left indent of the composer row (blank above the
+// sidebar column), shared by View() and geometry.
+func composerIndent(l layout) int {
+	if l.sidebarOn {
+		return l.sidebarWidth + 1
+	}
+	return 0
 }
 
 // ---- live cameras strip ------------------------------------------------------------
@@ -414,13 +571,10 @@ type camFeed struct {
 	audioOnly bool     // ♪ contributor without video
 }
 
-// camStripOn reports whether the bottom camera strip fits this terminal.
-func camStripOn(termW, termH int) bool {
-	return termW >= 90 && termH >= 26
-}
-
-// camStripRows is the fixed strip height (title + tile box). Tiles are
-// tall enough for the ASCII blur to read: header + pic + footer + border.
+// camStripRows is the fallback strip height (title + tile box) before the
+// layout pass measures the terminal. Tiles stay tall enough for the ASCII
+// blur to read: header + pic + footer + border. The live height is fully
+// adaptive (see layoutFor): taller terminals earn taller pictures.
 const camStripRows = 12
 
 // camPicRows is the picture height inside every tile.
@@ -472,9 +626,11 @@ func (c *chatScreen) camFeeds() []camFeed {
 			feeds = append(feeds, camFeed{name: p, audioOnly: true})
 		}
 	}
-	// Fill up to 3 tiles with recent peers so the strip mirrors the room.
+	// Fill peer tiles up to the width-derived target so the strip mirrors
+	// the room: more peers stay visible on wide terminals.
+	peerTarget := tilePeerTarget(c.width)
 	for _, u := range orderedUsers(c.users, c.me, c.lastDMAt) {
-		if len(feeds) >= 3 || len(c.users) == 0 {
+		if len(feeds) >= peerTarget || len(c.users) == 0 {
 			break
 		}
 		if u == c.me || seen[u] {
@@ -504,8 +660,8 @@ func (c *chatScreen) camFeeds() []camFeed {
 			}
 		}
 	}
-	if len(feeds) > 4 {
-		feeds = feeds[:4]
+	if cap := tileFeedCap(c.width); len(feeds) > cap {
+		feeds = feeds[:cap]
 	}
 	return feeds
 }
@@ -554,10 +710,13 @@ func tilePlaceholder(name string, w, h int) string {
 // truecolor braille. They are truncated by VISIBLE width only (SGR intact)
 // and never re-wrapped — stripping or re-wrapping is what turns the blur
 // image into monochrome dots.
-func renderCamTile(f camFeed, tileW int) string {
+func renderCamTile(f camFeed, tileW int, pictureRows ...int) string {
 	inner := maxInt(tileW-2, 8)
-	head := thCamLiveStyle.Render("●") + " " + thCamNameStyle.Render(truncateStringPlain(f.name, maxInt(inner-4, 1)))
+	head := thCamLiveStyle.Render("●") + " " + thCamNameStyle.Render(truncateByWidth(f.name, maxInt(inner-4, 1)))
 	picH := camPicRows
+	if len(pictureRows) > 0 {
+		picH = pictureRows[0]
+	}
 	if picH < 2 {
 		picH = 2
 	}
@@ -604,15 +763,29 @@ func (c *chatScreen) camerasStripView(outerW int) string {
 	title := thCamTitleStyle.Render("🎥 Live Cameras ("+fmt.Sprint(len(feeds))+")") + " " +
 		thCamLiveStyle.Render("●")
 	gap := 1
-	inner := camTileInner(outerW, len(feeds))
+	inner := max(tileMinFor(outerW), camTileInner(outerW, len(feeds)))
 	tileW := inner + 2
+	picRows := camPicRows
+	if c.width > 0 && c.height > 0 {
+		picRows = max(3, c.layoutFor().camRows-5)
+	}
 	// Horizontal join (NOT strings.Join: tiles are multi-line blocks).
 	strs := make([]string, 0, len(feeds)*2-1)
 	for i, f := range feeds {
 		if i > 0 {
 			strs = append(strs, strings.Repeat(" ", gap))
 		}
-		strs = append(strs, renderCamTile(f, tileW))
+		strs = append(strs, renderCamTile(f, tileW, picRows))
 	}
-	return title + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, strs...)
+	content := lipgloss.JoinHorizontal(lipgloss.Top, strs...)
+	maxOffset := max(0, lipgloss.Width(content)-outerW)
+	offset := min(c.cameraOffset, maxOffset)
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = ansi.Cut(line, offset, offset+outerW)
+	}
+	if maxOffset > 0 {
+		title += thCamMetaStyle.Render("  scroll to browse")
+	}
+	return truncateByWidth(title, outerW) + "\n" + strings.Join(lines, "\n")
 }

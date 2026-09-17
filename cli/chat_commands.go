@@ -175,15 +175,24 @@ func (c chatScreen) layoutFor() layout {
 	// strip. The sidebar column therefore always starts at the room-header
 	// top (rosterY0 from the pure pass already accounts for that).
 	l.videoRows = 0
-	// Room header above the transcript (center column only).
+	// Room header above the transcript (center column only): full two-row
+	// heading when roomy, compact single row when short or narrow, hidden
+	// when every row counts.
 	l.headRows = 0
-	if l.vpHeight > 8 {
-		l.headRows = 2
+	if l.vpHeight > 6 {
+		l.headRows = 1
+		if l.vpHeight > 10 && c.width >= 80 {
+			l.headRows = 2
+		}
 	}
 	// Bottom camera strip (full width, fixed height) when it fits.
 	l.camRows = 0
-	if camStripOn(c.width, c.height) && l.vpHeight-l.headRows-camStripRows >= 3 {
-		l.camRows = camStripRows
+	if c.width >= 40 && c.height >= 24 {
+		available := l.vpHeight - l.headRows
+		l.camRows = min(max(8, c.height/3), min(24, available-4))
+		if l.camRows < 8 {
+			l.camRows = 0
+		}
 	}
 	l.vpHeight -= l.headRows + l.camRows
 	if l.vpHeight < 0 {

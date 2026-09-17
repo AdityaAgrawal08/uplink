@@ -271,7 +271,7 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 
 	// Overflow: the list SCROLLS (scrollbar thumb paints) instead of a
 	// "+N more" row — every user stays reachable by scrolling. Each chat
-	// item owns exactly itemRowsPerChat rows beneath the fixed search row.
+	// item owns exactly chatItemHeight() rows beneath the fixed search row.
 	out := c.rosterBody(rosterMaxVisible + 1) // fill = search + N slots
 	rows := strings.Split(out, "\n")
 	if len(rows) != rosterMaxVisible+1 {
@@ -283,7 +283,7 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	// Every chat item stays reachable by scrolling: the synced viewport
 	// content covers all items (General room + every peer).
 	c.syncRosterVp()
-	wantLines := len(c.chatItems()) * itemRowsPerChat
+	wantLines := len(c.chatItems()) * c.chatItemHeight()
 	if c.rosterVp.TotalLineCount() != wantLines {
 		t.Errorf("scroll content must cover all chats: %d != %d", c.rosterVp.TotalLineCount(), wantLines)
 	}
@@ -395,7 +395,7 @@ func TestHandleMouseHitTest(t *testing.T) {
 
 	reset()
 	nItems := len(c.chatItems())
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+nItems*itemRowsPerChat+2)) // past last item
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+nItems*c.chatItemHeight()+2)) // past last item
 	if c.targetUser != "" {
 		t.Errorf("padding-row click leaked selection: %q", c.targetUser)
 	}
