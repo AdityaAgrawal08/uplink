@@ -354,9 +354,9 @@ func TestHandleMouseHitTest(t *testing.T) {
 	c.width, c.height = W, H
 	l := c.layoutFor() // hit-testing reads the settled layout, not the pure pass
 
-	// Rows: 3-row search box above rosterY0, General at +0/+1/+2,
-	// alice at +3/+4/+5, carol at +6/+7/+8.
-	yAlice := l.rosterY0 + 3 // first alice row (three rows per chat item)
+	// Rows: 3-row search box above rosterY0, General at +0/+1,
+	// alice at +2/+3, carol at +4/+5.
+	yAlice := l.rosterY0 + 2 // first alice row (two rows per chat item)
 	reset := func() { c.targetUser = "" }
 
 	c.handleMouse(mouseAt(l.rosterX+5, yAlice))

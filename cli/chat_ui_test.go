@@ -32,7 +32,8 @@ func TestSidebarWidthDensity(t *testing.T) {
 }
 
 func TestComposerRowsDensity(t *testing.T) {
-	cases := map[int]int{40: 4, 34: 4, 33: 3, 22: 3, 21: 2, 16: 2, 15: 1, 11: 1, 10: 0, 9: 0, 5: 0}
+	// Single-line composer whenever boxed; bare prompt when cramped.
+	cases := map[int]int{60: 1, 40: 1, 30: 1, 12: 1, 11: 0, 9: 0, 5: 0}
 	for h, want := range cases {
 		if got := composerRowsFor(h); got != want {
 			t.Errorf("composerRowsFor(%d) = %d; want %d", h, got, want)

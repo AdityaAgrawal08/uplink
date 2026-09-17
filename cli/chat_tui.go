@@ -139,22 +139,14 @@ func sidebarWidthVideo(termW int, videoOn bool) int {
 	return w
 }
 
-// composerRowsFor gives the message box breathing room on tall screens and
-// shrinks gracefully on small ones (0 => bare prompt, no border). Roomy
-// terminals earn a fourth row; every step rebalances the transcript.
+// composerRowsFor keeps the message box to a single line whenever it is
+// boxed (bare prompt when every row counts). The reference input is one
+// line; long text scrolls inside the field, rows belong to the transcript.
 func composerRowsFor(termH int) int {
-	switch {
-	case termH >= 34:
-		return composerRowsMax + 1
-	case termH >= 22:
-		return composerRowsMax
-	case termH >= 16:
-		return 2
-	case termH >= 11:
+	if termH >= 12 {
 		return 1
-	default:
-		return 0
 	}
+	return 0
 }
 
 // layout is the single source of truth for frame geometry. Both View() and the
@@ -756,7 +748,6 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
 		tsPlain = t.Local().Format("15:04")
 	}
-	bubbleTs := thBubbleTimeStyle.Render(tsPlain)
 	if m.Kind == "system" {
 		if isOwnPresence(m.Text, c.me) {
 			return "" // never announce my own join/leave to me
@@ -785,23 +776,18 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 		maxBubbleW = availWidth - 2
 	}
 
-	// Bubble inner: plain text + timestamp. The sender line (avatar + name
-	// + time) paints ABOVE the bubble, never inside it.
-	innerWithTs := textRendered + "  " + bubbleTs
-
+	// Bubble holds text only: the sender line above already carries name +
+	// time, so no interior timestamp clutters the bubble (reference look).
 	// Compact hug: needed = content width + padding/border
-	needed := lipgloss.Width(textRendered) + lipgloss.Width(tsPlain) + 6
-	if needed < 14 {
-		needed = 14
+	needed := lipgloss.Width(textRendered) + 4
+	if needed < 12 {
+		needed = 12
 	}
 	bubbleW := needed
 	if bubbleW > maxBubbleW {
 		bubbleW = maxBubbleW
 	}
-	bubbleInner := innerWithTs
-	if lipgloss.Width(textRendered) > maxBubbleW-10 {
-		bubbleInner = textRendered + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(tsPlain)-4)) + bubbleTs
-	}
+	bubbleInner := textRendered
 
 	var style lipgloss.Style
 	if isOwn {
@@ -1324,9 +1310,9 @@ func (c chatScreen) searchBox(inner int, sh int) []string {
 	return []string{h + strings.Repeat(" ", gap) + slash}
 }
 
-// chatItemHeight is the sidebar row budget per chat: three comfortable rows
-// (name, preview, air/selected-border) normally, one compact row (name only)
-// when terminal height is scarce.
+// chatItemHeight is the sidebar row budget per chat: two comfortable rows
+// (name, preview) normally, one compact row (name only) when terminal
+// height is scarce. Selection is a side bar + tint (no extra rows).
 func (c chatScreen) chatItemHeight() int {
 	if compactItems(c.width, c.height) {
 		return 1
@@ -1346,16 +1332,19 @@ func (c chatScreen) chatItemRows(items []chatItem, inner int, hover string) []st
 }
 
 // chatItemRow paints one sidebar item as exactly h rows (h from
-// chatItemHeight): comfortable 3-row cards (name, preview, air) with a blue
-// selection border, or a compact single name row. Pure function of inputs;
-// every row is exactly `inner` cells wide (truncateVisible pads/truncates
-// ANSI-safe, never wraps).
+// chatItemHeight): comfortable name + preview rows, or a compact single
+// name row. The active chat gets a blue side bar + tinted background (same
+// rows, no extra chrome); hover highlights the name. Pure function of
+// inputs; every row is exactly `inner` cells wide (truncateVisible
+// pads/truncates ANSI-safe, never wraps).
 func chatItemRow(it chatItem, inner int, hover string, h int) []string {
 	av := avatarCell(it.name)
 	if it.isRoom {
 		av = roomAvatarCell()
 	}
-	name := truncateStringPlain(it.name, maxInt(inner-14, 1))
+	// One leading cell is reserved for the selection bar (blue when active).
+	barW := 1
+	name := truncateStringPlain(it.name, maxInt(inner-barW-13, 1))
 	nameRendered := thChatNameStyle.Render(name)
 	if hover == it.peer && it.peer != "" && !it.active {
 		nameRendered = thHoverRowStyle.Render(name)
@@ -1364,29 +1353,24 @@ func chatItemRow(it chatItem, inner int, hover string, h int) []string {
 		nameRendered = tuiDimStyle.Render(name)
 	}
 	timeRendered := thChatTimeStyle.Render(it.timeStr)
-	dot := ""
+	dot := " "
 	if it.unread > 0 {
 		dot = thUnreadDotStyle.Render("●")
 	}
-	gap1 := inner - (lipgloss.Width(av) + 1 + len([]rune(name)) + 1 + len([]rune(it.timeStr)) + 1 + 1)
+	gap1 := inner - barW - (lipgloss.Width(av) + 1 + len([]rune(name)) + 1 + len([]rune(it.timeStr)) + 1 + 1)
 	if gap1 < 1 {
 		gap1 = 1
 	}
 	core1 := av + " " + nameRendered + strings.Repeat(" ", gap1) + timeRendered + " " + dot
-	if dot == "" {
-		core1 += " "
-	}
 
-	icon := ""
+	icon := " "
 	if it.inCall {
-		icon = thSignalStyle.Render("◉") + " "
+		icon = thSignalStyle.Render("◉")
 	}
-	if dot != "" {
-		icon += dot
-	} else {
-		icon += " "
+	if dot != " " {
+		icon += " " + dot
 	}
-	preview := truncateStringPlain(it.preview, maxInt(inner-10, 1))
+	preview := truncateStringPlain(it.preview, maxInt(inner-barW-8, 1))
 	pvRendered := thPreviewStyle.Render(preview)
 	if it.unread > 0 && !it.isRoom {
 		pvRendered = thUnreadNewStyle.Render(preview)
@@ -1394,30 +1378,25 @@ func chatItemRow(it chatItem, inner int, hover string, h int) []string {
 	if it.inCall && it.isRoom {
 		pvRendered = thSignalStyle.Render(preview)
 	}
-	gap2 := inner - (4 + len([]rune(preview)) + 1 + len([]rune(stripForWidth(icon))))
+	gap2 := inner - barW - (4 + len([]rune(preview)) + 1 + len([]rune(stripForWidth(icon))))
 	if gap2 < 1 {
 		gap2 = 1
 	}
 	core2 := "    " + pvRendered + strings.Repeat(" ", gap2) + icon
 
-	if h <= 1 {
-		return []string{truncateVisible(core1, inner)}
-	}
-	if !it.active {
-		return []string{
-			truncateVisible(core1, inner),
-			truncateVisible(core2, inner),
-			"",
+	selBar := lipgloss.NewStyle().Foreground(lipgloss.Color(thBlue)).Render("┃")
+	plainBar := " "
+	mkRow := func(core string) string {
+		row := truncateVisible(core, inner-barW)
+		if it.active {
+			return selBar + thSelRowStyle.Render(row)
 		}
+		return plainBar + row
 	}
-	// Selected chat: blue rounded border integrated into the 3 rows.
-	inner2 := maxInt(inner-2, 1)
-	bd := lipgloss.NewStyle().Foreground(lipgloss.Color(thBlue))
-	return []string{
-		bd.Render("╭") + truncateVisible(core1, inner2) + bd.Render("╮"),
-		bd.Render("│") + truncateVisible(core2, inner2) + bd.Render("│"),
-		bd.Render("╰" + strings.Repeat("─", inner2) + "╯"),
+	if h <= 1 {
+		return []string{mkRow(core1)}
 	}
+	return []string{mkRow(core1), mkRow(core2)}
 }
 
 // stripForWidth counts visible cells of a short styled fragment for padding
@@ -1645,9 +1624,9 @@ func (c *chatScreen) toggleAudio() tea.Cmd {
 	return nil
 }
 
-// callCardRows is the live-call status card height: 2 content rows +
-// border, pinned above the transcript while a call runs.
-const callCardRows = 4
+// callCardRows is the live-call status card height: sender line + two
+// green-bar rows, pinned above the transcript while a call runs.
+const callCardRows = 3
 
 // callActive reports whether this client is in a call right now:
 // publishing camera/mic or receiving a remote feed.
@@ -1880,28 +1859,22 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 		availWidth = 60
 	}
 	textRendered := renderMarkdown(text)
-	tsPlain := time.Now().Format("15:04")
-	bubbleTs := tuiBubbleTimeStyle.Render(tsPlain)
-	maxBubbleW := int(float64(availWidth) * 0.62)
-	if maxBubbleW < 22 {
-		maxBubbleW = 22
+	maxBubbleW := int(float64(availWidth) * bubbleRatioFor(availWidth))
+	if maxBubbleW < 14 {
+		maxBubbleW = 14
 	}
 	if maxBubbleW > availWidth-2 {
 		maxBubbleW = availWidth - 2
 	}
-	needed := lipgloss.Width(textRendered) + lipgloss.Width(tsPlain) + 6
-	if needed < 14 {
-		needed = 14
+	needed := lipgloss.Width(textRendered) + 4
+	if needed < 12 {
+		needed = 12
 	}
 	bubbleW := needed
 	if bubbleW > maxBubbleW {
 		bubbleW = maxBubbleW
 	}
-	innerWithTs := textRendered + "  " + bubbleTs
-	if lipgloss.Width(textRendered) > maxBubbleW-10 {
-		innerWithTs = textRendered + "\n" + strings.Repeat(" ", max(0, bubbleW-lipgloss.Width(tsPlain)-4)) + bubbleTs
-	}
-	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(innerWithTs)
+	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(textRendered)
 	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
 	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}

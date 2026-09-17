@@ -143,20 +143,20 @@ func TestRoomHeaderCompactRows(t *testing.T) {
 func TestSidebarItemHeightAdapts(t *testing.T) {
 	c := newFilterScreen("me", "", "me", "a", "b", "c")
 	c.width, c.height = 120, 40
-	if got := c.chatItemHeight(); got != 3 {
-		t.Fatalf("roomy terminal must use 3-row items, got %d", got)
+	if got := c.chatItemHeight(); got != 2 {
+		t.Fatalf("roomy terminal must use 2-row items, got %d", got)
 	}
 	c.height = 20
 	if got := c.chatItemHeight(); got != 1 {
 		t.Fatalf("short terminal must collapse to 1-row items, got %d", got)
 	}
-	// Row budget collapses: three times the chats visible without scrolling.
+	// Row budget halves: twice the chats visible without scrolling.
 	c.width, c.height = 120, 40
 	full := c.chatItemRows(c.chatItems(), 24, "")
 	c.height = 20
 	compact := c.chatItemRows(c.chatItems(), 24, "")
-	if len(compact)*3 != len(full) {
-		t.Fatalf("compact rows %d must be a third of comfortable %d", len(compact), len(full))
+	if len(compact)*2 != len(full) {
+		t.Fatalf("compact rows %d must be half of comfortable %d", len(compact), len(full))
 	}
 }
 
@@ -401,8 +401,8 @@ func TestSidebarSelectedBorderAndCallIcon(t *testing.T) {
 	sc := liveCallScreen(t, 120, 40)
 	out := sc.rosterBody(40)
 	plain := stripANSI(out)
-	if !strings.Contains(plain, "╭") || !strings.Contains(plain, "╯") {
-		t.Fatalf("selected chat must carry a border:\n%s", plain)
+	if !strings.Contains(plain, "┃") {
+		t.Fatalf("selected chat must carry a side bar:\n%s", plain)
 	}
 	if !strings.Contains(plain, "◉") {
 		t.Fatalf("in-call chat must show the live icon:\n%s", plain)

@@ -272,9 +272,9 @@ type chatItem struct {
 	inCall  bool // live video/audio on this conversation
 }
 
-// itemRowsPerChat is the comfortable row height of one chat item: name,
-// preview, and the selected-state border/bottom air.
-const itemRowsPerChat = 3
+// itemRowsPerChat is the comfortable row height of one chat item: name +
+// preview. Selection is a side bar + tint inside the same rows.
+const itemRowsPerChat = 2
 
 // chatItems builds the sidebar order: General room first, then DM peers in
 // display (recency) order. Read-only: no model mutation.
@@ -768,7 +768,22 @@ func (c *chatScreen) camFeeds() []camFeed {
 	return feeds
 }
 
-// tilePlaceholder paints a dark "camera off" tile with a big initial.
+// tileTextureRow is one faint dotted idle row: sparse dots read as an
+// inactive sensor, not as noise. Exactly w cells, ANSI-safe.
+func tileTextureRow(w, seed int) string {
+	var sb strings.Builder
+	for i := 0; i < w; i++ {
+		if (i+seed)%3 == 0 {
+			sb.WriteRune('·')
+		} else {
+			sb.WriteByte(' ')
+		}
+	}
+	return thCamMetaStyle.Render(sb.String())
+}
+
+// tilePlaceholder paints a dark "camera off" tile: dotted idle texture with
+// a big initial + label composited near the middle.
 func tilePlaceholder(name string, w, h int) string {
 	if w < 6 {
 		w = 6
@@ -797,7 +812,9 @@ func tilePlaceholder(name string, w, h int) string {
 		case mid + 1:
 			row = off
 		default:
-			row = ""
+			// Texture everywhere else so big idle tiles feel intentional.
+			rows = append(rows, lipgloss.NewStyle().Width(w).Align(lipgloss.Center).Render(tileTextureRow(w, i)))
+			continue
 		}
 		rows = append(rows, lipgloss.NewStyle().Width(w).Align(lipgloss.Center).Render(row))
 	}
@@ -1071,7 +1088,7 @@ func panelTile(chip, mic string, lines []string, inner, tileH int, active bool, 
 	}
 	fit := make([]string, 0, picH)
 	for i := 0; i < picH-len(take); i++ {
-		fit = append(fit, strings.Repeat(" ", inner))
+		fit = append(fit, tileTextureRow(inner, i))
 	}
 	for _, ln := range take {
 		fit = append(fit, truncateVisible(ln, inner))
@@ -1378,11 +1395,17 @@ func (c *chatScreen) peerAudioLive(peer string) bool {
 }
 
 // callCardView paints the pinned live-call status card (callCardRows rows):
-// green board, title + LIVE chip, participants + elapsed.
+// green "System" sender, then two green-bar rows (title + LIVE chip,
+// participants + elapsed). Borderless like the reference: the green bar is
+// the whole affordance, and every row is exactly outerW cells.
 func (c *chatScreen) callCardView(outerW int) string {
-	inner := maxInt(outerW-2, 10)
-	title := thCamLiveStyle.Render("●") + " " +
-		lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Video call started")
+	ts := "--:--"
+	if !c.callStart.IsZero() {
+		ts = c.callStart.Local().Format("15:04")
+	}
+	sender := thSystemNameStyle.Render("System") + "  " + thMsgTimeStyle.Render(ts)
+	bar := thSystemBarStyle.Render("▌")
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Video call started")
 	live := thCamLiveStyle.Render("● LIVE")
 	n := c.callParties()
 	sub := fmt.Sprintf("%d participant", n)
@@ -1390,13 +1413,16 @@ func (c *chatScreen) callCardView(outerW int) string {
 		sub += "s"
 	}
 	sub += " · " + c.callElapsed()
-	r1pad := inner - lipgloss.Width(stripForWidth(title)) - lipgloss.Width(stripForWidth(live))
+	r1 := bar + " " + title
+	r1pad := outerW - lipgloss.Width(stripForWidth(r1)) - lipgloss.Width(stripForWidth(live)) - 1
 	if r1pad < 1 {
 		r1pad = 1
 	}
-	body := title + strings.Repeat(" ", r1pad) + live + "\n" +
-		thCamMetaStyle.Render(truncateStringPlain(sub, inner))
-	return thTileStyle.Width(inner).Render(body)
+	r1 += strings.Repeat(" ", r1pad) + live
+	r2 := bar + " " + thCamMetaStyle.Render(truncateStringPlain(sub, maxInt(outerW-4, 1)))
+	return truncateVisible(sender, outerW) + "\n" +
+		truncateVisible(r1, outerW) + "\n" +
+		truncateVisible(r2, outerW)
 }
 
 // keyHintsView paints the 1-row composer footer. Every hint names a binding

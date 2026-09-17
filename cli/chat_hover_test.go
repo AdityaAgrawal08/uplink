@@ -81,9 +81,9 @@ func TestMotionUpdatesAndClearsHover(t *testing.T) {
 	scr := m.(chatScreen)
 	l := scr.layoutFor() // settled layout: search-box rows shift rosterY0
 
-	// Items: General at +0/+1/+2, "a" at +3/+4/+5 (three rows per item).
+	// Items: General at +0/+1, "a" at +2/+3 (two rows per item).
 	inside := l.rosterX + 4
-	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 3})
+	nm, _ := scr.Update(tea.MouseMsg{Type: tea.MouseMotion, X: inside, Y: l.rosterY0 + 2})
 	got := nm.(chatScreen)
 	if got.hoverPeer != "a" {
 		t.Fatalf("hover = %q; want a", got.hoverPeer)

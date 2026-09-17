@@ -481,8 +481,8 @@ func TestVideoBottomStripAndChatMapping(t *testing.T) {
 	if l.camRows == 0 {
 		t.Fatal("bottom Live Cameras strip must claim rows at this size")
 	}
-	// Items: General at +0/+1/+2, carol at +3/+4/+5 (three rows per item).
-	if got := sc.peerAtY(l.rosterY0+3, l); got != "carol" {
+	// Items: General at +0/+1, carol at +2/+3 (two rows per item).
+	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
 		t.Fatalf("chat row mapped to %q; want carol", got)
 	}
 	// Wheel over the camera strip never opens a thread (falls to chat).
