@@ -7,8 +7,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// geomScreen builds a screen with video + overflowing roster at 140x40,
-// the same geometry TestZZGeom measurements were taken on.
+// geomScreen builds a screen with an overflowing chat list at 140x40.
+// Video frames still flow (they render in the bottom Live Cameras strip).
 func geomScreen(t *testing.T) (*chatScreen, layout) {
 	t.Helper()
 	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena", "mallory", "nina", "olga", "peggy", "sybil", "trent", "uma"}
@@ -44,26 +44,36 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	rows := strings.Split(view, "\n")
 	chatG, videoG, rosterG := c.scrollBarGeoms(l)
 
-	// Chat bar: inside the transcript border, rightmost interior column.
-	if got := colAt(rows[3], chatG.x); got != "│" {
-		t.Fatalf("chat bar column mismatch: got %q at x=%d", got, chatG.x)
+	// No sidebar video box: feeds live in the bottom strip, so the video
+	// geom stays zero.
+	if videoG != (barGeom{}) {
+		t.Fatalf("sidebar video geom must be zero, got %+v", videoG)
 	}
-	if got := colAt(rows[2], chatG.x); got == "│" && got != "│" {
-		t.Fatal("unreachable")
+
+	// Chat bar: inside the transcript border, last interior column.
+	// Interior top = frame + top bar + room header + call card + border;
+	// the first interior row holds the up-arrow.
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
 	}
-	// Track rows: interior spans [3, 3+vpHeight); track starts below ▲.
-	if chatG.trackY0 != 4 || chatG.trackH != l.vpHeight-2 {
-		t.Fatalf("chat track y0=%d h=%d; want %d/%d", chatG.trackY0, chatG.trackH, 4, l.vpHeight-2)
+	if l.showHeader {
+		headOff = 1
 	}
-	// Video bar: x = rightmost sidebar interior column, track below ▲.
-	if got := colAt(rows[videoG.trackY0], videoG.x); got != "█" && got != "│" {
-		t.Fatalf("video bar column mismatch: %q at x=%d,y=%d", got, videoG.x, videoG.trackY0)
+	arrowRow := frameOff + headOff + l.headRows + l.callRows + 1
+	if got := colAt(rows[arrowRow], chatG.x); got != "│" && got != "▲" && got != "█" {
+		t.Fatalf("chat bar column mismatch: got %q at x=%d,y=%d", got, chatG.x, arrowRow)
 	}
-	if got := colAt(rows[videoG.trackY0-1], videoG.x); got != "▲" {
-		t.Fatalf("video bar must sit below the up-arrow; got %q", got)
+	// Track rows: track starts below ▲.
+	if chatG.trackY0 != arrowRow+1 || chatG.trackH != l.vpHeight-2 {
+		t.Fatalf("chat track y0=%d h=%d; want %d/%d", chatG.trackY0, chatG.trackH, arrowRow+1, l.vpHeight-2)
 	}
-	// Roster bar: track starts below the title row's ▲.
-	if got := colAt(rows[rosterG.trackY0-1], rosterG.x); got != "▲" {
+	// Roster bar: x = rightmost sidebar interior column, track below the
+	// first scroll row's ▲ (search row sits fixed above it).
+	if rosterG.x != l.rosterX+l.sidebarWidth-2 {
+		t.Fatalf("roster bar x=%d; want %d", rosterG.x, l.rosterX+l.sidebarWidth-2)
+	}
+	if got := colAt(rows[rosterG.trackY0-1], rosterG.x); got != "▲" && got != "│" && got != "█" {
 		t.Fatalf("roster bar must sit below its up-arrow; got %q at y=%d", got, rosterG.trackY0-1)
 	}
 }
@@ -78,7 +88,7 @@ func wheel(up bool, x, y int) tea.MouseMsg {
 }
 
 // TestIndependentScrollPanes: wheel/drag on one pane must never move the
-// other two.
+// other.
 func TestIndependentScrollPanes(t *testing.T) {
 	c, l := geomScreen(t)
 	// Give chat scrollable content.
@@ -86,29 +96,15 @@ func TestIndependentScrollPanes(t *testing.T) {
 	c.rebuildView()
 
 	chatBefore := c.vp.YOffset
-	videoBefore := c.videoVp.YOffset
 	rosterBefore := c.rosterVp.YOffset
 
-	// Wheel over the users list scrolls ONLY the roster.
+	// Wheel over the chat list scrolls ONLY the roster.
 	c.handleMouse(wheel(false, l.rosterX+5, l.rosterY0+2))
 	if c.rosterVp.YOffset == rosterBefore {
-		t.Fatal("wheel over roster must scroll the roster")
-	}
-	if c.vp.YOffset != chatBefore || c.videoVp.YOffset != videoBefore {
-		t.Fatalf("roster wheel moved other panes: chat %d→%d video %d→%d",
-			chatBefore, c.vp.YOffset, videoBefore, c.videoVp.YOffset)
-	}
-
-	// Wheel over the video pane scrolls ONLY the video feed.
-	c.handleMouse(wheel(false, l.rosterX+5, l.rosterY0-l.videoRows))
-	if c.videoVp.YOffset == videoBefore {
-		t.Fatal("wheel over video must scroll the video pane")
-	}
-	if c.rosterVp.YOffset != rosterBefore+3 && c.rosterVp.YOffset == rosterBefore {
-		t.Fatal("impossible")
+		t.Fatal("wheel over chat list must scroll the roster")
 	}
 	if c.vp.YOffset != chatBefore {
-		t.Fatal("video wheel moved chat")
+		t.Fatalf("roster wheel moved chat: %d→%d", chatBefore, c.vp.YOffset)
 	}
 
 	// Drag the chat scrollbar thumb: chat moves, sidebar stays.
@@ -135,7 +131,7 @@ func TestIndependentScrollPanes(t *testing.T) {
 }
 
 // TestRosterScrollKeepsSelection: with the list scrolled, clicks map to
-// the visible row (offset-aware hit-test).
+// the visible row (offset-aware hit-test, two rows per chat item).
 func TestRosterScrollKeepsSelection(t *testing.T) {
 	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena", "mallory", "nina", "olga", "peggy", "sybil", "trent", "uma", "victor", "walter", "xavier", "yusuf", "zoe", "a1", "b2", "c3", "d4", "e5", "f6", "g7", "h8", "i9", "j10", "k11", "l12", "m13"}
 	users := append([]string{"bob"}, names...)
@@ -144,16 +140,22 @@ func TestRosterScrollKeepsSelection(t *testing.T) {
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 	sc := m.(chatScreen)
 	l := sc.layoutFor()
-	// Roster taller than the box: sync content, wheel twice, click FIRST row.
+	// Chat list taller than the box: sync content, wheel twice, click the
+	// FIRST visible item row (below the fixed search row).
 	sc.syncRosterVp()
 	sc.handleMouse(wheel(false, l.rosterX+5, l.rosterY0+2))
-	sc.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // top visible row
+	sc.handleMouse(wheel(false, l.rosterX+5, l.rosterY0+2))
+	sc.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // top visible item row
 	if sc.targetUser == "" {
-		t.Fatal("click on a scrolled roster row must select someone")
+		t.Fatal("click on a scrolled chat-list row must select someone")
 	}
-	// The selected user must be the one visible at that row (offset-applied).
-	online := orderedUsers(sc.users, sc.me, sc.lastDMAt)
-	want := online[sc.rosterVp.YOffset]
+	// The selected user must be the item visible at that row
+	// (offset-applied, two rows per item).
+	items := sc.chatItems()
+	want := items[sc.rosterVp.YOffset/sc.chatItemHeight()].peer
+	if want == "" {
+		t.Fatal("scrolled top row landed on the room; test needs deeper scroll")
+	}
 	if sc.targetUser != want {
 		t.Fatalf("clicked row selected %q; want %q (offset %d)", sc.targetUser, want, sc.rosterVp.YOffset)
 	}

@@ -196,15 +196,16 @@ func TestNoNavigationNotesInTranscripts(t *testing.T) {
 		}
 	}
 
-	// Header carries the context INSTEAD: silent in general, explicit in DM.
-	c.width = 100 // banner needs a real width to render
+	// Room header carries the context INSTEAD: silent in general, explicit
+	// in DM. (The top bar stays neutral by design.)
+	c.width = 100 // header needs a real width to render
 	c.targetUser = ""
-	if h := c.headerView(); strings.Contains(h, "private") || strings.Contains(h, "ESC") {
-		t.Errorf("general header must stay clean: %q", h)
+	if h := c.roomHeaderView(80); strings.Contains(h, "Private") || strings.Contains(h, "ESC") {
+		t.Errorf("general room header must stay clean: %q", h)
 	}
 	c.targetUser = "a"
-	h := c.headerView()
-	if !strings.Contains(h, "private with a") || !strings.Contains(h, "ESC = general") {
-		t.Errorf("thread header missing permanent nav heading: %q", h)
+	h := c.roomHeaderView(80)
+	if !strings.Contains(h, "Private with a") || !strings.Contains(h, "ESC = general") {
+		t.Errorf("thread room header missing permanent nav heading: %q", h)
 	}
 }

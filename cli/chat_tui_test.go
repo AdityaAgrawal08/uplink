@@ -61,8 +61,13 @@ func TestComputeLayout(t *testing.T) {
 	if l.totalRows() != H {
 		t.Errorf("totalRows = %d; MUST equal termH exactly (%d)", l.totalRows(), H)
 	}
-	if want := W - 1 - l.sidebarWidth; l.rosterX != want {
-		t.Errorf("rosterX = %d; want %d (inner right edge)", l.rosterX, want)
+	// LEFT sidebar: rosterX is the frame inset, not the right edge.
+	wantX := 0
+	if l.frameOn {
+		wantX = 1
+	}
+	if l.rosterX != wantX {
+		t.Errorf("rosterX = %d; want %d (frame inset, left column)", l.rosterX, wantX)
 	}
 	innerW := W - frameChrome
 	if want := innerW - l.sidebarWidth - 1 - transcriptBorder; l.vpWidth != want {
@@ -265,8 +270,9 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	c.users = users
 
 	// Overflow: the list SCROLLS (scrollbar thumb paints) instead of a
-	// "+N more" row — every user stays reachable by scrolling.
-	out := c.rosterBody(rosterMaxVisible + 1) // fill = title + N slots
+	// "+N more" row — every user stays reachable by scrolling. Each chat
+	// item owns exactly chatItemHeight() rows beneath the fixed search row.
+	out := c.rosterBody(rosterMaxVisible + 1) // fill = search + N slots
 	rows := strings.Split(out, "\n")
 	if len(rows) != rosterMaxVisible+1 {
 		t.Fatalf("full roster height = %d rows; want %d", len(rows), rosterMaxVisible+1)
@@ -274,11 +280,12 @@ func TestRosterBodyAdaptiveSlots(t *testing.T) {
 	if !strings.Contains(out, "█") {
 		t.Error("scrollbar thumb missing on overflow")
 	}
-	// Every user stays reachable by scrolling: the synced viewport content
-	// covers all users.
+	// Every chat item stays reachable by scrolling: the synced viewport
+	// content covers all items (General room + every peer).
 	c.syncRosterVp()
-	if c.rosterVp.TotalLineCount() != len(users) {
-		t.Errorf("scroll content must cover all users: %d != %d", c.rosterVp.TotalLineCount(), len(users))
+	wantLines := len(c.chatItems()) * c.chatItemHeight()
+	if c.rosterVp.TotalLineCount() != wantLines {
+		t.Errorf("scroll content must cover all chats: %d != %d", c.rosterVp.TotalLineCount(), wantLines)
 	}
 
 	// Fewer slots than users: panel SHRINKS (never inflates short frames).
@@ -345,30 +352,51 @@ func TestHandleMouseHitTest(t *testing.T) {
 	const W, H = 120, 40
 	c := newFilterScreen("bob", "", "bob", "alice", "carol")
 	c.width, c.height = W, H
-	l := computeLayout(W, H, false)
+	l := c.layoutFor() // hit-testing reads the settled layout, not the pure pass
 
-	yAlice := l.rosterY0 + 1 // row 0 = self, row 1 = alice
+	// Rows: 3-row search box above rosterY0, General at +0/+1,
+	// alice at +2/+3, carol at +4/+5.
+	yAlice := l.rosterY0 + 2 // first alice row (two rows per chat item)
 	reset := func() { c.targetUser = "" }
 
 	c.handleMouse(mouseAt(l.rosterX+5, yAlice))
 	if c.targetUser != "alice" {
 		t.Fatalf("click on alice set target=%q", c.targetUser)
 	}
-
-	reset()
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // self row
-	if c.targetUser != "" {
-		t.Errorf("self-click selected %q", c.targetUser)
+	c.handleMouse(mouseAt(l.rosterX+5, yAlice+1)) // second alice row also selects
+	if c.targetUser != "alice" {
+		t.Fatalf("click on alice second row set target=%q", c.targetUser)
 	}
 
 	reset()
-	c.handleMouse(mouseAt(2, yAlice)) // transcript area
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0-1)) // search row: opens "/", selects nothing
+	if c.targetUser != "" {
+		t.Errorf("search-click selected %q", c.targetUser)
+	}
+
+	reset()
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // General room row: stays general
+	if c.targetUser != "" {
+		t.Errorf("room-click selected %q", c.targetUser)
+	}
+
+	// From inside a thread, clicking General returns to the room.
+	c.enterPrivate("alice")
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0)) // General room row
+	if c.targetUser != "" {
+		t.Errorf("room-click did not exit thread: %q", c.targetUser)
+	}
+	reset()
+
+	reset()
+	c.handleMouse(mouseAt(transcriptX0(l)+5, yAlice)) // transcript area
 	if c.targetUser != "" {
 		t.Errorf("transcript click leaked selection: %q", c.targetUser)
 	}
 
 	reset()
-	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+l.rosterSlots)) // past last user
+	nItems := len(c.chatItems())
+	c.handleMouse(mouseAt(l.rosterX+5, l.rosterY0+nItems*c.chatItemHeight()+2)) // past last item
 	if c.targetUser != "" {
 		t.Errorf("padding-row click leaked selection: %q", c.targetUser)
 	}

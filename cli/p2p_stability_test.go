@@ -1093,8 +1093,8 @@ func TestRoomUnreadInThread(t *testing.T) {
 	if sc.roomUnread != 1 {
 		t.Fatalf("roomUnread = %d; want 1", sc.roomUnread)
 	}
-	if !strings.Contains(sc.headerView(), "1 new in room") {
-		t.Fatalf("header must advertise the room backlog: %q", sc.headerView())
+	if h := sc.roomHeaderView(80); !strings.Contains(h, "1 new in room") {
+		t.Fatalf("room header must advertise the room backlog: %q", h)
 	}
 	sc.exitPrivate()
 	if sc.roomUnread != 0 {
@@ -1102,14 +1102,14 @@ func TestRoomUnreadInThread(t *testing.T) {
 	}
 }
 
-// The banner names the binary version: screenshots become self-identifying.
+// The room header names the binary version: screenshots stay self-identifying.
 func TestHeaderShowsVersion(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	sc := m.(chatScreen)
-	if !strings.Contains(sc.headerView(), "v"+normVersion(version)) {
-		t.Fatalf("header lacks version: %q", sc.headerView())
+	if h := sc.roomHeaderView(100); !strings.Contains(h, "v"+normVersion(version)) {
+		t.Fatalf("room header lacks version: %q", h)
 	}
 }
 

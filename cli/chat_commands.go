@@ -170,26 +170,108 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), c.videoActive())
-	// Video box claims the top of the sidebar column (mockup: VIDEO/AUDIO
-	// above ONLINE). Bounded to half the column so the roster never starves;
-	// collapsed entirely when too short to be useful.
+	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), false)
+	// Sidebar video box is retired: feeds render in the bottom Live Cameras
+	// strip. The sidebar column therefore always starts at the room-header
+	// top (rosterY0 from the pure pass already accounts for that).
 	l.videoRows = 0
-	if l.sidebarOn && c.videoActive() {
-		cols, frameRows, streams := videoPaneGeom(c, l)
-		pane := streams*frameRows + (streams - 1) // frames + divider
-		want := pane + 1 + 2                      // title + border
-		if len(c.videoLines) == 0 && len(c.selfLines) == 0 {
-			want = 1 + 3 + 2 // hint + "waiting" placeholder rows + border
+	// Room header above the transcript (center column only): full two-row
+	// heading when roomy, compact single row when short or narrow, hidden
+	// when every row counts.
+	l.headRows = 0
+	if l.vpHeight > 6 {
+		l.headRows = 1
+		if l.vpHeight > 10 && c.width >= 80 {
+			l.headRows = 2
 		}
-		l.videoRows = min(want, l.vpHeight/2)
-		if l.videoRows < 6 {
-			l.videoRows = 0
-		}
-		_ = cols
 	}
-	l.rosterY0 += l.videoRows
+	// The sidebar search box grows into the header zone: its rows sit above
+	// the first scroll row, so rosterY0 shifts with it (paint + hit-test).
+	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
+	// Live-call status card (pinned above the transcript while a call runs).
+	l.callRows = 0
+	if c.callActive() && l.vpHeight-l.headRows >= 12 {
+		l.callRows = callCardRows
+	}
+	// Composer key-hints footer (truthful bindings only, see keyHintsView).
+	l.hintRows = 0
+	if c.width >= 70 && l.composerRows > 0 && l.vpHeight-l.headRows-l.callRows >= 8 {
+		l.hintRows = 1
+	}
+	l.vpHeight -= l.headRows + l.callRows + l.hintRows
+	if l.vpHeight < 0 {
+		l.vpHeight = 0
+	}
+	// Video UI: right panel when wide (width split), bottom strip when
+	// narrow (height split), hidden when neither fits.
+	l.vidPanelW, l.camRows = c.videoChrome(l)
+	if l.camRows > 0 {
+		l.vpHeight -= l.camRows
+		if l.vpHeight < 0 {
+			l.vpHeight = 0
+			l.camRows = 0
+		}
+	}
+	// Right panel shrinks the transcript column (never below readable).
+	if l.vidPanelW > 0 {
+		l.vpWidth -= l.vidPanelW + 1 // panel + spacer
+		if l.vpWidth < 10 {
+			l.vpWidth = 10
+		}
+	}
+	// Roster adapts to the settled viewport: search row eats one slot.
+	l.rosterSlots = l.vpHeight - 1
+	if l.rosterSlots > rosterMaxVisible {
+		l.rosterSlots = rosterMaxVisible
+	}
+	if l.rosterSlots < 0 || !l.sidebarOn {
+		l.rosterSlots = 0
+	}
 	return l
+}
+
+// videoPanelWidth is the right video column width (0 = too narrow). Pure:
+// ~30% of the terminal, clamped to tile-usable bounds.
+func videoPanelWidth(termW int) int {
+	if termW < 120 {
+		return 0
+	}
+	w := termW * 30 / 100
+	if w < 32 {
+		w = 32
+	}
+	if w > 48 {
+		w = 48
+	}
+	return w
+}
+
+// videoChrome decides the video UI placement for a settled layout: right
+// panel (returns width, 0 strip rows) or bottom strip (0 width, rows).
+// The transcript keeps a readable floor in both modes.
+func (c chatScreen) videoChrome(l layout) (panelW, stripRows int) {
+	innerW := widthInsideFrame(c.width, l.frameOn)
+	sideW := 0
+	if l.sidebarOn {
+		sideW = l.sidebarWidth + 1
+	}
+	bodyH := l.headRows + l.vpHeight
+	if l.boxedTranscript && l.vpHeight > 0 {
+		bodyH += transcriptBorder
+	}
+	// Right panel: needs width for tiles plus a tall body column.
+	if w := videoPanelWidth(c.width); w > 0 && bodyH >= 22 {
+		if avail := innerW - sideW - (w + 1) - transcriptBorder; avail >= 48 {
+			return w, 0
+		}
+	}
+	// Bottom strip fallback (height split, transcript keeps 4+ rows).
+	if c.width >= 40 && c.height >= 24 {
+		if stripRows = min(max(8, c.height/3), min(24, l.vpHeight-4)); stripRows >= 8 {
+			return 0, stripRows
+		}
+	}
+	return 0, 0
 }
 
 // videoPaneGeom is the single source of truth for the ASCII picture size:
