@@ -18,7 +18,9 @@ import { anonymizeIp } from "./crypto";
 //   room:{code}:sig:{username}  list  JSON notes {from, type, payload, ts} (5 min TTL)
 //   room:{code}:inbox:{username} hash msgId -> JSON box {msgId, from, kind, payload, ts} (1h TTL)
 //
-// Roles: creator (room maker, rank 2) > admin (rank 1) > member (rank 0).
+// Roles: creator (main admin, rank 2) > admin (rank 1) > member (rank 0).
+// Kick: creator kicks anyone but self; admins kick members only; members
+// kick nobody; the creator cannot be kicked. Grant/revoke: creator only.
 // Moderation (kick/grant) requires strictly higher rank; creator is
 // immutable. Pre-roles rooms (no creator in meta, no role on members)
 // default to member and refuse moderation until recreated.
@@ -497,11 +499,11 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
 
 // ─── Moderation (creator/admin privileges) ─────────────────────────────────
 //
-// Rank: creator (2) > admin (1) > member (0). Moderation requires strictly
-// higher rank than the target, so nobody can kick/demote themselves,
-// peers, or superiors. The creator is immutable; admins are granted and
-// revoked by the creator only. Kicks ban the username while the room lives
-// (rejoin returns 403) and wipe the target's transient queues.
+// The room creator (main admin) holds every privilege: kick anyone except
+// themselves, grant/revoke admin. Granted admins may kick regular members
+// only — never another admin, never the creator. Members moderate nobody.
+// The creator is immune and immutable. Kicks ban the username while the
+// room lives (rejoin returns 403) and wipe the target's transient queues.
 
 function requireRole(members: Record<string, string>, username: string): { member: MemberInfo; rank: number } {
   const raw = members[username];
@@ -522,10 +524,18 @@ export async function kickMember(
   if (!all) throw new RoomError(404, "Session not found");
   const meta = await getRoomMeta(code);
   if (!meta?.creator) throw new RoomError(403, "This room predates roles — recreate it to enable moderation");
-  const { rank: actorRank } = requireRole(all, actor);
-  const { rank: targetRank } = requireRole(all, target);
-  if (actorRank <= targetRank) {
-    throw new RoomError(403, actor === target ? "You cannot kick yourself" : "Only a higher rank can kick that user");
+  const { member: actorMember } = requireRole(all, actor);
+  const { member: targetMember } = requireRole(all, target);
+  if (actor === target) throw new RoomError(403, "You cannot kick yourself");
+  if (targetMember.role === "creator") throw new RoomError(403, "Nobody can kick the room creator");
+  if (actorMember.role === "creator") {
+    // Main admin: full privilege, anyone but themselves (checked above).
+  } else if (actorMember.role === "admin" && targetMember.role === "member") {
+    // Granted admins may kick regular members only.
+  } else if (actorMember.role === "admin") {
+    throw new RoomError(403, "Only the room creator can kick an admin");
+  } else {
+    throw new RoomError(403, "Only the room creator or an admin can kick users");
   }
   // Best-effort transient cleanup (mirrors leaveRoom): failures must never
   // block the kick itself.

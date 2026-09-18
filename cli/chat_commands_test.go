@@ -171,16 +171,17 @@ func TestPaletteNavigationAndTabCompletes(t *testing.T) {
 	down := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown}); return m.(chatScreen) }
 	up := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyUp}); return m.(chatScreen) }
 
-	// Ranked "" = [/admin, /audio, /download, /help, ...] (alphabetical);
-	// down lands on /audio, up returns to the top (= /admin).
+	// Unwired screen = member role: mod commands are hidden, so ranked ""
+	// is [/audio, /download, /help, /upload, /video] (alphabetical); down
+	// lands on /download, up returns to the top (= /audio).
 	c = down(c)
 	if got := c.input.Value(); got != "/" || c.palette.sel != 1 {
 		t.Fatalf("down did not move to second row: input=%q sel=%d", got, c.palette.sel)
 	}
 	c = up(c)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyTab})
-	if got := c.input.Value(); got != "/admin " {
-		t.Fatalf("tab completion gave %q; want \"/admin \"", got)
+	if got := c.input.Value(); got != "/audio " {
+		t.Fatalf("tab completion gave %q; want \"/audio \"", got)
 	}
 	if c.palette.visible() {
 		t.Fatal("tab completion must close the drawer")
@@ -351,6 +352,113 @@ func TestKickDoneAppliesRoster(t *testing.T) {
 	sc = m.(chatScreen)
 	if len(sc.users) != 1 {
 		t.Fatalf("failed kick must not touch users: %v", sc.users)
+	}
+}
+
+func TestKickMatrixFakeServer(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	alice := newSignalTestClient(srv, "alice") // room creator = main admin
+	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice.key = sid
+	mk := func(u string) *signalClient {
+		c := newSignalTestClient(srv, u)
+		c.key = sid
+		if _, _, err := c.joinRoom(u, "pubkey-"+u, ""); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	bob, carol, dave := mk("bob"), mk("carol"), mk("dave")
+
+	mustFail := func(err error, what string) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s must fail", what)
+		}
+	}
+	// Members moderate nobody; non-creators cannot grant.
+	mustFail(func() error { _, _, e := carol.kickUser("dave"); return e }(), "member kick")
+	mustFail(func() error { _, _, e := bob.setRole("carol", true); return e }(), "non-creator grant")
+	// Creator grants two admins; admins can never touch each other.
+	if _, _, err := alice.setRole("bob", true); err != nil {
+		t.Fatalf("creator grant: %v", err)
+	}
+	if _, _, err := alice.setRole("carol", true); err != nil {
+		t.Fatalf("creator grant: %v", err)
+	}
+	mustFail(func() error { _, _, e := bob.kickUser("carol"); return e }(), "admin kick admin")
+	mustFail(func() error { _, _, e := carol.kickUser("bob"); return e }(), "admin kick admin")
+	mustFail(func() error { _, _, e := bob.setRole("carol", false); return e }(), "admin unadmin")
+	// The creator is immune to everyone.
+	mustFail(func() error { _, _, e := bob.kickUser("alice"); return e }(), "admin kick creator")
+	mustFail(func() error { _, _, e := dave.kickUser("alice"); return e }(), "member kick creator")
+	// Admins kick members; creator kicks admins.
+	if _, _, err := bob.kickUser("dave"); err != nil {
+		t.Fatalf("admin kick member: %v", err)
+	}
+	if _, _, err := alice.kickUser("bob"); err != nil {
+		t.Fatalf("creator kick admin: %v", err)
+	}
+}
+
+func TestModVisibilityByRole(t *testing.T) {
+	names := func(role string) []string {
+		out := []string{}
+		for _, cmd := range visibleSlashCommands(role) {
+			out = append(out, cmd.Name)
+		}
+		return out
+	}
+	has := func(role, name string) bool {
+		for _, n := range names(role) {
+			if n == name {
+				return true
+			}
+		}
+		return false
+	}
+	// Creator sees everything; admins see /kick only; members see none.
+	for _, cmd := range slashCommands {
+		if !has("creator", cmd.Name) {
+			t.Fatalf("creator must see %s", cmd.Name)
+		}
+	}
+	if !has("admin", "/kick") || has("admin", "/admin") || has("admin", "/unadmin") {
+		t.Fatalf("admin visibility = %v; want only /kick among mod commands", names("admin"))
+	}
+	for _, mod := range []string{"/kick", "/admin", "/unadmin"} {
+		if has("member", mod) || has("", mod) {
+			t.Fatalf("role member/unknown must not see %s", mod)
+		}
+	}
+
+	// Unwired engine fails closed to member (no mod rows).
+	memberScreen := newPaletteScreen()
+	if got := memberScreen.myRole(); got != "member" {
+		t.Fatalf("unwired myRole = %q; want member", got)
+	}
+	if ranked := memberScreen.rankedCommands("/"); len(ranked) != len(slashCommands)-3 {
+		t.Fatalf("member palette has %d rows; want %d (no mod commands)", len(ranked), len(slashCommands)-3)
+	}
+
+	// Wired creator sees their rank after a beat.
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob")
+	c.eng.beatOnce()
+	if got := c.myRole(); got != "creator" {
+		t.Fatalf("room maker myRole = %q; want creator", got)
+	}
+	if ranked := c.rankedCommands("/"); len(ranked) != len(slashCommands) {
+		t.Fatalf("creator palette has %d rows; want all %d", len(ranked), len(slashCommands))
 	}
 }
 

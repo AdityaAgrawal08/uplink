@@ -283,7 +283,13 @@ describe("delivery hardening", () => {
     expect(granted.roster.find((m) => m.username === admin)?.role).toBe("admin");
     expect(granted.epoch).toBeGreaterThan(0);
 
-    // Admin kicks members, never the creator or fellow admins.
+    // A second admin: admins can never kick each other — only the creator can.
+    await setRole(sessionId, creator, member, "admin");
+    await expect(kickMember(sessionId, admin, member)).rejects.toMatchObject({ status: 403 });
+    await expect(kickMember(sessionId, member, admin)).rejects.toMatchObject({ status: 403 });
+    await setRole(sessionId, creator, member, "member");
+
+    // Admin kicks members, never the creator.
     await expect(kickMember(sessionId, admin, creator)).rejects.toMatchObject({ status: 403 });
     const kicked = await kickMember(sessionId, admin, victim);
     expect(kicked.remaining).toBe(3);

@@ -63,6 +63,54 @@ func rankedSlashCommands(query string) []slashCommand {
 	return rankSlashCommands(slashCommands, query)
 }
 
+// visibleSlashCommands filters the registry to what a role may use: the
+// room creator (main admin) sees every moderation command, granted admins
+// see /kick only, everyone else sees none. Visibility always mirrors
+// capability — the server re-enforces every call, so a typed command for a
+// hidden row fails closed with the server's 403.
+func visibleSlashCommands(role string) []slashCommand {
+	out := make([]slashCommand, 0, len(slashCommands))
+	for _, cmd := range slashCommands {
+		switch cmd.Name {
+		case "/admin", "/unadmin":
+			if role != "creator" {
+				continue
+			}
+		case "/kick":
+			if role != "creator" && role != "admin" {
+				continue
+			}
+		}
+		out = append(out, cmd)
+	}
+	return out
+}
+
+// myRole reports our roster role (creator|admin|member). Anything unknown —
+// engine unwired, heartbeat not yet in, pre-roles server — fails closed to
+// member: moderation rows stay hidden until a beat proves otherwise.
+func (c *chatScreen) myRole() string {
+	if c.eng == nil {
+		return "member"
+	}
+	for _, m := range c.eng.peers() {
+		if m.Username == c.me {
+			if m.Role == "creator" || m.Role == "admin" {
+				return m.Role
+			}
+			return "member"
+		}
+	}
+	return "member"
+}
+
+// rankedCommands orders the commands visible to OUR role for the query.
+// Every palette path (paint, budget, keys, Tab, Enter) must use this — never
+// the raw registry — or hidden commands leak back in.
+func (c *chatScreen) rankedCommands(query string) []slashCommand {
+	return rankSlashCommands(visibleSlashCommands(c.myRole()), query)
+}
+
 // ---- palette styling ---------------------------------------------------------
 //
 // The drawer borrows the composer's rounded border + accent colour so the
@@ -158,7 +206,7 @@ func (c chatScreen) paletteRows() int {
 	if !c.palette.visible() {
 		return 0
 	}
-	n := len(rankedSlashCommands(c.input.Value()))
+	n := len(c.rankedCommands(c.input.Value()))
 	if n == 0 {
 		return 0
 	}
@@ -316,7 +364,7 @@ func (c chatScreen) paletteView(maxW int) string {
 	if !c.palette.visible() || maxW < 6 {
 		return ""
 	}
-	ranked := rankedSlashCommands(c.input.Value())
+	ranked := c.rankedCommands(c.input.Value())
 	if len(ranked) == 0 {
 		return ""
 	}
@@ -388,13 +436,13 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	}
 	switch msg.Type {
 	case tea.KeyUp:
-		c.palette.moveUp(visibleCount(len(rankedSlashCommands(c.input.Value()))))
+		c.palette.moveUp(visibleCount(len(c.rankedCommands(c.input.Value()))))
 		return true, nil
 	case tea.KeyDown:
-		c.palette.moveDown(visibleCount(len(rankedSlashCommands(c.input.Value()))))
+		c.palette.moveDown(visibleCount(len(c.rankedCommands(c.input.Value()))))
 		return true, nil
 	case tea.KeyTab:
-		ranked := rankedSlashCommands(c.input.Value())
+		ranked := c.rankedCommands(c.input.Value())
 		c.palette.clampSel(visibleCount(len(ranked)))
 		if c.palette.sel < len(ranked) {
 			c.input.SetValue(ranked[c.palette.sel].Name + " ") // complete inline
@@ -402,7 +450,7 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 		}
 		return true, nil
 	case tea.KeyEnter:
-		ranked := rankedSlashCommands(c.input.Value())
+		ranked := c.rankedCommands(c.input.Value())
 		c.palette.clampSel(visibleCount(len(ranked)))
 		if c.palette.sel < len(ranked) {
 			name := ranked[c.palette.sel].Name
@@ -424,8 +472,9 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "/help":
-		names := make([]string, 0, len(slashCommands))
-		for _, cmd := range slashCommands { // derived, so /help never goes stale
+		visible := visibleSlashCommands(c.myRole())
+		names := make([]string, 0, len(visible))
+		for _, cmd := range visible { // derived, so /help never goes stale
 			names = append(names, cmd.Name)
 		}
 		hint := "* Commands: " + strings.Join(names, " · ") +

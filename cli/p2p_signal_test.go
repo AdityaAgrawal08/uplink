@@ -62,7 +62,12 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.write(w, 409, map[string]string{"error": "taken"})
 			return
 		}
-		f.members[code][body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true}
+		// First member through create owns the room (mirrors server creator).
+		role := "member"
+		if len(f.members[code]) == 0 {
+			role = "creator"
+		}
+		f.members[code][body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true, Role: role}
 		f.write(w, 201, map[string]string{"sessionId": code})
 		return
 	}
@@ -101,7 +106,7 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.write(w, 409, map[string]string{"error": "Username already taken"})
 			return
 		}
-		members[body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true}
+		members[body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true, Role: "member"}
 		f.epochs[code]++
 		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{body.Username}, "roster": roster(), "epoch": f.epochs[code]})
 	case "leave|POST":
@@ -186,7 +191,8 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"boxes": out, "epoch": f.epochs[code]})
 	case "kick|POST":
 		me := f.me(r)
-		if _, ok := members[me]; !ok {
+		actor, ok := members[me]
+		if !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
 		}
@@ -194,8 +200,29 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Target string `json:"target"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
-		if _, ok := members[body.Target]; !ok {
+		tgt, ok := members[body.Target]
+		if !ok {
 			f.write(w, 404, map[string]string{"error": "User is not in this session"})
+			return
+		}
+		// Matrix mirrors the real server: creator kicks anyone but self;
+		// admins kick members only; the creator cannot be kicked.
+		switch {
+		case me == body.Target:
+			f.write(w, 403, map[string]string{"error": "You cannot kick yourself"})
+			return
+		case tgt.Role == "creator":
+			f.write(w, 403, map[string]string{"error": "Nobody can kick the room creator"})
+			return
+		case actor.Role == "creator":
+			// full privilege
+		case actor.Role == "admin" && tgt.Role == "member":
+			// granted admins kick members only
+		case actor.Role == "admin":
+			f.write(w, 403, map[string]string{"error": "Only the room creator can kick an admin"})
+			return
+		default:
+			f.write(w, 403, map[string]string{"error": "Only the room creator or an admin can kick users"})
 			return
 		}
 		delete(members, body.Target)
@@ -203,8 +230,13 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"ok": true, "roster": roster(), "epoch": f.epochs[code], "remaining": len(members)})
 	case "admin|POST":
 		me := f.me(r)
-		if _, ok := members[me]; !ok {
+		actor, ok := members[me]
+		if !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		if actor.Role != "creator" {
+			f.write(w, 403, map[string]string{"error": "Only the room creator can grant admin"})
 			return
 		}
 		var body struct {
@@ -212,9 +244,17 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Admin  bool   `json:"admin"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
+		if me == body.Target {
+			f.write(w, 403, map[string]string{"error": "You cannot change your own role"})
+			return
+		}
 		m, ok := members[body.Target]
 		if !ok {
 			f.write(w, 404, map[string]string{"error": "User is not in this session"})
+			return
+		}
+		if m.Role == "creator" {
+			f.write(w, 403, map[string]string{"error": "The creator role cannot be changed"})
 			return
 		}
 		role := "member"
