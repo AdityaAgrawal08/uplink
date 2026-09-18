@@ -17,6 +17,7 @@ type fakeSignalServer struct {
 	members map[string]map[string]rosterMember // code -> username -> member
 	signals map[string][]signalNote            // code/username -> notes
 	boxes   map[string]map[string]inboxBox     // code/username -> msgId -> box
+	epochs  map[string]int64                   // code -> roster generation (join/leave bumps)
 }
 
 func newFakeSignalServer() *fakeSignalServer {
@@ -24,6 +25,7 @@ func newFakeSignalServer() *fakeSignalServer {
 		members: map[string]map[string]rosterMember{},
 		signals: map[string][]signalNote{},
 		boxes:   map[string]map[string]inboxBox{},
+		epochs:  map[string]int64{},
 	}
 }
 
@@ -100,9 +102,13 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		members[body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true}
-		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{body.Username}, "roster": roster()})
+		f.epochs[code]++
+		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{body.Username}, "roster": roster(), "epoch": f.epochs[code]})
 	case "leave|POST":
 		me := f.me(r)
+		if _, ok := members[me]; ok {
+			f.epochs[code]++
+		}
 		delete(members, me)
 		remaining := len(members)
 		ended := remaining == 0
@@ -116,7 +122,7 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
 		}
-		f.write(w, 200, map[string]any{"ok": true, "activeUsers": []string{me}, "roster": roster()})
+		f.write(w, 200, map[string]any{"ok": true, "activeUsers": []string{me}, "roster": roster(), "epoch": f.epochs[code]})
 	case "signal|POST":
 		me := f.me(r)
 		if _, ok := members[me]; !ok {
@@ -177,7 +183,48 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, b := range f.boxes[code+"/"+me] {
 			out = append(out, b)
 		}
-		f.write(w, 200, map[string]any{"boxes": out})
+		f.write(w, 200, map[string]any{"boxes": out, "epoch": f.epochs[code]})
+	case "kick|POST":
+		me := f.me(r)
+		if _, ok := members[me]; !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		var body struct {
+			Target string `json:"target"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if _, ok := members[body.Target]; !ok {
+			f.write(w, 404, map[string]string{"error": "User is not in this session"})
+			return
+		}
+		delete(members, body.Target)
+		f.epochs[code]++
+		f.write(w, 200, map[string]any{"ok": true, "roster": roster(), "epoch": f.epochs[code], "remaining": len(members)})
+	case "admin|POST":
+		me := f.me(r)
+		if _, ok := members[me]; !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		var body struct {
+			Target string `json:"target"`
+			Admin  bool   `json:"admin"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		m, ok := members[body.Target]
+		if !ok {
+			f.write(w, 404, map[string]string{"error": "User is not in this session"})
+			return
+		}
+		role := "member"
+		if body.Admin {
+			role = "admin"
+		}
+		m.Role = role
+		members[body.Target] = m
+		f.epochs[code]++
+		f.write(w, 200, map[string]any{"ok": true, "roster": roster(), "epoch": f.epochs[code]})
 	case "inbox/ack|POST":
 		me := f.me(r)
 		if _, ok := members[me]; !ok {
@@ -220,12 +267,15 @@ func TestSignalFullFlow(t *testing.T) {
 
 	bob := newSignalTestClient(srv, "bob")
 	bob.key = sid
-	roster, err := bob.joinRoom("bob", "pubkey-bob", "")
+	roster, epoch, err := bob.joinRoom("bob", "pubkey-bob", "")
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
 	if len(roster) != 2 {
 		t.Fatalf("expected 2 members, got %d", len(roster))
+	}
+	if epoch != 1 {
+		t.Fatalf("join must report bumped epoch, got %d", epoch)
 	}
 	for _, m := range roster {
 		if m.Pubkey == "" {
@@ -234,13 +284,15 @@ func TestSignalFullFlow(t *testing.T) {
 	}
 
 	// duplicate claim
-	if _, err := bob.joinRoom("alice", "pubkey-x", ""); err == nil {
+	if _, _, err := bob.joinRoom("alice", "pubkey-x", ""); err == nil {
 		t.Fatal("expected 409 on duplicate username")
 	}
 
-	// heartbeat
-	if _, err := bob.heartbeat("peer1", []string{"/ip4/1.2.3.4/tcp/1"}); err != nil {
+	// heartbeat carries the roster epoch
+	if _, epoch, err := bob.heartbeat("peer1", []string{"/ip4/1.2.3.4/tcp/1"}); err != nil {
 		t.Fatalf("heartbeat: %v", err)
+	} else if epoch != 1 {
+		t.Fatalf("heartbeat epoch = %d; want 1", epoch)
 	}
 
 	// signaling roundtrip
@@ -266,18 +318,21 @@ func TestSignalFullFlow(t *testing.T) {
 	if err := alice.inboxSend("bob", "m1", "chat", "CIPH"); err != nil {
 		t.Fatalf("retry must succeed: %v", err)
 	}
-	boxes, err := bob.inboxFetch()
+	boxes, epoch, err := bob.inboxFetch()
 	if err != nil {
 		t.Fatalf("inboxFetch: %v", err)
 	}
 	if len(boxes) != 1 || boxes[0].MsgId != "m1" {
 		t.Fatalf("wrong boxes: %+v", boxes)
 	}
+	if epoch != 1 {
+		t.Fatalf("inbox epoch = %d; want 1", epoch)
+	}
 	n, err := bob.inboxAck([]string{"m1"})
 	if err != nil || n != 1 {
 		t.Fatalf("ack: %v %d", err, n)
 	}
-	boxes, _ = bob.inboxFetch()
+	boxes, _, _ = bob.inboxFetch()
 	if len(boxes) != 0 {
 		t.Fatal("inbox must be empty after ack")
 	}
@@ -285,7 +340,7 @@ func TestSignalFullFlow(t *testing.T) {
 	// guards
 	eve := newSignalTestClient(srv, "eve")
 	eve.key = sid
-	if _, err := eve.inboxFetch(); err == nil {
+	if _, _, err := eve.inboxFetch(); err == nil {
 		t.Fatal("expected 403 for non-member")
 	}
 	if err := alice.inboxSend("ghost", "m2", "chat", "x"); err == nil {
@@ -299,7 +354,7 @@ func TestSignalFullFlow(t *testing.T) {
 	if err := bob.leaveRoom(); err != nil {
 		t.Fatalf("leave: %v", err)
 	}
-	if _, err := eve.joinRoom("eve", "pub", ""); err == nil {
+	if _, _, err := eve.joinRoom("eve", "pub", ""); err == nil {
 		t.Fatal("expected 404 joining destroyed room")
 	}
 }

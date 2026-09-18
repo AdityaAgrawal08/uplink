@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -91,7 +92,86 @@ type pickerState struct {
 
 func (p *pickerState) isActive() bool { return p.active }
 
-// openPicker enters browser mode rooted at $HOME.
+// documentsDir resolves the OS-aware starting folder for the upload
+// browser via the Go runtime (no hardcoded paths): the user's Documents
+// folder on each OS, falling back to $HOME when it doesn't exist.
+// Install-time configs can't know the user's layout, so this resolves at
+// runtime on every open.
+func documentsDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	var candidates []string
+	switch runtime.GOOS {
+	case "windows":
+		// %USERPROFILE%\Documents is the default; OneDrive KFR moves it
+		// under %OneDriveCommercial%\%USERPROFILE-relative path, and
+		// HOMEDRIVE+HOMEPATH covers roaming profiles.
+		profile := os.Getenv("USERPROFILE")
+		candidates = []string{
+			filepath.Join(profile, "Documents"),
+			filepath.Join(os.Getenv("OneDriveCommercial"), profileRel(profile), "Documents"),
+			filepath.Join(os.Getenv("HOMEDRIVE")+os.Getenv("HOMEPATH"), "Documents"),
+			filepath.Join(home, "Documents"),
+		}
+	case "darwin":
+		candidates = []string{filepath.Join(home, "Documents")}
+	default: // linux and other unix-likes: XDG first (localized names)
+		if xdg := xdgDocumentsDir(home); xdg != "" {
+			return xdg
+		}
+		candidates = []string{filepath.Join(home, "Documents")}
+	}
+	for _, dir := range candidates {
+		if dir == "" || dir == "." {
+			continue
+		}
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			return dir
+		}
+	}
+	return home
+}
+
+// profileRel strips the drive/volume prefix so a %USERPROFILE% path can be
+// re-rooted under OneDrive (C:\Users\bob -> Users\bob). "" when unusable.
+func profileRel(profile string) string {
+	if profile == "" {
+		return ""
+	}
+	if vol := filepath.VolumeName(profile); vol != "" {
+		profile = strings.TrimPrefix(profile, vol)
+	}
+	return strings.TrimLeft(profile, `/\`)
+}
+
+// xdgDocumentsDir reads XDG_DOCUMENTS_DIR from ~/.config/user-dirs.dirs
+// (handles $HOME prefixes and quoting); "" when unset or unusable.
+func xdgDocumentsDir(home string) string {
+	raw, err := os.ReadFile(filepath.Join(home, ".config", "user-dirs.dirs"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "XDG_DOCUMENTS_DIR=") {
+			continue
+		}
+		val := strings.Trim(strings.TrimPrefix(line, "XDG_DOCUMENTS_DIR="), `"`)
+		val = strings.ReplaceAll(val, "$HOME", home)
+		if !filepath.IsAbs(val) {
+			return ""
+		}
+		if st, err := os.Stat(val); err == nil && st.IsDir() {
+			return val
+		}
+		return ""
+	}
+	return ""
+}
+
+// openPicker enters browser mode rooted at the OS Documents folder.
 func (c *chatScreen) openPicker() tea.Cmd {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -107,7 +187,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 	c.picker = pickerState{
 		active:   true,
 		mode:     modeBrowse,
-		cwd:      home,
+		cwd:      documentsDir(),
 		home:     home,
 		anchor:   -1,
 		buffered: c.uploadBuf,

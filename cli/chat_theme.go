@@ -103,14 +103,6 @@ func tileFeedCap(termW int) int {
 	return 4
 }
 
-// sendBtnWidthFor shrinks the Send button to an icon on narrow transcripts.
-func sendBtnWidthFor(transcriptOuter int) int {
-	if transcriptOuter < 60 {
-		return 6
-	}
-	return sendBtnWidth
-}
-
 // ---- palette --------------------------------------------------------------
 
 const (
@@ -174,11 +166,6 @@ var (
 
 	thBubbleTimeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#c3cede"))
 
-	thSendBtnStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color(thBlue)).
-			Foreground(lipgloss.Color("#ffffff")).
-			Bold(true)
-
 	thClipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
 
 	thFileCardStyle = lipgloss.NewStyle().
@@ -190,16 +177,6 @@ var (
 	thFileNameStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText))
 	thFileMetaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
 	thFileDlStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
-
-	thTabActiveStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(thBlue)).
-				Foreground(lipgloss.Color("#ffffff")).
-				Bold(true)
-	thTabInactiveStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#16233d")).
-				Foreground(lipgloss.Color(thDim))
-	thTabStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(thDim))
 
 	thCamTitleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
 	thCamNameStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
@@ -396,24 +373,21 @@ func (c *chatScreen) itemIndexFor(peer string) int {
 
 // ---- top bar -----------------------------------------------------------------
 
-// topBarView paints the app banner: logo + promises left, signal/lock/clock
-// right. Pure function of width + wall clock. Density collapses in steps:
-// full promises + date on wide, essentials in the middle, logo + time only
-// when cramped.
+// topBarView paints the app banner: logo left, signal/lock/clock right.
+// Pure function of width + wall clock. Density collapses in steps: date on
+// wide, essentials in the middle, logo + time only when cramped.
 func topBarView(w int) string {
 	now := time.Now()
 	enc := thLockStyle.Render("🔒 End-to-End Encrypted")
 	var left, right string
 	switch {
 	case w <= 0 || w >= 110:
-		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
-			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
 		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarDimStyle.Render(now.Format("Mon, 02 Jan 2006")) + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
 	case w >= 85:
-		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
-			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
 		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
 	case w >= 55:
@@ -468,29 +442,12 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		}
 	}
 	// Width() would wrap overlong rows and break the exact-row contract, so
-	// content is hard-truncated to fit instead; the style only pads. Tabs
-	// ride the name row (short) so the long context sub never squeezes out.
+	// content is hard-truncated to fit instead; the style only pads.
 	name = truncateStringPlain(name, maxInt(outerW-lipgloss.Width(av)-4, 1))
 	line1 := av + "  " + thRoomNameStyle.Render(name)
-	line1 = roomTabsLine(outerW, line1)
 	line2 := "     " + thRoomSubStyle.Render(truncateStringPlain(sub, maxInt(outerW-6, 0)))
 	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
 	return st.Render(line1) + "\n" + st.Render(line2)
-}
-
-// roomTabsLine appends the right-aligned Chat/Files tabs + menu to the room
-// header's name row. Geometry mirrors roomTabsGeoms (hit-testing): the Chat
-// chip is 6 cells, Files 7, ⋮ 3, single-space separated.
-func roomTabsLine(outerW int, line1 string) string {
-	chat := thTabActiveStyle.Render(" Chat ")
-	files := thTabInactiveStyle.Render(" Files ")
-	more := thTabStyle.Render(" ⋮ ")
-	tabs := chat + " " + files + " " + more
-	gap := outerW - lipgloss.Width(stripForWidth(line1)) - lipgloss.Width(tabs)
-	if gap < 1 || outerW < 50 {
-		return line1 // cramped: no tabs painted, none hit-testable either
-	}
-	return line1 + strings.Repeat(" ", gap) + tabs
 }
 
 // roomHeaderCompact paints the 1-row room heading for short/narrow
@@ -523,9 +480,6 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 
 // ---- composer -------------------------------------------------------------------
 
-// sendBtnWidth is the fixed outer width of the Send button.
-const sendBtnWidth = 10
-
 // truncateByWidth hard-cuts a string to w CELLS (width-aware: wide runes
 // count double). Width-truncation keeps single-row views exact where
 // rune-truncation would overflow on emoji/double-width glyphs.
@@ -534,27 +488,6 @@ func truncateByWidth(s string, w int) string {
 		return ""
 	}
 	return ansi.Truncate(s, w, "")
-}
-
-// sendButtonView renders the blue Send button at exactly sendW wide
-// and boxH rows tall (matches the composer box height; the style is
-// borderless so every row is button face). Narrow transcripts get an icon.
-func sendButtonView(boxH, sendW int) string {
-	inner := maxInt(boxH, 1)
-	label := "Send"
-	if sendW < sendBtnWidth {
-		label = "➤"
-	}
-	rows := make([]string, 0, inner)
-	mid := inner / 2
-	for i := 0; i < inner; i++ {
-		if i == mid {
-			rows = append(rows, thSendBtnStyle.Width(sendW-2).Align(lipgloss.Center).Render(label))
-		} else {
-			rows = append(rows, thSendBtnStyle.Width(sendW-2).Render(" "))
-		}
-	}
-	return thSendBtnStyle.Width(sendW).Render(strings.Join(rows, "\n"))
 }
 
 // composerTopRows counts the terminal rows above the composer box, mirroring
@@ -586,49 +519,13 @@ func composerTopRows(l layout) int {
 	return top
 }
 
-// roomTabsGeoms maps the Chat/Files/⋮ tab hit rects in terminal coords.
-// Mirrors roomTabsLine exactly: right-aligned tabs, none when cramped.
-func roomTabsGeoms(c *chatScreen, l layout) (chat, files, more tabRect, ok bool) {
-	if l.headRows < 2 || c.width == 0 || c.height == 0 {
-		return tabRect{}, tabRect{}, tabRect{}, false
-	}
-	outerW := l.vpWidth + 2
-	if outerW < 50 {
-		return tabRect{}, tabRect{}, tabRect{}, false
-	}
-	frameOff := 0
-	if l.frameOn {
-		frameOff = 1
-	}
-	headOff := 0
-	if l.showHeader {
-		headOff = headerHeight
-	}
-	y := frameOff + headOff // first room-header row
-	tx0 := transcriptX0(l)
-	x1 := tx0 + outerW
-	more = tabRect{x0: x1 - 3, x1: x1, y: y}
-	files = tabRect{x0: x1 - 3 - 1 - 7, x1: x1 - 3 - 1, y: y}
-	chat = tabRect{x0: x1 - 3 - 1 - 7 - 1 - 6, x1: x1 - 3 - 1 - 7 - 1, y: y}
-	return chat, files, more, true
-}
-
-// tabRect is one clickable tab (x1 exclusive, single row y).
-type tabRect struct {
-	x0, x1, y int
-}
-
-// hit reports whether a terminal point lands in the tab.
-func (t tabRect) hit(x, y int) bool {
-	return y == t.y && x >= t.x0 && x < t.x1
-}
-
 // composerGeoms derives the composer hit-test geometry deterministically from
-// the layout so View() and handleMouse() agree. Returns the Send button
-// x-range [sendX0,sendX1), its y-range [y0,y1), and the clip glyph column.
-// sendX0 < 0 when no button is painted (bare prompt mode).
-func composerGeoms(l layout, termW, termH int) (sendX0, sendX1, y0, y1, clipX int) {
-	sendX0, sendX1, clipX = -1, -1, -1
+// the layout so View() and handleMouse() agree. Returns the clip glyph
+// column and its single-row y-range [y0,y1) — the clip sits on the composer
+// field row (middle of the box). clipX < 0 when no clip is painted (bare
+// prompt mode, or too narrow to fit it).
+func composerGeoms(l layout, termW, termH int) (clipX, y0, y1 int) {
+	clipX = -1
 	if l.composerRows <= 0 {
 		return
 	}
@@ -638,13 +535,10 @@ func composerGeoms(l layout, termW, termH int) (sendX0, sendX1, y0, y1, clipX in
 	}
 	txX0 := frameOff + composerIndent(l)
 	transcriptOuter := l.vpWidth + 2
+	inputOuter := transcriptOuter // message box spans the full column width
 	boxH := l.composerRows + 2
-	y0 = composerTopRows(l)
-	y1 = y0 + boxH
-	sendW := sendBtnWidthFor(transcriptOuter)
-	inputOuter := transcriptOuter - sendW - 1
-	sendX0 = txX0 + inputOuter + 1
-	sendX1 = sendX0 + sendW
+	y0 = composerTopRows(l) + boxH/2 // the field row (middle of the box)
+	y1 = y0 + 1
 	if inputOuter >= 26 {
 		clipX = txX0 + inputOuter - 2
 	}

@@ -21,14 +21,16 @@ type slashCommand struct {
 }
 
 // slashCommands is the full catalogue. Keep it the ONLY place a command is
-// declared; execution switches on Name below. Product direction: exactly
-// /help, /upload, /download — nothing else.
+// declared; execution switches on Name below.
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
 	{Name: "/video", Desc: "toggle camera to your DM peer / the room"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
+	{Name: "/kick", Desc: "kick a user (creator/admin only)"},
+	{Name: "/admin", Desc: "grant admin (room creator only)"},
+	{Name: "/unadmin", Desc: "revoke admin (room creator only)"},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -190,7 +192,7 @@ func (c chatScreen) layoutFor() layout {
 	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
 	// Live-call status card (pinned above the transcript while a call runs).
 	l.callRows = 0
-	if c.callActive() && l.vpHeight-l.headRows >= 12 {
+	if c.callActive() && l.vpHeight-l.headRows >= 10 {
 		l.callRows = callCardRows
 	}
 	// Composer key-hints footer (truthful bindings only, see keyHintsView).
@@ -201,23 +203,6 @@ func (c chatScreen) layoutFor() layout {
 	l.vpHeight -= l.headRows + l.callRows + l.hintRows
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
-	}
-	// Video UI: right panel when wide (width split), bottom strip when
-	// narrow (height split), hidden when neither fits.
-	l.vidPanelW, l.camRows = c.videoChrome(l)
-	if l.camRows > 0 {
-		l.vpHeight -= l.camRows
-		if l.vpHeight < 0 {
-			l.vpHeight = 0
-			l.camRows = 0
-		}
-	}
-	// Right panel shrinks the transcript column (never below readable).
-	if l.vidPanelW > 0 {
-		l.vpWidth -= l.vidPanelW + 1 // panel + spacer
-		if l.vpWidth < 10 {
-			l.vpWidth = 10
-		}
 	}
 	// Roster adapts to the settled viewport: search row eats one slot.
 	l.rosterSlots = l.vpHeight - 1
@@ -423,7 +408,7 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 			name := ranked[c.palette.sel].Name
 			c.input.SetValue("")
 			c.palette.close()
-			return true, func() tea.Cmd { return c.runCommand(name) }
+			return true, func() tea.Cmd { return c.runCommand(name, "") }
 		}
 		return true, nil
 	case tea.KeyEsc:
@@ -433,9 +418,10 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	return false, nil
 }
 
-// runCommand executes a slash command by canonical name. Leaving the session
-// is deliberately NOT a command — Ctrl+C is the single exit path.
-func (c *chatScreen) runCommand(name string) tea.Cmd {
+// runCommand executes a slash command by canonical name + raw argument
+// ("/kick bob" → name "/kick", arg "bob"). Leaving the session is
+// deliberately NOT a command — Ctrl+C is the single exit path.
+func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "/help":
 		names := make([]string, 0, len(slashCommands))
@@ -454,9 +440,50 @@ func (c *chatScreen) runCommand(name string) tea.Cmd {
 		return c.toggleVideo()
 	case "/audio":
 		return c.toggleAudio()
+	case "/kick":
+		target, ok := modTarget(arg)
+		if !ok {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /kick <username>"))
+			return nil
+		}
+		return func() tea.Msg {
+			roster, epoch, err := c.sig.kickUser(target)
+			return kickDoneMsg{target: target, roster: roster, epoch: epoch, err: err}
+		}
+	case "/admin":
+		target, ok := modTarget(arg)
+		if !ok {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /admin <username>"))
+			return nil
+		}
+		return func() tea.Msg {
+			roster, epoch, err := c.sig.setRole(target, true)
+			return roleDoneMsg{target: target, admin: true, roster: roster, epoch: epoch, err: err}
+		}
+	case "/unadmin":
+		target, ok := modTarget(arg)
+		if !ok {
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /unadmin <username>"))
+			return nil
+		}
+		return func() tea.Msg {
+			roster, epoch, err := c.sig.setRole(target, false)
+			return roleDoneMsg{target: target, admin: false, roster: roster, epoch: epoch, err: err}
+		}
 	default:
 		return nil
 	}
+}
+
+// modTarget normalizes a moderation-command argument: one username, with an
+// optional leading @ forgiven. Usernames are [a-zA-Z0-9_]{3,20} server-side;
+// the server re-validates strictly, this just catches empty/garbage early.
+func modTarget(arg string) (string, bool) {
+	t := strings.TrimPrefix(strings.TrimSpace(arg), "@")
+	if t == "" || strings.ContainsAny(t, " \t") || len(t) > 20 {
+		return "", false
+	}
+	return t, true
 }
 
 // ---- helpers -----------------------------------------------------------------

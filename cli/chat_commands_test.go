@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
+	"errors"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -168,24 +171,26 @@ func TestPaletteNavigationAndTabCompletes(t *testing.T) {
 	down := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyDown}); return m.(chatScreen) }
 	up := func(m tea.Model) chatScreen { m, _ = step(m, tea.KeyMsg{Type: tea.KeyUp}); return m.(chatScreen) }
 
-	// Ranked "" = [/audio, /download, /help, ...] (alphabetical); down
-	// lands on /download, up returns to the top (= /audio).
+	// Ranked "" = [/admin, /audio, /download, /help, ...] (alphabetical);
+	// down lands on /audio, up returns to the top (= /admin).
 	c = down(c)
 	if got := c.input.Value(); got != "/" || c.palette.sel != 1 {
 		t.Fatalf("down did not move to second row: input=%q sel=%d", got, c.palette.sel)
 	}
 	c = up(c)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyTab})
-	if got := c.input.Value(); got != "/audio " {
-		t.Fatalf("tab completion gave %q; want \"/audio \"", got)
+	if got := c.input.Value(); got != "/admin " {
+		t.Fatalf("tab completion gave %q; want \"/admin \"", got)
 	}
 	if c.palette.visible() {
 		t.Fatal("tab completion must close the drawer")
 	}
 
-	// "/u" ranks /upload first; Enter selects it and OPENS THE PICKER.
+	// "/u" prefix-ranks /unadmin before /upload (alphabetical among
+	// prefix matches); "/uplo" is unambiguous — Enter selects /upload
+	// and OPENS THE PICKER.
 	c2 := newPaletteScreen()
-	c2, _ = typeKeys(c2, "/u")
+	c2, _ = typeKeys(c2, "/uplo")
 	got2, cmd := step(c2, tea.KeyMsg{Type: tea.KeyEnter})
 	if !got2.picker.isActive() {
 		t.Fatal("selecting /upload must open the file browser")
@@ -313,6 +318,130 @@ func TestSubmitLineDelegatesRegistryCommands(t *testing.T) {
 	cmd := c.submitLine("/foo hello")
 	if cmd == nil {
 		t.Fatal("unknown /foo must fall through to dispatchSend")
+	}
+}
+
+func TestKickDoneAppliesRoster(t *testing.T) {
+	fs := newFakeSignalServer()
+	srv := httptest.NewServer(fs)
+	defer srv.Close()
+
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob")
+	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+		t.Fatal(err)
+	}
+	c.eng.beatOnce()
+	m, _ := c.Update(rosterTickMsg{})
+	sc := m.(chatScreen)
+	if len(sc.users) != 2 {
+		t.Fatalf("users = %v; want [bob alice]", sc.users)
+	}
+	// A completed /kick drops the target from engine + sidebar at once.
+	m, _ = sc.Update(kickDoneMsg{target: "alice",
+		roster: []rosterMember{{Username: "bob", Online: true}}, epoch: 7})
+	sc = m.(chatScreen)
+	if len(sc.users) != 1 || sc.users[0] != "bob" {
+		t.Fatalf("users after kick = %v; want [bob]", sc.users)
+	}
+	// Failures surface as status text, roster untouched.
+	m, _ = sc.Update(kickDoneMsg{target: "alice", err: errors.New("403: crews only")})
+	sc = m.(chatScreen)
+	if len(sc.users) != 1 {
+		t.Fatalf("failed kick must not touch users: %v", sc.users)
+	}
+}
+
+func TestModTargetParsing(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"bob", "bob", true},
+		{"@bob", "bob", true},
+		{"  carol  ", "carol", true},
+		{"", "", false},
+		{"   ", "", false},
+		{"two words", "", false},
+		{strings.Repeat("x", 21), "", false},
+	} {
+		got, ok := modTarget(tc.in)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("modTarget(%q) = (%q, %v); want (%q, %v)", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestKickAdminDispatchAndClient(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+
+	alice := newSignalTestClient(srv, "alice")
+	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	alice.key = sid
+	bob := newSignalTestClient(srv, "bob")
+	bob.key = sid
+	if _, _, err := bob.joinRoom("bob", "pubkey-bob", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client methods parse roster + epoch.
+	roster, epoch, err := alice.setRole("bob", true)
+	if err != nil {
+		t.Fatalf("setRole: %v", err)
+	}
+	if epoch == 0 {
+		t.Fatal("setRole must report epoch")
+	}
+	roleOf := func(rs []rosterMember, u string) string {
+		for _, m := range rs {
+			if m.Username == u {
+				return m.Role
+			}
+		}
+		return ""
+	}
+	if roleOf(roster, "bob") != "admin" {
+		t.Fatalf("bob role = %q; want admin", roleOf(roster, "bob"))
+	}
+	if _, _, err := alice.setRole("bob", false); err != nil {
+		t.Fatalf("unadmin: %v", err)
+	}
+	roster, _, err = alice.kickUser("bob")
+	if err != nil {
+		t.Fatalf("kick: %v", err)
+	}
+	if roleOf(roster, "bob") != "" {
+		t.Fatal("kicked bob must leave the roster")
+	}
+	if _, _, err := alice.kickUser("ghost"); err == nil {
+		t.Fatal("kicking a stranger must fail")
+	}
+
+	// Dispatch: /kick with arg runs the command (async closure), bare
+	// /kick prints usage locally, unknown /kick-extra is just chat.
+	c := newPaletteScreen()
+	if cmd := c.submitLine("/kick bob"); cmd == nil {
+		t.Fatal("/kick bob must dispatch to runCommand")
+	}
+	c2 := newPaletteScreen()
+	if cmd := c2.submitLine("/kick"); cmd != nil {
+		t.Fatal("bare /kick must resolve locally (usage), not dispatch")
+	}
+	found := false
+	for _, ll := range c2.localLines {
+		if strings.Contains(ll.text, "/kick <username>") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("bare /kick must paint usage")
 	}
 }
 

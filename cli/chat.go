@@ -90,7 +90,7 @@ func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
 
 	// Seed the roster synchronously so the welcome line is accurate; the
 	// engine's beat loop keeps it fresh from here on.
-	if roster, err := sig.heartbeat("", nil); err != nil {
+	if roster, _, err := sig.heartbeat("", nil); err != nil {
 		fmt.Printf("* Warning: presence ping failed (%v)\n", err)
 	} else {
 		names := []string{}

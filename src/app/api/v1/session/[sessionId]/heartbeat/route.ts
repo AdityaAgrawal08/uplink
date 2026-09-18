@@ -23,12 +23,12 @@ export async function POST(
 
     // Rooms.heartbeat() validates both fields (400 on garbage), so the
     // narrow-down cast here is safe.
-    const roster = await heartbeat(sessionId, usernameHeader, {
+    const { roster, epoch } = await heartbeat(sessionId, usernameHeader, {
       peerId: peerId as string | undefined,
       addrs: addrs as string[] | undefined,
     });
     const activeUsers = roster.filter((m) => m.online).map((m) => m.username);
-    return NextResponse.json({ ok: true, activeUsers, roster });
+    return NextResponse.json({ ok: true, activeUsers, roster, epoch });
   } catch (error) {
     if (error instanceof RoomError) return apiError(error.message, error.status);
     console.error("Error in POST /api/v1/session/heartbeat:", error);

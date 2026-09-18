@@ -447,7 +447,7 @@ func TestAudioBothTalkersDecoded(t *testing.T) {
 }
 
 func TestSlashRegistryExact(t *testing.T) {
-	want := []string{"/help", "/upload", "/download", "/video", "/audio"}
+	want := []string{"/help", "/upload", "/download", "/video", "/audio", "/kick", "/admin", "/unadmin"}
 	got := make([]string, 0, len(slashCommands))
 	for _, cmd := range slashCommands {
 		got = append(got, cmd.Name)
@@ -457,10 +457,9 @@ func TestSlashRegistryExact(t *testing.T) {
 	}
 }
 
-func TestVideoBottomStripAndChatMapping(t *testing.T) {
+func TestHiddenVideoAndChatMapping(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
-	// 100x30: too narrow for the right panel → bottom strip mode.
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	sc := m.(chatScreen)
 	sc.call = &mediaManager{videoOn: true, renderCols: videoPaneDefaultCols, renderRows: videoPaneDefaultRows}
@@ -471,15 +470,11 @@ func TestVideoBottomStripAndChatMapping(t *testing.T) {
 	m2, _ := sc.Update(netVideoMsg{lines: lines})
 	sc = m2.(chatScreen)
 	l := sc.layoutFor()
-	// Sidebar video box is retired: feeds render in the bottom strip.
-	if l.videoRows != 0 {
-		t.Fatal("sidebar must not claim video rows; feeds live in the strip")
+	if l.videoRows != 0 || l.vidPanelW != 0 || l.camRows != 0 {
+		t.Fatal("video surfaces must not claim UI space")
 	}
-	if l.vidPanelW != 0 {
-		t.Fatal("narrow terminal must not open the right panel")
-	}
-	if l.camRows == 0 {
-		t.Fatal("bottom Live Cameras strip must claim rows at this size")
+	if len(sc.videoLines) != len(lines) || !sc.call.VideoOn() {
+		t.Fatal("hiding video UI must preserve received frames and call state")
 	}
 	// Items: General at +0/+1, carol at +2/+3 (two rows per item).
 	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
@@ -499,9 +494,8 @@ func TestVideoBottomStripAndChatMapping(t *testing.T) {
 	if sc.targetUser != "" {
 		t.Fatal("wheel over camera strip must not open a thread")
 	}
-	// Strip paints below the transcript with live tiles.
-	if got := sc.View(); !strings.Contains(got, "Live Cameras") {
-		t.Fatal("view must show the Live Cameras strip")
+	if got := sc.View(); strings.Contains(got, "Live Cameras") {
+		t.Fatal("view must not show the Live Cameras strip")
 	}
 	// Tiny terminal collapses the strip cleanly (rows return to chat).
 	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 18})

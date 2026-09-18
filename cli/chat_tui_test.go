@@ -206,7 +206,7 @@ func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string
 	// fall back to joining it.
 	if sid, err := sig.createRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); err == nil {
 		sig.key = sid
-	} else if _, jerr := sig.joinRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); jerr != nil {
+	} else if _, _, jerr := sig.joinRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); jerr != nil {
 		t.Fatalf("create/join %s: %v / %v", me, err, jerr)
 	} else {
 		sig.key = "123456"
@@ -219,7 +219,7 @@ func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string
 		}
 		pk := base64.StdEncoding.EncodeToString(pid.publicKey())
 		psig := &signalClient{serverURL: srv.URL, key: "123456", me: p}
-		if _, err := psig.joinRoom(p, pk, ""); err != nil {
+		if _, _, err := psig.joinRoom(p, pk, ""); err != nil {
 			t.Fatalf("join %s: %v", p, err)
 		}
 		pubkeys[p] = pk
