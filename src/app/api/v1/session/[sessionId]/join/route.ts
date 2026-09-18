@@ -31,7 +31,7 @@ export async function POST(
       }
     }
 
-    const roster = await joinRoom(sessionId, username as string, pubkey as string);
+    const { roster, epoch } = await joinRoom(sessionId, username as string, pubkey as string);
     return NextResponse.json({
       sessionId,
       participants: roster.map((m) => m.username),
@@ -42,6 +42,7 @@ export async function POST(
         ...(m.peerId !== undefined ? { peerId: m.peerId } : {}),
         ...(m.addrs !== undefined ? { addrs: m.addrs } : {}),
       })),
+      epoch, // joiner seeds its roster-change tracker (no extra round trip)
     });
   } catch (error) {
     if (error instanceof RoomError) return apiError(error.message, error.status);

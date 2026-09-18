@@ -117,7 +117,7 @@ func TestEngineEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	roster, err := sigB.joinRoom("bob", pubB, "")
+	roster, _, err := sigB.joinRoom("bob", pubB, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestEngineAutoRejoinAfterPrune(t *testing.T) {
 	}
 	// Bob stays behind so the room survives alice's prune.
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	pa := newEngineProbe()
@@ -284,7 +284,7 @@ func TestEngineAutoRejoinAfterPrune(t *testing.T) {
 
 	// Next beat must rejoin transparently.
 	ea.beatOnce()
-	roster, err := sigA.heartbeat("", nil)
+	roster, _, err := sigA.heartbeat("", nil)
 	if err != nil {
 		t.Fatalf("still out after rejoin: %v", err)
 	}
@@ -296,5 +296,71 @@ func TestEngineAutoRejoinAfterPrune(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("engine did not rejoin after prune")
+	}
+}
+
+func TestLoneUserBroadcastSucceeds(t *testing.T) {
+	e := &engine{me: "bob", roster: map[string][]byte{}}
+	f := newFrame(frameChat, "id1", "bob", "")
+	f.Data = "hello alone"
+	// Never synced: empty roster means we haven't learned the room yet —
+	// fail loudly so the sender retries instead of dropping silently.
+	if err := e.sendFrame("", f); err == nil {
+		t.Fatal("unsynced engine must fail loudly on empty roster")
+	}
+	// Synced but alone: chatting is allowed — the local echo stands,
+	// there is simply nobody to fan out to.
+	e.setRoster(nil)
+	if err := e.sendFrame("", f); err != nil {
+		t.Fatalf("lone synced user must chat freely, got %v", err)
+	}
+}
+
+func TestEpochChangeTriggersRosterRefresh(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
+	idc, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
+	pubC := base64.StdEncoding.EncodeToString(idc.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+		t.Fatal(err)
+	}
+	pa := newEngineProbe()
+	ea := newEngineWithStun("alice", ida, sigA, pa.callbacks(), []string{})
+	defer ea.stop()
+	ea.beatOnce() // seeds roster + epoch (bob's join bumped it to 1)
+	names := func() map[string]bool {
+		out := map[string]bool{}
+		for _, m := range ea.peers() {
+			out[m.Username] = true
+		}
+		return out
+	}
+	if got := names(); len(got) != 2 || !got["bob"] {
+		t.Fatalf("seeded presence = %v; want alice+bob", got)
+	}
+	// Carol joins elsewhere; alice's next inbox poll (2s cadence) sees the
+	// epoch move and refreshes immediately — no waiting out the 5s beat.
+	sigC := &signalClient{serverURL: srv.URL, me: "carol", key: sigA.key}
+	if _, _, err := sigC.joinRoom("carol", pubC, ""); err != nil {
+		t.Fatal(err)
+	}
+	ea.inboxOnce()
+	if got := names(); !got["carol"] {
+		t.Fatalf("epoch-triggered refresh missed carol: %v", got)
+	}
+	ea.mu.Lock()
+	epoch := ea.lastEpoch
+	ea.mu.Unlock()
+	if epoch != 2 {
+		t.Fatalf("lastEpoch = %d; want 2", epoch)
 	}
 }

@@ -60,8 +60,8 @@ export async function GET(
     assertUsernameHeader(username);
     await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
 
-    const boxes = await fetchBoxes(sessionId, username);
-    return NextResponse.json({ boxes });
+    const { boxes, epoch } = await fetchBoxes(sessionId, username);
+    return NextResponse.json({ boxes, epoch });
   } catch (error) {
     if (error instanceof RoomError) return apiError(error.message, error.status);
     console.error("Error in GET /api/v1/session/[sessionId]/inbox:", error);

@@ -28,7 +28,7 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	}
 	// bob present from the start so alice's scope is non-empty
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,7 +90,7 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	// emulate what chat_tui does (PublishTo with the new roster).
 	idc, _ := generateIdentity()
 	sigC := &signalClient{serverURL: srv.URL, me: "carol", key: sid}
-	if _, err := sigC.joinRoom("carol", base64.StdEncoding.EncodeToString(idc.publicKey()), ""); err != nil {
+	if _, _, err := sigC.joinRoom("carol", base64.StdEncoding.EncodeToString(idc.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
 	rendered := make(chan []string, 8)

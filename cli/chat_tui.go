@@ -386,6 +386,75 @@ type netLostMsg struct{ user string }
 type netErrMsg struct{ err error }
 type rosterTickMsg struct{}
 
+// netRosterMsg arrives when the engine's beat learns membership moved
+// (join/leave): refresh the sidebar now instead of waiting for the tick.
+type netRosterMsg struct{}
+
+// kickDoneMsg arrives when a /kick request completes.
+type kickDoneMsg struct {
+	target string
+	roster []rosterMember
+	epoch  int64
+	err    error
+}
+
+// roleDoneMsg arrives when a /admin or /unadmin request completes.
+type roleDoneMsg struct {
+	target string
+	admin  bool // true = grant, false = revoke
+	roster []rosterMember
+	epoch  int64
+	err    error
+}
+
+// syncRosterFromEngine refreshes the sidebar from the engine's heartbeat
+// roster: membership, call publish scope, unread/hover pruning, and an
+// immediate repaint on ANY change. Shared by the 2s render tick and the
+// engine's roster-changed push.
+func (c *chatScreen) syncRosterFromEngine() {
+	roster := c.eng.peers()
+	users := onlineNames(roster, c.me)
+	changed := len(users) != len(c.users)
+	if !changed {
+		for i := range users {
+			if users[i] != c.users[i] {
+				changed = true
+				break
+			}
+		}
+	}
+	c.users = users
+	live := map[string]bool{c.me: true}
+	for _, u := range users {
+		live[u] = true
+	}
+	// Publish catch-up: late joiners get our announce; leavers get
+	// pruned (streams with an emptied scope stop themselves).
+	if c.call != nil {
+		room := users
+		if c.targetUser != "" {
+			room = []string{c.targetUser}
+		}
+		c.call.PublishTo(room)
+	}
+	for peer := range c.unread {
+		if !live[peer] {
+			delete(c.unread, peer)
+		}
+	}
+	for peer := range c.lastDMAt {
+		if !live[peer] {
+			delete(c.lastDMAt, peer)
+		}
+	}
+	if c.hoverPeer != "" && !live[c.hoverPeer] {
+		c.hoverPeer = ""
+	}
+	if changed {
+		c.rebuildView() // repaint the sidebar NOW, not on the next message
+	}
+}
+
 // unconfirmedAfter is how long an own message may sit without a delivery
 // ack before the status line warns. Churn windows (re-handshake + 3 inbox
 // retries) legitimately take ~10-15s; past 30s something is wrong enough
@@ -659,6 +728,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
 		onPeerReady:  func(user, code string) { push(netReadyMsg{user: user, code: code}) },
 		onPeerLost:   func(user string) { push(netLostMsg{user: user}) },
+		onRoster:     func() { push(netRosterMsg{}) },
 		onDelivered:  func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
 		onError:      func(err error) { push(netErrMsg{err: err}) },
 		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
@@ -1244,6 +1314,36 @@ func searchHeightFor(headRows, inner int) int {
 	return 1
 }
 
+// sidebarFill is the sidebar interior height: the full right-stack height
+// (room header + call card + transcript + hints + drawer + composer) minus
+// the sidebar's own top/bottom border. The search column runs all the way
+// down beside the composer instead of stopping at the transcript.
+// Mirrors View()'s assembly exactly — paint, scrollbar, and viewport sync
+// share it so the list never over/under-fills its box.
+func (c chatScreen) sidebarFill(l layout) int {
+	h := l.headRows + l.callRows
+	if l.vpHeight > 0 {
+		h += l.vpHeight
+		if l.boxedTranscript {
+			h += transcriptBorder
+		}
+	}
+	h += l.hintRows
+	if l.paletteRows > 0 {
+		if pal := c.drawerView(maxInt(l.vpWidth+2, 0)); pal != "" {
+			h += 1 + strings.Count(pal, "\n") + 1 // spacer + panel rows
+		}
+	}
+	if l.composerRows > 0 {
+		h += l.composerRows + 2 // composer box + border
+	} else if l.inputBoxed {
+		h += strings.Count(tuiBorderStyle.Render(c.input.View()), "\n") + 1
+	} else {
+		h++ // bare prompt line
+	}
+	return h - 2 // sidebar top + bottom border
+}
+
 // rosterBody paints the chat list: search box, then one item per
 // conversation (General room + DM threads) with avatars, previews, times,
 // unread dots and call icons. fill = interior rows of the sidebar box.
@@ -1815,17 +1915,19 @@ func (c *chatScreen) exitPrivate() {
 // the message on the wire. Registry commands are executed here too, so a
 // typed "/help" behaves exactly like one picked from the palette.
 func (c *chatScreen) submitLine(text string) tea.Cmd {
-	t := strings.ToLower(strings.TrimSpace(text))
-	// /video + /audio take no username (publish to the current scope):
-	// trailing words are ignored, never sent as chat.
-	for _, name := range []string{"/video", "/audio"} {
-		if t == name || strings.HasPrefix(t, name+" ") {
-			return c.runCommand(name)
+	// Commands take arguments now ("/kick bob"): match the first token
+	// against the registry (case-insensitive), pass the rest through in
+	// original case — usernames are case-sensitive.
+	if fields := strings.Fields(strings.TrimSpace(text)); len(fields) > 0 && strings.HasPrefix(fields[0], "/") {
+		name := strings.ToLower(fields[0])
+		arg := ""
+		if len(fields) > 1 {
+			arg = strings.Join(fields[1:], " ")
 		}
-	}
-	for _, cmd := range slashCommands {
-		if t == cmd.Name {
-			return c.runCommand(t)
+		for _, cmd := range slashCommands {
+			if name == cmd.Name {
+				return c.runCommand(name, arg)
+			}
 		}
 	}
 	if c.pending != nil {
@@ -1920,18 +2022,18 @@ func (c *chatScreen) syncViewport() {
 	// Chat list gets its own viewport (scrollable like the transcript);
 	// the search box lives outside the viewport.
 	if l.sidebarOn {
-		rosterH := l.headRows + l.callRows + l.vpHeight - l.videoRows
+		fill := c.sidebarFill(l)
 		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
-		c.rosterVp.Height = maxInt(rosterH-searchHeightFor(l.headRows, c.sidebarInnerWidth()-1), 1)
+		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()-1), 1)
 	}
 	atBottom := c.vp.AtBottom()
 	offset := c.vp.YOffset
 	changed := vpW != c.vp.Width || l.vpHeight != c.vp.Height
 	c.vp.Width, c.vp.Height = vpW, l.vpHeight
-	// Composer input shares its row with the Send button: shrink the field
-	// so typed text scrolls inside the box instead of under the button.
+	// Composer input spans the full column width: shrink the field so typed
+	// text scrolls inside the box instead of under its border.
 	transcriptOuter := l.vpWidth + 2
-	inputOuter := transcriptOuter - sendBtnWidthFor(transcriptOuter) - 1
+	inputOuter := transcriptOuter
 	if want := maxInt(inputOuter-6, 1); c.input.Width != want {
 		c.input.Width = want
 	}
@@ -1983,50 +2085,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Sidebar freshness from the engine's heartbeat roster (the engine
 		// owns the 5s beat; this only renders, every 2s). Membership lives
 		// ONLY in the Online sidebar — no join/leave lines in the
-		// transcript by product direction. On ANY change, rebuild
-		// immediately: the tick used to update c.users with no repaint, so
-		// the list visibly refreshed only when the next message arrived.
-		roster := c.eng.peers()
-		users := onlineNames(roster, c.me)
-		changed := len(users) != len(c.users)
-		if !changed {
-			for i := range users {
-				if users[i] != c.users[i] {
-					changed = true
-					break
-				}
-			}
-		}
-		c.users = users
-		live := map[string]bool{c.me: true}
-		for _, u := range users {
-			live[u] = true
-		}
-		// Publish catch-up: late joiners get our announce; leavers get
-		// pruned (streams with an emptied scope stop themselves).
-		if c.call != nil {
-			room := users
-			if c.targetUser != "" {
-				room = []string{c.targetUser}
-			}
-			c.call.PublishTo(room)
-		}
-		for peer := range c.unread {
-			if !live[peer] {
-				delete(c.unread, peer)
-			}
-		}
-		for peer := range c.lastDMAt {
-			if !live[peer] {
-				delete(c.lastDMAt, peer)
-			}
-		}
-		if c.hoverPeer != "" && !live[c.hoverPeer] {
-			c.hoverPeer = ""
-		}
-		if changed {
-			c.rebuildView() // repaint the sidebar NOW, not on the next message
-		}
+		// transcript by product direction.
+		c.syncRosterFromEngine()
 		// Delivery-receipt sweep: warn on messages unacked past
 		// unconfirmedAfter; forget entries past receiptExpiry (the engine's
 		// own retries are long over by then — most likely a lost ack frame,
@@ -2052,6 +2112,38 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.status = ""
 		}
 		cmds = append(cmds, scheduleRoster())
+
+	case netRosterMsg:
+		// Engine beat learned membership moved (join/leave, possibly via
+		// an epoch-triggered refresh): same sync, right now. Re-arm the
+		// pump like every other net case — without this the event loop
+		// strands after the first roster push.
+		c.syncRosterFromEngine()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case kickDoneMsg:
+		if msg.err != nil {
+			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* kick failed: "+msg.err.Error()))
+		} else {
+			c.eng.applyPushedRoster(msg.roster, msg.epoch)
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* kicked "+msg.target))
+			c.syncRosterFromEngine()
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
+	case roleDoneMsg:
+		what := "is now an admin"
+		if !msg.admin {
+			what = "is no longer an admin"
+		}
+		if msg.err != nil {
+			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* admin change failed: "+msg.err.Error()))
+		} else {
+			c.eng.applyPushedRoster(msg.roster, msg.epoch)
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.target+" "+what))
+			c.syncRosterFromEngine()
+		}
+		cmds = append(cmds, c.drainNetCmd())
 
 	case netChatMsg:
 		m := msg.chat
@@ -2532,11 +2624,11 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
 		}
 	}
 	if l.sidebarOn {
-		rosterH := l.headRows + l.callRows + l.vpHeight - l.videoRows
+		fill := c.sidebarFill(l)
 		roster = barGeom{
 			x:       l.rosterX + l.sidebarWidth - 2,
 			trackY0: l.rosterY0 + 1,
-			trackH:  maxInt(rosterH-3, 0),
+			trackH:  maxInt(fill-3, 0),
 		}
 	}
 	return chat, video, roster
@@ -2601,42 +2693,14 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if msg.Button != tea.MouseButtonLeft || c.width == 0 || c.height == 0 {
 			break
 		}
-		// Send button: submit the composer exactly like Enter.
-		sendX0, sendX1, sendY0, sendY1, clipX := composerGeoms(l, c.width, c.height)
-		if sendX0 >= 0 && msg.X >= sendX0 && msg.X < sendX1 && msg.Y >= sendY0 && msg.Y < sendY1 {
-			text := strings.TrimSpace(c.input.Value())
-			c.input.SetValue("")
-			if text == "" {
-				return nil
-			}
-			return c.submitLine(text)
-		}
-		// Clip glyph: open the upload browser (same as /upload).
-		if clipX >= 0 && msg.X == clipX && msg.Y >= sendY0 && msg.Y < sendY1 && l.sidebarOn {
+		// Clip glyph: open the upload browser (same as /upload). Painted
+		// whenever the box fits it — clickable with or without the sidebar.
+		clipX, clipY0, clipY1 := composerGeoms(l, c.width, c.height)
+		if clipX >= 0 && msg.X == clipX && msg.Y >= clipY0 && msg.Y < clipY1 {
 			if !c.picker.isActive() {
 				return c.openPicker()
 			}
 			return nil
-		}
-		// Room tabs: Chat (close drawer), Files (received files), ⋮ (/ menu).
-		if tc, tf, tm, ok := roomTabsGeoms(c, l); ok {
-			switch {
-			case tc.hit(msg.X, msg.Y):
-				if c.picker.isActive() {
-					c.closePicker(composerPlaceholder)
-					c.rebuildView()
-				}
-				return nil
-			case tf.hit(msg.X, msg.Y):
-				if !c.picker.isActive() || c.picker.mode != modeFiles {
-					return c.openFilesDrawer()
-				}
-				return nil
-			case tm.hit(msg.X, msg.Y):
-				c.input.SetValue("/")
-				c.palette.sync("/")
-				return nil
-			}
 		}
 		// Video call controls: M mic, V camera, X hang up (wired); S/P are
 		// dimmed (unsupported here) and explain themselves on click.
@@ -2896,16 +2960,69 @@ func (c chatScreen) View() string {
 	}
 	chatCol := strings.Join(parts, "\n")
 
+	// Composer core (unindented): the message box spans the full column
+	// width (Enter sends). The sidebar path joins it beside the chat list;
+	// the sidebar-off path indents it below.
+	var inputCore string
+	switch {
+	case l.composerRows > 0:
+		inputOuter := transcriptOuter         // full column width, no Send button
+		contentW := maxInt(inputOuter-2-2, 1) // border + padding, never wrap
+		showClip := inputOuter >= 26
+		clipW := 0
+		if showClip {
+			clipW = lipgloss.Width("📎") + 1
+		}
+		field := c.input.View()
+		if lipgloss.Width(field) > contentW-clipW {
+			field = truncateByWidth(field, contentW-clipW)
+		}
+		tail := ""
+		if showClip {
+			tail = " " + thClipStyle.Render("📎")
+		}
+		pad := contentW - lipgloss.Width(field) - lipgloss.Width(tail)
+		if pad < 0 {
+			pad = 0
+		}
+		inputCore = tuiComposerStyle.
+			Width(inputOuter - 2).
+			Height(l.composerRows).
+			Render(field + strings.Repeat(" ", pad) + tail)
+	case l.inputBoxed:
+		inputCore = tuiBorderStyle.Render(c.input.View())
+	default:
+		inputCore = "❯ " + c.input.View()
+	}
+	// Drawer panel core: OpenCode-style pop-out emerging upward out of the
+	// composer (a blank spacer row sells the lift). Empty when budgeted but
+	// nothing matches — never paint unbudgeted rows.
+	pal := ""
+	if l.paletteRows > 0 {
+		pal = c.drawerView(maxInt(l.vpWidth+2, 0))
+	}
+
 	body := chatCol
-	if l.sidebarOn && body != "" {
-		// LEFT sidebar column: the chat list. Its outer height matches the
-		// center column (header + call card + transcript) so bottoms align.
-		rosterH := l.headRows + l.callRows + l.vpHeight - l.videoRows
+	fullSide := l.sidebarOn && body != ""
+	if fullSide {
+		// LEFT sidebar column: the chat list, full height. Its outer height
+		// matches the whole right stack (header + call card + transcript +
+		// hints + drawer + composer) so the search column runs all the way
+		// down beside the composer.
+		fill := c.sidebarFill(l)
 		col := tuiRosterBoxStyle.
 			Width(c.sidebarInnerWidth()).
-			Height(rosterH). // interior rows; border completes the column
-			Render(c.rosterBody(rosterH))
-		body = lipgloss.JoinHorizontal(lipgloss.Top, col, " ", chatCol)
+			Height(fill). // interior rows; border completes the column
+			Render(c.rosterBody(fill))
+		right := chatCol
+		if l.hintRows > 0 {
+			right += "\n" + keyHintsView(transcriptOuter)
+		}
+		if pal != "" {
+			right += "\n\n" + pal
+		}
+		right += "\n" + inputCore
+		body = lipgloss.JoinHorizontal(lipgloss.Top, col, " ", right)
 	}
 	// RIGHT video panel: call header, tile grid, controls, note. Same body
 	// row, same height — the three columns share top and bottom edges.
@@ -2930,59 +3047,21 @@ func (c chatScreen) View() string {
 		}
 		rows = append(rows, c.camerasStripView(maxInt(w, 0)))
 	}
-	// Truthful key hints under the composer (budgeted in layout).
-	if l.hintRows > 0 {
-		rows = append(rows, strings.Repeat(" ", composerIndent(l))+keyHintsView(transcriptOuter))
-	}
-	// Composer row: input box + Send button (icon on narrow transcripts),
-	// aligned under the transcript (indent keeps the left edge truthful).
-	indent := strings.Repeat(" ", composerIndent(l))
-	var input string
-	switch {
-	case l.composerRows > 0:
-		boxH := l.composerRows + 2
-		sendW := sendBtnWidthFor(transcriptOuter)
-		inputOuter := transcriptOuter - sendW - 1
-		contentW := maxInt(inputOuter-2-2, 1) // border + padding, never wrap
-		showClip := inputOuter >= 26
-		clipW := 0
-		if showClip {
-			clipW = lipgloss.Width("📎") + 1
+	// Hints, drawer, and composer ride the right stack beside the full-height
+	// sidebar when it is on; otherwise they paint below, indented past it.
+	if fullSide {
+		// Already joined into body above — nothing more to append.
+	} else {
+		// Truthful key hints under the composer (budgeted in layout).
+		indent := strings.Repeat(" ", composerIndent(l))
+		if l.hintRows > 0 {
+			rows = append(rows, indent+keyHintsView(transcriptOuter))
 		}
-		field := c.input.View()
-		if lipgloss.Width(field) > contentW-clipW {
-			field = truncateByWidth(field, contentW-clipW)
-		}
-		tail := ""
-		if showClip {
-			tail = " " + thClipStyle.Render("📎")
-		}
-		pad := contentW - lipgloss.Width(field) - lipgloss.Width(tail)
-		if pad < 0 {
-			pad = 0
-		}
-		box := tuiComposerStyle.
-			Width(inputOuter - 2).
-			Height(l.composerRows).
-			Render(field + strings.Repeat(" ", pad) + tail)
-		input = lipgloss.JoinHorizontal(lipgloss.Top, box, " ", sendButtonView(boxH, sendW))
-		input = indent + strings.ReplaceAll(input, "\n", "\n"+indent)
-	case l.inputBoxed:
-		input = indent + tuiBorderStyle.Render(c.input.View())
-	default:
-		input = indent + "❯ " + c.input.View()
-	}
-	// OpenCode-style pop-out: with a leading "/" the command drawer emerges
-	// upward out of the composer; in /upload|/download mode the same slot
-	// paints a browser instead. A blank spacer row sells the "lifted off the
-	// input" look. When the layout budget DISSOLVED the drawer (absurdly tiny
-	// terminals), paletteRows==0 wins over visibility — never paint unbudgeted.
-	if l.paletteRows > 0 {
-		if pal := c.drawerView(maxInt(l.vpWidth+2, 0)); pal != "" {
+		if pal != "" {
 			rows = append(rows, "", pal)
 		}
+		rows = append(rows, indent+strings.ReplaceAll(inputCore, "\n", "\n"+indent))
 	}
-	rows = append(rows, input)
 	if l.statusRows == 1 {
 		rows = append(rows, c.statusView())
 	}
@@ -2998,8 +3077,8 @@ func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 	scr := newChatScreen(serverURL, key, me, id, password)
 	// Seed the roster synchronously so the sidebar isn't empty on paint;
 	// the engine beat loop keeps it fresh, rosterTickMsg renders it.
-	if roster, err := scr.sig.heartbeat("", nil); err == nil {
-		scr.eng.setRoster(roster)
+	if roster, epoch, err := scr.sig.heartbeat("", nil); err == nil {
+		scr.eng.applyPushedRoster(roster, epoch)
 		scr.users = onlineNames(roster, me)
 	}
 	scr.eng.start()

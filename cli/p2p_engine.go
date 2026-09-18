@@ -62,7 +62,11 @@ type engineCallbacks struct {
 	onTyping    func(from, to string, active bool)
 	onPeerReady func(username, safetyCode string)
 	onPeerLost  func(username string)
-	onError     func(err error)
+	// onRoster fires when a beat learns membership moved (join/leave).
+	// The sidebar refreshes off this (~100ms) instead of waiting for the
+	// next render tick. Nil-tolerant: headless consumers ignore it.
+	onRoster func()
+	onError  func(err error)
 	// onSignalNote receives non-chat signal types (call control, media
 	// handshake). The engine owns the only signal drain; consumers of
 	// other note types subscribe here instead of polling.
@@ -124,6 +128,15 @@ type engine struct {
 	// on demand when stale (rosterFreshTTL), so a join is never missed
 	// for longer than this — without putting a Redis read on every send.
 	lastRosterAt time.Time
+	// lastEpoch is the roster generation from the last heartbeat/inbox
+	// response. A changed epoch proves membership moved, so the engine
+	// refreshes immediately instead of waiting out the beat cadence.
+	lastEpoch int64
+	// rosterSynced flips on the first successful roster sync. A broadcast
+	// with zero peers after that means the user is genuinely alone (chat
+	// freely: the echo stands, nothing to fan out); before that it means
+	// we haven't learned the room yet (fail loudly, retry soon).
+	rosterSynced bool
 	// lastTrigger throttles traffic-triggered refreshes (see triggerRefresh).
 	lastTrigger time.Time
 	// endedNotified/lastRejoinErr quiet the beat failure paths: a destroyed
@@ -305,11 +318,23 @@ func (e *engine) stopped() bool {
 	}
 }
 
+// applyPushedRoster installs a server-fresh roster from a moderation
+// response (kick/grant): presence for the UI, keys for the mesh, epoch for
+// the change tracker — one locked handoff, no waiting for the next beat.
+func (e *engine) applyPushedRoster(roster []rosterMember, epoch int64) {
+	e.mu.Lock()
+	e.presence = roster
+	e.lastEpoch = epoch
+	e.mu.Unlock()
+	e.setRoster(roster)
+}
+
 // setRoster replaces the known member set: learns pubkeys (validated),
 // opens setup for newcomers, tears down the departed.
 func (e *engine) setRoster(members []rosterMember) {
 	e.mu.Lock()
 	e.lastRosterAt = time.Now()
+	e.rosterSynced = true
 	next := map[string][]byte{}
 	for _, m := range members {
 		if m.Username == "" || m.Username == e.me {
@@ -393,7 +418,7 @@ func (e *engine) beatLoop() {
 }
 
 func (e *engine) beatOnce() {
-	roster, err := e.sig.heartbeat("", nil)
+	roster, epoch, err := e.sig.heartbeat("", nil)
 	if err != nil {
 		// Pruned while asleep (missed beats): rejoin with the same identity
 		// instead of rotting at 403 forever. A 409 here means someone took
@@ -402,7 +427,7 @@ func (e *engine) beatOnce() {
 			e.mu.Lock()
 			recentErr := time.Since(e.lastRejoinErr) < 60*time.Second
 			e.mu.Unlock()
-			if _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
+			if _, _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
 				e.mu.Lock()
 				e.lastRejoinErr = time.Now()
 				e.mu.Unlock()
@@ -414,7 +439,7 @@ func (e *engine) beatOnce() {
 			e.mu.Lock()
 			e.lastRejoinErr = time.Time{}
 			e.mu.Unlock()
-			roster, err = e.sig.heartbeat("", nil)
+			roster, epoch, err = e.sig.heartbeat("", nil)
 			if err != nil {
 				return
 			}
@@ -435,9 +460,30 @@ func (e *engine) beatOnce() {
 	}
 	e.mu.Lock()
 	e.presence = roster
+	e.lastEpoch = epoch
+	before := make(map[string]bool, len(e.roster))
+	for u := range e.roster {
+		before[u] = true
+	}
 	e.mu.Unlock()
 	e.setRoster(roster)
 	e.reconcilePeers(roster)
+	// Membership moved: wake the UI now (~100ms drain) instead of letting
+	// it sit stale until the next render tick.
+	e.mu.Lock()
+	changed := len(e.roster) != len(before)
+	if !changed {
+		for u := range e.roster {
+			if !before[u] {
+				changed = true
+				break
+			}
+		}
+	}
+	e.mu.Unlock()
+	if changed && e.cb.onRoster != nil {
+		e.cb.onRoster()
+	}
 }
 
 // isNotMember reports the server's "you are not in this session" rejection.
@@ -774,9 +820,20 @@ func (e *engine) inboxLoop() {
 }
 
 func (e *engine) inboxOnce() {
-	boxes, err := e.sig.inboxFetch()
+	boxes, epoch, err := e.sig.inboxFetch()
 	if err != nil {
 		return
+	}
+	// Roster generation moved (join/leave/prune elsewhere): refresh the
+	// roster NOW on the 2s inbox cadence instead of waiting out the 5s
+	// beat. Costs nothing extra — the epoch rides the fetch we already
+	// made — and triggerRefresh throttles stampedes to one per 2s.
+	e.mu.Lock()
+	changed := epoch != e.lastEpoch
+	e.lastEpoch = epoch
+	e.mu.Unlock()
+	if changed {
+		e.triggerRefresh()
 	}
 	if len(boxes) == 0 {
 		return
@@ -889,6 +946,14 @@ func (e *engine) sendFrame(to string, f frame) error {
 	}
 	e.mu.Unlock()
 	if len(peers) == 0 {
+		e.mu.Lock()
+		synced := e.rosterSynced
+		e.mu.Unlock()
+		if synced {
+			// Genuinely alone in the room: chatting is allowed — the
+			// local echo stands, there is simply nobody to fan out to.
+			return nil
+		}
 		// Fail loudly, not silently: a broadcast with no known recipients
 		// (typically a roster not yet refreshed after a join) must surface
 		// instead of returning success having sent nothing.
@@ -1099,12 +1164,13 @@ func (e *engine) ensureFreshRoster() {
 	if !stale {
 		return
 	}
-	roster, err := e.sig.heartbeat("", nil)
+	roster, epoch, err := e.sig.heartbeat("", nil)
 	if err != nil {
 		return
 	}
 	e.mu.Lock()
 	e.presence = roster
+	e.lastEpoch = epoch
 	e.mu.Unlock()
 	e.setRoster(roster)
 }

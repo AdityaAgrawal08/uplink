@@ -11,10 +11,19 @@ import { anonymizeIp } from "./crypto";
 // without any global key directory (code-only rooms need nothing else).
 //
 // Key layout:
-//   room:{code}                 hash  {passwordHash?, createdAt}
-//   room:{code}:members         hash  username -> JSON {pubkey, beat, peerId?, addrs?}
+//   room:{code}                 hash  {passwordHash?, createdAt, creator?}
+//   room:{code}:members         hash  username -> JSON {pubkey, beat, peerId?, addrs?, role?}
+//   room:{code}:banned          hash  username -> JSON {at, by} (kicked users; dies with the room)
+//   room:{code}:epoch           string  monotonic roster generation (join/leave/prune bumps)
 //   room:{code}:sig:{username}  list  JSON notes {from, type, payload, ts} (5 min TTL)
 //   room:{code}:inbox:{username} hash msgId -> JSON box {msgId, from, kind, payload, ts} (1h TTL)
+//
+// Roles: creator (main admin, rank 2) > admin (rank 1) > member (rank 0).
+// Kick: creator kicks anyone but self; admins kick members only; members
+// kick nobody; the creator cannot be kicked. Grant/revoke: creator only.
+// Moderation (kick/grant) requires strictly higher rank; creator is
+// immutable. Pre-roles rooms (no creator in meta, no role on members)
+// default to member and refuse moderation until recreated.
 //
 // Two delivery paths share the inbox: offline message boxes AND the
 // serverless fallback relay (when P2P fails). Both are ciphertext the
@@ -47,11 +56,24 @@ export class RoomError extends Error {
   }
 }
 
+export type Role = "creator" | "admin" | "member";
+
+const ROLE_RANK: Record<Role, number> = { creator: 2, admin: 1, member: 0 };
+
+export function roleRank(role: Role): number {
+  return ROLE_RANK[role] ?? 0;
+}
+
+function parseRole(raw: unknown): Role {
+  return raw === "creator" || raw === "admin" ? raw : "member";
+}
+
 export interface MemberInfo {
   username: string;
   pubkey: string;
   beat: number;
   online: boolean;
+  role: Role;
   peerId?: string;
   addrs?: string[];
 }
@@ -73,8 +95,42 @@ export interface InboxBox {
 
 const roomKey = (code: string) => `room:${code}`;
 const membersKey = (code: string) => `room:${code}:members`;
+const bannedKey = (code: string) => `room:${code}:banned`;
+const epochKey = (code: string) => `room:${code}:epoch`;
 const sigKey = (code: string, username: string) => `room:${code}:sig:${username}`;
 const inboxKey = (code: string, username: string) => `room:${code}:inbox:${username}`;
+
+// bumpEpoch advances the roster generation after any membership change
+// (join, leave, stale-prune). Polling clients compare it against their last
+// seen value and refresh the roster immediately on change — join visibility
+// without shortening the poll cadence (no extra QPS under pressure: the
+// epoch rides inside responses the client already fetches).
+async function bumpEpoch(code: string): Promise<number> {
+  const [epoch] = (await redis.pipeline([
+    { cmd: "incr", key: epochKey(code), args: [] },
+    { cmd: "expire", key: epochKey(code), args: [ROOM_TTL_SEC] },
+  ])) as [number, unknown];
+  return epoch;
+}
+
+// getEpoch reads the roster generation (0 when the key never existed —
+// pre-epoch rooms and brand-new rooms both start there).
+export async function getEpoch(code: string): Promise<number> {
+  const raw = await redis.get(epochKey(code));
+  const n = typeof raw === "string" ? parseInt(raw, 10) : typeof raw === "number" ? raw : 0;
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// bumpEpochBestEffort advances the generation without failing the caller:
+// a bump failure after a successful membership write must degrade to
+// beat-cadence discovery, never to a 500 for a join that already happened.
+async function bumpEpochBestEffort(code: string): Promise<number> {
+  try {
+    return await bumpEpoch(code);
+  } catch {
+    return 0;
+  }
+}
 
 // hgetall normalizes backend differences: MockRedis returns null for
 // missing keys, but real Upstash Redis returns an empty object. Without
@@ -149,7 +205,7 @@ export function parseStored<T>(raw: unknown): T | null {
 }
 
 function parseMember(username: string, raw: unknown): MemberInfo | null {
-  const m = parseStored<{ pubkey?: unknown; beat?: unknown; peerId?: unknown; addrs?: unknown }>(raw);
+  const m = parseStored<{ pubkey?: unknown; beat?: unknown; peerId?: unknown; addrs?: unknown; role?: unknown }>(raw);
   if (!m) return null;
     if (typeof m.pubkey !== "string") return null;
     const beat = typeof m.beat === "number" ? m.beat : 0;
@@ -158,17 +214,22 @@ function parseMember(username: string, raw: unknown): MemberInfo | null {
       pubkey: m.pubkey,
       beat,
       online: Date.now() - beat <= PRESENCE_TIMEOUT_MS,
+      role: parseRole(m.role),
     };
     if (typeof m.peerId === "string") info.peerId = m.peerId;
     if (Array.isArray(m.addrs)) info.addrs = m.addrs.filter((a): a is string => typeof a === "string");
     return info;
 }
 
-// Refresh the sliding TTL safety net on room + roster (one round trip).
+// Refresh the sliding TTL safety net on room + roster + epoch + bans
+// (one round trip). Skipping epoch/bans here would let them decay under an
+// active room: the generation would rewind and kicked users could return.
 async function touchRoom(code: string): Promise<void> {
   await redis.pipeline([
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: epochKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: bannedKey(code), args: [ROOM_TTL_SEC] },
   ]);
 }
 
@@ -177,19 +238,26 @@ export async function roomExists(code: string): Promise<boolean> {
   return meta !== null;
 }
 
-export async function getRoomMeta(code: string): Promise<{ passwordHash: string | null; createdAt: string } | null> {
+export interface RoomMeta {
+  passwordHash: string | null;
+  createdAt: string;
+  creator: string | null; // room creator (null = pre-roles room: moderation disabled)
+}
+
+export async function getRoomMeta(code: string): Promise<RoomMeta | null> {
   const meta = await hgetall(roomKey(code));
   if (!meta) return null;
   // BUGFIX x2: (1) room metadata lives under the single "meta" field, not
   // top-level; (2) real Upstash auto-parses the JSON string into an object,
   // so a typeof-string gate kills it. parseStored tolerates both shapes.
-  const parsed = parseStored<{ passwordHash?: unknown; createdAt?: unknown }>(
+  const parsed = parseStored<{ passwordHash?: unknown; createdAt?: unknown; creator?: unknown }>(
     (meta as Record<string, unknown>).meta
   );
   if (!parsed) return null;
   return {
     passwordHash: typeof parsed.passwordHash === "string" ? parsed.passwordHash : null,
     createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
+    creator: typeof parsed.creator === "string" ? parsed.creator : null,
   };
 }
 
@@ -262,12 +330,14 @@ export async function createRoom(
     const created = await redis.hsetnx(roomKey(code), "meta", JSON.stringify({
       passwordHash,
       createdAt: new Date().toISOString(),
+      creator: username,
     }));
     if (created === 0) continue; // collision — regenerate
     // Claim the creator and arm TTLs in one round trip. The hsetnx result
     // tells us if our own username somehow raced us (rollback + retry).
+    // The creator owns the room: member role for moderation rank.
     const [claimed] = (await redis.pipeline([
-      { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now() })] },
+      { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now(), role: "creator" })] },
       { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
       { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     ])) as [number, unknown, unknown];
@@ -284,8 +354,10 @@ export async function createRoom(
   throw new RoomError(500, "Failed to generate a unique session code");
 }
 
-// Atomically claim a username in a live room. Returns the roster.
-export async function joinRoom(code: string, username: string, pubkey: string): Promise<MemberInfo[]> {
+// Atomically claim a username in a live room. Returns the roster plus the
+// roster epoch (bumped by this join) so the joiner seeds its change tracker
+// without an extra round trip.
+export async function joinRoom(code: string, username: string, pubkey: string): Promise<{ roster: MemberInfo[]; epoch: number }> {
   assertRoomCode(code);
   assertUsername(username);
   assertPubkey(pubkey);
@@ -293,9 +365,15 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   if (!(await roomExists(code))) {
     throw new RoomError(404, "Session not found");
   }
-  // Claim + TTLs + fresh roster in one round trip.
+  // Kicked users stay out while the room lives.
+  if (await redis.hget(bannedKey(code), username)) {
+    throw new RoomError(403, "You were kicked from this session");
+  }
+  // Claim + TTLs + fresh roster in one round trip. Joiners start as
+  // members; roles are granted explicitly (existing roles survive rejoins
+  // via the 409 path below — re-claiming never demotes).
   const [claimed, , , rosterRaw] = (await redis.pipeline([
-    { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now() })] },
+    { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now(), role: "member" })] },
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "hgetall", key: membersKey(code), args: [] },
@@ -303,12 +381,12 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   if (claimed === 0) {
     const existing = await redis.hget(membersKey(code), username);
     if (existing && !parseMember(username, existing)) {
-      await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: Date.now() }));
-      return rosterFrom(await hgetall(membersKey(code)));
+      await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: Date.now(), role: "member" }));
+      return { roster: rosterFrom(await hgetall(membersKey(code))), epoch: await bumpEpochBestEffort(code) };
     }
     throw new RoomError(409, "Username already taken");
   }
-  return rosterFrom(rosterRaw);
+  return { roster: rosterFrom(rosterRaw), epoch: await bumpEpochBestEffort(code) };
 }
 
 export async function getRoster(code: string): Promise<MemberInfo[]> {
@@ -340,7 +418,7 @@ export async function heartbeat(
   code: string,
   username: string,
   patch: { peerId?: string; addrs?: string[] }
-): Promise<MemberInfo[]> {
+): Promise<{ roster: MemberInfo[]; epoch: number }> {
   assertRoomCode(code);
   assertUsername(username);
   if (patch.peerId !== undefined && (typeof patch.peerId !== "string" || patch.peerId.length > 256)) {
@@ -367,18 +445,25 @@ export async function heartbeat(
   const entry: Record<string, unknown> = {
     pubkey: current?.pubkey ?? "",
     beat: Date.now(),
+    role: current?.role ?? "member", // beats never demote: role changes only via setRole
   };
   if (patch.peerId !== undefined) entry.peerId = patch.peerId;
   else if (current?.peerId !== undefined) entry.peerId = current.peerId;
   if (patch.addrs !== undefined) entry.addrs = patch.addrs;
   else if (current?.addrs !== undefined) entry.addrs = current.addrs;
-  const [, , , rosterRaw] = (await redis.pipeline([
+  // Beat write + TTLs + roster + epoch in one round trip: the epoch costs
+  // no extra QPS, it just rides the response the client already fetches.
+  // The epoch TTL refreshes here so active rooms never decay to 0.
+  const [, , , , rosterRaw, epochRaw] = (await redis.pipeline([
     { cmd: "hset", key: membersKey(code), args: [username, JSON.stringify(entry)] },
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: epochKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "hgetall", key: membersKey(code), args: [] },
-  ])) as [unknown, unknown, unknown, Record<string, string> | null];
-  return rosterFrom(rosterRaw);
+    { cmd: "get", key: epochKey(code), args: [] },
+  ])) as [unknown, unknown, unknown, unknown, Record<string, string> | null, unknown];
+  const epoch = typeof epochRaw === "string" ? parseInt(epochRaw, 10) : typeof epochRaw === "number" ? epochRaw : 0;
+  return { roster: rosterFrom(rosterRaw), epoch: Number.isFinite(epoch) && epoch > 0 ? epoch : 0 };
 }
 
 // Remove a member. When the room empties, destroy it immediately — rooms
@@ -407,13 +492,115 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
     ended = true;
   } else {
     await touchRoom(code);
+    await bumpEpochBestEffort(code); // survivors must learn the departure ASAP
   }
   return { remaining, ended };
 }
 
+// ─── Moderation (creator/admin privileges) ─────────────────────────────────
+//
+// The room creator (main admin) holds every privilege: kick anyone except
+// themselves, grant/revoke admin. Granted admins may kick regular members
+// only — never another admin, never the creator. Members moderate nobody.
+// The creator is immune and immutable. Kicks ban the username while the
+// room lives (rejoin returns 403) and wipe the target's transient queues.
+
+function requireRole(members: Record<string, string>, username: string): { member: MemberInfo; rank: number } {
+  const raw = members[username];
+  const member = raw ? parseMember(username, raw) : null;
+  if (!member) throw new RoomError(403, "Not in this session");
+  return { member, rank: roleRank(member.role) };
+}
+
+export async function kickMember(
+  code: string,
+  actor: string,
+  target: string
+): Promise<{ roster: MemberInfo[]; epoch: number; remaining: number }> {
+  assertRoomCode(code);
+  assertUsername(actor);
+  assertUsername(target);
+  const all = await hgetall(membersKey(code));
+  if (!all) throw new RoomError(404, "Session not found");
+  const meta = await getRoomMeta(code);
+  if (!meta?.creator) throw new RoomError(403, "This room predates roles — recreate it to enable moderation");
+  const { member: actorMember } = requireRole(all, actor);
+  const { member: targetMember } = requireRole(all, target);
+  if (actor === target) throw new RoomError(403, "You cannot kick yourself");
+  if (targetMember.role === "creator") throw new RoomError(403, "Nobody can kick the room creator");
+  if (actorMember.role === "creator") {
+    // Main admin: full privilege, anyone but themselves (checked above).
+  } else if (actorMember.role === "admin" && targetMember.role === "member") {
+    // Granted admins may kick regular members only.
+  } else if (actorMember.role === "admin") {
+    throw new RoomError(403, "Only the room creator can kick an admin");
+  } else {
+    throw new RoomError(403, "Only the room creator or an admin can kick users");
+  }
+  // Best-effort transient cleanup (mirrors leaveRoom): failures must never
+  // block the kick itself.
+  await redis.pipeline([
+    { cmd: "del", key: sigKey(code, target), args: [] },
+    { cmd: "del", key: inboxKey(code, target), args: [] },
+  ]).catch(() => [] as unknown[]);
+  await redis.hdel(membersKey(code), target);
+  await redis.pipeline([
+    { cmd: "hset", key: bannedKey(code), args: [target, JSON.stringify({ at: Date.now(), by: actor })] },
+    { cmd: "expire", key: bannedKey(code), args: [ROOM_TTL_SEC] },
+  ]).catch(() => [] as unknown[]);
+  const remaining = await redis.hlen(membersKey(code));
+  if (remaining === 0) {
+    await destroyRoom(code);
+    await unindexRoom(code);
+    return { roster: [], epoch: 0, remaining: 0 };
+  }
+  await touchRoom(code);
+  const epoch = await bumpEpochBestEffort(code);
+  return { roster: rosterFrom(await hgetall(membersKey(code))), epoch, remaining };
+}
+
+export async function setRole(
+  code: string,
+  actor: string,
+  target: string,
+  role: Role
+): Promise<{ roster: MemberInfo[]; epoch: number }> {
+  assertRoomCode(code);
+  assertUsername(actor);
+  assertUsername(target);
+  if (role !== "admin" && role !== "member") {
+    throw new RoomError(400, "Role must be admin or member");
+  }
+  const all = await hgetall(membersKey(code));
+  if (!all) throw new RoomError(404, "Session not found");
+  const meta = await getRoomMeta(code);
+  if (!meta?.creator) throw new RoomError(403, "This room predates roles — recreate it to enable moderation");
+  const { member: actorMember } = requireRole(all, actor);
+  if (actorMember.role !== "creator") {
+    throw new RoomError(403, "Only the room creator can grant admin");
+  }
+  if (actor === target) throw new RoomError(403, "You cannot change your own role");
+  const targetRaw = all[target];
+  const targetMember = targetRaw ? parseMember(target, targetRaw) : null;
+  if (!targetMember) throw new RoomError(404, "User is not in this session");
+  if (targetMember.role === "creator") throw new RoomError(403, "The creator role cannot be changed");
+  if (targetMember.role === role) return { roster: rosterFrom(all), epoch: await getEpoch(code) };
+  const entry: Record<string, unknown> = {
+    pubkey: targetMember.pubkey,
+    beat: Date.now(),
+    role,
+  };
+  if (targetMember.peerId !== undefined) entry.peerId = targetMember.peerId;
+  if (targetMember.addrs !== undefined) entry.addrs = targetMember.addrs;
+  await redis.hset(membersKey(code), target, JSON.stringify(entry));
+  await touchRoom(code);
+  const epoch = await bumpEpochBestEffort(code);
+  return { roster: rosterFrom(await hgetall(membersKey(code))), epoch };
+}
+
 export async function destroyRoom(code: string): Promise<void> {
   const members = (await hgetall(membersKey(code))) || {};
-  const keys = [roomKey(code), membersKey(code)];
+  const keys = [roomKey(code), membersKey(code), epochKey(code), bannedKey(code)];
   for (const username of Object.keys(members)) {
     keys.push(sigKey(code, username), inboxKey(code, username));
   }
@@ -538,12 +725,13 @@ export async function depositBox(
 }
 
 const FETCH_BOX_CAP = 50; // one fetch never exceeds ~50 boxes; remainder self-paginates next poll
-export async function fetchBoxes(code: string, username: string): Promise<InboxBox[]> {
+export async function fetchBoxes(code: string, username: string): Promise<{ boxes: InboxBox[]; epoch: number }> {
   assertRoomCode(code);
   assertUsername(username);
   await requireMember(code, username);
   const all = await hgetall(inboxKey(code, username));
-  if (!all) return [];
+  const epoch = await getEpoch(code); // piggyback: membership changes surface on the 2s inbox cadence
+  if (!all) return { boxes: [], epoch };
   const out: InboxBox[] = [];
   const corrupt: string[] = [];
   for (const [field, raw] of Object.entries(all)) {
@@ -556,7 +744,7 @@ export async function fetchBoxes(code: string, username: string): Promise<InboxB
   }
   if (corrupt.length > 0) await redis.hdel(inboxKey(code, username), ...corrupt).catch(() => 0);
   out.sort((a, b) => a.ts - b.ts);
-  return out.slice(0, FETCH_BOX_CAP);
+  return { boxes: out.slice(0, FETCH_BOX_CAP), epoch };
 }
 
 // Explicit ACK: delete exactly the acknowledged boxes. Fetch-then-ACK (not
@@ -634,6 +822,7 @@ export async function sweepRooms(): Promise<{ processed: number; prunedMembers: 
         ]).catch(() => [] as unknown[]);
         prunedMembers++;
       }
+      if (stale.length > 0) await bumpEpochBestEffort(code); // one bump per swept room
       const remaining = await redis.hlen(membersKey(code));
       if (remaining === 0) {
         await destroyRoom(code);

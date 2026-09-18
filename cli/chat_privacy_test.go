@@ -161,7 +161,7 @@ func TestPollAdoptsRosterImmediately(t *testing.T) {
 
 	// A peer joins server-side between beats.
 	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
-	if _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
 		t.Fatal(err)
 	}
 

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -504,5 +505,60 @@ func TestTarballDirPacksFiles(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "one.txt,two.txt" {
 		t.Fatalf("tarball contents = %v", names)
+	}
+}
+
+func TestDocumentsDirPrefersDocuments(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if got := documentsDir(); got != home {
+		t.Fatalf("without Documents, want home %q, got %q", home, got)
+	}
+	docs := filepath.Join(home, "Documents")
+	if err := os.MkdirAll(docs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := documentsDir(); got != docs {
+		t.Fatalf("with Documents, want %q, got %q", docs, got)
+	}
+}
+
+func TestDocumentsDirHonorsXDG(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("XDG override is Linux-only")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	custom := filepath.Join(home, "MyDocs")
+	if err := os.MkdirAll(custom, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(home, ".config")
+	if err := os.MkdirAll(cfg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "# test dirs\nXDG_DOCUMENTS_DIR=\"$HOME/MyDocs\"\n"
+	if err := os.WriteFile(filepath.Join(cfg, "user-dirs.dirs"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := documentsDir(); got != custom {
+		t.Fatalf("XDG override want %q, got %q", custom, got)
+	}
+}
+
+func TestOpenPickerStartsInDocuments(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	docs := filepath.Join(home, "Documents")
+	if err := os.MkdirAll(docs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.openPicker()
+	if !c.picker.isActive() {
+		t.Fatal("picker must be active")
+	}
+	if c.picker.cwd != docs {
+		t.Fatalf("picker cwd = %q; want Documents %q", c.picker.cwd, docs)
 	}
 }
