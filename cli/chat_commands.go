@@ -18,6 +18,9 @@ import (
 type slashCommand struct {
 	Name string // canonical form including the leading "/"
 	Desc string // one-line hint painted next to the name
+	// TakesUser marks commands whose argument is a room member (/kick bob):
+	// once "<cmd> " is typed, the drawer morphs into a member picker.
+	TakesUser bool
 }
 
 // slashCommands is the full catalogue. Keep it the ONLY place a command is
@@ -28,9 +31,9 @@ var slashCommands = []slashCommand{
 	{Name: "/download", Desc: "fetch shared room files"},
 	{Name: "/video", Desc: "toggle camera to your DM peer / the room"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
-	{Name: "/kick", Desc: "kick a user (creator/admin only)"},
-	{Name: "/admin", Desc: "grant admin (room creator only)"},
-	{Name: "/unadmin", Desc: "revoke admin (room creator only)"},
+	{Name: "/kick", Desc: "kick a user (creator/admin only)", TakesUser: true},
+	{Name: "/admin", Desc: "grant admin (room creator only)", TakesUser: true},
+	{Name: "/unadmin", Desc: "revoke admin (room creator only)", TakesUser: true},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
@@ -111,6 +114,97 @@ func (c *chatScreen) rankedCommands(query string) []slashCommand {
 	return rankSlashCommands(visibleSlashCommands(c.myRole()), query)
 }
 
+// ---- second-stage member picker --------------------------------------------
+//
+// Moderation commands take a username, so the drawer works in two stages:
+// "<cmd>" filters commands; "<cmd> <fragment>" morphs the same drawer into
+// a member picker (up/down to move, Tab to complete, Enter to run, Esc to
+// step back to the command). This is what makes a typed "/kick bob"+Enter
+// work at all — without it the open drawer would swallow Enter as a command
+// pick and the argument would never reach runCommand.
+
+// userArgTarget parses "<cmd> <fragment>" from live composer text. It
+// reports the visible TakesUser command + the username fragment, or ok=false
+// when the drawer stays in command mode (no space yet, unknown or hidden
+// command, command takes no user).
+func (c *chatScreen) userArgTarget(input string) (cmd, query string, ok bool) {
+	space := strings.Index(input, " ")
+	if space < 0 {
+		return "", "", false
+	}
+	head := strings.ToLower(input[:space])
+	if !strings.HasPrefix(head, "/") {
+		return "", "", false
+	}
+	for _, vc := range visibleSlashCommands(c.myRole()) {
+		if vc.Name == head && vc.TakesUser {
+			return vc.Name, strings.TrimLeft(input[space+1:], " "), true
+		}
+	}
+	return "", "", false
+}
+
+// userCandidates lists pickable room members: online, never self, carrying
+// roles for the row annotation. Engine presence is the source of truth; the
+// sidebar snapshot covers unwired screens.
+func (c *chatScreen) userCandidates() []rosterMember {
+	var out []rosterMember
+	if c.eng != nil {
+		for _, m := range c.eng.peers() {
+			if m.Online && m.Username != "" && m.Username != c.me {
+				out = append(out, m)
+			}
+		}
+	} else {
+		for _, u := range c.users {
+			if u != "" && u != c.me {
+				out = append(out, rosterMember{Username: u, Online: true})
+			}
+		}
+	}
+	return out
+}
+
+// rankUsers orders candidates for a fragment: prefix matches first
+// (case-insensitive), alphabetical inside each group — the same contract as
+// rankSlashCommands, so both picker stages feel identical.
+func rankUsers(users []rosterMember, query string) []rosterMember {
+	q := strings.ToLower(strings.TrimSpace(query))
+	out := make([]rosterMember, len(users))
+	copy(out, users)
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := strings.ToLower(out[i].Username), strings.ToLower(out[j].Username)
+		ap, bp := strings.HasPrefix(a, q), strings.HasPrefix(b, q)
+		if ap != bp {
+			return ap // prefix matches float to the top
+		}
+		return a < b // dictionary order inside each group
+	})
+	return out
+}
+
+// paletteUsers reports the member-picker state: the command being completed
+// plus ranked candidates. ok=false means command mode.
+func (c *chatScreen) paletteUsers() (cmd string, users []rosterMember, ok bool) {
+	cmd, query, ok := c.userArgTarget(c.input.Value())
+	if !ok {
+		return "", nil, false
+	}
+	return cmd, rankUsers(c.userCandidates(), query), true
+}
+
+// userRoleTag annotates picker rows: staff stand out, members stay clean.
+func userRoleTag(role string) string {
+	switch role {
+	case "creator":
+		return "main admin"
+	case "admin":
+		return "admin"
+	default:
+		return ""
+	}
+}
+
 // ---- palette styling ---------------------------------------------------------
 //
 // The drawer borrows the composer's rounded border + accent colour so the
@@ -140,6 +234,10 @@ const paletteMaxVisible = 6
 
 // paletteFooterHints is the dim keymap legend under the list.
 const paletteFooterHints = "↑↓ select · tab complete · enter run · esc dismiss"
+
+// paletteUserHints is the legend when the drawer morphed into the member
+// picker: Esc steps back to the command instead of dismissing.
+const paletteUserHints = "↑↓ select user · tab complete · enter run · esc back"
 
 // ---- palette state -----------------------------------------------------------
 
@@ -207,6 +305,9 @@ func (c chatScreen) paletteRows() int {
 		return 0
 	}
 	n := len(c.rankedCommands(c.input.Value()))
+	if _, users, ok := c.paletteUsers(); ok {
+		n = len(users) // member-picker stage budgets member rows, not commands
+	}
 	if n == 0 {
 		return 0
 	}
@@ -364,6 +465,9 @@ func (c chatScreen) paletteView(maxW int) string {
 	if !c.palette.visible() || maxW < 6 {
 		return ""
 	}
+	if _, users, ok := c.paletteUsers(); ok {
+		return c.paletteUsersView(maxW, users)
+	}
 	ranked := c.rankedCommands(c.input.Value())
 	if len(ranked) == 0 {
 		return ""
@@ -421,6 +525,65 @@ func (c chatScreen) paletteView(maxW int) string {
 	return panel
 }
 
+// paletteUsersView renders the member-picker stage: one row per candidate
+// (username + role tag), same box/chip/overflow geometry as command rows so
+// the height budget in paletteRows() still holds exactly.
+func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
+	if len(users) == 0 {
+		return ""
+	}
+	c.palette.clampSel(len(users))
+	shown := min(len(users), paletteMaxVisible)
+
+	inner := maxW - 2 // room for the box border
+	query := strings.ToLower(strings.TrimSpace(c.input.Value()))
+	if i := strings.Index(query, " "); i >= 0 {
+		query = strings.TrimLeft(query[i+1:], " ") // match the fragment, not "<cmd> "
+	}
+
+	fit := func(s string) string {
+		if lipgloss.Width(s) > inner {
+			return lipgloss.NewStyle().MaxWidth(inner).Render(s)
+		}
+		return s
+	}
+
+	nameCol := 0
+	for _, u := range users[:shown] {
+		if w := lipgloss.Width(u.Username); w > nameCol {
+			nameCol = w
+		}
+	}
+	nameCol += 2
+
+	rows := make([]string, 0, shown+2)
+	for i := 0; i < shown; i++ {
+		u := users[i]
+		name := u.Username
+		if len(name) >= len(query) && len(query) > 0 &&
+			strings.EqualFold(name[:len(query)], query) {
+			name = tuiPaletteMatchStyle.Render(name[:len(query)]) + name[len(query):]
+		}
+		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(userRoleTag(u.Role)))
+		line = padVisible(line, inner)
+		if i == c.palette.sel {
+			line = tuiPaletteSelStyle.Render(line)
+		}
+		rows = append(rows, line)
+	}
+	if hidden := len(users) - shown; hidden > 0 {
+		rows = append(rows, fit(padVisible(
+			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", hidden)), inner)))
+	}
+	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(paletteUserHints, inner))))
+
+	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
+	if lipgloss.Width(panel) > maxW {
+		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
+	}
+	return panel
+}
+
 // ---- palette key handling ----------------------------------------------------
 
 // visibleCount is how many ranked rows the panel can currently paint; the
@@ -432,6 +595,41 @@ func visibleCount(ranked int) int { return min(ranked, paletteMaxVisible) }
 // editing), optionally returning an action to run afterwards.
 func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action func() tea.Cmd) {
 	if !c.palette.visible() {
+		return false, nil
+	}
+	// Member-picker stage: the same drawer completes usernames for the
+	// pending moderation command. Empty candidate list falls through to
+	// submitLine so a hand-typed (possibly stale-presence) name still
+	// reaches the server for validation.
+	if cmd, users, ok := c.paletteUsers(); ok && len(users) > 0 {
+		switch msg.Type {
+		case tea.KeyUp:
+			c.palette.moveUp(visibleCount(len(users)))
+			return true, nil
+		case tea.KeyDown:
+			c.palette.moveDown(visibleCount(len(users)))
+			return true, nil
+		case tea.KeyTab:
+			c.palette.clampSel(visibleCount(len(users)))
+			if c.palette.sel < len(users) {
+				c.input.SetValue(cmd + " " + users[c.palette.sel].Username + " ")
+				c.palette.close()
+			}
+			return true, nil
+		case tea.KeyEnter:
+			c.palette.clampSel(visibleCount(len(users)))
+			if c.palette.sel < len(users) {
+				user := users[c.palette.sel].Username
+				c.input.SetValue("")
+				c.palette.close()
+				return true, func() tea.Cmd { return c.runCommand(cmd, user) }
+			}
+			return true, nil
+		case tea.KeyEsc:
+			// Step back to the command stage, drawer stays open.
+			c.input.SetValue(cmd)
+			return true, nil
+		}
 		return false, nil
 	}
 	switch msg.Type {
