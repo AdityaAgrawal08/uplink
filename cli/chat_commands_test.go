@@ -610,6 +610,61 @@ func TestUserPickerFlow(t *testing.T) {
 	}
 }
 
+func TestCommandMorphsIntoUserPicker(t *testing.T) {
+	srv, c, _ := wireModRoom(t)
+	defer srv.Close()
+
+	typeText := func(cs chatScreen, s string) chatScreen {
+		for _, r := range s {
+			m, _ := cs.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			cs = m.(chatScreen)
+		}
+		return cs
+	}
+
+	// Partial "/ki" + Enter: /kick is top-ranked, morphs into the picker
+	// instead of firing with an empty arg.
+	sc := typeText(*c, "/ki")
+	m, _ := sc.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	sc = m.(chatScreen)
+	if got := sc.input.Value(); got != "/kick " {
+		t.Fatalf("enter morphed to %q; want \"/kick \"", got)
+	}
+	if !sc.palette.visible() {
+		t.Fatal("morph must keep the drawer open")
+	}
+	if cmd, users, ok := sc.paletteUsers(); !ok || cmd != "/kick" || len(users) != 2 {
+		t.Fatalf("morphed picker = (%q, %d users, %v)", cmd, len(users), ok)
+	}
+
+	// Partial "/adm" + Tab: same morph, inline completion.
+	sc2 := typeText(*c, "/adm")
+	m2, _ := sc2.Update(tea.KeyMsg{Type: tea.KeyTab})
+	sc2 = m2.(chatScreen)
+	if got := sc2.input.Value(); got != "/admin " {
+		t.Fatalf("tab morphed to %q; want \"/admin \"", got)
+	}
+	if !sc2.palette.visible() {
+		t.Fatal("tab morph must keep the drawer open")
+	}
+	if cmd, _, ok := sc2.paletteUsers(); !ok || cmd != "/admin" {
+		t.Fatalf("tab morphed picker = (%q, %v)", cmd, ok)
+	}
+
+	// Members see no mod commands: "/ki" + Enter runs the top visible
+	// command and closes, never morphs.
+	mem := newPaletteScreen()
+	mem, _ = typeKeys(mem, "/ki")
+	m3, _ := mem.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	mem = m3.(chatScreen)
+	if mem.palette.visible() {
+		t.Fatal("member enter must close the drawer (command ran)")
+	}
+	if _, _, ok := mem.paletteUsers(); ok {
+		t.Fatal("member must never enter user mode")
+	}
+}
+
 func TestModTargetParsing(t *testing.T) {
 	for _, tc := range []struct {
 		in   string

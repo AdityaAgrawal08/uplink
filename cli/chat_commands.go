@@ -643,15 +643,28 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 		ranked := c.rankedCommands(c.input.Value())
 		c.palette.clampSel(visibleCount(len(ranked)))
 		if c.palette.sel < len(ranked) {
-			c.input.SetValue(ranked[c.palette.sel].Name + " ") // complete inline
-			c.palette.close()
+			picked := ranked[c.palette.sel]
+			c.input.SetValue(picked.Name + " ") // complete inline
+			if picked.TakesUser {
+				c.palette.sel = 0 // stay open: morph into the member picker
+			} else {
+				c.palette.close()
+			}
 		}
 		return true, nil
 	case tea.KeyEnter:
 		ranked := c.rankedCommands(c.input.Value())
 		c.palette.clampSel(visibleCount(len(ranked)))
 		if c.palette.sel < len(ranked) {
-			name := ranked[c.palette.sel].Name
+			picked := ranked[c.palette.sel]
+			if picked.TakesUser {
+				// Stage two: don't fire with an empty arg (usage ping) —
+				// complete the command and morph into the member picker.
+				c.input.SetValue(picked.Name + " ")
+				c.palette.sel = 0
+				return true, nil
+			}
+			name := picked.Name
 			c.input.SetValue("")
 			c.palette.close()
 			return true, func() tea.Cmd { return c.runCommand(name, "") }
