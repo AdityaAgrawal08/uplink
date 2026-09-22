@@ -28,7 +28,7 @@ export interface IRedisClient {
 // Results come back positionally; a failing command throws (fail-fast),
 // matching sequential semantics where the error would surface inline.
 export interface PipeOp {
-  cmd: "hsetnx" | "hset" | "hget" | "expire" | "rpush" | "rpop" | "lrem" | "ltrim" | "del" | "hgetall" | "hdel" | "lrange" | "llen" | "hlen" | "incr";
+  cmd: "hsetnx" | "hset" | "hget" | "get" | "expire" | "rpush" | "rpop" | "lrem" | "ltrim" | "del" | "hgetall" | "hdel" | "lrange" | "llen" | "hlen" | "incr";
   key: string;
   args: Array<string | number>;
 }
@@ -258,6 +258,7 @@ export class MockRedis implements IRedisClient {
         case "hsetnx": out.push(await this.hsetnx(op.key, String(op.args[0]), String(op.args[1]))); break;
         case "hset": out.push(await this.hset(op.key, String(op.args[0]), String(op.args[1]))); break;
         case "hget": out.push(await this.hget(op.key, String(op.args[0]))); break;
+        case "get": out.push(await this.get(op.key)); break;
         case "expire": out.push(await this.expire(op.key, Number(op.args[0]))); break;
         case "rpush": out.push(await this.rpush(op.key, ...op.args.map(String))); break;
         case "rpop": out.push(await this.rpop(op.key)); break;

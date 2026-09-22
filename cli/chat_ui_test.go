@@ -13,19 +13,39 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestSidebarWidthDensity(t *testing.T) {
-	cases := map[int]int{70: rosterTotalWidth, 89: rosterTotalWidth, 90: 26, 129: 26, 130: 30, 200: 30}
+	// Fluid column: ~1 cell per 10 terminal columns, clamped [22,38].
+	cases := map[int]int{66: 22, 70: 22, 86: 24, 90: 24, 106: 26, 130: 28, 176: 33, 200: 35, 226: 38, 300: 38}
 	for w, want := range cases {
 		if got := sidebarWidthFor(w); got != want {
 			t.Errorf("sidebarWidthFor(%d) = %d; want %d", w, got, want)
 		}
 	}
+	// Monotonic: every wider terminal rebalances (never jumps backwards).
+	prev := 0
+	for w := 40; w <= 260; w++ {
+		if got := sidebarWidthFor(w); got < prev {
+			t.Fatalf("sidebarWidthFor(%d) = %d < %d: not monotonic", w, got, prev)
+		} else {
+			prev = got
+		}
+	}
 }
 
 func TestComposerRowsDensity(t *testing.T) {
-	cases := map[int]int{40: 3, 22: 3, 21: 2, 14: 2, 13: 1, 10: 1, 9: 0, 5: 0}
+	// Single-line composer whenever boxed; bare prompt when cramped.
+	cases := map[int]int{60: 1, 40: 1, 30: 1, 12: 1, 11: 0, 9: 0, 5: 0}
 	for h, want := range cases {
 		if got := composerRowsFor(h); got != want {
 			t.Errorf("composerRowsFor(%d) = %d; want %d", h, got, want)
+		}
+	}
+	// Monotonic growth with height.
+	prev := -1
+	for h := 0; h <= 60; h++ {
+		if got := composerRowsFor(h); got < prev {
+			t.Fatalf("composerRowsFor(%d) = %d < %d: not monotonic", h, got, prev)
+		} else {
+			prev = got
 		}
 	}
 }
@@ -76,11 +96,12 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 	l := computeLayout(100, 30, false)
 	out := c.rosterBody(l.rosterSlots)
 
-	if !strings.Contains(out, "ONLINE — 3") {
-		t.Errorf("online section missing: %q", out)
+	if !strings.Contains(out, "Search chats") || !strings.Contains(out, "General") {
+		t.Errorf("chat list missing search/room:\n%s", out)
 	}
-	if !strings.Contains(out, "● alice (you)") || !strings.Contains(out, "○ bob") {
-		t.Errorf("presence dots wrong:\n%s", out)
+	// Self (alice) has no chat row of its own; peers do.
+	if !strings.Contains(out, "bob") || !strings.Contains(out, "carol") {
+		t.Errorf("peers missing from chat list:\n%s", out)
 	}
 	if strings.Contains(out, "THREADS") && l.rosterSlots < 4 {
 		t.Error("threads section rendered without room")
@@ -93,15 +114,15 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 	if strings.Contains(out, "THREADS") || strings.Contains(out, "▸ · bob") || strings.Contains(out, "# general") {
 		t.Errorf("thread panel remnants after removal:\n%s", out)
 	}
-	if !strings.Contains(out, "● bob") {
+	if !strings.Contains(out, "bob") {
 		t.Errorf("selected peer lost its highlight:\n%s", out)
 	}
 
-	// Back to general: still just the ONLINE roster.
+	// Back to general: still the same chat list.
 	c.exitPrivate()
 	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
-	if !strings.Contains(out, "ONLINE — 3") {
-		t.Errorf("roster damaged by mode switches:\n%s", out)
+	if !strings.Contains(out, "General") || !strings.Contains(out, "bob") {
+		t.Errorf("chat list damaged by mode switches:\n%s", out)
 	}
 }
 

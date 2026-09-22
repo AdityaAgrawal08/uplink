@@ -18,6 +18,7 @@ type rosterMember struct {
 	Username string   `json:"username"`
 	Pubkey   string   `json:"pubkey"`
 	Online   bool     `json:"online"`
+	Role     string   `json:"role,omitempty"` // creator|admin|member (empty = pre-roles server)
 	PeerId   string   `json:"peerId,omitempty"`
 	Addrs    []string `json:"addrs,omitempty"`
 }
@@ -114,26 +115,69 @@ func (c *signalClient) createRoom(username, pubkey, password string) (string, er
 	return r.SessionId, nil
 }
 
-// joinRoom claims a username and returns the roster (with peer pubkeys).
-func (c *signalClient) joinRoom(username, pubkey, password string) ([]rosterMember, error) {
+// joinRoom claims a username and returns the roster (with peer pubkeys)
+// plus the roster epoch (bumped by this join) for the change tracker.
+func (c *signalClient) joinRoom(username, pubkey, password string) ([]rosterMember, int64, error) {
 	payload := map[string]any{"username": username, "pubkey": pubkey}
 	if password != "" {
 		payload["password"] = password
 	}
 	code, body, err := postJSON(c.endpoint("/join"), payload, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if code != 200 {
-		return nil, apiErr(code, body)
+		return nil, 0, apiErr(code, body)
 	}
 	var r struct {
 		Roster []rosterMember `json:"roster"`
+		Epoch  int64          `json:"epoch"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return r.Roster, nil
+	return r.Roster, r.Epoch, nil
+}
+
+// kickUser removes a user from the room (creator/admin only, server
+// enforced). Returns the fresh roster + epoch so the caller refreshes
+// without waiting for the next beat.
+func (c *signalClient) kickUser(target string) ([]rosterMember, int64, error) {
+	code, body, err := postJSON(c.endpoint("/kick"), map[string]any{"target": target}, c.headers())
+	if err != nil {
+		return nil, 0, err
+	}
+	if code != 200 {
+		return nil, 0, apiErr(code, body)
+	}
+	var r struct {
+		Roster []rosterMember `json:"roster"`
+		Epoch  int64          `json:"epoch"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, 0, err
+	}
+	return r.Roster, r.Epoch, nil
+}
+
+// setRole grants (admin=true) or revokes (admin=false) the admin role
+// (room creator only, server enforced). Returns the fresh roster + epoch.
+func (c *signalClient) setRole(target string, admin bool) ([]rosterMember, int64, error) {
+	code, body, err := postJSON(c.endpoint("/admin"), map[string]any{"target": target, "admin": admin}, c.headers())
+	if err != nil {
+		return nil, 0, err
+	}
+	if code != 200 {
+		return nil, 0, apiErr(code, body)
+	}
+	var r struct {
+		Roster []rosterMember `json:"roster"`
+		Epoch  int64          `json:"epoch"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, 0, err
+	}
+	return r.Roster, r.Epoch, nil
 }
 
 func (c *signalClient) leaveRoom() error {
@@ -147,8 +191,10 @@ func (c *signalClient) leaveRoom() error {
 	return nil
 }
 
-// heartbeat pings presence and returns the fresh roster.
-func (c *signalClient) heartbeat(peerId string, addrs []string) ([]rosterMember, error) {
+// heartbeat pings presence and returns the fresh roster plus the roster
+// epoch. Absent epoch (older servers) parses as 0 — change tracking simply
+// stays quiet.
+func (c *signalClient) heartbeat(peerId string, addrs []string) ([]rosterMember, int64, error) {
 	payload := map[string]any{}
 	if peerId != "" {
 		payload["peerId"] = peerId
@@ -158,18 +204,19 @@ func (c *signalClient) heartbeat(peerId string, addrs []string) ([]rosterMember,
 	}
 	code, body, err := postJSON(c.endpoint("/heartbeat"), payload, c.headers())
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if code != 200 {
-		return nil, apiErr(code, body)
+		return nil, 0, apiErr(code, body)
 	}
 	var r struct {
 		Roster []rosterMember `json:"roster"`
+		Epoch  int64          `json:"epoch"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return r.Roster, nil
+	return r.Roster, r.Epoch, nil
 }
 
 // signalSend deposits one rendezvous note (SDP offer/answer, ICE).
@@ -220,25 +267,27 @@ func (c *signalClient) inboxSend(to, msgId, kind, payload string) error {
 	return nil
 }
 
-// inboxFetch returns my boxes WITHOUT deleting (deletion is explicit ACK).
-func (c *signalClient) inboxFetch() ([]inboxBox, error) {
+// inboxFetch returns my boxes WITHOUT deleting (deletion is explicit ACK),
+// plus the roster epoch piggybacked on the response.
+func (c *signalClient) inboxFetch() ([]inboxBox, int64, error) {
 	code, body, err := getJSON(c.endpoint("/inbox"), c.headers())
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if code != 200 {
-		return nil, apiErr(code, body)
+		return nil, 0, apiErr(code, body)
 	}
 	var r struct {
 		Boxes []inboxBox `json:"boxes"`
+		Epoch int64      `json:"epoch"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if r.Boxes == nil {
 		r.Boxes = []inboxBox{}
 	}
-	return r.Boxes, nil
+	return r.Boxes, r.Epoch, nil
 }
 
 // inboxAck deletes exactly the acknowledged boxes.

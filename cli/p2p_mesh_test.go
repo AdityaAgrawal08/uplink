@@ -129,10 +129,10 @@ func TestMeshLoopback(t *testing.T) {
 	// register both members (fake server has no pubkey requirement)
 	sa := &signalClient{serverURL: srv.URL, me: "alice", key: sid}
 	sb := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sa.joinRoom("alice", "pub-a", ""); err != nil {
+	if _, _, err := sa.joinRoom("alice", "pub-a", ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := sb.joinRoom("bob", "pub-b", ""); err != nil {
+	if _, _, err := sb.joinRoom("bob", "pub-b", ""); err != nil {
 		t.Fatal(err)
 	}
 

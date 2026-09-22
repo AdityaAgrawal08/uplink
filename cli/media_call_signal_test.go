@@ -48,7 +48,7 @@ func TestPublishOverSignalPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +166,7 @@ func TestAudioEndToEndWithTestMic(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
 

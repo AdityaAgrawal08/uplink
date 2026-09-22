@@ -7,6 +7,8 @@ import {
   getRoster,
   heartbeat,
   leaveRoom,
+  kickMember,
+  setRole,
   depositSignal,
   drainSignals,
   depositBox,
@@ -47,14 +49,16 @@ describe("rooms signaling plane", () => {
     const { sessionId, username } = await makeRoom();
     await expect(joinRoom(sessionId, username, PUBKEY)).rejects.toMatchObject({ status: 409 });
     const other = `o_${Math.random().toString(36).slice(2, 10)}`;
-    const roster = await joinRoom(sessionId, other, PUBKEY);
+    const { roster, epoch } = await joinRoom(sessionId, other, PUBKEY);
     expect(roster).toHaveLength(2);
+    expect(epoch).toBeGreaterThan(0);
   });
 
   it("heartbeat refreshes presence and returns roster", async () => {
     const { sessionId, username } = await makeRoom();
-    const roster = await heartbeat(sessionId, username, { peerId: "peer1", addrs: ["/ip4/1.2.3.4/tcp/1"] });
+    const { roster, epoch } = await heartbeat(sessionId, username, { peerId: "peer1", addrs: ["/ip4/1.2.3.4/tcp/1"] });
     expect(roster[0].peerId).toBe("peer1");
+    expect(epoch).toBe(0); // no membership change since create
     await expect(heartbeat(sessionId, "stranger", {})).rejects.toMatchObject({ status: 403 });
     await expect(heartbeat(sessionId, username, { peerId: 42 as never })).rejects.toThrow();
   });
@@ -95,17 +99,17 @@ describe("rooms signaling plane", () => {
     await depositBox(sessionId, username, other, "m1", "chat", "cipher1");
     await depositBox(sessionId, username, other, "m1", "chat", "cipher1"); // retry: no duplicate
     await depositBox(sessionId, username, other, "m2", "chat", "cipher2");
-    let boxes = await fetchBoxes(sessionId, other);
+    let { boxes } = await fetchBoxes(sessionId, other);
     expect(boxes.map((b) => b.msgId).sort()).toEqual(["m1", "m2"]);
     // crash-before-ACK simulation: fetch again, boxes still there
-    boxes = await fetchBoxes(sessionId, other);
+    ({ boxes } = await fetchBoxes(sessionId, other));
     expect(boxes).toHaveLength(2);
     const ack = await ackBoxes(sessionId, other, ["m1"]);
     expect(ack.removed).toBe(1);
-    boxes = await fetchBoxes(sessionId, other);
+    ({ boxes } = await fetchBoxes(sessionId, other));
     expect(boxes.map((b) => b.msgId)).toEqual(["m2"]);
     await ackBoxes(sessionId, other, ["m2"]);
-    expect(await fetchBoxes(sessionId, other)).toHaveLength(0);
+    expect((await fetchBoxes(sessionId, other)).boxes).toHaveLength(0);
     await expect(depositBox(sessionId, username, username, "m3", "chat", "x")).rejects.toMatchObject({ status: 400 });
   });
 
@@ -236,9 +240,73 @@ describe("delivery hardening", () => {
     for (let i = 0; i < 60; i++) {
       await depositBox(sessionId, username, peer, `c-${i}`, "p2p", "e30=");
     }
-    const boxes = await fetchBoxes(sessionId, peer);
+    const { boxes } = await fetchBoxes(sessionId, peer);
     expect(boxes.length).toBe(50);
     expect(boxes[0].msgId).toBe("c-0");
+  });
+
+  it("roster epoch bumps on join/leave and rides heartbeat+inbox", async () => {
+    const { sessionId, username } = await makeRoom();
+    const other = `o_${Math.random().toString(36).slice(2, 10)}`;
+    // Fresh room: epoch 0 everywhere.
+    expect((await heartbeat(sessionId, username, {})).epoch).toBe(0);
+    expect((await fetchBoxes(sessionId, username)).epoch).toBe(0);
+    // Join bumps; joiner + heartbeat + inbox all report it.
+    const joined = await joinRoom(sessionId, other, PUBKEY);
+    expect(joined.epoch).toBe(1);
+    expect((await heartbeat(sessionId, username, {})).epoch).toBe(1);
+    expect((await fetchBoxes(sessionId, username)).epoch).toBe(1);
+    // Leave bumps again; survivors see it without waiting for a beat.
+    await leaveRoom(sessionId, other);
+    expect((await heartbeat(sessionId, username, {})).epoch).toBe(2);
+    expect((await fetchBoxes(sessionId, username)).epoch).toBe(2);
+  });
+
+  it("creator/admin/member ranks gate kick and grant", async () => {
+    const { sessionId, username: creator } = await makeRoom();
+    const admin = `a_${Math.random().toString(36).slice(2, 10)}`;
+    const member = `m_${Math.random().toString(36).slice(2, 10)}`;
+    const victim = `v_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, admin, PUBKEY);
+    await joinRoom(sessionId, member, PUBKEY);
+    await joinRoom(sessionId, victim, PUBKEY);
+
+    const roles = async () => Object.fromEntries((await getRoster(sessionId)).map((m) => [m.username, m.role]));
+    expect(await roles()).toMatchObject({ [creator]: "creator", [admin]: "member" });
+
+    // Member cannot kick; admin cannot kick yet (not granted).
+    await expect(kickMember(sessionId, member, victim)).rejects.toMatchObject({ status: 403 });
+    await expect(kickMember(sessionId, admin, victim)).rejects.toMatchObject({ status: 403 });
+    // Only the creator grants admin.
+    await expect(setRole(sessionId, admin, member, "admin")).rejects.toMatchObject({ status: 403 });
+    const granted = await setRole(sessionId, creator, admin, "admin");
+    expect(granted.roster.find((m) => m.username === admin)?.role).toBe("admin");
+    expect(granted.epoch).toBeGreaterThan(0);
+
+    // A second admin: admins can never kick each other — only the creator can.
+    await setRole(sessionId, creator, member, "admin");
+    await expect(kickMember(sessionId, admin, member)).rejects.toMatchObject({ status: 403 });
+    await expect(kickMember(sessionId, member, admin)).rejects.toMatchObject({ status: 403 });
+    await setRole(sessionId, creator, member, "member");
+
+    // Admin kicks members, never the creator.
+    await expect(kickMember(sessionId, admin, creator)).rejects.toMatchObject({ status: 403 });
+    const kicked = await kickMember(sessionId, admin, victim);
+    expect(kicked.remaining).toBe(3);
+    expect(kicked.roster.some((m) => m.username === victim)).toBe(false);
+    // Kicked users stay out while the room lives.
+    await expect(joinRoom(sessionId, victim, PUBKEY)).rejects.toMatchObject({ status: 403 });
+
+    // Creator kicks admins too; nobody kicks themselves; creator role is immutable.
+    await kickMember(sessionId, creator, admin);
+    await expect(kickMember(sessionId, creator, creator)).rejects.toMatchObject({ status: 403 });
+    await expect(setRole(sessionId, creator, creator, "admin")).rejects.toMatchObject({ status: 403 });
+    await expect(setRole(sessionId, creator, member, "creator" as never)).rejects.toMatchObject({ status: 400 });
+
+    // Revoke keeps them a member (not banned): re-grant works.
+    await setRole(sessionId, creator, member, "admin");
+    await setRole(sessionId, creator, member, "member");
+    expect((await getRoster(sessionId)).find((m) => m.username === member)?.role).toBe("member");
   });
 
   it("ack reports skipped ids", async () => {

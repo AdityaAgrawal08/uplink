@@ -179,7 +179,7 @@ func cmdJoinChat(args []string, cfg *Config) {
 	transientFails := 0
 	for {
 		sc := &signalClient{serverURL: serverURL, me: username, key: key}
-		_, err := sc.joinRoom(username, pubkey, password)
+		_, _, err := sc.joinRoom(username, pubkey, password)
 		if err == nil {
 			break
 		}

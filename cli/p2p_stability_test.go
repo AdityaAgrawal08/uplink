@@ -246,7 +246,7 @@ func TestRosterTickSilentSidebar(t *testing.T) {
 	wireTestEngine(t, c, srv, "bob")
 
 	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
-	if _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
 		t.Fatal(err)
 	}
 	c.eng.beatOnce()
@@ -310,7 +310,7 @@ func TestEnginePeerRestartConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -390,7 +390,7 @@ func TestAckBackstopRetryAndGraduate(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -415,7 +415,7 @@ func TestAckBackstopRetryAndGraduate(t *testing.T) {
 	ea.trackUnacked("bob", f)
 	backdate("m1")
 	ea.retryOnce()
-	boxes, err := sigB.inboxFetch()
+	boxes, _, err := sigB.inboxFetch()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,7 +521,7 @@ func TestSendAckNamesOriginal(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	ea := newEngine("alice", ida, sigA, engineCallbacks{})
@@ -534,7 +534,7 @@ func TestSendAckNamesOriginal(t *testing.T) {
 	if err := ea.sendAck("bob", "orig-99"); err != nil {
 		t.Fatal(err)
 	}
-	boxes, err := sigB.inboxFetch()
+	boxes, _, err := sigB.inboxFetch()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestMeshFailTeardownAndInboxFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -633,7 +633,7 @@ func TestMeshFailTeardownAndInboxFallback(t *testing.T) {
 		t.Fatal("dead transport entry kept — reconcile would stall on it")
 	}
 	// ...and the frame still delivered durably.
-	boxes, err := sigB.inboxFetch()
+	boxes, _, err := sigB.inboxFetch()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +660,7 @@ func TestStreamFramesNeverInbox(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	ea := newEngine("alice", ida, sigA, engineCallbacks{})
@@ -747,7 +747,7 @@ func TestRosterVisibilityWithoutSends(t *testing.T) {
 	// Bob joins a second later; nobody sends anything, ever.
 	time.Sleep(1100 * time.Millisecond)
 	sigB := &signalClient{serverURL: srv.URL, key: sigA.key, me: "bob"}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	joinedAt := time.Now()
@@ -796,7 +796,7 @@ func TestMidSessionDesyncRecoversViaBackstop(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	members := []rosterMember{
@@ -1093,8 +1093,8 @@ func TestRoomUnreadInThread(t *testing.T) {
 	if sc.roomUnread != 1 {
 		t.Fatalf("roomUnread = %d; want 1", sc.roomUnread)
 	}
-	if !strings.Contains(sc.headerView(), "1 new in room") {
-		t.Fatalf("header must advertise the room backlog: %q", sc.headerView())
+	if h := sc.roomHeaderView(80); !strings.Contains(h, "1 new in room") {
+		t.Fatalf("room header must advertise the room backlog: %q", h)
 	}
 	sc.exitPrivate()
 	if sc.roomUnread != 0 {
@@ -1102,14 +1102,14 @@ func TestRoomUnreadInThread(t *testing.T) {
 	}
 }
 
-// The banner names the binary version: screenshots become self-identifying.
+// The room header names the binary version: screenshots stay self-identifying.
 func TestHeaderShowsVersion(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	sc := m.(chatScreen)
-	if !strings.Contains(sc.headerView(), "v"+normVersion(version)) {
-		t.Fatalf("header lacks version: %q", sc.headerView())
+	if h := sc.roomHeaderView(100); !strings.Contains(h, "v"+normVersion(version)) {
+		t.Fatalf("room header lacks version: %q", h)
 	}
 }
 
@@ -1129,7 +1129,7 @@ func TestUnknownHandshakeNoteRefreshesSilently(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1183,7 +1183,7 @@ func TestVerifyReadyUnknownPeerNoAlert(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1263,7 +1263,7 @@ func TestUnknownInboxSenderRefreshesAndDelivers(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	p := newEngineProbe()
@@ -1315,7 +1315,7 @@ func TestRosterLearnedAfterOpenStillHandshakes(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 	members := []rosterMember{
@@ -1377,7 +1377,7 @@ func TestTuiRapidConversationCrossDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
+	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1386,7 +1386,7 @@ func TestTuiRapidConversationCrossDelivery(t *testing.T) {
 		sc.vp = *viewportPtr(60, 20)
 		m, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 		out := m.(chatScreen)
-		if roster, err := out.sig.heartbeat("", nil); err == nil {
+		if roster, _, err := out.sig.heartbeat("", nil); err == nil {
 			out.eng.setRoster(roster)
 			out.users = onlineNames(roster, me)
 		}

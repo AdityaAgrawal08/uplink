@@ -447,7 +447,7 @@ func TestAudioBothTalkersDecoded(t *testing.T) {
 }
 
 func TestSlashRegistryExact(t *testing.T) {
-	want := []string{"/help", "/upload", "/download", "/video", "/audio"}
+	want := []string{"/help", "/upload", "/download", "/video", "/audio", "/kick", "/admin", "/unadmin"}
 	got := make([]string, 0, len(slashCommands))
 	for _, cmd := range slashCommands {
 		got = append(got, cmd.Name)
@@ -457,10 +457,10 @@ func TestSlashRegistryExact(t *testing.T) {
 	}
 }
 
-func TestVideoSidebarSplitAndScroll(t *testing.T) {
+func TestHiddenVideoAndChatMapping(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
-	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	sc := m.(chatScreen)
 	sc.call = &mediaManager{videoOn: true, renderCols: videoPaneDefaultCols, renderRows: videoPaneDefaultRows}
 	lines := make([]string, 0, videoPaneDefaultRows)
@@ -470,27 +470,41 @@ func TestVideoSidebarSplitAndScroll(t *testing.T) {
 	m2, _ := sc.Update(netVideoMsg{lines: lines})
 	sc = m2.(chatScreen)
 	l := sc.layoutFor()
-	if l.videoRows == 0 {
-		t.Fatal("video box must claim rows while streaming")
+	if l.videoRows != 0 || l.vidPanelW != 0 {
+		t.Fatal("narrow terminal must not claim the right panel")
 	}
-	if got := sc.peerAtY(l.rosterY0+1, l); got != "carol" {
-		t.Fatalf("roster row below the video box mapped to %q; want carol", got)
+	if l.camRows <= 0 {
+		t.Fatal("narrow live video must claim the bottom strip")
 	}
-	// Wheel over the video box is swallowed (scrolls video), never selects.
-	m3, _ := sc.Update(tea.MouseMsg{X: l.rosterX + 1, Y: l.rosterY0 - 1, Type: tea.MouseWheelDown})
+	if len(sc.videoLines) != len(lines) || !sc.call.VideoOn() {
+		t.Fatal("hiding video UI must preserve received frames and call state")
+	}
+	// Items: General at +0/+1, carol at +2/+3 (two rows per item).
+	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
+		t.Fatalf("chat row mapped to %q; want carol", got)
+	}
+	// Wheel over the camera strip never opens a thread (falls to chat).
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	if l.showHeader {
+		headOff = 1
+	}
+	stripY := frameOff + headOff + l.headRows + l.callRows + l.vpHeight + 2 + 1
+	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: stripY, Type: tea.MouseWheelDown})
 	sc = m3.(chatScreen)
 	if sc.targetUser != "" {
-		t.Fatal("wheel over video must not open a thread")
+		t.Fatal("wheel over camera strip must not open a thread")
 	}
-	// Video box present above the roster.
-	if got := sc.View(); !strings.Contains(got, "VIDEO") || !strings.Contains(got, "ONLINE") {
-		t.Fatal("sidebar must show VIDEO above ONLINE")
+	if got := sc.View(); !strings.Contains(got, "Live Cameras") {
+		t.Fatal("narrow view must show the Live Cameras strip")
 	}
-	// Video off collapses the split cleanly.
-	sc.call = &mediaManager{}
-	l2 := sc.layoutFor()
-	if l2.videoRows != 0 || l2.rosterY0 >= l.rosterY0 {
-		t.Fatal("video collapse must return rows to the roster")
+	// Tiny terminal collapses the strip cleanly (rows return to chat).
+	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 18})
+	sc = m4.(chatScreen)
+	if l2 := sc.layoutFor(); l2.camRows != 0 || l2.vidPanelW != 0 {
+		t.Fatal("video UI must collapse on short terminals")
 	}
 }
 
