@@ -1724,9 +1724,9 @@ func (c *chatScreen) toggleAudio() tea.Cmd {
 	return nil
 }
 
-// callCardRows is the live-call status card height: sender line + bordered
-// box (top/bottom border + title/button row + participants row).
-const callCardRows = 5
+// callCardRows is the live-call status card height: sender line + two
+// green-bar rows, pinned above the transcript while a call runs.
+const callCardRows = 3
 
 // callActive reports whether this client is in a call right now:
 // publishing camera/mic or receiving a remote feed.
@@ -2087,6 +2087,16 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ONLY in the Online sidebar — no join/leave lines in the
 		// transcript by product direction.
 		c.syncRosterFromEngine()
+		// Server watchdog: while heartbeats fail with the server gone,
+		// hold the down alert on the status line; clear it on recovery.
+		// Guarded: bare test screens carry no engine.
+		if c.eng != nil {
+			if isServerDown(c.eng.beatErr()) {
+				c.status = serverDownMsg
+			} else if c.status == serverDownMsg {
+				c.status = ""
+			}
+		}
 		// Delivery-receipt sweep: warn on messages unacked past
 		// unconfirmedAfter; forget entries past receiptExpiry (the engine's
 		// own retries are long over by then — most likely a lost ack frame,
@@ -2123,7 +2133,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case kickDoneMsg:
 		if msg.err != nil {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* kick failed: "+msg.err.Error()))
+			if isServerDown(msg.err) {
+				c.status = serverDownMsg
+				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
+			} else {
+				c.appendLocal(c.activeConv(), tuiErrStyle.Render("* kick failed: "+msg.err.Error()))
+			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
 			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* kicked "+msg.target))
@@ -2137,7 +2152,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			what = "is no longer an admin"
 		}
 		if msg.err != nil {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* admin change failed: "+msg.err.Error()))
+			if isServerDown(msg.err) {
+				c.status = serverDownMsg
+				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
+			} else {
+				c.appendLocal(c.activeConv(), tuiErrStyle.Render("* admin change failed: "+msg.err.Error()))
+			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
 			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.target+" "+what))
@@ -2240,8 +2260,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case mediaInfoMsg:
+		// Media chatter never reaches the transcript: the latest event
+		// parks on the status line, conversation stays clean.
 		if msg.info != "" {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.info))
+			c.status = msg.info
 		}
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
@@ -2280,7 +2302,13 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:
-		c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
+		// Server outages surface as the status alert, never as chat lines.
+		if isServerDown(msg.err) {
+			c.status = serverDownMsg
+			c.rebuildView()
+		} else {
+			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
+		}
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netIdleMsg:
@@ -2448,7 +2476,14 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
 		}
 	case msg.err != nil:
-		if echoIdx >= 0 {
+		if isServerDown(msg.err) {
+			c.status = serverDownMsg
+			if echoIdx >= 0 {
+				c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ " + serverDownMsg)}
+			} else {
+				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
+			}
+		} else if echoIdx >= 0 {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
 		} else {
 			c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
@@ -2693,42 +2728,14 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if msg.Button != tea.MouseButtonLeft || c.width == 0 || c.height == 0 {
 			break
 		}
-		// Send button: submit the composer exactly like Enter.
-		sendX0, sendX1, sendY0, sendY1, clipX := composerGeoms(l, c.width, c.height)
-		if sendX0 >= 0 && msg.X >= sendX0 && msg.X < sendX1 && msg.Y >= sendY0 && msg.Y < sendY1 {
-			text := strings.TrimSpace(c.input.Value())
-			c.input.SetValue("")
-			if text == "" {
-				return nil
-			}
-			return c.submitLine(text)
-		}
-		// Clip glyph: open the upload browser (same as /upload).
-		if clipX >= 0 && msg.X == clipX && msg.Y >= sendY0 && msg.Y < sendY1 && l.sidebarOn {
+		// Clip glyph: open the upload browser (same as /upload). Painted
+		// whenever the box fits it — clickable with or without the sidebar.
+		clipX, clipY0, clipY1 := composerGeoms(l, c.width, c.height)
+		if clipX >= 0 && msg.X == clipX && msg.Y >= clipY0 && msg.Y < clipY1 {
 			if !c.picker.isActive() {
 				return c.openPicker()
 			}
 			return nil
-		}
-		// Room tabs: Chat (close drawer), Files (received files), ⋮ (/ menu).
-		if tc, tf, tm, ok := roomTabsGeoms(c, l); ok {
-			switch {
-			case tc.hit(msg.X, msg.Y):
-				if c.picker.isActive() {
-					c.closePicker(composerPlaceholder)
-					c.rebuildView()
-				}
-				return nil
-			case tf.hit(msg.X, msg.Y):
-				if !c.picker.isActive() || c.picker.mode != modeFiles {
-					return c.openFilesDrawer()
-				}
-				return nil
-			case tm.hit(msg.X, msg.Y):
-				c.input.SetValue("/")
-				c.palette.sync("/")
-				return nil
-			}
 		}
 		// Video call controls: M mic, V camera, X hang up (wired); S/P are
 		// dimmed (unsupported here) and explain themselves on click.
@@ -2988,15 +2995,13 @@ func (c chatScreen) View() string {
 	}
 	chatCol := strings.Join(parts, "\n")
 
-	// Composer row: input box + Send button (icon on narrow transcripts),
-	// aligned under the transcript. The sidebar path joins it beside the
-	// chat list; the sidebar-off path indents it below.
+	// Composer core (unindented): the message box spans the full column
+	// width (Enter sends). The sidebar path joins it beside the chat list;
+	// the sidebar-off path indents it below.
 	var inputCore string
 	switch {
 	case l.composerRows > 0:
-		boxH := l.composerRows + 2
-		sendW := sendBtnWidthFor(transcriptOuter)
-		inputOuter := transcriptOuter - sendW - 1
+		inputOuter := transcriptOuter         // full column width, no Send button
 		contentW := maxInt(inputOuter-2-2, 1) // border + padding, never wrap
 		showClip := inputOuter >= 26
 		clipW := 0
@@ -3015,22 +3020,21 @@ func (c chatScreen) View() string {
 		if pad < 0 {
 			pad = 0
 		}
-		box := tuiComposerStyle.
+		inputCore = tuiComposerStyle.
 			Width(inputOuter - 2).
 			Height(l.composerRows).
 			Render(field + strings.Repeat(" ", pad) + tail)
-		inputCore = lipgloss.JoinHorizontal(lipgloss.Top, box, " ", sendButtonView(boxH, sendW))
 	case l.inputBoxed:
 		inputCore = tuiBorderStyle.Render(c.input.View())
 	default:
 		inputCore = "❯ " + c.input.View()
 	}
-	// Drawer panel: OpenCode-style pop-out emerging upward out of the
+	// Drawer panel core: OpenCode-style pop-out emerging upward out of the
 	// composer (a blank spacer row sells the lift). Empty when budgeted but
 	// nothing matches — never paint unbudgeted rows.
 	pal := ""
 	if l.paletteRows > 0 {
-		pal = c.drawerView(transcriptOuter)
+		pal = c.drawerView(maxInt(l.vpWidth+2, 0))
 	}
 
 	body := chatCol

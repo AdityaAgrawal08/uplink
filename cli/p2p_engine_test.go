@@ -364,3 +364,33 @@ func TestEpochChangeTriggersRosterRefresh(t *testing.T) {
 		t.Fatalf("lastEpoch = %d; want 2", epoch)
 	}
 }
+
+func TestBeatRecordsAndClearsFailures(t *testing.T) {
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+	ida, _ := generateIdentity()
+	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
+	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
+		t.Fatal(err)
+	}
+	e := newEngine("alice", ida, sigA, engineCallbacks{})
+	// Healthy beat records nothing.
+	e.beatOnce()
+	if err := e.beatErr(); err != nil {
+		t.Fatalf("healthy beat must clear failures, got %v", err)
+	}
+	// Dead server records a down-classified failure.
+	e.sig.serverURL = "http://127.0.0.1:1"
+	e.beatOnce()
+	berr := e.beatErr()
+	if berr == nil || !isServerDown(berr) {
+		t.Fatalf("dead beat must record a down error, got %v", berr)
+	}
+	// Recovery clears it.
+	e.sig.serverURL = srv.URL
+	e.beatOnce()
+	if err := e.beatErr(); err != nil {
+		t.Fatalf("recovered beat must clear failures, got %v", err)
+	}
+}

@@ -29,53 +29,27 @@ func TestCamTilesKeepFrameColor(t *testing.T) {
 	}
 }
 
-func TestVisibleVideoPreservesRenderSize(t *testing.T) {
-	// Screenshot-exact: video surfaces claim UI space on roomy terminals
-	// (panel when wide, strip when narrow) and collapse only when short —
-	// while never disturbing the negotiated render size.
-	for _, size := range [][2]int{{100, 30}, {154, 44}} {
+func TestHiddenVideoPreservesRenderSize(t *testing.T) {
+	for _, size := range [][2]int{{100, 30}, {154, 44}, {80, 18}} {
 		c := newFilterScreen("bob", "", "bob", "alice", "carol")
 		c.vp = *viewportPtr(60, 20)
 		c.call = &mediaManager{videoOn: true, renderCols: 60, renderRows: 20}
 		m, _ := c.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		sc := m.(chatScreen)
 		l := sc.layoutFor()
-		if l.vidPanelW == 0 && l.camRows == 0 {
-			t.Fatalf("video UI claimed no space at %v", size)
+		if l.vidPanelW != 0 || l.camRows != 0 || l.videoRows != 0 {
+			t.Fatalf("video UI allocated space at %v", size)
 		}
-		if !sc.call.VideoOn() {
-			t.Fatalf("video UI stopped publishing at %v", size)
+		if sc.call.renderCols != 60 || sc.call.renderRows != 20 || !sc.call.VideoOn() {
+			t.Fatalf("hidden video UI changed media state at %v", size)
 		}
-	}
-	// Short terminal: the strip collapses cleanly, state still preserved.
-	c := newFilterScreen("bob", "", "bob", "alice", "carol")
-	c.vp = *viewportPtr(60, 20)
-	c.call = &mediaManager{videoOn: true, renderCols: 60, renderRows: 20}
-	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 18})
-	sc := m.(chatScreen)
-	l := sc.layoutFor()
-	if l.camRows != 0 || l.vidPanelW != 0 {
-		t.Fatalf("video UI must collapse on short terminals, got panel=%d strip=%d", l.vidPanelW, l.camRows)
-	}
-	if sc.call.renderCols != 60 || sc.call.renderRows != 20 || !sc.call.VideoOn() {
-		t.Fatal("collapsed video UI changed media state")
 	}
 }
 
 // ---- adaptive density: every resize step must visibly rebalance --------
 
 func TestTopBarCollapsesByWidth(t *testing.T) {
-	// Screenshot-exact: wide terminals show the promises tagline.
-	for _, w := range []int{90, 110, 160, 220} {
-		got := stripANSI(topBarView(w))
-		for _, want := range []string{"secure", "ephemeral", "p2p"} {
-			if !strings.Contains(got, want) {
-				t.Fatalf("topBarView(%d) must show %q: %q", w, want, got)
-			}
-		}
-	}
-	// Cramped terminals drop the tagline but keep the logo.
-	for _, w := range []int{40, 60} {
+	for _, w := range []int{40, 60, 90, 160, 220} {
 		got := stripANSI(topBarView(w))
 		for _, banned := range []string{"secure", "ephemeral", "p2p"} {
 			if strings.Contains(got, banned) {
@@ -219,27 +193,28 @@ func TestWheelStepProportional(t *testing.T) {
 	}
 }
 
-func TestComposerSendButton(t *testing.T) {
-	// Screenshot-exact: the composer row carries a blue Send button beside
-	// the message box (Enter and click both send).
-	const W, H = 160, 44
+func TestComposerFullWidthNoSend(t *testing.T) {
+	// No Send button anywhere: the message box spans the full column and
+	// Enter (not a click target) sends.
+	const W, H = 120, 40
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
 	sc := m.(chatScreen)
 	got := stripANSI(sc.View())
-	if !strings.Contains(got, "Send") {
-		t.Fatalf("Send button must be visible:\n%s", got)
-	}
-	l := sc.layoutFor()
-	sendX0, sendX1, y0, y1, _ := composerGeoms(l, W, H)
-	if sendX0 < 0 || sendX1 <= sendX0 || y1 <= y0 {
-		t.Fatalf("Send button must hit-test a real rect, got x=[%d,%d) y=[%d,%d)", sendX0, sendX1, y0, y1)
+	if strings.Contains(got, "Send") {
+		t.Fatalf("Send button must be gone:\n%s", got)
 	}
 	found := false
 	for _, r := range strings.Split(got, "\n") {
 		if strings.Contains(r, "Type a message") {
 			found = true
+			// Message box runs to the frame edge (box border + frame
+			// border adjacent), with no button column carved out.
+			if !strings.HasSuffix(r, "││") {
+				t.Fatalf("composer must span the full column, row ends %q",
+					string([]rune(r)[len([]rune(r))-4:]))
+			}
 		}
 	}
 	if !found {
@@ -254,9 +229,9 @@ func TestClipOpensPicker(t *testing.T) {
 	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
 	sc := m.(chatScreen)
 	l := sc.layoutFor()
-	_, _, y0, y1, clipX := composerGeoms(l, W, H)
-	if clipX < 0 || y1-y0 <= 0 {
-		t.Fatalf("clip must hit-test inside the composer box, got x=%d y=[%d,%d)", clipX, y0, y1)
+	clipX, y0, y1 := composerGeoms(l, W, H)
+	if clipX < 0 || y1-y0 != 1 {
+		t.Fatalf("clip must hit-test exactly one row, got x=%d y=[%d,%d)", clipX, y0, y1)
 	}
 	// Click beside the clip (same row, one cell left) must not open it.
 	sc.handleMouse(mouseAt(clipX-1, y0))
@@ -313,27 +288,31 @@ func liveCallScreen(t *testing.T, w, h int) chatScreen {
 	return m.(chatScreen)
 }
 
-func TestVideoPanelShown(t *testing.T) {
+func TestVideoPanelHidden(t *testing.T) {
 	const W, H = 154, 44
 	sc := liveCallScreen(t, W, H)
 	l := sc.layoutFor()
-	if l.vidPanelW <= 0 {
-		t.Fatal("wide live call must allocate the right video panel")
+	if l.vidPanelW != 0 || l.camRows != 0 || l.videoRows != 0 {
+		t.Fatal("video surfaces must not allocate space")
+	}
+	base := computeLayoutMedia(W, H, sc.status != "", sc.paletteRows(), false)
+	if l.vpWidth != base.vpWidth || l.vpHeight != base.vpHeight-l.headRows-l.callRows-l.hintRows {
+		t.Fatal("chat must reclaim all video surface space")
 	}
 	sc.selfLines = []string{"VIDEO_FRAME_SENTINEL"}
 	sc.videoLines = []string{"VIDEO_FRAME_SENTINEL"}
 	got := sc.View()
-	for _, want := range []string{"Video Call", "[M]", "[V]", "[S]", "[P]", "[X]", "intentionally blurred", "⛶"} {
-		if !strings.Contains(stripANSI(got), want) {
-			t.Errorf("video element %q missing", want)
+	for _, absent := range []string{"Video Call", "Live Cameras", "[M]", "[V]", "[S]", "[P]", "[X]", "intentionally blurred", "VIDEO_FRAME_SENTINEL", "⛶"} {
+		if strings.Contains(stripANSI(got), absent) {
+			t.Errorf("hidden video element %q still visible", absent)
 		}
 	}
-	for _, want := range []string{" Chat ", " Files ", "⋮"} {
-		if !strings.Contains(stripANSI(got), want) {
-			t.Errorf("room tab %q missing", want)
+	for _, absent := range []string{" Chat ", " Files ", "⋮"} {
+		if strings.Contains(stripANSI(got), absent) {
+			t.Errorf("removed room tab %q still visible", absent)
 		}
 	}
-	for _, want := range []string{"Video call started", "View Video",
+	for _, want := range []string{"Video call started", "LIVE",
 		"End-to-End Encrypted", "Ctrl+k", "Ctrl+l", "Enter send"} {
 		if !strings.Contains(stripANSI(got), want) {
 			t.Errorf("reference element %q missing from view", want)
@@ -380,15 +359,15 @@ func TestSidebarRunsFullHeight(t *testing.T) {
 	}
 }
 
-func TestVisiblePanelHasHitTargets(t *testing.T) {
+func TestHiddenPanelHasNoHitTargets(t *testing.T) {
 	sc := liveCallScreen(t, 154, 44)
 	l := sc.layoutFor()
 	pg := videoPanelGeom(&sc, l, sc.camFeeds())
-	if !pg.on || len(pg.btns) == 0 {
-		t.Fatal("visible panel must expose mouse targets")
+	if pg.on || len(pg.btns) != 0 || pg.fsX0 != pg.fsX1 {
+		t.Fatal("hidden panel must not expose mouse targets")
 	}
-	if cols, rows := sc.videoTileGeom(l, sc.camFeeds()); cols <= 0 || rows <= 0 {
-		t.Fatalf("visible video tile geometry = %dx%d", cols, rows)
+	if cols, rows := sc.videoTileGeom(l, sc.camFeeds()); cols != 0 || rows != 0 {
+		t.Fatalf("hidden video tile geometry = %dx%d", cols, rows)
 	}
 }
 
@@ -422,16 +401,16 @@ func TestCallButtonsAct(t *testing.T) {
 	}
 }
 
-func TestRoomTabsPresent(t *testing.T) {
+func TestRoomTabsRemoved(t *testing.T) {
 	const W, H = 120, 40
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
 	sc := m.(chatScreen)
 	got := stripANSI(sc.View())
-	for _, want := range []string{" Chat ", " Files ", "⋮"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("room tab %q missing", want)
+	for _, absent := range []string{" Chat ", " Files ", "⋮"} {
+		if strings.Contains(got, absent) {
+			t.Fatalf("removed room tab %q still visible", absent)
 		}
 	}
 	// Files drawer stays reachable through /download (backend untouched).
@@ -447,7 +426,7 @@ func TestCallCardShowsLive(t *testing.T) {
 		t.Fatalf("live call must budget %d card rows, got %d", callCardRows, l.callRows)
 	}
 	got := stripANSI(sc.View())
-	for _, want := range []string{"Video call started", "View Video", "participant"} {
+	for _, want := range []string{"Video call started", "LIVE", "participant"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("call card element %q missing", want)
 		}
@@ -481,7 +460,7 @@ func TestSidebarSelectedBorderAndCallIcon(t *testing.T) {
 	if !strings.Contains(plain, "◉") {
 		t.Fatalf("in-call chat must show the live icon:\n%s", plain)
 	}
-	if !strings.Contains(plain, "in call") {
+	if !strings.Contains(plain, "Live now") {
 		t.Fatalf("in-call preview must name the call:\n%s", plain)
 	}
 }
@@ -534,16 +513,16 @@ func TestSystemCardGreenBar(t *testing.T) {
 	}
 }
 
-func TestVisibleFullscreenTargetExplains(t *testing.T) {
+func TestHiddenFullscreenTargetDoesNotAct(t *testing.T) {
 	sc := liveCallScreen(t, 154, 44)
 	l := sc.layoutFor()
+	l.vidPanelW = videoPanelWidth(sc.width)
+	l.vpWidth -= l.vidPanelW + 1
 	pg := videoPanelGeom(&sc, l, sc.camFeeds())
-	if !pg.on {
-		t.Fatal("panel must be on for the fullscreen target")
-	}
+	before := sc.status
 	sc.handleMouse(mouseAt(pg.fsX0, pg.fsY))
-	if !strings.Contains(sc.status, "fullscreen") {
-		t.Fatalf("fullscreen target must explain itself, got %q", sc.status)
+	if sc.status != before {
+		t.Fatalf("hidden fullscreen target changed status to %q", sc.status)
 	}
 }
 

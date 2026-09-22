@@ -341,7 +341,7 @@ func (c chatScreen) layoutFor() layout {
 	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
 	// Live-call status card (pinned above the transcript while a call runs).
 	l.callRows = 0
-	if c.callActive() && l.vpHeight-l.headRows >= 12 {
+	if c.callActive() && l.vpHeight-l.headRows >= 10 {
 		l.callRows = callCardRows
 	}
 	// Composer key-hints footer (truthful bindings only, see keyHintsView).
@@ -353,23 +353,8 @@ func (c chatScreen) layoutFor() layout {
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
 	}
-	// Video UI: right panel when wide (width split), bottom strip when
-	// narrow (height split), hidden when neither fits.
-	l.vidPanelW, l.camRows = c.videoChrome(l)
-	if l.camRows > 0 {
-		l.vpHeight -= l.camRows
-		if l.vpHeight < 0 {
-			l.vpHeight = 0
-			l.camRows = 0
-		}
-	}
-	// Right panel shrinks the transcript column (never below readable).
-	if l.vidPanelW > 0 {
-		l.vpWidth -= l.vidPanelW + 1 // panel + spacer
-		if l.vpWidth < 10 {
-			l.vpWidth = 10
-		}
-	}
+	// Video surfaces stay off: the transcript owns every column.
+	l.vidPanelW, l.camRows = 0, 0
 	// Roster adapts to the settled viewport: search row eats one slot.
 	l.rosterSlots = l.vpHeight - 1
 	if l.rosterSlots > rosterMaxVisible {

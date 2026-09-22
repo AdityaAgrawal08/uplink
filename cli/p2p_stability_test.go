@@ -1102,14 +1102,21 @@ func TestRoomUnreadInThread(t *testing.T) {
 	}
 }
 
-// The room header names the binary version: screenshots stay self-identifying.
-func TestHeaderShowsVersion(t *testing.T) {
+// The room header stays clean: no version, key, or member counts —
+// just the room name and kind.
+func TestHeaderStaysClean(t *testing.T) {
 	c := newFilterScreen("bob", "")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	sc := m.(chatScreen)
-	if h := sc.roomHeaderView(100); !strings.Contains(h, "v"+normVersion(version)) {
-		t.Fatalf("room header lacks version: %q", h)
+	h := sc.roomHeaderView(100)
+	if !strings.Contains(h, "General") || !strings.Contains(h, "Public Room") {
+		t.Fatalf("room header must name the room: %q", h)
+	}
+	for _, banned := range []string{"v" + normVersion(version), "members", "in call", "key "} {
+		if strings.Contains(h, banned) {
+			t.Fatalf("room header must not show %q: %q", banned, h)
+		}
 	}
 }
 

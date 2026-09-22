@@ -829,3 +829,85 @@ func errTestSinkNew() error {
 type errTestSinkVal struct{}
 
 func (errTestSinkVal) Error() string { return "sink" }
+
+// ---------------------------------------------------------------------------
+// Server-down alert + silent media chatter
+// ---------------------------------------------------------------------------
+
+func refusedErr() error {
+	return fmt.Errorf(`Post "http://127.0.0.1:1/api/v1/session/x/heartbeat": dial tcp 127.0.0.1:1: connection refused`)
+}
+
+func TestMediaInfoStaysOutOfTranscript(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(mediaInfoMsg{info: "alice is sharing video"})
+	sc := m.(chatScreen)
+	if len(sc.localLines) != 0 {
+		t.Fatalf("media chatter must not reach the transcript: %+v", sc.localLines)
+	}
+	if sc.status != "alice is sharing video" {
+		t.Fatalf("media event must park on the status line, got %q", sc.status)
+	}
+	for _, ln := range sc.lines {
+		if strings.Contains(ln, "sharing") {
+			t.Fatalf("painted rows must not carry media chatter: %q", ln)
+		}
+	}
+}
+
+func TestServerDownAlertAcrossActions(t *testing.T) {
+	// Idle watchdog: a dead beat holds the alert on the tick.
+	srv := httptest.NewServer(newFakeSignalServer())
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "alice")
+	srv.Close()
+	c.eng.beatOnce()
+	if !isServerDown(c.eng.beatErr()) {
+		t.Fatal("killed server must record a down beat error")
+	}
+	m, _ := c.Update(rosterTickMsg{})
+	sc := m.(chatScreen)
+	if sc.status != serverDownMsg {
+		t.Fatalf("tick must hold the down alert, got %q", sc.status)
+	}
+	// Recovery clears it.
+	sc.eng.mu.Lock()
+	sc.eng.lastBeatErr = nil
+	sc.eng.mu.Unlock()
+	m2, _ := sc.Update(rosterTickMsg{})
+	if m2.(chatScreen).status != "" {
+		t.Fatalf("recovery must clear the alert, got %q", m2.(chatScreen).status)
+	}
+	// Sending while down alerts on the echo and the status line.
+	c2 := newFilterScreen("bob", "")
+	c2.vp = *viewportPtr(40, 10)
+	c2.submitLine("hello?")
+	idx := c2.pending.lineIdx
+	c2.settleSend(sendDoneMsg{text: "hello?", err: refusedErr()})
+	if c2.status != serverDownMsg {
+		t.Fatalf("failed send must raise the alert, got %q", c2.status)
+	}
+	if !strings.Contains(c2.lines[idx], serverDownMsg) {
+		t.Fatalf("failed echo must carry the alert, got %q", c2.lines[idx])
+	}
+	// Engine errors from a dead server alert instead of chatting.
+	c3 := newFilterScreen("bob", "")
+	c3.vp = *viewportPtr(40, 10)
+	m3, _ := c3.Update(netErrMsg{err: refusedErr()})
+	sc3 := m3.(chatScreen)
+	if sc3.status != serverDownMsg {
+		t.Fatalf("dead-server engine error must alert, got %q", sc3.status)
+	}
+	if len(sc3.localLines) != 0 {
+		t.Fatalf("dead-server engine error must not chat: %+v", sc3.localLines)
+	}
+	// Moderation failures while down alert too.
+	c4 := newFilterScreen("bob", "")
+	c4.vp = *viewportPtr(40, 10)
+	m4, _ := c4.Update(kickDoneMsg{target: "mallory", err: refusedErr()})
+	if m4.(chatScreen).status != serverDownMsg {
+		t.Fatal("dead-server kick failure must alert")
+	}
+}

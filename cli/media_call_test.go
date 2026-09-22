@@ -493,7 +493,7 @@ func TestSlashRegistryExact(t *testing.T) {
 	}
 }
 
-func TestVideoPanelRightAndChatMapping(t *testing.T) {
+func TestHiddenVideoAndChatMapping(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -506,33 +506,34 @@ func TestVideoPanelRightAndChatMapping(t *testing.T) {
 	m2, _ := sc.Update(netVideoMsg{lines: lines})
 	sc = m2.(chatScreen)
 	l := sc.layoutFor()
-	// Video lives on the right, never in a strip below.
-	if l.vidPanelW <= 0 {
-		t.Fatal("100-col terminal must claim the right video panel")
-	}
-	if l.camRows != 0 {
-		t.Fatal("bottom strip is retired: video must not claim rows below")
+	if l.videoRows != 0 || l.vidPanelW != 0 || l.camRows != 0 {
+		t.Fatal("video surfaces must not claim UI space")
 	}
 	if len(sc.videoLines) != len(lines) || !sc.call.VideoOn() {
-		t.Fatal("panel video UI must preserve received frames and call state")
+		t.Fatal("hiding video UI must preserve received frames and call state")
 	}
 	// Items: General at +0/+1, carol at +2/+3 (two rows per item).
 	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
 		t.Fatalf("chat row mapped to %q; want carol", got)
 	}
-	// Wheel over the video panel never opens a thread (falls to chat).
-	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: 10, Type: tea.MouseWheelDown})
+	// Wheel over the camera strip never opens a thread (falls to chat).
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	if l.showHeader {
+		headOff = 1
+	}
+	stripY := frameOff + headOff + l.headRows + l.callRows + l.vpHeight + 2 + 1
+	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: stripY, Type: tea.MouseWheelDown})
 	sc = m3.(chatScreen)
 	if sc.targetUser != "" {
-		t.Fatal("wheel over video panel must not open a thread")
-	}
-	if got := sc.View(); !strings.Contains(got, "Video Call") {
-		t.Fatal("view must show the right Video Call panel")
+		t.Fatal("wheel over camera strip must not open a thread")
 	}
 	if got := sc.View(); strings.Contains(got, "Live Cameras") {
-		t.Fatal("view must not show a bottom strip")
+		t.Fatal("view must not show the Live Cameras strip")
 	}
-	// Tiny terminal collapses the panel cleanly (rows return to chat).
+	// Tiny terminal collapses the strip cleanly (rows return to chat).
 	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 18})
 	sc = m4.(chatScreen)
 	if l2 := sc.layoutFor(); l2.camRows != 0 || l2.vidPanelW != 0 {

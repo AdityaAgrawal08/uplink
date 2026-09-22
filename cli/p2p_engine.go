@@ -143,6 +143,9 @@ type engine struct {
 	// room reports once, a failing rejoin backs off to 60s.
 	endedNotified bool
 	lastRejoinErr time.Time
+	// lastBeatErr is the latest heartbeat failure (nil after any success).
+	// The TUI polls it on its render tick to hold the server-down alert.
+	lastBeatErr error
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 }
@@ -288,6 +291,14 @@ func (e *engine) peers() []rosterMember {
 	return out
 }
 
+// beatErr reports the latest heartbeat failure (nil after any success).
+// The TUI holds the server-down alert while this classifies as down.
+func (e *engine) beatErr() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastBeatErr
+}
+
 // ─── lifecycle ──────────────────────────────────────────────────────────────
 
 func (e *engine) start() {
@@ -430,6 +441,7 @@ func (e *engine) beatOnce() {
 			if _, _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
 				e.mu.Lock()
 				e.lastRejoinErr = time.Now()
+				e.lastBeatErr = jerr
 				e.mu.Unlock()
 				if !recentErr {
 					e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
@@ -441,6 +453,9 @@ func (e *engine) beatOnce() {
 			e.mu.Unlock()
 			roster, epoch, err = e.sig.heartbeat("", nil)
 			if err != nil {
+				e.mu.Lock()
+				e.lastBeatErr = err
+				e.mu.Unlock()
 				return
 			}
 		} else if apiStatusCode(err) == 404 {
@@ -449,18 +464,23 @@ func (e *engine) beatOnce() {
 			e.mu.Lock()
 			notified := e.endedNotified
 			e.endedNotified = true
+			e.lastBeatErr = err
 			e.mu.Unlock()
 			if !notified {
 				e.emitErr(fmt.Errorf("session ended — rooms vanish when emptied; create or join a new one"))
 			}
 			return
 		} else {
+			e.mu.Lock()
+			e.lastBeatErr = err
+			e.mu.Unlock()
 			return // transient; next tick retries
 		}
 	}
 	e.mu.Lock()
 	e.presence = roster
 	e.lastEpoch = epoch
+	e.lastBeatErr = nil
 	before := make(map[string]bool, len(e.roster))
 	for u := range e.roster {
 		before[u] = true

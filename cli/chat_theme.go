@@ -103,14 +103,6 @@ func tileFeedCap(termW int) int {
 	return 4
 }
 
-// sendBtnWidthFor shrinks the Send button to an icon on narrow transcripts.
-func sendBtnWidthFor(transcriptOuter int) int {
-	if transcriptOuter < 60 {
-		return 6
-	}
-	return sendBtnWidth
-}
-
 // ---- palette --------------------------------------------------------------
 
 const (
@@ -287,12 +279,8 @@ func (c *chatScreen) chatItems() []chatItem {
 	items := make([]chatItem, 0, len(online)+1)
 	preview, ts := c.convPreview(generalConv)
 	inCall, inCallElapsed := false, ""
-	if n := c.callParties(); n > 0 {
-		members := len(c.users)
-		if members == 0 {
-			members = 1
-		}
-		preview = fmt.Sprintf("%d in call • %d members", n, members)
+	if c.callParties() > 0 {
+		preview = "● Live now"
 		ts = time.Now().Local().Format("15:04")
 		inCall = true
 	}
@@ -396,24 +384,21 @@ func (c *chatScreen) itemIndexFor(peer string) int {
 
 // ---- top bar -----------------------------------------------------------------
 
-// topBarView paints the app banner: logo + promises left, signal/lock/clock
-// right. Pure function of width + wall clock. Density collapses in steps:
-// full promises + date on wide, essentials in the middle, logo + time only
-// when cramped.
+// topBarView paints the app banner: logo left, signal/lock/clock right.
+// Pure function of width + wall clock. Density collapses in steps: date on
+// wide, essentials in the middle, logo + time only when cramped.
 func topBarView(w int) string {
 	now := time.Now()
 	enc := thLockStyle.Render("🔒 End-to-End Encrypted")
 	var left, right string
 	switch {
 	case w <= 0 || w >= 110:
-		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
-			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
 		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarDimStyle.Render(now.Format("Mon, 02 Jan 2006")) + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
 	case w >= 85:
-		left = thTopbarLogoStyle.Render("◆ UPLINK") + " " +
-			thTopbarDimStyle.Render("secure  •  ephemeral  •  p2p")
+		left = thTopbarLogoStyle.Render("◆ UPLINK")
 		right = thSignalStyle.Render("▂▄▆") + "  " + enc + "  " +
 			thTopbarTimeStyle.Render(now.Format("15:04"))
 	case w >= 55:
@@ -445,20 +430,7 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 	if c.targetUser == "" {
 		av = roomAvatarCell()
 		name = "General"
-		n := len(c.users)
-		if n == 0 {
-			n = 1
-		}
-		sub = fmt.Sprintf("%d members  |  Public Room", n)
-		if inCall := c.callParties(); inCall > 0 {
-			sub = fmt.Sprintf("%d members  |  %d in call  |  Public Room", n, inCall)
-		}
-		if c.key != "" {
-			sub += "  ·  key " + c.key
-		}
-		if shortVersion(version) != "" {
-			sub += "  ·  v" + normVersion(shortVersion(version))
-		}
+		sub = "Public Room"
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
@@ -468,11 +440,9 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		}
 	}
 	// Width() would wrap overlong rows and break the exact-row contract, so
-	// content is hard-truncated to fit instead; the style only pads. Tabs
-	// ride the name row (short) so the long context sub never squeezes out.
+	// content is hard-truncated to fit instead; the style only pads.
 	name = truncateStringPlain(name, maxInt(outerW-lipgloss.Width(av)-4, 1))
 	line1 := av + "  " + thRoomNameStyle.Render(name)
-	line1 = roomTabsLine(outerW, line1)
 	line2 := "     " + thRoomSubStyle.Render(truncateStringPlain(sub, maxInt(outerW-6, 0)))
 	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
 	return st.Render(line1) + "\n" + st.Render(line2)
@@ -500,14 +470,7 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 	if c.targetUser == "" {
 		av = roomAvatarCell()
 		name = "General"
-		n := len(c.users)
-		if n == 0 {
-			n = 1
-		}
-		sub = fmt.Sprintf("%d · Public", n)
-		if inCall := c.callParties(); inCall > 0 {
-			sub = fmt.Sprintf("%d · %d in call", n, inCall)
-		}
+		sub = "Public"
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
@@ -562,28 +525,32 @@ func composerTopRows(l layout) int {
 	return top
 }
 
-// sendBtnWidth is the fixed outer width of the Send button.
-const sendBtnWidth = 10
-
-// sendButtonView renders the blue Send button at exactly sendW wide
-// and boxH rows tall (matches the composer box height; the style is
-// borderless so every row is button face). Narrow transcripts get an icon.
-func sendButtonView(boxH, sendW int) string {
-	inner := maxInt(boxH, 1)
-	label := "Send"
-	if sendW < sendBtnWidth {
-		label = "➤"
+// composerGeoms derives the composer hit-test geometry deterministically from
+// the layout so View() and handleMouse() agree. Returns the clip glyph
+// column and its single-row y-range [y0,y1) — the clip sits on the composer
+// field row (middle of the box). clipX < 0 when no clip is painted (bare
+// prompt mode, or too narrow to fit it).
+func composerGeoms(l layout, termW, termH int) (clipX, y0, y1 int) {
+	clipX = -1
+	if l.composerRows <= 0 {
+		return
 	}
-	rows := make([]string, 0, inner)
-	mid := inner / 2
-	for i := 0; i < inner; i++ {
-		if i == mid {
-			rows = append(rows, thSendBtnStyle.Width(sendW-2).Align(lipgloss.Center).Render(label))
-		} else {
-			rows = append(rows, thSendBtnStyle.Width(sendW-2).Render(" "))
-		}
+	frameOff := 0
+	if l.frameOn {
+		frameOff = 1
 	}
-	return thSendBtnStyle.Width(sendW).Render(strings.Join(rows, "\n"))
+	txX0 := frameOff + composerIndent(l)
+	transcriptOuter := l.vpWidth + 2
+	inputOuter := transcriptOuter // message box spans the full column width
+	boxH := l.composerRows + 2
+	y0 = composerTopRows(l) + boxH/2 // the field row (middle of the box)
+	y1 = y0 + 1
+	if inputOuter >= 26 {
+		clipX = txX0 + inputOuter - 2
+	}
+	_ = termW
+	_ = termH
+	return
 }
 
 // roomTabsGeoms maps the Chat/Files/⋮ tab hit rects in terminal coords.
@@ -621,36 +588,6 @@ type tabRect struct {
 // hit reports whether a terminal point lands in the tab.
 func (t tabRect) hit(x, y int) bool {
 	return y == t.y && x >= t.x0 && x < t.x1
-}
-
-// composerGeoms derives the composer hit-test geometry deterministically from
-// the layout so View() and handleMouse() agree. Returns the Send button
-// x-range [sendX0,sendX1), its y-range [y0,y1), and the clip glyph column.
-// sendX0 < 0 when no button is painted (bare prompt mode).
-func composerGeoms(l layout, termW, termH int) (sendX0, sendX1, y0, y1, clipX int) {
-	sendX0, sendX1, clipX = -1, -1, -1
-	if l.composerRows <= 0 {
-		return
-	}
-	frameOff := 0
-	if l.frameOn {
-		frameOff = 1
-	}
-	txX0 := frameOff + composerIndent(l)
-	transcriptOuter := l.vpWidth + 2
-	boxH := l.composerRows + 2
-	y0 = composerTopRows(l)
-	y1 = y0 + boxH
-	sendW := sendBtnWidthFor(transcriptOuter)
-	inputOuter := transcriptOuter - sendW - 1
-	sendX0 = txX0 + inputOuter + 1
-	sendX1 = sendX0 + sendW
-	if inputOuter >= 26 {
-		clipX = txX0 + inputOuter - 2
-	}
-	_ = termW
-	_ = termH
-	return
 }
 
 // composerIndent is the left indent of the composer row (blank above the
@@ -1413,33 +1350,34 @@ func (c *chatScreen) peerAudioLive(peer string) bool {
 }
 
 // callCardView paints the pinned live-call status card (callCardRows rows):
-// green "System" sender, then a bordered box: title + "View Video [V]"
-// button row, participants sub row. Matches the reference mockup exactly.
+// green "System" sender, then two green-bar rows (title + LIVE chip,
+// participants + elapsed). Borderless: the green bar is the whole
+// affordance, and every row is exactly outerW cells.
 func (c *chatScreen) callCardView(outerW int) string {
 	ts := "--:--"
 	if !c.callStart.IsZero() {
 		ts = c.callStart.Local().Format("15:04")
 	}
 	sender := thSystemNameStyle.Render("System") + "  " + thMsgTimeStyle.Render(ts)
+	bar := thSystemBarStyle.Render("▌")
+	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Video call started")
+	live := thCamLiveStyle.Render("● LIVE")
 	n := c.callParties()
 	sub := fmt.Sprintf("%d participant", n)
 	if n != 1 {
 		sub += "s"
 	}
-	inner := maxInt(outerW-2, 10)
-	title := "📹 " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Video call started")
-	btn := thTabInactiveStyle.Render(" View Video [V] ")
-	subLine := thCamMetaStyle.Render(truncateStringPlain(sub, maxInt(inner-2, 1)))
-	// First content row: title left, button right.
-	r1plain := lipgloss.Width(stripForWidth(title)) + lipgloss.Width(stripForWidth(btn))
-	pad := inner - r1plain
-	if pad < 1 {
-		pad = 1
+	sub += " · " + c.callElapsed()
+	r1 := bar + " " + title
+	r1pad := outerW - lipgloss.Width(stripForWidth(r1)) - lipgloss.Width(stripForWidth(live)) - 1
+	if r1pad < 1 {
+		r1pad = 1
 	}
-	r1 := title + strings.Repeat(" ", pad) + btn
-	body := r1 + "\n" + subLine
+	r1 += strings.Repeat(" ", r1pad) + live
+	r2 := bar + " " + thCamMetaStyle.Render(truncateStringPlain(sub, maxInt(outerW-4, 1)))
 	return truncateVisible(sender, outerW) + "\n" +
-		thTileStyle.Width(inner).Render(body)
+		truncateVisible(r1, outerW) + "\n" +
+		truncateVisible(r2, outerW)
 }
 
 // keyHintsView paints the 1-row composer footer. Every hint names a binding
