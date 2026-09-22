@@ -338,6 +338,15 @@ func micSource() (<-chan []int16, func(), error) {
 	return mc.frames, mc.stop, err
 }
 
+// requireFFmpeg reports a friendly error when ffmpeg is unavailable
+// (test-mic synthesis shells out to it).
+func requireFFmpeg(what string) error {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg not found (needed for %s): install it (apt/pacman/brew) and retry", what)
+	}
+	return nil
+}
+
 // openTestMic synthesizes a 440Hz sine at 48kHz mono (UPLINK_MIC=test):
 // proves capture → Opus → UDP → jitter → playout end to end with zero
 // hardware, and lets a user verify the app path in one tab.

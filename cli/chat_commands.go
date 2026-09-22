@@ -29,7 +29,6 @@ var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
-	{Name: "/video", Desc: "toggle camera to your DM peer / the room"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
 	{Name: "/kick", Desc: "kick a user (creator/admin only)", TakesUser: true},
 	{Name: "/admin", Desc: "grant admin (room creator only)", TakesUser: true},
@@ -322,9 +321,8 @@ func (c chatScreen) paletteRows() int {
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
 	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), false)
-	// Sidebar video box is retired: feeds render in the bottom Live Cameras
-	// strip. The sidebar column therefore always starts at the room-header
-	// top (rosterY0 from the pure pass already accounts for that).
+	// The sidebar column always starts at the room-header top (rosterY0
+	// from the pure pass already accounts for that).
 	l.videoRows = 0
 	// Room header above the transcript (center column only): full two-row
 	// heading when roomy, compact single row when short or narrow, hidden
@@ -366,94 +364,15 @@ func (c chatScreen) layoutFor() layout {
 	return l
 }
 
-// videoPanelWidth is the right video column width (0 = too narrow). Pure:
-// ~28% of the terminal, clamped to tile-usable bounds. The panel is the
-// only video surface: narrow terminals keep a readable transcript instead
-// of a squeezed strip below it.
-func videoPanelWidth(termW int) int {
-	if termW < 90 {
-		return 0
-	}
-	w := termW * 28 / 100
-	if w < 26 {
-		w = 26
-	}
-	if w > 44 {
-		w = 44
-	}
-	return w
-}
-
-// videoChrome decides the video UI placement for a settled layout: the
-// right panel when it fits, otherwise nothing (the transcript keeps a
-// readable floor in both modes). There is no bottom strip: video lives on
-// the right, matching the reference layout.
-func (c chatScreen) videoChrome(l layout) (panelW, stripRows int) {
-	innerW := widthInsideFrame(c.width, l.frameOn)
-	sideW := 0
-	if l.sidebarOn {
-		sideW = l.sidebarWidth + 1
-	}
-	bodyH := l.headRows + l.vpHeight
-	if l.boxedTranscript && l.vpHeight > 0 {
-		bodyH += transcriptBorder
-	}
-	// Right panel: needs width for tiles plus a tall-enough body column.
-	// The panel splits width (never height), so even short terminals keep
-	// it — tiles degrade gracefully to fewer rows (see videoPanelGeom).
-	if w := videoPanelWidth(c.width); w > 0 && bodyH >= 14 {
-		if avail := innerW - sideW - (w + 1) - transcriptBorder; avail >= 30 {
-			return w, 0
-		}
-	}
-	return 0, 0
-}
-
-// videoPaneGeom is the single source of truth for the ASCII picture size:
-// the picture tracks the pane's real width (the old fixed-56-col render
-// inside a ~20-col viewport cropped ~40% of every frame), with rows from
-// the 4:3 aspect at the cell dot ratio (braille 2px×4px, half-block 1px×2px
-// — both 3/8 rows per column), capped by the sidebar's half-height budget.
-// Uses l.sidebarWidth, never sidebarInnerWidth (which re-derives the
-// layout — infinite recursion).
-func videoPaneGeom(c chatScreen, l layout) (cols, frameRows, streams int) {
-	cols = l.sidebarWidth - 2
-	streams = 1
-	if len(c.selfLines) > 0 {
-		streams = 2
-	}
-	frameRows = cols * 3 / 8
-	budget := (l.vpHeight/2 - 4) / streams
-	if frameRows > budget {
-		frameRows = budget
-	}
-	if frameRows < 3 {
-		frameRows = 3
-	}
-	return cols, frameRows, streams
-}
-
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot: the file browser
-// (picker) or the "/" command list. (Remote video lives in the sidebar, not
-// here.)
+// (picker) or the "/" command list.
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
 	return c.paletteView(maxW)
-}
-
-// videoActive reports whether the video pane should paint: publishing,
-// receiving, or waiting for the first frame (the pane itself is the proof
-// the UI path works — it must never stay invisible while video is on).
-// Stale frames alone don't hold the split: flags own the layout.
-func (c chatScreen) videoActive() bool {
-	if c.call == nil {
-		return false
-	}
-	return c.call.VideoOn() || c.call.RxOn() || c.call.Watching()
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -697,8 +616,6 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":
 		return c.openFilesDrawer() // morphs the drawer into the room's files
-	case "/video":
-		return c.toggleVideo()
 	case "/audio":
 		return c.toggleAudio()
 	case "/kick":

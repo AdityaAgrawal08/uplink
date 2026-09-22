@@ -165,12 +165,12 @@ type layout struct {
 	rosterX         int  // leftmost column of the sidebar (LEFT column)
 	rosterY0        int  // first terminal row inside the sidebar that holds content
 	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
-	videoRows       int  // legacy sidebar video box (0: feeds live in panel/strip)
+	videoRows       int  // retired (always 0)
 	headRows        int  // room-header rows above the transcript (0/1/2 by space)
 	callRows        int  // live-call status card rows (0 when no call)
 	hintRows        int  // composer key-hints row (0 when collapsed)
-	camRows         int  // bottom Live Cameras strip rows (0 when panel/none)
-	vidPanelW       int  // right video panel outer width (0 = off/strip mode)
+	camRows         int  // retired (always 0)
+	vidPanelW       int  // retired (always 0)
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
@@ -473,25 +473,6 @@ type netDeliveredMsg struct{ msgId string }
 type mediaInfoMsg struct{ info string }
 type callLevelMsg struct{ level float64 }
 
-// netVideoMsg carries one decoded ASCII video frame for the drawer pane.
-type netVideoMsg struct{ lines []string }
-
-// netSelfVideoMsg carries one local-camera preview frame.
-type netSelfVideoMsg struct{ lines []string }
-
-// paneContent paints ONE feed: the remote publisher's video. The local
-// self-view shows only when nobody else is publishing (it never stacks
-// under a remote feed — two pictures in one small pane read as a glitch).
-func (c *chatScreen) paneContent() []string {
-	if len(c.videoLines) > 0 {
-		return append([]string(nil), c.videoLines...)
-	}
-	if len(c.selfLines) == 0 {
-		return nil
-	}
-	return append([]string{tuiPaletteHintStyle.Render("— you —")}, c.selfLines...)
-}
-
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
 // exactly one pump goroutine exists at all times.
@@ -558,13 +539,7 @@ type chatScreen struct {
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
 	call         *mediaManager
 	callLevel    float64 // mic loudness for the status meter
-	videoLines   []string
-	selfLines    []string
 	callStart    time.Time // latched while a call is live (timer source)
-	cameraOffset int
-	vidCols      int // last tile geometry pushed via SetVideoSize (change-gated)
-	vidRows      int
-	videoVp      viewport.Model // scrollable video pane (wheel + scrollbar)
 	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
 	vp           viewport.Model
 	drag         barDrag // scrollbar drag state (any of the three panes)
@@ -584,7 +559,6 @@ type scrollSection int
 
 const (
 	secChat scrollSection = iota
-	secVideo
 	secRoster
 )
 
@@ -695,7 +669,6 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
-	videoVp := viewport.New(40, 10)
 	netCh := make(chan tea.Msg, 256)
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	// Engine callbacks only ever push into netCh (never touch the screen:
@@ -712,10 +685,8 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
 		nil, // roster bound below once eng exists
 		mediaUICallbacks{
-			onInfo:       func(info string) { push(mediaInfoMsg{info: info}) },
-			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
-			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
-			onSelfFrame:  func(lines []string) { push(netSelfVideoMsg{lines: lines}) },
+			onInfo:  func(info string) { push(mediaInfoMsg{info: info}) },
+			onLevel: func(level float64) { push(callLevelMsg{level: level}) },
 		})
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
@@ -742,7 +713,6 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		key:         key,
 		me:          me,
 		vp:          vp,
-		videoVp:     videoVp,
 		input:       ti,
 		netCh:       netCh,
 		rendered:    map[int]bool{},
@@ -1540,23 +1510,15 @@ func (c chatScreen) rosterRow(u string, inner int, trunc func(string) string) st
 	}
 	line := dot + " " + name
 
-	// Media badges: publishing state at a glance — my row shows what
-	// I send (▶ camera, ♪ mic), others' rows show what they share.
+	// Media badges: publishing state at a glance — my row shows the mic
+	// when live (♪), others' rows show what they share.
 	if c.call != nil {
 		mark := ""
 		if u == c.me {
-			if c.call.VideoOn() {
-				mark += " ▶"
-			}
 			if c.call.AudioOn() {
 				mark += " ♪"
 			}
 		} else {
-			for _, p := range c.call.VideoPublishers() {
-				if p == u {
-					mark += " ▶"
-				}
-			}
 			for _, p := range c.call.AudioPublishers() {
 				if p == u {
 					mark += " ♪"
@@ -1685,7 +1647,7 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// ---- media publishing (/video + /audio) --------------------------------------
+// ---- media publishing (/audio voice calls) ------------------------------------
 
 // currentScope resolves "wherever the user is": their DM peer, or the
 // room's online members.
@@ -1698,18 +1660,6 @@ func (c *chatScreen) currentScope() []string {
 		room = onlineNames(c.eng.peers(), c.me)
 	}
 	return c.call.scopeFor(c.targetUser, room)
-}
-
-// toggleVideo runs the /video command: publish/stop camera to the scope.
-func (c *chatScreen) toggleVideo() tea.Cmd {
-	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
-		return nil
-	}
-	if err := c.call.ToggleVideo(c.currentScope()); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
-	}
-	return nil
 }
 
 // toggleAudio runs the /audio command: publish/stop mic to the scope.
@@ -1729,7 +1679,7 @@ func (c *chatScreen) toggleAudio() tea.Cmd {
 const callCardRows = 3
 
 // callActive reports whether this client is in a call right now:
-// publishing camera/mic or receiving a remote feed.
+// publishing mic or receiving a remote feed.
 func (c *chatScreen) callActive() bool {
 	return c.call != nil && c.call.MediaActive()
 }
@@ -1757,7 +1707,7 @@ func (c *chatScreen) callElapsed() string {
 }
 
 // callParties counts distinct call participants: self (when live) plus all
-// video/audio publishers.
+// audio publishers.
 func (c *chatScreen) callParties() int {
 	seen := map[string]bool{}
 	n := 0
@@ -1766,12 +1716,6 @@ func (c *chatScreen) callParties() int {
 		n = 1
 	}
 	if c.call != nil {
-		for _, p := range c.call.VideoPublishers() {
-			if !seen[p] {
-				seen[p] = true
-				n++
-			}
-		}
 		for _, p := range c.call.AudioPublishers() {
 			if !seen[p] {
 				seen[p] = true
@@ -1782,64 +1726,18 @@ func (c *chatScreen) callParties() int {
 	return n
 }
 
-// peerInCall reports whether a peer has a live video/audio feed right now,
+// peerInCall reports whether a peer has a live audio feed right now,
 // or is the current target of our own publishing.
 func (c *chatScreen) peerInCall(peer string) bool {
 	if peer == "" || c.call == nil {
 		return false
-	}
-	for _, p := range c.call.VideoPublishers() {
-		if p == peer {
-			return true
-		}
 	}
 	for _, p := range c.call.AudioPublishers() {
 		if p == peer {
 			return true
 		}
 	}
-	return peer == c.targetUser && (c.call.VideoOn() || c.call.AudioOn())
-}
-
-// pressCallButton runs one video control-bank button: M toggles the mic,
-// V toggles the camera, X hangs up (stops our publishing); S/P have no
-// screen-share or people panel behind them, so they say so honestly.
-func (c *chatScreen) pressCallButton(id string) tea.Cmd {
-	switch id {
-	case "M":
-		return c.toggleAudio()
-	case "V":
-		return c.toggleVideo()
-	case "X":
-		return c.hangupCall()
-	case "S":
-		c.status = "screen sharing is not supported in this build"
-	case "P":
-		c.status = "the chat list on the left is the people panel"
-	}
-	return nil
-}
-
-// hangupCall leaves the call: stops our camera/mic publishing (composes the
-// same toggles the buttons and /video + /audio run — no backend change).
-// Watching ends when peers reap the withdrawn feeds.
-func (c *chatScreen) hangupCall() tea.Cmd {
-	if c.call == nil {
-		return nil
-	}
-	var cmds []tea.Cmd
-	scope := c.currentScope()
-	if c.call.VideoOn() {
-		if err := c.call.ToggleVideo(scope); err != nil {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video stop failed: "+err.Error()))
-		}
-	}
-	if c.call.AudioOn() {
-		if err := c.call.ToggleAudio(scope); err != nil {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio stop failed: "+err.Error()))
-		}
-	}
-	return tea.Batch(cmds...)
+	return peer == c.targetUser && c.call.AudioOn()
 }
 
 // mediaStatus renders the header chips for active media ("" when idle).
@@ -1848,12 +1746,6 @@ func (c *chatScreen) mediaStatus() string {
 		return ""
 	}
 	var parts []string
-	if scope := c.call.VideoScope(); scope != "" {
-		parts = append(parts, "● VID → "+scope)
-	}
-	if c.call.Watching() {
-		parts = append(parts, "● VID ← "+strings.Join(c.call.VideoPublishers(), ","))
-	}
 	if scope := c.call.AudioScope(); scope != "" {
 		parts = append(parts, "● MIC → "+scope)
 	}
@@ -2001,23 +1893,6 @@ func (c *chatScreen) syncViewport() {
 	vpW := l.vpWidth
 	if l.vpHeight > 0 && vpW > 10 {
 		vpW--
-	}
-	// Tiles own the render size now (the retired sidebar pane used to):
-	// push the TRUE painted tile geometry (panel or strip) into the manager
-	// so frames render at the tile's real size with full truecolor.
-	// Change-gated: re-rendering the pump on every keystroke would churn.
-	if c.call != nil {
-		inner, rows := c.videoTileGeom(l, c.camFeeds())
-		if inner > 0 && rows > 0 {
-			if inner != c.vidCols || rows != c.vidRows {
-				c.call.SetVideoSize(inner, rows)
-				c.vidCols, c.vidRows = inner, rows
-			}
-		} else {
-			c.vidCols, c.vidRows = 0, 0
-		}
-	} else {
-		c.vidCols, c.vidRows = 0, 0
 	}
 	// Chat list gets its own viewport (scrollable like the transcript);
 	// the search box lives outside the viewport.
@@ -2270,20 +2145,6 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case callLevelMsg:
 		c.callLevel = msg.level
-		cmds = append(cmds, c.drainNetCmd())
-
-	case netVideoMsg:
-		c.videoLines = msg.lines
-		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
-		c.syncViewport()
-		c.rebuildView()
-		cmds = append(cmds, c.drainNetCmd())
-
-	case netSelfVideoMsg:
-		c.selfLines = msg.lines
-		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
-		c.syncViewport()
-		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
@@ -2633,7 +2494,7 @@ func transcriptX0(l layout) int {
 
 // scrollBarGeoms is the paint-verified track geometry for the scrollbars
 // (constants validated against View() by TestScrollbarDrag).
-func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
+func (c chatScreen) scrollBarGeoms(l layout) (chat, roster barGeom) {
 	frameOff := 0
 	if l.frameOn {
 		frameOff = 1
@@ -2649,15 +2510,6 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
 		trackY0: frameOff + headOff + l.headRows + l.callRows + 2,
 		trackH:  maxInt(l.vpHeight-2, 0),
 	}
-	// Sidebar video box is gone (feeds live in the bottom strip): the
-	// video geom stays zero so wheel/drag routing skips it.
-	if l.videoRows > 0 {
-		video = barGeom{
-			x:       l.rosterX + l.sidebarWidth - 2,
-			trackY0: l.rosterY0 - l.videoRows + 1,
-			trackH:  maxInt(l.videoRows-4, 0),
-		}
-	}
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
 		roster = barGeom{
@@ -2666,7 +2518,7 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
 			trackH:  maxInt(fill-3, 0),
 		}
 	}
-	return chat, video, roster
+	return chat, roster
 }
 
 // thumbFor computes the thumb position for one pane's scrollbar.
@@ -2674,8 +2526,6 @@ func (c chatScreen) thumbFor(sec scrollSection, g barGeom) barGeom {
 	switch sec {
 	case secChat:
 		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.vp.TotalLineCount(), c.vp.Height, c.vp.YOffset, g.trackH+2)
-	case secVideo:
-		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.videoVp.TotalLineCount(), c.videoVp.Height, c.videoVp.YOffset, g.trackH+2)
 	case secRoster:
 		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.rosterVp.TotalLineCount(), c.rosterVp.Height, c.rosterVp.YOffset, g.trackH+2)
 	}
@@ -2737,31 +2587,16 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			}
 			return nil
 		}
-		// Video call controls: M mic, V camera, X hang up (wired); S/P are
-		// dimmed (unsupported here) and explain themselves on click.
-		if l.vidPanelW > 0 {
-			pg := videoPanelGeom(c, l, c.camFeeds())
-			if msg.X >= pg.fsX0 && msg.X < pg.fsX1 && msg.Y == pg.fsY {
-				c.status = "the video panel follows your terminal: fullscreen the window for a bigger picture"
-				return nil
-			}
-			for _, b := range pg.btns {
-				if msg.X >= b.x0 && msg.X < b.x1 && msg.Y >= b.y0 && msg.Y < b.y1 {
-					return c.pressCallButton(b.id)
-				}
-			}
-		}
 		if !l.sidebarOn {
 			break
 		}
-		chatG, videoG, rosterG := c.scrollBarGeoms(l)
+		chatG, rosterG := c.scrollBarGeoms(l)
 		chatG = c.thumbFor(secChat, chatG)
-		videoG = c.thumbFor(secVideo, videoG)
 		rosterG = c.thumbFor(secRoster, rosterG)
 		for _, g := range []struct {
 			sec scrollSection
 			b   barGeom
-		}{{secChat, chatG}, {secVideo, videoG}, {secRoster, rosterG}} {
+		}{{secChat, chatG}, {secRoster, rosterG}} {
 			if g.b.trackH <= 0 {
 				continue
 			}
@@ -2803,13 +2638,10 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 
 	case tea.MouseActionMotion:
 		if c.drag.active {
-			_, videoG, rosterG := c.scrollBarGeoms(l)
-			chatG, _, _ := c.scrollBarGeoms(l)
+			chatG, rosterG := c.scrollBarGeoms(l)
 			switch c.drag.sec {
 			case secChat:
 				c.dragTo(secChat, msg.Y, c.thumbFor(secChat, chatG), l)
-			case secVideo:
-				c.dragTo(secVideo, msg.Y, c.thumbFor(secVideo, videoG), l)
 			case secRoster:
 				c.dragTo(secRoster, msg.Y, c.thumbFor(secRoster, rosterG), l)
 			}
@@ -2840,34 +2672,6 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		up := msg.Type == tea.MouseWheelUp
-		frameOffset, headerOffset := 0, 0
-		if l.frameOn {
-			frameOffset = 1
-		}
-		if l.showHeader {
-			headerOffset = headerHeight
-		}
-		cameraY := frameOffset + headerOffset + l.headRows + l.callRows + l.vpHeight
-		if l.boxedTranscript && l.vpHeight > 0 {
-			cameraY += transcriptBorder
-		} else if (l.headRows > 0 || l.callRows > 0) && l.vpHeight == 0 {
-			// body holds header/card only; no transcript border
-		}
-		if l.camRows > 0 && msg.Y >= cameraY && msg.Y < cameraY+l.camRows {
-			// Wheels over an overflowing strip pan it horizontally;
-			// otherwise they fall through to the transcript.
-			width := camStripContentW(c.width, l.frameOn)
-			count := len(c.camFeeds())
-			inner := max(tileMinFor(width), camTileInner(width, count))
-			if maxOffset := max(0, count*(inner+3)-1-width); maxOffset > 0 {
-				step := wheelStepFor(l.camRows) * 4
-				if up {
-					step = -step
-				}
-				c.cameraOffset = min(maxOffset, max(0, c.cameraOffset+step))
-				return nil
-			}
-		}
 		// Route by pane: sidebar list vs transcript — each scrolls only
 		// itself with steps proportional to its own height.
 		if l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth &&
@@ -2910,9 +2714,6 @@ func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
 	case secChat:
 		vp = &c.vp
 		total = c.vp.TotalLineCount()
-	case secVideo:
-		vp = &c.videoVp
-		total = c.videoVp.TotalLineCount()
 	case secRoster:
 		vp = &c.rosterVp
 		total = c.rosterVp.TotalLineCount()
@@ -3059,28 +2860,12 @@ func (c chatScreen) View() string {
 		right += "\n" + inputCore
 		body = lipgloss.JoinHorizontal(lipgloss.Top, col, " ", right)
 	}
-	// RIGHT video panel: call header, tile grid, controls, note. Same body
-	// row, same height — the three columns share top and bottom edges.
-	if l.vidPanelW > 0 && body != "" {
-		feeds := c.camFeeds()
-		pg := videoPanelGeom(&c, l, feeds)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", c.rightPanelView(l, pg, feeds))
-	}
 	rows := make([]string, 0, 10)
 	if l.showHeader {
 		rows = append(rows, c.headerView())
 	}
 	if body != "" {
 		rows = append(rows, body)
-	}
-	// Bottom Live Cameras strip (full content width, budgeted in layout;
-	// only when the right panel is off).
-	if l.camRows > 0 {
-		w := c.width
-		if l.frameOn {
-			w -= frameChrome
-		}
-		rows = append(rows, c.camerasStripView(maxInt(w, 0)))
 	}
 	// Hints, drawer, and composer ride the right stack beside the full-height
 	// sidebar when it is on; otherwise they paint below, indented past it.
