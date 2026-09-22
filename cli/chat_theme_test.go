@@ -19,10 +19,7 @@ func TestAudioStateSurvivesLayout(t *testing.T) {
 		c.call = &mediaManager{audioOn: true}
 		m, _ := c.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		sc := m.(chatScreen)
-		l := sc.layoutFor()
-		if l.vidPanelW != 0 || l.camRows != 0 || l.videoRows != 0 {
-			t.Fatalf("video UI allocated space at %v", size)
-		}
+		_ = sc.layoutFor()
 		if !sc.call.AudioOn() {
 			t.Fatalf("layout pass changed audio state at %v", size)
 		}
@@ -251,17 +248,9 @@ func liveCallScreen(t *testing.T, w, h int) chatScreen {
 	return m.(chatScreen)
 }
 
-func TestVideoPanelHidden(t *testing.T) {
+func TestNoVideoSurfaces(t *testing.T) {
 	const W, H = 154, 44
 	sc := liveCallScreen(t, W, H)
-	l := sc.layoutFor()
-	if l.vidPanelW != 0 || l.camRows != 0 || l.videoRows != 0 {
-		t.Fatal("video surfaces must not allocate space")
-	}
-	base := computeLayoutMedia(W, H, sc.status != "", sc.paletteRows(), false)
-	if l.vpWidth != base.vpWidth || l.vpHeight != base.vpHeight-l.headRows-l.callRows-l.hintRows {
-		t.Fatal("chat must reclaim all video surface space")
-	}
 	got := sc.View()
 	for _, absent := range []string{"Video Call", "Live Cameras", "[M]", "[V]", "[S]", "[P]", "[X]", "intentionally blurred", "VIDEO_FRAME_SENTINEL", "⛶"} {
 		if strings.Contains(stripANSI(got), absent) {

@@ -165,12 +165,9 @@ type layout struct {
 	rosterX         int  // leftmost column of the sidebar (LEFT column)
 	rosterY0        int  // first terminal row inside the sidebar that holds content
 	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
-	videoRows       int  // retired (always 0)
 	headRows        int  // room-header rows above the transcript (0/1/2 by space)
 	callRows        int  // live-call status card rows (0 when no call)
 	hintRows        int  // composer key-hints row (0 when collapsed)
-	camRows         int  // retired (always 0)
-	vidPanelW       int  // retired (always 0)
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
@@ -183,7 +180,7 @@ type layout struct {
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
-	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.camRows + l.callRows + l.hintRows
+	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.callRows + l.hintRows
 	if l.boxedTranscript {
 		h += transcriptBorder
 	}

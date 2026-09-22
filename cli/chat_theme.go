@@ -474,7 +474,7 @@ func composerTopRows(l layout) int {
 	if bodyRows > 0 {
 		top += bodyRows
 	}
-	top += l.camRows + l.hintRows
+	top += l.hintRows
 	if l.paletteRows > 0 {
 		top += l.paletteRows + 1 // drawer panel + its spacer row
 	}

@@ -323,7 +323,6 @@ func (c chatScreen) layoutFor() layout {
 	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), false)
 	// The sidebar column always starts at the room-header top (rosterY0
 	// from the pure pass already accounts for that).
-	l.videoRows = 0
 	// Room header above the transcript (center column only): full two-row
 	// heading when roomy, compact single row when short or narrow, hidden
 	// when every row counts.
@@ -351,8 +350,6 @@ func (c chatScreen) layoutFor() layout {
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
 	}
-	// Video surfaces stay off: the transcript owns every column.
-	l.vidPanelW, l.camRows = 0, 0
 	// Roster adapts to the settled viewport: search row eats one slot.
 	l.rosterSlots = l.vpHeight - 1
 	if l.rosterSlots > rosterMaxVisible {
