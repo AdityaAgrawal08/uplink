@@ -431,6 +431,9 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		av = roomAvatarCell()
 		name = "General"
 		sub = "Public Room"
+		if c.key != "" {
+			sub += "  ·  key " + c.key
+		}
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
@@ -471,6 +474,9 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 		av = roomAvatarCell()
 		name = "General"
 		sub = "Public"
+		if c.key != "" {
+			sub += " · " + c.key
+		}
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser

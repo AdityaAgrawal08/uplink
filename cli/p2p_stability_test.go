@@ -1113,10 +1113,18 @@ func TestHeaderStaysClean(t *testing.T) {
 	if !strings.Contains(h, "General") || !strings.Contains(h, "Public Room") {
 		t.Fatalf("room header must name the room: %q", h)
 	}
-	for _, banned := range []string{"v" + normVersion(version), "members", "in call", "key "} {
+	for _, banned := range []string{"v" + normVersion(version), "members", "in call"} {
 		if strings.Contains(h, banned) {
 			t.Fatalf("room header must not show %q: %q", banned, h)
 		}
+	}
+	// The room code (invite key) must always be visible while in the room.
+	sc.key = "ABC123"
+	if h := sc.roomHeaderView(100); !strings.Contains(h, "ABC123") {
+		t.Fatalf("room header must show the room code: %q", h)
+	}
+	if h := sc.roomHeaderCompact(100); !strings.Contains(h, "ABC123") {
+		t.Fatalf("compact header must show the room code: %q", h)
 	}
 }
 
