@@ -221,13 +221,49 @@ func TestAudioPublishLoopback(t *testing.T) {
 	}
 }
 
-func TestToggleVideoRequiresScope(t *testing.T) {
+func TestToggleVideoSoloPreview(t *testing.T) {
 	p := newPublishPair(t)
-	if err := p.a.ToggleVideo(nil); err == nil {
-		t.Fatal("publishing to nobody must fail")
+	// Solo (nil scope): the camera starts in preview-only mode instead of
+	// failing — self-view works with nobody else around.
+	if err := p.a.ToggleVideo(nil); err != nil {
+		t.Fatalf("solo ToggleVideo must succeed: %v", err)
+	}
+	if !p.a.VideoOn() {
+		t.Fatal("solo toggle must flip videoOn")
+	}
+	// Empty-scope roster ticks while alone must not stop the preview.
+	p.a.PublishTo(nil)
+	p.a.PublishTo([]string{})
+	if !p.a.VideoOn() {
+		t.Fatal("solo preview must survive empty-scope ticks")
+	}
+	// Toggle off stops the preview.
+	if err := p.a.ToggleVideo(nil); err != nil {
+		t.Fatalf("solo toggle-off must succeed: %v", err)
 	}
 	if p.a.VideoOn() {
-		t.Fatal("failed toggle must not flip state")
+		t.Fatal("second solo toggle must stop the stream")
+	}
+}
+
+func TestToggleAudioSoloPreview(t *testing.T) {
+	p := newPublishPair(t)
+	if err := p.a.ToggleAudio(nil); err != nil {
+		t.Fatalf("solo ToggleAudio must succeed: %v", err)
+	}
+	if !p.a.AudioOn() {
+		t.Fatal("solo toggle must flip audioOn")
+	}
+	p.a.PublishTo(nil)
+	p.a.PublishTo([]string{})
+	if !p.a.AudioOn() {
+		t.Fatal("solo mic must survive empty-scope ticks")
+	}
+	if err := p.a.ToggleAudio(nil); err != nil {
+		t.Fatalf("solo toggle-off must succeed: %v", err)
+	}
+	if p.a.AudioOn() {
+		t.Fatal("second solo toggle must stop the mic")
 	}
 }
 
@@ -457,7 +493,7 @@ func TestSlashRegistryExact(t *testing.T) {
 	}
 }
 
-func TestHiddenVideoAndChatMapping(t *testing.T) {
+func TestVideoPanelRightAndChatMapping(t *testing.T) {
 	c := newFilterScreen("bob", "", "carol")
 	c.vp = *viewportPtr(60, 20)
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
@@ -470,37 +506,33 @@ func TestHiddenVideoAndChatMapping(t *testing.T) {
 	m2, _ := sc.Update(netVideoMsg{lines: lines})
 	sc = m2.(chatScreen)
 	l := sc.layoutFor()
-	if l.videoRows != 0 || l.vidPanelW != 0 {
-		t.Fatal("narrow terminal must not claim the right panel")
+	// Video lives on the right, never in a strip below.
+	if l.vidPanelW <= 0 {
+		t.Fatal("100-col terminal must claim the right video panel")
 	}
-	if l.camRows <= 0 {
-		t.Fatal("narrow live video must claim the bottom strip")
+	if l.camRows != 0 {
+		t.Fatal("bottom strip is retired: video must not claim rows below")
 	}
 	if len(sc.videoLines) != len(lines) || !sc.call.VideoOn() {
-		t.Fatal("hiding video UI must preserve received frames and call state")
+		t.Fatal("panel video UI must preserve received frames and call state")
 	}
 	// Items: General at +0/+1, carol at +2/+3 (two rows per item).
 	if got := sc.peerAtY(l.rosterY0+2, l); got != "carol" {
 		t.Fatalf("chat row mapped to %q; want carol", got)
 	}
-	// Wheel over the camera strip never opens a thread (falls to chat).
-	frameOff, headOff := 0, 0
-	if l.frameOn {
-		frameOff = 1
-	}
-	if l.showHeader {
-		headOff = 1
-	}
-	stripY := frameOff + headOff + l.headRows + l.callRows + l.vpHeight + 2 + 1
-	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: stripY, Type: tea.MouseWheelDown})
+	// Wheel over the video panel never opens a thread (falls to chat).
+	m3, _ := sc.Update(tea.MouseMsg{X: 70, Y: 10, Type: tea.MouseWheelDown})
 	sc = m3.(chatScreen)
 	if sc.targetUser != "" {
-		t.Fatal("wheel over camera strip must not open a thread")
+		t.Fatal("wheel over video panel must not open a thread")
 	}
-	if got := sc.View(); !strings.Contains(got, "Live Cameras") {
-		t.Fatal("narrow view must show the Live Cameras strip")
+	if got := sc.View(); !strings.Contains(got, "Video Call") {
+		t.Fatal("view must show the right Video Call panel")
 	}
-	// Tiny terminal collapses the strip cleanly (rows return to chat).
+	if got := sc.View(); strings.Contains(got, "Live Cameras") {
+		t.Fatal("view must not show a bottom strip")
+	}
+	// Tiny terminal collapses the panel cleanly (rows return to chat).
 	m4, _ := sc.Update(tea.WindowSizeMsg{Width: 100, Height: 18})
 	sc = m4.(chatScreen)
 	if l2 := sc.layoutFor(); l2.camRows != 0 || l2.vidPanelW != 0 {

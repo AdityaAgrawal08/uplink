@@ -421,6 +421,9 @@ func describeScope(set map[string]bool) string {
 
 // ToggleVideo turns the camera on (announce to scope) or off (media-stop).
 // Toggling on again while on re-announces to fresh scope members only.
+// Solo use is fully supported: with nobody else around the camera starts
+// in preview-only mode (self-view renders, no announce goes out) and late
+// joiners are admitted automatically via PublishTo.
 func (m *mediaManager) ToggleVideo(scope []string) error {
 	m.mu.Lock()
 	if m.videoOn {
@@ -434,10 +437,7 @@ func (m *mediaManager) ToggleVideo(scope []string) error {
 			m.videoTo[p] = true
 		}
 	}
-	if len(m.videoTo) == 0 {
-		m.mu.Unlock()
-		return fmt.Errorf("nobody to show (alone here)")
-	}
+	solo := len(m.videoTo) == 0
 	desc := describeScope(m.videoTo)
 	m.videoOn = true
 	m.mu.Unlock()
@@ -447,7 +447,11 @@ func (m *mediaManager) ToggleVideo(scope []string) error {
 		m.mu.Unlock()
 		return err
 	}
-	m.emit("camera on — showing " + desc)
+	if solo {
+		m.emit("camera on — preview only (alone here; peers join automatically)")
+	} else {
+		m.emit("camera on — showing " + desc)
+	}
 	if err := m.publishAnnounce(); err != nil {
 		return err
 	}
@@ -469,6 +473,9 @@ func (m *mediaManager) ToggleVideo(scope []string) error {
 }
 
 // ToggleAudio turns the mic on (announce to scope) or off (media-stop).
+// Solo use is fully supported: with nobody else around the mic starts
+// locally (level meter live, no announce goes out) and late joiners are
+// admitted automatically via PublishTo.
 func (m *mediaManager) ToggleAudio(scope []string) error {
 	m.mu.Lock()
 	if m.audioOn {
@@ -482,10 +489,7 @@ func (m *mediaManager) ToggleAudio(scope []string) error {
 			m.audioTo[p] = true
 		}
 	}
-	if len(m.audioTo) == 0 {
-		m.mu.Unlock()
-		return fmt.Errorf("nobody to talk to (alone here)")
-	}
+	solo := len(m.audioTo) == 0
 	desc := describeScope(m.audioTo)
 	m.audioOn = true
 	m.mu.Unlock()
@@ -495,7 +499,11 @@ func (m *mediaManager) ToggleAudio(scope []string) error {
 		m.mu.Unlock()
 		return err
 	}
-	m.emit("mic live — talking to " + desc)
+	if solo {
+		m.emit("mic live — preview only (alone here; peers join automatically)")
+	} else {
+		m.emit("mic live — talking to " + desc)
+	}
 	if err := m.publishAnnounce(); err != nil {
 		return err
 	}
@@ -534,8 +542,10 @@ func (m *mediaManager) publishAnnounce() error {
 // prunes leavers. Live scope members join the send scope for every kind
 // that is on: announcing without admitting them would complete the
 // handshake yet never send them a frame (late joiners saw "media
-// secured" and then silence forever). Streams whose scope empties stop
-// themselves.
+// secured" and then silence forever). A send set pruned down from remotes
+// to nobody stops its stream; a preview-only solo session (empty from the
+// start) keeps running until the user toggles off or hangs up, and joiners
+// are admitted the moment they appear.
 func (m *mediaManager) PublishTo(scope []string) {
 	m.mu.Lock()
 	if !m.videoOn && !m.audioOn {
@@ -548,6 +558,11 @@ func (m *mediaManager) PublishTo(scope []string) {
 			live[p] = true
 		}
 	}
+	// Snapshot before pruning: a send set that HAD remotes and loses its
+	// last one stops its stream (leavers). A set that was already empty
+	// (preview-only solo session) keeps running — only an explicit toggle
+	// or hangup stops it.
+	hadVideoRemote, hadAudioRemote := len(m.videoTo) > 0, len(m.audioTo) > 0
 	// Prune grace: a scope member missing from one tick is usually a
 	// flapped heartbeat, not a leaver. Count consecutive absences and
 	// prune only past the grace window; presence clears the count.
@@ -585,19 +600,23 @@ func (m *mediaManager) PublishTo(scope []string) {
 			fresh = append(fresh, p)
 		}
 	}
-	videoOn, audioOn := len(m.videoTo) > 0, len(m.audioTo) > 0
-	wasPublishing := m.videoOn || m.audioOn
+	videoScopeEmpty, audioScopeEmpty := len(m.videoTo) == 0, len(m.audioTo) == 0
+	stopV := m.videoOn && hadVideoRemote && videoScopeEmpty
+	stopA := m.audioOn && hadAudioRemote && audioScopeEmpty
 	m.mu.Unlock()
-	if m.videoOn && !videoOn {
+	if stopV {
 		m.stopVideoPublish()
 	}
-	if m.audioOn && !audioOn {
+	if stopA {
 		m.stopAudioPublish()
 	}
-	// Scope-shift line: the publish continues but to a different set than
-	// the toggle described (DM↔room move, joiners, leavers past grace).
-	// Without this the header chips are the only clue and toasts get lost.
-	if wasPublishing && (len(fresh) > 0 || !videoOn || !audioOn) {
+	// Status lines only on real transitions (joiners admitted, last leaver
+	// stopped a stream) — never a per-tick heartbeat, so preview-only solo
+	// sessions and single-kind calls stay quiet.
+	if stopV || stopA {
+		m.emit("sharing stopped — nobody left in scope")
+	}
+	if len(fresh) > 0 {
 		m.emit("sharing now covers: " + describeScope(m.currentSendScope()))
 	}
 	for _, to := range fresh {

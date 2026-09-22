@@ -487,7 +487,7 @@ func roomTabsLine(outerW int, line1 string) string {
 	more := thTabStyle.Render(" ⋮ ")
 	tabs := chat + " " + files + " " + more
 	gap := outerW - lipgloss.Width(stripForWidth(line1)) - lipgloss.Width(tabs)
-	if gap < 1 || outerW < 50 {
+	if gap < 1 || outerW < 40 {
 		return line1 // cramped: no tabs painted, none hit-testable either
 	}
 	return line1 + strings.Repeat(" ", gap) + tabs
@@ -593,7 +593,7 @@ func roomTabsGeoms(c *chatScreen, l layout) (chat, files, more tabRect, ok bool)
 		return tabRect{}, tabRect{}, tabRect{}, false
 	}
 	outerW := l.vpWidth + 2
-	if outerW < 50 {
+	if outerW < 40 {
 		return tabRect{}, tabRect{}, tabRect{}, false
 	}
 	frameOff := 0
@@ -906,6 +906,10 @@ type panelGeom struct {
 	ctrlY     int // terminal row of the controls box top
 	ctrlH     int // outer controls height
 	ctrlWide  bool
+	// ctrlIconsOnly renders icon-only buttons: key labels fit beside icons
+	// at segW>=6 ("♪ M") and below icons when wide — narrower boxes show
+	// just the glyph (the hints footer documents the keys).
+	ctrlIconsOnly bool
 	segW      int
 	btns      []callBtn
 	noteY     int // terminal row of the note box top (-1 when hidden)
@@ -940,10 +944,12 @@ func videoPanelGeom(c *chatScreen, l layout, feeds []camFeed) (pg panelGeom) {
 	pg.topY = frameOff + headOff
 	pg.contentH = l.headRows + l.callRows + l.vpHeight - l.videoRows
 	pw := pg.w - 2
-	// Controls: one bordered box per button (icon + key rows when wide,
-	// single inline row when narrow), joined with 1-col gaps. Exact math:
-	// 5*segW + 4 gaps == pw, each box segW wide including its border.
-	pg.ctrlWide = pw >= 42
+	// Controls: one bordered box per button — icon over [key] when wide,
+	// icon + key inline when compact, icon-only when narrow — joined with
+	// 1-col gaps. Exact math: 5*segW + 4 gaps == pw, each box segW wide
+	// including its border.
+	pg.ctrlWide = pw >= 34
+	pg.ctrlIconsOnly = pw < 30
 	pg.ctrlH = 3
 	if pg.ctrlWide {
 		pg.ctrlH = 4
@@ -1003,7 +1009,7 @@ func videoPanelGeom(c *chatScreen, l layout, feeds []camFeed) (pg panelGeom) {
 	pg.fsX1 = pg.x0 + pg.w - 1
 	pg.fsX0 = pg.fsX1 - fsW
 	// Control-bank buttons split the inner width evenly (gaps between).
-	pg.segW = maxInt((pw-4)/5, 5)
+	pg.segW = maxInt((pw-4)/5, 4)
 	bx := pg.x0 + 1
 	by0 := pg.ctrlY
 	by1 := by0 + pg.ctrlH
@@ -1246,8 +1252,17 @@ func (c *chatScreen) rightPanelView(l layout, pg panelGeom, feeds []camFeed) str
 	if members == 0 {
 		members = 1
 	}
-	title := dot + " " + thCamNameStyle.Render("Video Call") + "  " + thCamMetaStyle.Render(c.callElapsed())
-	right := thCamMetaStyle.Render(fmt.Sprintf("%d / %d ⛶", c.callParties(), members))
+	// Narrow panels get a compact header (short timer, tight counts) so the
+	// fullscreen glyph always survives truncation.
+	timer, counts := c.callElapsed(), fmt.Sprintf("%d / %d ⛶", c.callParties(), members)
+	if pw < 34 {
+		if len(timer) > 5 {
+			timer = timer[len(timer)-5:]
+		}
+		counts = fmt.Sprintf("%d/%d ⛶", c.callParties(), members)
+	}
+	title := dot + " " + thCamNameStyle.Render("Video Call") + "  " + thCamMetaStyle.Render(timer)
+	right := thCamMetaStyle.Render(counts)
 	headPad := pw - lipgloss.Width(stripForWidth(title)) - lipgloss.Width(stripForWidth(right))
 	if headPad < 1 {
 		headPad = 1
@@ -1331,7 +1346,7 @@ func (c *chatScreen) rightPanelView(l layout, pg panelGeom, feeds []camFeed) str
 		{icon: micIcon, key: "M", border: lipgloss.Color(thPanelEdge)},
 		{icon: vidIcon, key: "V", border: lipgloss.Color(thPanelEdge)},
 		{icon: thCallBtnDimStyle.Render("▢"), key: "S", border: lipgloss.Color(thPanelEdge)},
-		{icon: thCallBtnDimStyle.Render("○○"), key: "P", border: lipgloss.Color(thPanelEdge)},
+		{icon: thCallBtnDimStyle.Render("○"), key: "P", border: lipgloss.Color(thPanelEdge)},
 		{icon: thHangupStyle.Render("✕"), key: "X", border: lipgloss.Color("#dc2626")},
 	}
 	if !micOn {
@@ -1354,6 +1369,9 @@ func (c *chatScreen) rightPanelView(l layout, pg panelGeom, feeds []camFeed) str
 			ic := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(b.icon)
 			ky := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(thCamMetaStyle.Render("[" + b.key + "]"))
 			btns = append(btns, st.Render(ic+"\n"+ky))
+		} else if pg.ctrlIconsOnly {
+			one := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(b.icon)
+			btns = append(btns, st.Render(one))
 		} else {
 			one := lipgloss.NewStyle().Width(maxInt(w-2, 1)).Align(lipgloss.Center).Render(b.icon + " " + thCamMetaStyle.Render(b.key))
 			btns = append(btns, st.Render(one))

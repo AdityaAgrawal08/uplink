@@ -382,24 +382,27 @@ func (c chatScreen) layoutFor() layout {
 }
 
 // videoPanelWidth is the right video column width (0 = too narrow). Pure:
-// ~30% of the terminal, clamped to tile-usable bounds.
+// ~28% of the terminal, clamped to tile-usable bounds. The panel is the
+// only video surface: narrow terminals keep a readable transcript instead
+// of a squeezed strip below it.
 func videoPanelWidth(termW int) int {
-	if termW < 120 {
+	if termW < 90 {
 		return 0
 	}
-	w := termW * 30 / 100
-	if w < 32 {
-		w = 32
+	w := termW * 28 / 100
+	if w < 26 {
+		w = 26
 	}
-	if w > 48 {
-		w = 48
+	if w > 44 {
+		w = 44
 	}
 	return w
 }
 
-// videoChrome decides the video UI placement for a settled layout: right
-// panel (returns width, 0 strip rows) or bottom strip (0 width, rows).
-// The transcript keeps a readable floor in both modes.
+// videoChrome decides the video UI placement for a settled layout: the
+// right panel when it fits, otherwise nothing (the transcript keeps a
+// readable floor in both modes). There is no bottom strip: video lives on
+// the right, matching the reference layout.
 func (c chatScreen) videoChrome(l layout) (panelW, stripRows int) {
 	innerW := widthInsideFrame(c.width, l.frameOn)
 	sideW := 0
@@ -410,16 +413,12 @@ func (c chatScreen) videoChrome(l layout) (panelW, stripRows int) {
 	if l.boxedTranscript && l.vpHeight > 0 {
 		bodyH += transcriptBorder
 	}
-	// Right panel: needs width for tiles plus a tall body column.
-	if w := videoPanelWidth(c.width); w > 0 && bodyH >= 22 {
-		if avail := innerW - sideW - (w + 1) - transcriptBorder; avail >= 48 {
+	// Right panel: needs width for tiles plus a tall-enough body column.
+	// The panel splits width (never height), so even short terminals keep
+	// it — tiles degrade gracefully to fewer rows (see videoPanelGeom).
+	if w := videoPanelWidth(c.width); w > 0 && bodyH >= 14 {
+		if avail := innerW - sideW - (w + 1) - transcriptBorder; avail >= 30 {
 			return w, 0
-		}
-	}
-	// Bottom strip fallback (height split, transcript keeps 4+ rows).
-	if c.width >= 40 && c.height >= 24 {
-		if stripRows = min(max(8, c.height/3), min(24, l.vpHeight-4)); stripRows >= 8 {
-			return 0, stripRows
 		}
 	}
 	return 0, 0

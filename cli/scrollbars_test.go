@@ -8,7 +8,7 @@ import (
 )
 
 // geomScreen builds a screen with an overflowing chat list at 140x40.
-// Video frames still flow (they render in the bottom Live Cameras strip).
+// Video frames still flow (they render in the right video panel).
 func geomScreen(t *testing.T) (*chatScreen, layout) {
 	t.Helper()
 	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena", "mallory", "nina", "olga", "peggy", "sybil", "trent", "uma"}
