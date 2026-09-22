@@ -77,8 +77,13 @@ type fileAssembly struct {
 	meta     frame
 	chunks   map[int][]byte
 	received int
+	total    int64 // bytes stored (bounded by meta.Size)
 	started  time.Time
 }
+
+// maxFileAssemblies bounds concurrent inbound file reassemblies: each can
+// hold megabytes, so count must be capped as well as bytes.
+const maxFileAssemblies = 16
 
 type engine struct {
 	me     string
@@ -1395,6 +1400,24 @@ func (e *engine) onFileFrame(f frame) {
 			e.mu.Unlock()
 			return // absurd sizes fail closed
 		}
+		// Chunks must agree with Size: 4096×64KB of 64KB chunks against a
+		// 1MB Size is a memory-exhaustion lie, not a file.
+		maxChunks := int((f.Size+frameChunkSize-1)/frameChunkSize) + 1
+		if int(f.Chunks) > maxChunks {
+			e.mu.Unlock()
+			return
+		}
+		// Cap concurrent assemblies: evict the oldest started one first.
+		if len(e.files) >= maxFileAssemblies {
+			var oldest string
+			var oldestAt time.Time
+			for id, fa := range e.files {
+				if oldest == "" || fa.started.Before(oldestAt) {
+					oldest, oldestAt = id, fa.started
+				}
+			}
+			delete(e.files, oldest)
+		}
 		a = &fileAssembly{meta: f, chunks: map[int][]byte{}, started: time.Now()}
 		e.files[f.MsgId] = a
 	}
@@ -1406,7 +1429,13 @@ func (e *engine) onFileFrame(f frame) {
 		if _, dup := a.chunks[f.ChunkIndex]; !dup {
 			raw, err := base64.StdEncoding.DecodeString(f.Data)
 			if err == nil && len(raw) <= frameChunkSize {
+				// Running total can never exceed the declared Size:
+				// oversize chunks are dropped before they accumulate.
+				if a.total+int64(len(raw)) > a.meta.Size {
+					break
+				}
 				a.chunks[f.ChunkIndex] = raw
+				a.total += int64(len(raw))
 				a.received++
 			}
 		}
@@ -1438,7 +1467,23 @@ func (e *engine) onFileFrame(f frame) {
 // saveVerifiedFile checks the SHA-256 fingerprint and atomically saves the
 // blob to ~/Downloads, then reports it. Shared by streamed and single-box
 // receives; integrity failure discards, never displays.
+// safeDestName maps a peer-supplied filename to a leaf name inside the
+// download directory: traversal-proof, never empty, never dot-dot.
+func safeDestName(filename string) string {
+	safe := filepath.Base(filename)
+	if safe == "" || safe == "." || safe == ".." {
+		safe = "file"
+	}
+	return safe
+}
+
 func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, shaHex string, blob []byte) {
+	if int64(len(blob)) != size {
+		if e.cb.onFileErr != nil {
+			e.cb.onFileErr(msgId, from, "size mismatch — file discarded")
+		}
+		return
+	}
 	sum := sha256.Sum256(blob)
 	if hex.EncodeToString(sum[:]) != shaHex {
 		if e.cb.onFileErr != nil {
@@ -1453,10 +1498,7 @@ func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, 
 		}
 		return
 	}
-	safe := filepath.Base(filename)
-	if safe == "" || safe == "." {
-		safe = "file"
-	}
+	safe := safeDestName(filename)
 	dest := uniquePath(dir, safe)
 	tmp := dest + ".part"
 	if err := os.WriteFile(tmp, blob, 0o644); err != nil {

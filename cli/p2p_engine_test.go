@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -392,5 +394,67 @@ func TestBeatRecordsAndClearsFailures(t *testing.T) {
 	e.beatOnce()
 	if err := e.beatErr(); err != nil {
 		t.Fatalf("recovered beat must clear failures, got %v", err)
+	}
+}
+
+func TestAssemblyBounds(t *testing.T) {
+	e := newEngine("bob", nil, nil, engineCallbacks{})
+	// Lying meta: 4096 chunks against a 1MB size must be rejected outright.
+	meta := newFrame(frameFileMeta, "m1", "alice", "bob")
+	meta.Filename = "x.bin"
+	meta.Size = 1 << 20
+	meta.SHA256 = "00"
+	meta.Chunks = 4096
+	e.onFileFrame(meta)
+	e.mu.Lock()
+	_, kept := e.files["m1"]
+	e.mu.Unlock()
+	if kept {
+		t.Fatal("chunk-count/size mismatch must not allocate an assembly")
+	}
+	// Assembly-count cap: 20 concurrent metas leave at most the cap.
+	for i := 0; i < 20; i++ {
+		m := newFrame(frameFileMeta, "cap", "alice", "bob")
+		m.MsgId = "cap" + string(rune('a'+i))
+		m.Filename = "x.bin"
+		m.Size = 1024
+		m.SHA256 = "00"
+		m.Chunks = 1
+		e.onFileFrame(m)
+	}
+	e.mu.Lock()
+	n := len(e.files)
+	e.mu.Unlock()
+	if n > maxFileAssemblies {
+		t.Fatalf("assemblies = %d exceeds cap %d", n, maxFileAssemblies)
+	}
+}
+
+func TestSaveVerifiedSizeMismatch(t *testing.T) {
+	var errs []string
+	e := newEngine("bob", nil, nil, engineCallbacks{
+		onFileErr: func(msgId, from, reason string) { errs = append(errs, reason) },
+	})
+	// Hash matches the bytes but Size lies: must discard without writing.
+	blob := []byte("hello")
+	raw := sha256.Sum256(blob)
+	e.saveVerifiedFile("m9", "alice", "bob", "note.txt", 999, hex.EncodeToString(raw[:]), blob)
+	if len(errs) != 1 {
+		t.Fatalf("size mismatch must report exactly once, got %v", errs)
+	}
+}
+
+func TestSafeDestName(t *testing.T) {
+	for in, want := range map[string]string{
+		"../../etc/passwd": "passwd",
+		"..":               "file",
+		".":                "file",
+		"":                 "file",
+		"ok.txt":           "ok.txt",
+		"/abs/path.dat":    "path.dat",
+	} {
+		if got := safeDestName(in); got != want {
+			t.Errorf("safeDestName(%q) = %q; want %q", in, got, want)
+		}
 	}
 }

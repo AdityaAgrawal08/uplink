@@ -375,3 +375,38 @@ func TestLateJoinerSeesRunningPublisher(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
+
+func TestStopAllNotifiesScope(t *testing.T) {
+	var mu sync.Mutex
+	var stops []string
+	m := newMediaManager("alice", nil,
+		func(to, typ, payload string) error {
+			if typ == mediaStop {
+				mu.Lock()
+				stops = append(stops, to)
+				mu.Unlock()
+			}
+			return nil
+		}, nil, mediaUICallbacks{})
+	m.mu.Lock()
+	m.audioOn = true
+	m.audioTo = map[string]bool{"bob": true, "carol": true}
+	m.mu.Unlock()
+	m.stopAll()
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"bob", "carol"} {
+		found := false
+		for _, to := range stops {
+			if to == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("stopAll must notify %q, got %v", want, stops)
+		}
+	}
+	if m.AudioOn() {
+		t.Fatal("stopAll must switch audio off")
+	}
+}

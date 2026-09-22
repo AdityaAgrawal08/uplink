@@ -1233,6 +1233,9 @@ func (m *mediaManager) stopAll() {
 	stopPlay := m.stopPlayFn
 	m.audioStop, m.audioRxStop, m.stopMic, m.stopPlayFn = nil, nil, nil, nil
 	m.audioOn = false
+	// Snapshot the scope BEFORE clearing: stop notes must reach everyone
+	// we were publishing to, otherwise peers wait on silence + heal churn.
+	audioScope := sortedKeys(m.audioTo)
 	m.audioTo = map[string]bool{}
 	m.pubAudio, m.replied = map[string]bool{}, map[string]bool{}
 	m.rxDecs = map[string]*opusVoice{}
@@ -1240,7 +1243,6 @@ func (m *mediaManager) stopAll() {
 	m.annRxAt, m.lastWantSent = map[string]time.Time{}, map[string]time.Time{}
 	m.healPingAt = map[string]time.Time{}
 	m.started = false
-	audioScope := sortedKeys(m.audioTo)
 	m.mu.Unlock()
 	// Best-effort stop notes so listeners do not wait on silence.
 	for _, to := range audioScope {

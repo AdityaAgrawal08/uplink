@@ -334,8 +334,11 @@ func (f *frameForwarder) stop() { f.once.Do(func() { close(f.done) }) }
 // its name for status lines.
 func micSource() (<-chan []int16, func(), error) {
 	mc, name, err := openMicResilient()
+	if err != nil {
+		return nil, nil, err
+	}
 	lastMicSource.Store(name)
-	return mc.frames, mc.stop, err
+	return mc.frames, mc.stop, nil
 }
 
 // requireFFmpeg reports a friendly error when ffmpeg is unavailable

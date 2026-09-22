@@ -353,6 +353,19 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// tryEnqueue inserts into the UI event queue without blocking: true when
+// the main loop will see the message. Chat acks ride on acceptance — an
+// acked-but-dropped message would graduate the sender's backstop and
+// vanish forever.
+func tryEnqueue(ch chan tea.Msg, m tea.Msg) bool {
+	select {
+	case ch <- m:
+		return true
+	default:
+		return false
+	}
+}
+
 // truncateStringPlain hard-cuts a string to n cells (runes), no styling.
 func truncateStringPlain(s string, n int) string {
 	if n <= 0 {
@@ -369,8 +382,9 @@ func truncateStringPlain(s string, n int) string {
 
 // The engine pushes network events from its own goroutines; they arrive here
 // through netCh (see drainNetCmd) because bubbletea Update must stay on the
-// main loop. Buffer is generous; drops are safe (inbox redelivers unacked,
-// P2P is already reliably delivered — a dropped paint is just a missed row).
+// main loop. Buffer is generous; a dropped paint is only a missed row when
+// the sender still retries — so chat acks ride on successful enqueue (see
+// onChat), never before it. P2P is otherwise reliably delivered.
 type netChatMsg struct{ chat engineChat }
 type netFileMsg struct{ file engineFile }
 type netFileErrMsg struct {
@@ -409,6 +423,9 @@ type roleDoneMsg struct {
 // immediate repaint on ANY change. Shared by the 2s render tick and the
 // engine's roster-changed push.
 func (c *chatScreen) syncRosterFromEngine() {
+	if c.eng == nil {
+		return // bare/test screens carry no engine
+	}
 	roster := c.eng.peers()
 	users := onlineNames(roster, c.me)
 	changed := len(users) != len(c.users)
@@ -658,7 +675,11 @@ const maxHistory = 5000
 // without limit. Dropped file cards stay reachable in the files drawer.
 const maxLocalLines = 500
 
+// maxOutbox bounds queued unsent lines while a send is in flight.
+const maxOutbox = 100
+
 func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
+	leftSent.Store(false) // fresh screen, fresh leave guard (tests reuse processes)
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
 	ti.Focus()
@@ -672,10 +693,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	// they run on network goroutines). The drain command below feeds them
 	// into Update on the main loop.
 	push := func(m tea.Msg) {
-		select {
-		case netCh <- m:
-		default:
-		}
+		tryEnqueue(netCh, m)
 	}
 	var eng *engine
 	callMgr := newMediaManager(me, id,
@@ -687,10 +705,12 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		})
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
-			// Ack at receipt, not at paint: a dropped queue slot must not
-			// silence the sender's backstop (the paint path still dedups).
-			_ = eng.sendAck(c.From, c.MsgId)
-			push(netChatMsg{chat: c})
+			// Ack only what the queue accepted: a dropped slot stays
+			// unacked so the sender's retry redelivers it (paint dedups
+			// via seenMsg — at-least-once in, exactly-once shown).
+			if tryEnqueue(netCh, netChatMsg{chat: c}) {
+				_ = eng.sendAck(c.From, c.MsgId)
+			}
 		},
 		onFile:       func(f engineFile) { push(netFileMsg{file: f}) },
 		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
@@ -1820,6 +1840,12 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 		}
 	}
 	if c.pending != nil {
+		// Cap the queue: offline/slow peers plus fast typing must not
+		// grow memory without bound. Oldest queued line drops first.
+		if len(c.outbox) >= maxOutbox {
+			c.outbox = c.outbox[1:]
+			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* outbox full — oldest queued message dropped"))
+		}
 		c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
 		return nil
 	}
@@ -1896,7 +1922,9 @@ func (c *chatScreen) syncViewport() {
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
 		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
-		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()-1), 1)
+		// Same inner width the painter uses (rosterBody): a divergent value
+		// desyncs the search-box row count and misroutes roster clicks.
+		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()), 1)
 	}
 	atBottom := c.vp.AtBottom()
 	offset := c.vp.YOffset
@@ -2388,7 +2416,13 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	c.rebuildView()
 
 	if msg.code == 410 {
-		return nil // room ended; nothing further to promote
+		// Room ended: fail everything still queued so lines never strand
+		// invisibly in the outbox.
+		for _, q := range c.outbox {
+			c.appendLocal(q.conv, tuiSystemStyle.Render("* Session has ended"))
+		}
+		c.outbox = nil
+		return nil
 	}
 	if n := len(c.outbox); n > 0 {
 		next := c.outbox[0]

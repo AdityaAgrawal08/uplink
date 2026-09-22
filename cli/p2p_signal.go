@@ -107,6 +107,17 @@ func isServerDown(err error) bool {
 		return code == 502 || code == 503 || code == 504
 	}
 	s := strings.ToLower(err.Error())
+	// Mesh/WebRTC path failures (ICE, offer/answer, DTLS, STUN) are local
+	// connectivity problems, never proof the server is down — a symmetric
+	// NAT must not raise the server banner.
+	for _, sub := range []string{
+		"ice", "offer", "answer", "dtls", "stun", "turn", "webrtc",
+		"safety code", "handshake",
+	} {
+		if strings.Contains(s, sub) {
+			return false
+		}
+	}
 	for _, sub := range []string{
 		"connection refused",
 		"connection reset",

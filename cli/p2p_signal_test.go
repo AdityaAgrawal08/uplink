@@ -433,3 +433,21 @@ func TestIsServerDown(t *testing.T) {
 		}
 	}
 }
+
+func TestIsServerDownExcludesMesh(t *testing.T) {
+	// Local WebRTC/mesh path failures must never raise the server banner.
+	for _, s := range []string{
+		"ICE gathering timed out",
+		"answer wait timed out",
+		"offer wait timed out",
+		"KEY SWAP ALERT for alice: handshake key does not match roster",
+		"offer SDP 9000 bytes exceeds signaling cap",
+	} {
+		if isServerDown(fmt.Errorf("%s", s)) {
+			t.Errorf("mesh error must not classify as down: %q", s)
+		}
+	}
+	if !isServerDown(fmt.Errorf("Post https://x: connection refused")) {
+		t.Error("refused transport error must classify as down")
+	}
+}

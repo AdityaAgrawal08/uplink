@@ -98,18 +98,25 @@ func fileExtLabel(ext string) string {
 }
 
 // truncateFilename shortens a filename to maxLen, preserving the extension.
+// Rune-based: byte slicing could split a multi-byte rune and emit invalid
+// UTF-8 (broken glyphs, width miscalculations, card overflow).
 func truncateFilename(name string, maxLen int) string {
-	if len(name) <= maxLen {
+	r := []rune(name)
+	if len(r) <= maxLen {
 		return name
 	}
 	ext := filepath.Ext(name)
-	stem := name[:len(name)-len(ext)]
+	extR := []rune(ext)
+	stemR := r[:len(r)-len(extR)]
 	// Reserve room for "…" + extension
-	avail := maxLen - len(ext) - 1
+	avail := maxLen - len(extR) - 1
 	if avail < 4 {
 		avail = 4
 	}
-	return stem[:avail] + "…" + ext
+	if avail > len(stemR) {
+		avail = len(stemR)
+	}
+	return string(stemR[:avail]) + "…" + ext
 }
 
 // fileAttachmentCard renders a multi-line styled card for a file upload.

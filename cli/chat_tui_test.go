@@ -911,3 +911,111 @@ func TestServerDownAlertAcrossActions(t *testing.T) {
 		t.Fatal("dead-server kick failure must alert")
 	}
 }
+
+func TestRosterTickBareScreen(t *testing.T) {
+	// Bare screens (no engine) must survive the render tick: sync is a
+	// no-op, and the watchdog must not fire without a beat source.
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(rosterTickMsg{})
+	if m.(chatScreen).status != "" {
+		t.Fatalf("bare tick must leave status empty, got %q", m.(chatScreen).status)
+	}
+}
+
+func TestTryEnqueue(t *testing.T) {
+	full := make(chan tea.Msg, 1)
+	full <- netIdleMsg{}
+	if tryEnqueue(full, netIdleMsg{}) {
+		t.Fatal("full queue must reject")
+	}
+	empty := make(chan tea.Msg, 1)
+	if !tryEnqueue(empty, netIdleMsg{}) {
+		t.Fatal("empty queue must accept")
+	}
+	if <-empty == nil {
+		t.Fatal("accepted message must arrive")
+	}
+}
+
+func TestSettle410DrainsOutbox(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.submitLine("first")
+	c.submitLine("second")
+	c.submitLine("third")
+	if len(c.outbox) != 2 {
+		t.Fatalf("outbox = %d; want 2 queued", len(c.outbox))
+	}
+	c.settleSend(sendDoneMsg{text: "first", code: 410})
+	if c.pending != nil {
+		t.Fatal("pending must clear on 410")
+	}
+	if len(c.outbox) != 0 {
+		t.Fatalf("410 must drain the outbox, left %d", len(c.outbox))
+	}
+	found := false
+	for _, ln := range c.lines {
+		if strings.Contains(ln, "Session has ended") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("queued lines must be annotated on 410")
+	}
+}
+
+func TestOutboxCap(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.submitLine("in-flight")
+	for i := 0; i < maxOutbox+5; i++ {
+		c.submitLine("queued")
+	}
+	if len(c.outbox) > maxOutbox {
+		t.Fatalf("outbox = %d exceeds cap %d", len(c.outbox), maxOutbox)
+	}
+	found := false
+	for _, ln := range c.lines {
+		if strings.Contains(ln, "outbox full") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("overflow must warn in the transcript")
+	}
+}
+
+func TestLeaveGuardResets(t *testing.T) {
+	leftSent.Store(true)
+	ida, err := generateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = newChatScreen("http://127.0.0.1:1", "ABC123", "bob", ida, "")
+	if leftSent.Load() {
+		t.Fatal("new screen must reset the leave guard")
+	}
+}
+
+func TestSearchHeightAgreement(t *testing.T) {
+	// Paint, viewport sync, and hit-test must derive the search-box rows
+	// from the same inner width at every terminal size.
+	for w := 66; w <= 200; w += 2 {
+		c := newFilterScreen("bob", "", "bob", "alice")
+		c.vp = *viewportPtr(60, 20)
+		m, _ := c.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		sc := m.(chatScreen)
+		l := sc.layoutFor()
+		if !l.sidebarOn {
+			continue
+		}
+		inner := sc.sidebarInnerWidth()
+		paintH := searchHeightFor(l.headRows, inner)
+		syncH := searchHeightFor(l.headRows, sc.sidebarInnerWidth())
+		hitH := searchHeightFor(l.headRows, l.sidebarWidth-2)
+		if paintH != syncH || paintH != hitH {
+			t.Fatalf("w=%d: paint=%d sync=%d hit=%d", w, paintH, syncH, hitH)
+		}
+	}
+}

@@ -322,7 +322,9 @@ func (c *chatScreen) convPreview(conv string) (string, string) {
 	if bestText == "" {
 		return "No messages yet", ""
 	}
-	return bestText, bestTime
+	// Previews paint raw (no markdown pass): strip control bytes here so a
+	// peer message can never inject terminal escapes via the sidebar.
+	return sanitizeDisplay(bestText), bestTime
 }
 
 // itemIndexFor returns the chatItems index for a peer (0 = General).

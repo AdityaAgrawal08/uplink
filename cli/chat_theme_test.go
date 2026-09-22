@@ -434,3 +434,18 @@ func TestCallTimerFormat(t *testing.T) {
 }
 
 // Live frames must not break the exact-row / max-width frame contract.
+
+func TestSidebarPreviewSanitized(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.history = append(c.history, chatMessage{
+		Seq: 1, Username: "alice", Kind: "chat",
+		Text: "hi\x1b[2J\x1b]0;pwned\x07there", ConvID: generalConv,
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
+	for _, it := range c.chatItems() {
+		if strings.ContainsRune(it.preview, 0x1b) || strings.ContainsRune(it.preview, 0x07) {
+			t.Fatalf("sidebar preview must not carry escapes: %q", it.preview)
+		}
+	}
+}
