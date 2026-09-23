@@ -1,8 +1,9 @@
 # UPLINK-Delta — File Map (exhaustive)
 
 > Every file and directory in the repo, what it does, and where to change
-> what. Line counts and symbol lists describe the **`UI` branch tip**.
-> Format per entry: `PATH | LINES | PURPOSE | KEY SYMBOLS`.
+> what. Line counts and symbol lists describe the **`UI` branch tip**
+> (`3765ba5`). Files untouched by the UI branch match `main`.
+> Convention per entry: `PATH | LINES | PURPOSE | KEY SYMBOLS`.
 > How to use this file: find the area below, read the listed files, then
 > implement — it replaces grep-first navigation.
 
@@ -15,34 +16,34 @@ cli/wan/             libp2p DHT wide-area transfer
 cli/pkg/crc64        NVMe CRC64 helper
 cli/pkg/tarball      Safe directory pack/unpack
 src/app/api/v1/      19 Next.js API routes (admin/cleanup/mock-r2/session/share/speedtest)
-src/app/share/       Share landing/preview pages
+src/app/share/       Share landing + preview pages
 src/components/      FilePreview, SyntaxHighlighter (React)
 src/lib/             Backend libraries (auth/rooms/redis/r2/crypto/quota/mongo/env/utils/crc64)
 server/              SHELVED Go WebSocket relay (own module) — not deployed
-scratch/             Dev e2e shell scripts + R2/quota debug probes (not shipped)
+scratch/             Dev e2e shell scripts + debug probes (not shipped)
 packaging/           Arch Linux PKGBUILD
 .github/workflows/  ci.yml, release.yml, npm.yml
-docs/                Documentatio.md (project manual) + FILEMAP.md (this file)
+docs/                Documentatio.md (this project manual) + FILEMAP.md (this file)
 ```
 
 ## 1. CLI root — chat TUI (`cli/chat_*.go`)
 
 - `cli/chat.go` | 139 | Routes chat between fullscreen TUI and plain mode. | `chatMessage, conversationKey, generalConv, runChat, runChatPlain`
 - `cli/chat_commands.go` | 678 | Slash-command registry (7 commands), palette, member picker, settled layout. | `slashCommands, rankSlashCommands, paletteState, paletteView, handlePaletteKeys, runCommand, modTarget, layoutFor, drawerView`
-- `cli/chat_conv_test.go` | 211 | DM isolation from general view and navigation. | `TestDMNeverPaintsInGeneralView, TestThreadViewIsolatedFromRoom, TestPendingEchoLivesInItsConversation, TestEnterPrivateSwitchesInstantly`
+- `cli/chat_conv_test.go` | 211 | DM isolation from general view and navigation. | `TestDMNeverPaintsInGeneralView, TestThreadViewIsolatedFromRoom, TestMultipleIndependentThreads, TestPendingEchoLivesInItsConversation, TestEnterPrivateSwitchesInstantly`
 - `cli/chat_download.go` | 43 | Downloads dir resolution + unique file paths. | `downloadsDir, uniquePath`
 - `cli/chat_filecard.go` | 247 | File attachment cards, icons, rune-safe truncation. | `fileIcon, fileExtLabel, truncateFilename, fileAttachmentCard, fileKindLabel`
 - `cli/chat_filecard_test.go` | 28 | Rune-safe truncation (emoji/CJK/ASCII). | `TestTruncateFilenameRuneSafe`
 - `cli/chat_hover_test.go` | 116 | Hover highlights exactly one roster row. | `TestHoverPaintsExactlyOneRow, TestMotionUpdatesAndClearsHover`
 - `cli/chat_markdown.go` | 100 | Terminal-escape sanitizer + lightweight markdown. | `sanitizeDisplay, renderMarkdown`
 - `cli/chat_picker.go` | 1031 | File-browser drawer for uploads/downloads/buffers. | `pickerEntry, pickerState, openPicker, loadPickerDir, humanSize, pickerView`
-- `cli/chat_picker_test.go` | 564 | Picker browsing, buffering, upload pipeline, drawer. | `TestListDirDirsFirstWithDotfiles, TestParentDirAndBreadcrumb, TestPickerRangeSelectBuffersWholeRange, TestPickerEnterOnFileRunsUploadPipeline`
+- `cli/chat_picker_test.go` | 564 | Picker browsing, buffering, upload pipeline, drawer. | `TestListDirDirsFirstWithDotfiles, TestParentDirAndBreadcrumb, TestPickerRangeMath, TestPickerBrowseBufferAndQuickUpload`
 - `cli/chat_privacy_test.go` | 186 | Private-view filtering, echoes, targeting. | `TestPrivateViewRetroFiltersHistory, TestPendingEchoSurvivesModeSwitch, TestSendTargetsCurrentPeer, TestCommonRoomSendsBroadcast`
 - `cli/chat_repro_test.go` | 77 | DM routing over the wire through real Update pipeline. | `TestReproDMRoutingOverWire`
 - `cli/chat_sanitize_test.go` | 44 | Escape stripping, markdown attack neutralization. | `TestSanitizeDisplayStripsEscapes, TestRenderMarkdownNeutralizesTerminalAttacks`
 - `cli/chat_theme.go` | 583 | Pure presentation theme: sidebar, header, bubbles, composer, system card. No video/tabs/panel/Send/call-card code remains. | `bubbleRatioFor, avatarColorFor, avatarCell, chatItem, chatItems, topBarView, roomHeaderView, roomHeaderCompact, keyHintsView, renderSystemCard, convPreview`
 - `cli/chat_theme_test.go` | 453 | Density, headers, clean-UI and no-surface contracts. | `TestAudioStateSurvivesLayout, TestNoVideoSurfaces, TestNoCallCard, TestSidebarPreviewSanitized, TestTopBarCollapsesByWidth, TestComposerFullWidthNoSend, TestRoomTabsRemoved, TestSystemCardGreenBar, TestResizeSweepExactFrame`
-- `cli/chat_tui.go` | 2907 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave. | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, Update, View, runChatTUI, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox`
+- `cli/chat_tui.go` | 2907 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave. | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, orderedUsers, Update, View, runChatTUI, currentScope, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox`
 - `cli/chat_tui_test.go` | 1052 | Layout, viewport, sending, outbox, alerts, wire integration. | `newFilterScreen, wireTestEngine, TestComputeLayout, TestFrameNeverExceedsTerminal, TestTryEnqueue, TestSettle410DrainsOutbox, TestOutboxCap, TestLeaveGuardResets, TestRosterTickBareScreen, TestSearchHeightAgreement, TestNotesParkOnStatusLine, TestServerDownAlertAcrossActions, TestMediaInfoStaysOutOfTranscript`
 - `cli/chat_ui_test.go` | 146 | Sidebar density, composer sizing, fullscreen frame. | `TestSidebarWidthDensity, TestComposerRowsDensity, TestFullScreenFrame, TestSidebarSectionsAndNavigation, TestComposerGrowsAndShrinks`
 - `cli/chat_unread_test.go` | 221 | Recency ordering, unread badges, roster pruning. | `TestOrderedUsersRecency, TestUnreadLifecycle, TestSidebarRendersAndClearsBadge, TestBeatPrunesDepartedPeers, TestMouseFollowsRecencyOrder`
@@ -57,7 +58,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `cli/media_call_signal_test.go` | 261 | Media publish over the real signal path end-to-end. | `waitMediaPeer, TestPublishOverSignalPath, TestAudioEndToEndWithTestMic`
 - `cli/media_audit_test.go` | 388 | Prune grace, mic-fail withdraw, speaker death. | `TestPruneGraceKeepsFlappingPeer, TestFailedMicStartWithdrawsWatchers, TestSpeakerDeathEmits`
 - `cli/media_audio.go` | 635 | Opus voice, mic capture backends, speaker playout. | `voiceRate, opusVoice, newOpusVoice, frameChunker, micCapture, micCandidates, micSource, openMicResilient, requireFFmpeg, speaker`
-- `cli/media_audio_test.go` | 216 | Opus roundtrip, chunking, resampling, jitter, mic-fail nil-safety. | `TestOpusVoiceRoundtrip, TestFrameChunkerExact, TestDownmixResample, TestMicSourceFailureNilSafe`
+- `cli/media_audio_test.go` | 216 | Opus roundtrip, chunking, resampling, jitter, mic-fail nil-safety. | `TestOpusVoiceRoundtrip, TestFrameChunkerExact, TestDownmixResample, TestJitterInOrderWithLoss, TestMicSourceFailureNilSafe`
 - `cli/media_audio_alsa.go` | 91 | Linux microphone capture via pure-Go ALSA. | `openAlsaMic`
 - `cli/media_audio_noalsa.go` | 11 | Non-Linux ALSA stub (returns Linux-only error). | `openAlsaMic`
 - `cli/media_codec.go` | 61 | Audio packet codec + transport dispatch (audio/keyreq/ping/pong). | `audioPacket, encodeAudioPacket, decodeAudioPacket, dispatchMedia`
@@ -68,11 +69,11 @@ Video calling is fully removed on this branch. Audio-only.
 
 ## 3. CLI root — P2P engine and protocol (`cli/p2p_*.go`)
 
-- `cli/p2p_box.go` | 99 | Async E2E pairwise boxes (static ECDH to AES-GCM) for inbox fallback. | `deriveBoxKey, sealBox, openBox`
+- `cli/p2p_box.go` | 99 | Async E2E pairwise boxes (static ECDH → AES-GCM) for inbox fallback. | `deriveBoxKey, sealBox, openBox`
 - `cli/p2p_box_test.go` | 87 | Box round-trip, tamper, wrong-peer, nonce, inputs. | `TestBoxRoundTrip, TestBoxTamperRejected, TestBoxWrongPeerFails, TestBoxNonceRandomness`
-- `cli/p2p_engine.go` | 1560 | Mesh+Noise orchestration, heartbeats, inbox, files, roster, beat-error record. | `engineChat, engineFile, engineCallbacks, engine, newEngine, sendChat, sendFile, beatErr, saveVerifiedFile, safeDestName, maxFileAssemblies, fileAssembly`
+- `cli/p2p_engine.go` | 1560 | Mesh+Noise orchestration, heartbeats, inbox, files, roster, beat-error record. | `engineChat, engineFile, engineCallbacks, engine, newEngine, sendChat, sendFile, beatErr, saveVerifiedFile, safeDestName, maxFileAssemblies, fileAssembly, PublishTo`
 - `cli/p2p_engine_test.go` | 460 | Engine e2e, assembly bounds, size checks, beat failures. | `TestEngineEndToEnd, TestAssemblyBounds, TestSaveVerifiedSizeMismatch, TestSafeDestName, TestBeatRecordsAndClearsFailures`
-- `cli/p2p_mesh.go` | 552 | WebRTC mesh transport, deterministic offer roles, STUN. | `resolveStunURLs, meshCallbacks, meshPeer, mesh, newMesh, ensurePeer`
+- `cli/p2p_mesh.go` | 552 | WebRTC mesh transport, deterministic offer roles, STUN. | `meshLabel, resolveStunURLs, meshCallbacks, meshPeer, mesh, newMesh, ensurePeer`
 - `cli/p2p_mesh_test.go` | 186 | Mesh loopback messaging and tie-break roles. | `TestMeshLoopback, TestMeshTieBreak`
 - `cli/p2p_noise.go` | 211 | Noise_XX E2E sessions per peer pair. | `identityKey, generateIdentity, peerSession, beginNoise, stepNoise`
 - `cli/p2p_noise_test.go` | 150 | Handshake round-trip, tamper, guards, safety codes. | `TestNoiseHandshakeRoundTrip, TestNoiseTamperRejected, TestSafetyCodeAgainstHandshake`
@@ -84,7 +85,7 @@ Video calling is fully removed on this branch. Audio-only.
 
 ## 4. CLI root — transfers, entrypoint, support
 
-- `cli/main.go` | 1595 | Entrypoint: send/receive/create/join/config/version/update, E2EE cloud flow, LAN/WAN dispatch. | `ShareMeta, main, printUsage, normalizeFlagOrder, generateShareCode, handleSend, handleReceive, cmdCreateSession`
+- `cli/main.go` | 1595 | Entrypoint: `send`/`receive`/`create session`/`join`/`config`/`version`/`update`, E2EE cloud flow, LAN/WAN dispatch. | `ShareMeta, main, printUsage, normalizeFlagOrder, generateShareCode, handleSend, handleReceive, cmdCreateSession`
 - `cli/main_test.go` | 292 | Share codes, filename sanitizing, chunking, flag order. | `TestGenerateShareCode, TestSanitizeFilename, TestChunkSizeFloor, TestNormalizeFlagOrder, TestAdaptiveChunkerClamping`
 - `cli/download.go` | 186 | Resumable downloads with hash verification + checkpoints. | `DownloadResumable`
 - `cli/resume.go` | 112 | Multipart upload resume state + cleanup. | `ResumeState, Save, LoadResumeState, DeleteResumeState, CleanOldResumeStates`
@@ -101,7 +102,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `cli/version.go` | 462 | Version display, update check, checksum-verified install. | `handleVersion, normVersion, handleUpdate, installBinary, verifyReleaseChecksum`
 - `cli/version_update_test.go` | 198 | Release extraction, versions, auth headers, zip-slip. | `TestExtractReleaseAssetTar, TestExtractReleaseAssetZipSlip, TestCmpVersions`
 - `cli/scrollbars_test.go` | 149 | Scrollbar geometry + independent pane scrolling. | `geomScreen, TestScrollbarDragGeometry, TestIndependentScrollPanes, TestRosterScrollKeepsSelection`
-- `cli/go.mod` | — | Module `github.com/AdityaAgrawal08/uplink-delta/cli`, go 1.27. Direct deps: charmbracelet (bubbles/bubbletea/lipgloss/termenv), flynn/noise, gen2brain/beeep, hashicorp/mdns, ipfs/go-cid, libp2p + kad-dht, multiformats/go-multihash, pion/rtp + webrtc/v4, skip2/go-qrcode, tphakala/go-audio-capture + go-opus, atotto/clipboard, x/crypto, x/term. All imported (`go mod tidy` is a no-op). |
+- `cli/go.mod` | — | Module `github.com/AdityaAgrawal08/uplink-delta/cli`, go 1.27. Direct deps: charmbracelet (bubbles/bubbletea/lipgloss/termenv), flynn/noise, gen2brain/beeep, hashicorp/mdns, ipfs/go-cid, libp2p + kad-dht, multiformats/go-multihash, pion/rtp + webrtc/v4, skip2/go-qrcode, tphakala/go-audio-capture + go-opus, atotto/clipboard, x/crypto, x/term. All imported (tidy is a no-op). |
 
 ## 5. CLI subpackages
 
@@ -133,6 +134,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `share/[id]/authorize-download/route.ts` | 207 | `POST` password verify + presigned URL. |
 - `share/[id]/confirm/route.ts` | 324 | `POST` verify completion + activate share. |
 - `share/[id]/parts/route.ts` | 100 | `GET` multipart parts list (resume). |
+- `share/[id]/preview-text/route.ts` | 91 | `POST` truncated text preview (authed). |
 - `share/init/route.ts` | 334 | `POST` init share, reserve quota, issue upload URLs. |
 - `speedtest/route.ts` | 36 | `GET` random bytes, rate-limited. |
 
