@@ -219,14 +219,13 @@ func TestPaletteEnterRunsSelectedCommand(t *testing.T) {
 	if got.palette.visible() {
 		t.Fatal("drawer must close after a selection")
 	}
-	found := false
+	if !strings.Contains(got.status, "Commands:") {
+		t.Fatalf("running /help must park the command hint on status; status=%q localLines=%v", got.status, got.localLines)
+	}
 	for _, ll := range got.localLines {
 		if strings.Contains(ll.text, "Commands:") {
-			found = true
+			t.Fatalf("help must not paint transcript rows: %+v", got.localLines)
 		}
-	}
-	if !found {
-		t.Fatalf("running /help must paint the command hint; localLines=%v", got.localLines)
 	}
 }
 
@@ -305,14 +304,8 @@ func TestSubmitLineDelegatesRegistryCommands(t *testing.T) {
 	if cmd := c.submitLine("/HELP"); cmd != nil {
 		t.Fatal("/HELP must resolve locally (case-insensitive)")
 	}
-	found := false
-	for _, ll := range c.localLines {
-		if strings.Contains(ll.text, "Commands:") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("typed /HELP must paint the hint via runCommand")
+	if !strings.Contains(c.status, "Commands:") {
+		t.Fatalf("typed /HELP must park the hint on status; status=%q", c.status)
 	}
 
 	// Unknown slash text still goes to the wire as a normal message.
@@ -745,14 +738,13 @@ func TestKickAdminDispatchAndClient(t *testing.T) {
 	if cmd := c2.submitLine("/kick"); cmd != nil {
 		t.Fatal("bare /kick must resolve locally (usage), not dispatch")
 	}
-	found := false
+	if !strings.Contains(c2.status, "/kick <username>") {
+		t.Fatalf("bare /kick must park usage on status; status=%q", c2.status)
+	}
 	for _, ll := range c2.localLines {
 		if strings.Contains(ll.text, "/kick <username>") {
-			found = true
+			t.Fatal("usage must not paint transcript rows")
 		}
-	}
-	if !found {
-		t.Fatal("bare /kick must paint usage")
 	}
 }
 

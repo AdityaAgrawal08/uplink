@@ -472,7 +472,7 @@ func composerTopRows(l layout) int {
 			bodyRows += transcriptBorder
 		}
 	}
-	bodyRows += l.headRows + l.callRows
+	bodyRows += l.headRows
 	if bodyRows > 0 {
 		top += bodyRows
 	}
@@ -623,37 +623,6 @@ func renderSystemCard(name, tsPlain, text string, availWidth int) string {
 		Width(cardW).
 		Render(strings.Join(rows, "\n"))
 	return sender + "\n" + card
-}
-
-// callCardView paints the pinned live-call status card (callCardRows rows):
-// green "System" sender, then two green-bar rows (title + LIVE chip,
-// participants + elapsed). Borderless: the green bar is the whole
-// affordance, and every row is exactly outerW cells.
-func (c *chatScreen) callCardView(outerW int) string {
-	ts := "--:--"
-	if !c.callStart.IsZero() {
-		ts = c.callStart.Local().Format("15:04")
-	}
-	sender := thSystemNameStyle.Render("System") + "  " + thMsgTimeStyle.Render(ts)
-	bar := thSystemBarStyle.Render("▌")
-	title := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText)).Render("Voice call started")
-	live := thCamLiveStyle.Render("● LIVE")
-	n := c.callParties()
-	sub := fmt.Sprintf("%d participant", n)
-	if n != 1 {
-		sub += "s"
-	}
-	sub += " · " + c.callElapsed()
-	r1 := bar + " " + title
-	r1pad := outerW - lipgloss.Width(stripForWidth(r1)) - lipgloss.Width(stripForWidth(live)) - 1
-	if r1pad < 1 {
-		r1pad = 1
-	}
-	r1 += strings.Repeat(" ", r1pad) + live
-	r2 := bar + " " + thCamMetaStyle.Render(truncateStringPlain(sub, maxInt(outerW-4, 1)))
-	return truncateVisible(sender, outerW) + "\n" +
-		truncateVisible(r1, outerW) + "\n" +
-		truncateVisible(r2, outerW)
 }
 
 // keyHintsView paints the 1-row composer footer. Every hint names a binding

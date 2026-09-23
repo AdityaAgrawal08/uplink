@@ -954,14 +954,19 @@ func TestSettle410DrainsOutbox(t *testing.T) {
 	if len(c.outbox) != 0 {
 		t.Fatalf("410 must drain the outbox, left %d", len(c.outbox))
 	}
-	found := false
+	if c.status != "Session has ended" {
+		t.Fatalf("410 drain must hold the status, got %q", c.status)
+	}
+	// Only the in-flight echo keeps its in-place annotation (like 429);
+	// queued lines vanish without painting new rows.
+	n := 0
 	for _, ln := range c.lines {
 		if strings.Contains(ln, "Session has ended") {
-			found = true
+			n++
 		}
 	}
-	if !found {
-		t.Fatal("queued lines must be annotated on 410")
+	if n != 1 {
+		t.Fatalf("only the echo row may carry the annotation, got %d", n)
 	}
 }
 
@@ -975,14 +980,8 @@ func TestOutboxCap(t *testing.T) {
 	if len(c.outbox) > maxOutbox {
 		t.Fatalf("outbox = %d exceeds cap %d", len(c.outbox), maxOutbox)
 	}
-	found := false
-	for _, ln := range c.lines {
-		if strings.Contains(ln, "outbox full") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("overflow must warn in the transcript")
+	if c.status != "outbox full — oldest queued message dropped" {
+		t.Fatalf("overflow must warn on the status line, got %q", c.status)
 	}
 }
 
@@ -1017,5 +1016,37 @@ func TestSearchHeightAgreement(t *testing.T) {
 		if paintH != syncH || paintH != hitH {
 			t.Fatalf("w=%d: paint=%d sync=%d hit=%d", w, paintH, syncH, hitH)
 		}
+	}
+}
+
+func TestNotesParkOnStatusLine(t *testing.T) {
+	// Moderation results, usage hints, and engine errors must surface on
+	// the status line — never as transcript rows.
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "mallory")
+	m, _ := c.Update(kickDoneMsg{target: "mallory", roster: nil, err: nil})
+	sc := m.(chatScreen)
+	if sc.status != "kicked mallory" {
+		t.Fatalf("kick result must park on status, got %q", sc.status)
+	}
+	m, _ = sc.Update(roleDoneMsg{target: "mallory", admin: true, err: nil})
+	sc = m.(chatScreen)
+	if sc.status != "mallory is now an admin" {
+		t.Fatalf("admin result must park on status, got %q", sc.status)
+	}
+	m, _ = sc.Update(netErrMsg{err: fmt.Errorf("rejoin failed (boom)")})
+	sc = m.(chatScreen)
+	if sc.status != "rejoin failed (boom)" {
+		t.Fatalf("engine error must park on status, got %q", sc.status)
+	}
+	if len(sc.localLines) != 0 {
+		t.Fatalf("no note may reach the transcript: %+v", sc.localLines)
+	}
+	use, _ := sc.Update(roleDoneMsg{target: "x", admin: false, err: fmt.Errorf("nope")})
+	if use.(chatScreen).status != "admin change failed: nope" {
+		t.Fatal("admin failure must park on status")
 	}
 }

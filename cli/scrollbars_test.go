@@ -47,7 +47,7 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	if l.showHeader {
 		headOff = 1
 	}
-	arrowRow := frameOff + headOff + l.headRows + l.callRows + 1
+	arrowRow := frameOff + headOff + l.headRows + 1
 	if got := colAt(rows[arrowRow], chatG.x); got != "│" && got != "▲" && got != "█" {
 		t.Fatalf("chat bar column mismatch: got %q at x=%d,y=%d", got, chatG.x, arrowRow)
 	}

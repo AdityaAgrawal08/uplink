@@ -166,7 +166,6 @@ type layout struct {
 	rosterY0        int  // first terminal row inside the sidebar that holds content
 	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
 	headRows        int  // room-header rows above the transcript (0/1/2 by space)
-	callRows        int  // live-call status card rows (0 when no call)
 	hintRows        int  // composer key-hints row (0 when collapsed)
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
@@ -180,7 +179,7 @@ type layout struct {
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
-	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.callRows + l.hintRows
+	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.hintRows
 	if l.boxedTranscript {
 		h += transcriptBorder
 	}
@@ -1262,7 +1261,13 @@ func (c chatScreen) statusView() string {
 	if c.status == "" {
 		return ""
 	}
-	return tuiErrStyle.Render(c.status)
+	// Width-clamped: statuses now carry command output (/help lists) and
+	// must never break the exact-width frame contract.
+	w := c.width
+	if c.layoutFor().frameOn {
+		w -= frameChrome
+	}
+	return truncateByWidth(tuiErrStyle.Render(c.status), maxInt(w, 1))
 }
 
 // circledNum maps 1..50 onto Unicode circled digits (①…⑳ ㉑…㉟ ㊱…㊿).
@@ -1308,7 +1313,7 @@ func searchHeightFor(headRows, inner int) int {
 // Mirrors View()'s assembly exactly — paint, scrollbar, and viewport sync
 // share it so the list never over/under-fills its box.
 func (c chatScreen) sidebarFill(l layout) int {
-	h := l.headRows + l.callRows
+	h := l.headRows
 	if l.vpHeight > 0 {
 		h += l.vpHeight
 		if l.boxedTranscript {
@@ -1682,18 +1687,15 @@ func (c *chatScreen) currentScope() []string {
 // toggleAudio runs the /audio command: publish/stop mic to the scope.
 func (c *chatScreen) toggleAudio() tea.Cmd {
 	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
+		c.status = "media unavailable here"
 		return nil
 	}
 	if err := c.call.ToggleAudio(c.currentScope()); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio failed: "+err.Error()))
+		c.status = "audio failed: " + err.Error()
 	}
+	c.rebuildView()
 	return nil
 }
-
-// callCardRows is the live-call status card height: sender line + two
-// green-bar rows, pinned above the transcript while a call runs.
-const callCardRows = 3
 
 // callActive reports whether this client is in a call right now:
 // publishing mic or receiving a remote feed.
@@ -1844,7 +1846,7 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 		// grow memory without bound. Oldest queued line drops first.
 		if len(c.outbox) >= maxOutbox {
 			c.outbox = c.outbox[1:]
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* outbox full — oldest queued message dropped"))
+			c.status = "outbox full — oldest queued message dropped"
 		}
 		c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
 		return nil
@@ -2035,13 +2037,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			if isServerDown(msg.err) {
 				c.status = serverDownMsg
-				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
 			} else {
-				c.appendLocal(c.activeConv(), tuiErrStyle.Render("* kick failed: "+msg.err.Error()))
+				c.status = "kick failed: " + msg.err.Error()
 			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* kicked "+msg.target))
+			c.status = "kicked " + msg.target
 			c.syncRosterFromEngine()
 		}
 		cmds = append(cmds, c.drainNetCmd())
@@ -2052,15 +2053,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			what = "is no longer an admin"
 		}
 		if msg.err != nil {
-			if isServerDown(msg.err) {
-				c.status = serverDownMsg
-				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
+			if !isServerDown(msg.err) {
+				c.status = "admin change failed: " + msg.err.Error()
 			} else {
-				c.appendLocal(c.activeConv(), tuiErrStyle.Render("* admin change failed: "+msg.err.Error()))
+				c.status = serverDownMsg
 			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.target+" "+what))
+			c.status = msg.target + " " + what
 			c.syncRosterFromEngine()
 		}
 		cmds = append(cmds, c.drainNetCmd())
@@ -2173,7 +2173,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
-		c.appendLocal(c.activeConv(), tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		c.status = fmt.Sprintf("file from %s failed: %s", msg.from, msg.reason)
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netReadyMsg:
@@ -2188,13 +2188,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:
-		// Server outages surface as the status alert, never as chat lines.
+		// Engine errors surface on the status line, never as chat rows.
+		// Server outages hold the down alert; everything else parks once.
 		if isServerDown(msg.err) {
 			c.status = serverDownMsg
-			c.rebuildView()
 		} else {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
+			c.status = msg.err.Error()
 		}
+		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netIdleMsg:
@@ -2366,13 +2367,11 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			c.status = serverDownMsg
 			if echoIdx >= 0 {
 				c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ " + serverDownMsg)}
-			} else {
-				c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ "+serverDownMsg))
 			}
 		} else if echoIdx >= 0 {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
 		} else {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
+			c.status = "send failed: " + msg.err.Error()
 		}
 	default:
 		to := ""
@@ -2418,8 +2417,8 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	if msg.code == 410 {
 		// Room ended: fail everything still queued so lines never strand
 		// invisibly in the outbox.
-		for _, q := range c.outbox {
-			c.appendLocal(q.conv, tuiSystemStyle.Render("* Session has ended"))
+		if len(c.outbox) > 0 {
+			c.status = "Session has ended"
 		}
 		c.outbox = nil
 		return nil
@@ -2538,7 +2537,7 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, roster barGeom) {
 	// + border; the track starts one row below the up-arrow.
 	chat = barGeom{
 		x:       transcriptX0(l) + l.vpWidth,
-		trackY0: frameOff + headOff + l.headRows + l.callRows + 2,
+		trackY0: frameOff + headOff + l.headRows + 2,
 		trackH:  maxInt(l.vpHeight-2, 0),
 	}
 	if l.sidebarOn {
@@ -2812,15 +2811,10 @@ func (c chatScreen) View() string {
 	} else if l.headRows >= 2 {
 		roomHead = c.roomHeaderView(transcriptOuter)
 	}
-	// Center column: room header, live-call card, transcript box.
-	parts := make([]string, 0, 3)
+	// Center column: room header, transcript box.
+	parts := make([]string, 0, 2)
 	if roomHead != "" {
 		parts = append(parts, roomHead)
-	}
-	callCard := ""
-	if l.callRows > 0 {
-		callCard = c.callCardView(transcriptOuter)
-		parts = append(parts, callCard)
 	}
 	if transcript != "" {
 		parts = append(parts, transcript)

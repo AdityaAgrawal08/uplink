@@ -193,7 +193,7 @@ func (c *chatScreen) settleUploadDone(msg uploadDoneMsg) tea.Cmd {
 		c.rebuildView()
 	} else {
 		c.paintUploadLine(tuiErrStyle.Render(
-			fmt.Sprintf("✗ upload failed: %s (%v)", msg.display, msg.err)), conv)
+			fmt.Sprintf("✗ upload failed: %s (%v)", sanitizeDisplay(msg.display), msg.err)), conv)
 	}
 	c.uploadQ.lineIdx = -1 // next job paints its own row
 	if len(c.uploadQ.queue) > 0 {

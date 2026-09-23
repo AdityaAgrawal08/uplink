@@ -336,17 +336,12 @@ func (c chatScreen) layoutFor() layout {
 	// The sidebar search box grows into the header zone: its rows sit above
 	// the first scroll row, so rosterY0 shifts with it (paint + hit-test).
 	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
-	// Live-call status card (pinned above the transcript while a call runs).
-	l.callRows = 0
-	if c.callActive() && l.vpHeight-l.headRows >= 10 {
-		l.callRows = callCardRows
-	}
 	// Composer key-hints footer (truthful bindings only, see keyHintsView).
 	l.hintRows = 0
-	if c.width >= 70 && l.composerRows > 0 && l.vpHeight-l.headRows-l.callRows >= 8 {
+	if c.width >= 70 && l.composerRows > 0 && l.vpHeight-l.headRows >= 8 {
 		l.hintRows = 1
 	}
-	l.vpHeight -= l.headRows + l.callRows + l.hintRows
+	l.vpHeight -= l.headRows + l.hintRows
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
 	}
@@ -605,9 +600,9 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 		for _, cmd := range visible { // derived, so /help never goes stale
 			names = append(names, cmd.Name)
 		}
-		hint := "* Commands: " + strings.Join(names, " · ") +
+		c.status = "Commands: " + strings.Join(names, " · ") +
 			" · type / for the picker · Ctrl+C leaves the session"
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render(hint))
+		c.rebuildView()
 		return nil
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
@@ -618,7 +613,8 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 	case "/kick":
 		target, ok := modTarget(arg)
 		if !ok {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /kick <username>"))
+			c.status = "usage: /kick <username>"
+			c.rebuildView()
 			return nil
 		}
 		return func() tea.Msg {
@@ -628,7 +624,8 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 	case "/admin":
 		target, ok := modTarget(arg)
 		if !ok {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /admin <username>"))
+			c.status = "usage: /admin <username>"
+			c.rebuildView()
 			return nil
 		}
 		return func() tea.Msg {
@@ -638,7 +635,8 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 	case "/unadmin":
 		target, ok := modTarget(arg)
 		if !ok {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* usage: /unadmin <username>"))
+			c.status = "usage: /unadmin <username>"
+			c.rebuildView()
 			return nil
 		}
 		return func() tea.Msg {

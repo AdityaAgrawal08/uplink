@@ -262,7 +262,7 @@ func TestNoVideoSurfaces(t *testing.T) {
 			t.Errorf("removed room tab %q still visible", absent)
 		}
 	}
-	for _, want := range []string{"Voice call started", "LIVE",
+	for _, want := range []string{
 		"End-to-End Encrypted", "Ctrl+k", "Ctrl+l", "Enter send"} {
 		if !strings.Contains(stripANSI(got), want) {
 			t.Errorf("reference element %q missing from view", want)
@@ -328,27 +328,29 @@ func TestRoomTabsRemoved(t *testing.T) {
 	}
 }
 
-func TestCallCardShowsLive(t *testing.T) {
+func TestNoCallCard(t *testing.T) {
+	// No pinned status card exists: a live voice call must not paint
+	// System / started rows. Liveness still shows in the sidebar and
+	// header mic chips.
 	sc := liveCallScreen(t, 154, 44)
-	if l := sc.layoutFor(); l.callRows != callCardRows {
-		t.Fatalf("live call must budget %d card rows, got %d", callCardRows, l.callRows)
-	}
 	got := stripANSI(sc.View())
-	for _, want := range []string{"Voice call started", "LIVE", "participant"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("call card element %q missing", want)
+	for _, absent := range []string{"Voice call started", "Video call started", "● LIVE", "participant"} {
+		if strings.Contains(got, absent) {
+			t.Errorf("call card element %q must not paint", absent)
 		}
 	}
-	// Idle sessions budget no card and paint none.
-	c := newFilterScreen("bob", "", "bob", "alice")
-	c.vp = *viewportPtr(80, 20)
-	m, _ := c.Update(tea.WindowSizeMsg{Width: 154, Height: 44})
-	idle := m.(chatScreen)
-	if l := idle.layoutFor(); l.callRows != 0 {
-		t.Fatalf("idle session must budget no card rows, got %d", l.callRows)
+	if rows := strings.Count(got, "\n") + 1; rows != 44 {
+		t.Fatalf("frame painted %d rows; want exactly 44", rows)
 	}
-	if strings.Contains(stripANSI(idle.View()), "Voice call started") {
-		t.Fatal("idle session must not paint a call card")
+	// Sidebar still marks the live conversation.
+	found := false
+	for _, it := range sc.chatItems() {
+		if it.isRoom && it.inCall {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("live call must still flag the room in the sidebar")
 	}
 }
 
