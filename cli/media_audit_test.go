@@ -209,20 +209,20 @@ func rmsFile(t *testing.T, raw []byte) float64 {
 func TestPruneGraceKeepsFlappingPeer(t *testing.T) {
 	m := newMediaManager("alice", nil, func(string, string, string) error { return nil }, nil, mediaUICallbacks{})
 	m.mu.Lock()
-	m.videoOn = true
-	m.videoTo = map[string]bool{"bob": true}
+	m.audioOn = true
+	m.audioTo = map[string]bool{"bob": true}
 	m.mu.Unlock()
 	// One missed tick must NOT prune (heartbeat every 5s, tick every 2s).
 	m.PublishTo([]string{})
 	m.mu.Lock()
-	_, kept1 := m.videoTo["bob"]
+	_, kept1 := m.audioTo["bob"]
 	m.mu.Unlock()
 	if !kept1 {
 		t.Fatal("first missed tick pruned a live peer")
 	}
 	m.PublishTo([]string{})
 	m.mu.Lock()
-	_, kept2 := m.videoTo["bob"]
+	_, kept2 := m.audioTo["bob"]
 	m.mu.Unlock()
 	if !kept2 {
 		t.Fatal("second missed tick pruned a live peer")
@@ -230,8 +230,8 @@ func TestPruneGraceKeepsFlappingPeer(t *testing.T) {
 	// Third consecutive absence: genuinely gone, prune + stop.
 	m.PublishTo([]string{})
 	m.mu.Lock()
-	_, kept3 := m.videoTo["bob"]
-	on := m.videoOn
+	_, kept3 := m.audioTo["bob"]
+	on := m.audioOn
 	m.mu.Unlock()
 	if kept3 {
 		t.Fatal("third consecutive absence must prune the leaver")
@@ -241,14 +241,14 @@ func TestPruneGraceKeepsFlappingPeer(t *testing.T) {
 	}
 	// Presence clears the count: rejoin, flap once, still kept.
 	m.mu.Lock()
-	m.videoOn = true
-	m.videoTo = map[string]bool{"bob": true}
+	m.audioOn = true
+	m.audioTo = map[string]bool{"bob": true}
 	m.mu.Unlock()
 	m.PublishTo([]string{})
 	m.PublishTo([]string{"bob"})
 	m.PublishTo([]string{})
 	m.mu.Lock()
-	_, kept := m.videoTo["bob"]
+	_, kept := m.audioTo["bob"]
 	m.mu.Unlock()
 	if !kept {
 		t.Fatal("presence must reset the absence count")
@@ -289,7 +289,7 @@ func TestFailedStartWithdrawsWatchers(t *testing.T) {
 	}
 }
 
-func TestFailedCameraStartWithdrawsWatchers(t *testing.T) {
+func TestFailedMicStartWithdrawsWatchers(t *testing.T) {
 	var mu sync.Mutex
 	var stops []string
 	m := newMediaManager("alice", nil,
@@ -301,11 +301,17 @@ func TestFailedCameraStartWithdrawsWatchers(t *testing.T) {
 			}
 			return nil
 		}, nil, mediaUICallbacks{})
-	m.videoSrcFn = func() (<-chan vidFrame, func(), error) {
-		return nil, nil, fmt.Errorf("no such camera")
+	m.micSrc = func() (<-chan []int16, func(), error) {
+		return nil, nil, fmt.Errorf("no such mic")
 	}
-	if err := m.ToggleVideo([]string{"bob"}); err == nil {
-		t.Fatal("camera failure must surface an error")
+	// Mic start fails asynchronously inside startMicTx (unlike the camera
+	// path): the toggle itself succeeds, then the failure withdraws the
+	// announce and switches the mic back off.
+	if err := m.ToggleAudio([]string{"bob"}); err != nil {
+		t.Fatalf("toggle must not fail synchronously: %v", err)
+	}
+	if m.AudioOn() {
+		t.Fatal("dead mic must switch audio back off")
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -316,56 +322,11 @@ func TestFailedCameraStartWithdrawsWatchers(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatal("camera failure after announce must send media-stop to the scope")
+		t.Fatal("mic failure after announce must send media-stop to the scope")
 	}
 }
 
 // ---- H4/M2: rapid toggles, single live loop --------------------------------
-
-func TestRapidToggleSingleTxLoop(t *testing.T) {
-	m := newMediaManager("alice", nil, func(string, string, string) error { return nil }, nil, mediaUICallbacks{})
-	m.dialIP = "127.0.0.1"
-	src1 := make(chan vidFrame, 8)
-	src2 := make(chan vidFrame, 8)
-	calls := 0
-	m.videoSrcFn = func() (<-chan vidFrame, func(), error) {
-		calls++
-		if calls == 1 {
-			return src1, func() {}, nil
-		}
-		return src2, func() {}, nil
-	}
-	if err := m.ToggleVideo([]string{"bob"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.ToggleVideo([]string{"bob"}); err != nil { // off
-		t.Fatal(err)
-	}
-	if err := m.ToggleVideo([]string{"bob"}); err != nil { // on again
-		t.Fatal(err)
-	}
-	f := jpegFrame(t, 10, 200, 10)
-	before := m.txFramesOf()
-	src1 <- f // stale loop must ignore this
-	time.Sleep(150 * time.Millisecond)
-	if got := m.txFramesOf(); got != before {
-		t.Fatalf("stale TX loop sent %d frames after toggle", got-before)
-	}
-	src2 <- f
-	deadline := time.Now().Add(2 * time.Second)
-	for m.txFramesOf() == before && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	if m.txFramesOf() == before {
-		t.Fatal("fresh TX loop never sent")
-	}
-	m.mu.Lock()
-	gen := m.cameraGen
-	m.mu.Unlock()
-	if gen != 2 {
-		t.Fatalf("camera generation = %d; want 2 (one per successful start)", gen)
-	}
-}
 
 // ---- M1: speaker death surfaces --------------------------------------------
 
@@ -424,10 +385,4 @@ func TestSpeakerDeathEmits(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-func (m *mediaManager) txFramesOf() uint64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.txFrames
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -396,5 +397,57 @@ func TestSignalFullFlow(t *testing.T) {
 	}
 	if _, _, err := eve.joinRoom("eve", "pub", ""); err == nil {
 		t.Fatal("expected 404 joining destroyed room")
+	}
+}
+
+func TestIsServerDown(t *testing.T) {
+	down := []error{
+		fmt.Errorf(`Post "http://s/x": dial tcp 127.0.0.1:1: connection refused`),
+		fmt.Errorf(`Post "http://s/x": read: connection reset by peer`),
+		fmt.Errorf(`Post "http://s/x": no such host`),
+		fmt.Errorf(`Post "http://s/x": Client.Timeout exceeded while awaiting headers`),
+		fmt.Errorf(`Post "http://s/x": context deadline exceeded`),
+		fmt.Errorf(`Post "http://s/x": unexpected EOF`),
+		fmt.Errorf(`Post "http://s/x": dial tcp: network is unreachable`),
+		apiErr(502, []byte(`{"error":"bad gateway"}`)),
+		apiErr(503, []byte(`{"error":"unavailable"}`)),
+		apiErr(504, []byte(`{"error":"gateway timeout"}`)),
+	}
+	for _, err := range down {
+		if !isServerDown(err) {
+			t.Errorf("must classify as down: %v", err)
+		}
+	}
+	up := []error{
+		nil,
+		fmt.Errorf("empty message"),
+		apiErr(400, []byte(`{"error":"bad input"}`)),
+		apiErr(403, []byte(`{"error":"not in session"}`)),
+		apiErr(404, []byte(`{"error":"Session not found"}`)),
+		apiErr(409, []byte(`{"error":"taken"}`)),
+		apiErr(429, []byte(`{"error":"slow"}`)),
+	}
+	for _, err := range up {
+		if isServerDown(err) {
+			t.Errorf("must NOT classify as down: %v", err)
+		}
+	}
+}
+
+func TestIsServerDownExcludesMesh(t *testing.T) {
+	// Local WebRTC/mesh path failures must never raise the server banner.
+	for _, s := range []string{
+		"ICE gathering timed out",
+		"answer wait timed out",
+		"offer wait timed out",
+		"KEY SWAP ALERT for alice: handshake key does not match roster",
+		"offer SDP 9000 bytes exceeds signaling cap",
+	} {
+		if isServerDown(fmt.Errorf("%s", s)) {
+			t.Errorf("mesh error must not classify as down: %q", s)
+		}
+	}
+	if !isServerDown(fmt.Errorf("Post https://x: connection refused")) {
+		t.Error("refused transport error must classify as down")
 	}
 }

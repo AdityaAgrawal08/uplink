@@ -191,17 +191,6 @@ func TestAudioVideoCodecRoundtrip(t *testing.T) {
 	if _, err := decodeAudioPacket([]byte{1}); err == nil {
 		t.Fatal("short audio must fail")
 	}
-	vf := encodeVideoFrag(9, 2, 5, 777, []byte{4, 5})
-	gotV, err := decodeVideoFrag(vf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotV.Seq != 9 || gotV.FragIdx != 2 || gotV.FragTotal != 5 || gotV.Ts != 777 {
-		t.Fatalf("video codec wrong: %+v", gotV)
-	}
-	if _, err := decodeVideoFrag([]byte{1, 2}); err == nil {
-		t.Fatal("short frag must fail")
-	}
 }
 
 func TestNominateSkipsUnroutable(t *testing.T) {

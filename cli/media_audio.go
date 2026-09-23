@@ -334,8 +334,20 @@ func (f *frameForwarder) stop() { f.once.Do(func() { close(f.done) }) }
 // its name for status lines.
 func micSource() (<-chan []int16, func(), error) {
 	mc, name, err := openMicResilient()
+	if err != nil {
+		return nil, nil, err
+	}
 	lastMicSource.Store(name)
-	return mc.frames, mc.stop, err
+	return mc.frames, mc.stop, nil
+}
+
+// requireFFmpeg reports a friendly error when ffmpeg is unavailable
+// (test-mic synthesis shells out to it).
+func requireFFmpeg(what string) error {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		return fmt.Errorf("ffmpeg not found (needed for %s): install it (apt/pacman/brew) and retry", what)
+	}
+	return nil
 }
 
 // openTestMic synthesizes a 440Hz sine at 48kHz mono (UPLINK_MIC=test):

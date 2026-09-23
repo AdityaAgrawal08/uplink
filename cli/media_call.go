@@ -11,25 +11,23 @@ import (
 	"time"
 )
 
-// ─── Media publishing (/video + /audio, no calls) ───────────────────────────
+// ─── Media publishing (/audio voice calls) ────────────────────────────────
 //
-// One model: publish. /video and /audio toggle what THIS machine sends to
-// its current scope (the DM peer, or every online room member); receivers
-// dial the publisher back over per-peer Noise_XX UDP sessions and render
-// or play. There is no ringing, no accepting, no busy: announces are
-// idempotent, watchers reply with their own coords so the publisher can
-// dial back, and handshake roles follow the username glare rule (the same
-// rule that made calls converge, so concurrent publishers never deadlock).
+// One model: publish. /audio toggles what THIS machine sends to its current
+// scope (the DM peer, or every online room member); receivers dial the
+// publisher back over per-peer Noise_XX UDP sessions and play. There is no
+// ringing, no accepting, no busy: announces are idempotent, watchers reply
+// with their own coords so the publisher can dial back, and handshake roles
+// follow the username glare rule (concurrent publishers never deadlock).
 //
 // Signaling (rides the existing signal queue, tiny + rare):
-//   media-live {ip, ips, port, video, audio} — "I am sending X to you"
-//   media-stop {video, audio}                — "I stopped sending X"
+//   media-live {ip, ips, port, audio} — "I am sending audio to you"
+//   media-stop {audio}                 — "I stopped sending audio"
 // A Live=false announce is a watcher's join reply (coords for the
 // publisher's fan-out; never rendered, never re-replied).
 //
-// One video feed is shown and one speaker heard at a time (pin model):
-// interleaved frames or mixed voice from two publishers cannot be
-// un-corrupted, so the pin holds until 5s (video) / 2s (audio) of silence.
+// One speaker heard at a time (pin model): mixed voice from two publishers
+// cannot be un-corrupted, so the pin holds until 2s of silence.
 //
 // Path healing: every 2s the manager checks every expected peer (we send
 // to them or they send to us); a session silent >10s is re-probed at most
@@ -46,38 +44,21 @@ const (
 	callWatchdogAfter = 10 * time.Second
 	healCheckEvery    = 2 * time.Second
 	healEvery         = 30 * time.Second
-	// videoRenderMinInterval bounds paint cost: decode runs full-rate,
-	// the TUI sheds (~14fps at this interval is smooth for ASCII).
-	videoRenderMinInterval = 70 * time.Millisecond
 )
-
-// videoFeed is one remote publisher's RX state: reassembly, decoded
-// frames, and freshness. Per-peer (not pinned): every publisher's feed
-// is decoded and painted — interleaved timestamps can't corrupt because
-// each sender owns its assembler.
-type videoFeed struct {
-	peer   string
-	asm    *fragAssembler
-	frames chan vidFrame // decoded, bounded, drop-oldest
-	lastRx time.Time
-}
 
 type mediaAnnouncePayload struct {
 	IP    string   `json:"ip"`
 	Ips   []string `json:"ips,omitempty"`
 	Port  int      `json:"port"`
 	Live  bool     `json:"live"`
-	Video bool     `json:"video"`
 	Audio bool     `json:"audio"`
 }
 
 // mediaUICallbacks is the manager → UI surface (never called from the
 // network path without a snapshot).
 type mediaUICallbacks struct {
-	onInfo       func(info string)    // one-line status/errors for the transcript
-	onLevel      func(level float64)  // mic loudness 0..1 (throttled)
-	onVideoFrame func(lines []string) // decoded remote ASCII frame
-	onSelfFrame  func(lines []string) // local camera preview
+	onInfo  func(info string)   // one-line status/errors for the status line
+	onLevel func(level float64) // mic loudness 0..1 (throttled)
 }
 
 type mediaManager struct {
@@ -94,12 +75,9 @@ type mediaManager struct {
 	mu sync.Mutex
 	// Publish state: what we send, and to whom (scope locked at toggle;
 	// roster ticks top up fresh joiners and prune leavers).
-	videoOn bool
 	audioOn bool
-	videoTo map[string]bool
 	audioTo map[string]bool
 	// Watch state: who sends to us.
-	pubVideo map[string]bool
 	pubAudio map[string]bool
 	replied  map[string]bool // announced/replied peers (no note storms)
 
@@ -107,20 +85,6 @@ type mediaManager struct {
 	started   bool
 	healStop  chan struct{}
 	wg        sync.WaitGroup
-
-	// camera live-cycle (nil unless streaming)
-	cameraStop    chan struct{}
-	stopCameraSrc func()
-	cameraGen     uint64        // TX loop generation: stale loops exit (M2)
-	previewQ      chan vidFrame // self-view queue (bounded, drop-oldest)
-	videoOnFlag   bool          // camera loop running (videoOn is the toggle)
-	videoFeeds    map[string]*videoFeed
-	rxDone        chan struct{}
-	rxPump        bool
-	rxOnFlag      bool
-	videoSrcFn    func() (<-chan vidFrame, func(), error)
-	videoSeq      uint16
-	videoTs       uint32
 
 	// audio live-cycle
 	audioStop   chan struct{}
@@ -132,13 +96,11 @@ type mediaManager struct {
 	rxJbs       map[string]*jitterBuffer
 	rxDecs      map[string]*opusVoice
 
-	// render geometry + throttle + counters (diagnostics on toggle lines)
+	// render counters (diagnostics on toggle lines)
 	txFrames    uint64
 	rxFrames    uint64
 	remoteShows uint64
 	selfShows   uint64
-	renderCols  int
-	renderRows  int
 
 	// path healing
 	lastHeal  map[string]time.Time
@@ -169,14 +131,11 @@ func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, pay
 		lanIPs:       localLANIPs,
 		micSrc:       openMicFrames,
 		playSink:     openPlaySink,
-		videoTo:      map[string]bool{},
 		audioTo:      map[string]bool{},
-		pubVideo:     map[string]bool{},
 		pubAudio:     map[string]bool{},
 		replied:      map[string]bool{},
 		rxJbs:        map[string]*jitterBuffer{},
 		rxDecs:       map[string]*opusVoice{},
-		videoFeeds:   map[string]*videoFeed{},
 		lastHeal:     map[string]time.Time{},
 		healPingAt:   map[string]time.Time{},
 		peerAnn:      map[string]mediaAnnouncePayload{},
@@ -186,8 +145,6 @@ func newMediaManager(me string, id *identityKey, sendNote func(to, noteType, pay
 		annRxAt:      map[string]time.Time{},
 		lastWantSent: map[string]time.Time{},
 		absentTicks:  map[string]int{},
-		renderCols:   videoPaneDefaultCols,
-		renderRows:   videoPaneDefaultRows,
 	}
 }
 
@@ -289,47 +246,16 @@ func rosterMap(peers []rosterMember) map[string][]byte {
 
 // ─── Status accessors (TUI chips + roster badges) ───────────────────────────
 
-func (m *mediaManager) VideoOn() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.videoOn
-}
-
 func (m *mediaManager) AudioOn() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.audioOn
 }
 
-func (m *mediaManager) VideoPublishers() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return sortedKeys(m.pubVideo)
-}
-
 func (m *mediaManager) AudioPublishers() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return sortedKeys(m.pubAudio)
-}
-
-// VideoScope describes who we show ("bob" / "the room (3 people)") or "".
-// videoStatsLine summarizes the last publish in one line (frames sent,
-// received, painted on both sides) — diagnostics without a command.
-func (m *mediaManager) videoStatsLine() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return fmt.Sprintf("sent=%d recv=%d remotePaints=%d selfPaints=%d",
-		m.txFrames, m.rxFrames, m.remoteShows, m.selfShows)
-}
-
-func (m *mediaManager) VideoScope() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.videoOn {
-		return ""
-	}
-	return describeScope(m.videoTo)
 }
 
 func (m *mediaManager) AudioScope() string {
@@ -341,13 +267,6 @@ func (m *mediaManager) AudioScope() string {
 	return describeScope(m.audioTo)
 }
 
-// Watching reports whether any remote video feed is being rendered.
-func (m *mediaManager) Watching() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return len(m.pubVideo) > 0 || m.rxOnFlag
-}
-
 // Hearing reports whether any remote audio is being played.
 func (m *mediaManager) Hearing() bool {
 	m.mu.Lock()
@@ -355,19 +274,11 @@ func (m *mediaManager) Hearing() bool {
 	return len(m.pubAudio) > 0
 }
 
-// RxOn reports whether remote video has arrived at least once.
-func (m *mediaManager) RxOn() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.rxOnFlag
-}
-
 // MediaActive reports whether any media state exists (exit cleanup gate).
 func (m *mediaManager) MediaActive() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.videoOn || m.audioOn || len(m.pubVideo) > 0 || len(m.pubAudio) > 0 ||
-		m.transport != nil
+	return m.audioOn || len(m.pubAudio) > 0 || m.transport != nil
 }
 
 func sortedKeys(set map[string]bool) []string {
@@ -419,56 +330,10 @@ func describeScope(set map[string]bool) string {
 	return fmt.Sprintf("the room (%d people)", len(set))
 }
 
-// ToggleVideo turns the camera on (announce to scope) or off (media-stop).
-// Toggling on again while on re-announces to fresh scope members only.
-func (m *mediaManager) ToggleVideo(scope []string) error {
-	m.mu.Lock()
-	if m.videoOn {
-		m.mu.Unlock()
-		m.stopVideoPublish()
-		m.emit(m.videoStatsLine() + " · camera off")
-		return nil
-	}
-	for _, p := range scope {
-		if p != "" && p != m.me {
-			m.videoTo[p] = true
-		}
-	}
-	if len(m.videoTo) == 0 {
-		m.mu.Unlock()
-		return fmt.Errorf("nobody to show (alone here)")
-	}
-	desc := describeScope(m.videoTo)
-	m.videoOn = true
-	m.mu.Unlock()
-	if _, err := m.ensureTransport(); err != nil {
-		m.mu.Lock()
-		m.videoOn, m.videoTo = false, map[string]bool{}
-		m.mu.Unlock()
-		return err
-	}
-	m.emit("camera on — showing " + desc)
-	if err := m.publishAnnounce(); err != nil {
-		return err
-	}
-	if err := m.startCameraTx(); err != nil {
-		// Camera failed AFTER the announce: withdraw so watchers don't
-		// complete handshakes and wait on a stream that will never come
-		// (heal-loop "silent" churn against a dead publisher).
-		m.mu.Lock()
-		scope := sortedKeys(m.videoTo)
-		m.videoTo = map[string]bool{}
-		m.videoOn = false
-		m.mu.Unlock()
-		for _, to := range scope {
-			m.sendStop(to, true, false)
-		}
-		return err
-	}
-	return nil
-}
-
 // ToggleAudio turns the mic on (announce to scope) or off (media-stop).
+// Solo use is fully supported: with nobody else around the mic starts
+// locally (level meter live, no announce goes out) and late joiners are
+// admitted automatically via PublishTo.
 func (m *mediaManager) ToggleAudio(scope []string) error {
 	m.mu.Lock()
 	if m.audioOn {
@@ -482,10 +347,7 @@ func (m *mediaManager) ToggleAudio(scope []string) error {
 			m.audioTo[p] = true
 		}
 	}
-	if len(m.audioTo) == 0 {
-		m.mu.Unlock()
-		return fmt.Errorf("nobody to talk to (alone here)")
-	}
+	solo := len(m.audioTo) == 0
 	desc := describeScope(m.audioTo)
 	m.audioOn = true
 	m.mu.Unlock()
@@ -495,7 +357,11 @@ func (m *mediaManager) ToggleAudio(scope []string) error {
 		m.mu.Unlock()
 		return err
 	}
-	m.emit("mic live — talking to " + desc)
+	if solo {
+		m.emit("mic live — preview only (alone here; peers join automatically)")
+	} else {
+		m.emit("mic live — talking to " + desc)
+	}
 	if err := m.publishAnnounce(); err != nil {
 		return err
 	}
@@ -508,11 +374,6 @@ func (m *mediaManager) ToggleAudio(scope []string) error {
 func (m *mediaManager) publishAnnounce() error {
 	m.mu.Lock()
 	var targets []string
-	for p := range m.videoTo {
-		if !m.replied[p] {
-			targets = append(targets, p)
-		}
-	}
 	for p := range m.audioTo {
 		if !m.replied[p] {
 			targets = append(targets, p)
@@ -531,14 +392,16 @@ func (m *mediaManager) publishAnnounce() error {
 }
 
 // PublishTo announces to scope members missed earlier (late joiners) and
-// prunes leavers. Live scope members join the send scope for every kind
-// that is on: announcing without admitting them would complete the
-// handshake yet never send them a frame (late joiners saw "media
-// secured" and then silence forever). Streams whose scope empties stop
-// themselves.
+// prunes leavers. Live scope members join the send scope while audio is
+// on: announcing without admitting them would complete the handshake yet
+// never send them a frame (late joiners saw "media secured" and then
+// silence forever). A send set pruned down from remotes to nobody stops
+// its stream; a preview-only solo session (empty from the start) keeps
+// running until the user toggles off or hangs up, and joiners are admitted
+// the moment they appear.
 func (m *mediaManager) PublishTo(scope []string) {
 	m.mu.Lock()
-	if !m.videoOn && !m.audioOn {
+	if !m.audioOn {
 		m.mu.Unlock()
 		return
 	}
@@ -548,31 +411,29 @@ func (m *mediaManager) PublishTo(scope []string) {
 			live[p] = true
 		}
 	}
+	// Snapshot before pruning: a send set that HAD remotes and loses its
+	// last one stops its stream (leavers). A set that was already empty
+	// (preview-only solo session) keeps running — only an explicit toggle
+	// or hangup stops it.
+	hadAudioRemote := len(m.audioTo) > 0
 	// Prune grace: a scope member missing from one tick is usually a
 	// flapped heartbeat, not a leaver. Count consecutive absences and
 	// prune only past the grace window; presence clears the count.
 	// Without this, one missed 5s beat on a 2s tick tore down live
-	// streams (camera loops, sessions, ffmpeg respawns).
-	for _, set := range []map[string]bool{m.videoTo, m.audioTo} {
-		for p := range set {
-			if live[p] {
-				delete(m.absentTicks, p)
-				continue
-			}
-			m.absentTicks[p]++
-			if m.absentTicks[p] < pruneGraceTicks {
-				continue
-			}
+	// streams (mic loops, session respawns).
+	for p := range m.audioTo {
+		if live[p] {
 			delete(m.absentTicks, p)
-			delete(set, p)
-			delete(m.replied, p)
-			m.maybeForgetJoinLocked(p)
+			continue
 		}
-	}
-	if m.videoOn {
-		for p := range live {
-			m.videoTo[p] = true
+		m.absentTicks[p]++
+		if m.absentTicks[p] < pruneGraceTicks {
+			continue
 		}
+		delete(m.absentTicks, p)
+		delete(m.audioTo, p)
+		delete(m.replied, p)
+		m.maybeForgetJoinLocked(p)
 	}
 	if m.audioOn {
 		for p := range live {
@@ -585,19 +446,19 @@ func (m *mediaManager) PublishTo(scope []string) {
 			fresh = append(fresh, p)
 		}
 	}
-	videoOn, audioOn := len(m.videoTo) > 0, len(m.audioTo) > 0
-	wasPublishing := m.videoOn || m.audioOn
+	audioScopeEmpty := len(m.audioTo) == 0
+	stopA := m.audioOn && hadAudioRemote && audioScopeEmpty
 	m.mu.Unlock()
-	if m.videoOn && !videoOn {
-		m.stopVideoPublish()
-	}
-	if m.audioOn && !audioOn {
+	if stopA {
 		m.stopAudioPublish()
 	}
-	// Scope-shift line: the publish continues but to a different set than
-	// the toggle described (DM↔room move, joiners, leavers past grace).
-	// Without this the header chips are the only clue and toasts get lost.
-	if wasPublishing && (len(fresh) > 0 || !videoOn || !audioOn) {
+	// Status lines only on real transitions (joiners admitted, last leaver
+	// stopped a stream) — never a per-tick heartbeat, so preview-only solo
+	// sessions stay quiet.
+	if stopA {
+		m.emit("sharing stopped — nobody left in scope")
+	}
+	if len(fresh) > 0 {
 		m.emit("sharing now covers: " + describeScope(m.currentSendScope()))
 	}
 	for _, to := range fresh {
@@ -610,14 +471,11 @@ func (m *mediaManager) PublishTo(scope []string) {
 	}
 }
 
-// currentSendScope unions both send scopes for status lines.
+// currentSendScope returns the audio send scope for status lines.
 func (m *mediaManager) currentSendScope() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := map[string]bool{}
-	for p := range m.videoTo {
-		out[p] = true
-	}
 	for p := range m.audioTo {
 		out[p] = true
 	}
@@ -627,13 +485,13 @@ func (m *mediaManager) currentSendScope() map[string]bool {
 // pruneGraceTicks is how many consecutive 2s roster ticks a scope member
 // may be absent before PublishTo prunes them. Heartbeats run every 5s, so
 // a single missed beat must never kill a live stream (flapping roster =
-// stop/restart churn, torn-down camera loops, ffmpeg respawns).
+// stop/restart churn, torn-down mic loops, session respawns).
 const pruneGraceTicks = 3
 
 // maybeForgetJoinLocked drops join-retry state when a peer is no longer
 // either side of a media relationship. Runs under m.mu.
 func (m *mediaManager) maybeForgetJoinLocked(p string) {
-	if m.pubVideo[p] || m.pubAudio[p] {
+	if m.pubAudio[p] {
 		return
 	}
 	delete(m.peerAnn, p)
@@ -649,7 +507,7 @@ func (m *mediaManager) maybeForgetJoinLocked(p string) {
 func (m *mediaManager) sendAnnounce(to string, live bool) error {
 	m.mu.Lock()
 	t := m.transport
-	video, audio := m.videoOn, m.audioOn
+	audio := m.audioOn
 	m.mu.Unlock()
 	if t == nil {
 		return fmt.Errorf("no media socket")
@@ -659,13 +517,13 @@ func (m *mediaManager) sendAnnounce(to string, live bool) error {
 		return fmt.Errorf("no media socket")
 	}
 	ip, ips := m.advertiseAddrs()
-	raw, _ := json.Marshal(mediaAnnouncePayload{IP: ip, Ips: ips, Port: addr.Port, Live: live, Video: video, Audio: audio})
+	raw, _ := json.Marshal(mediaAnnouncePayload{IP: ip, Ips: ips, Port: addr.Port, Live: live, Audio: audio})
 	return m.sendNote(to, mediaLive, string(raw))
 }
 
-// sendStop tells one peer we stopped a kind.
-func (m *mediaManager) sendStop(to string, video, audio bool) {
-	raw, _ := json.Marshal(mediaAnnouncePayload{Video: video, Audio: audio})
+// sendStop tells one peer we stopped audio.
+func (m *mediaManager) sendStop(to string, audio bool) {
+	raw, _ := json.Marshal(mediaAnnouncePayload{Audio: audio})
 	_ = m.sendNote(to, mediaStop, string(raw))
 }
 
@@ -785,7 +643,7 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 		// A watcher asks us to (re-)announce. Answer only if we actually
 		// publish; the announce itself is idempotent on their side.
 		m.mu.Lock()
-		publishing := m.videoOn || m.audioOn
+		publishing := m.audioOn
 		m.mu.Unlock()
 		if publishing {
 			_ = m.sendAnnounce(n.From, true)
@@ -806,32 +664,26 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 		}
 		m.mu.Lock()
 		changed := ""
-		if ann.Live && ann.Video && !m.pubVideo[n.From] {
-			m.pubVideo[n.From] = true
-			changed = describePublisherChange(n.From, ann)
-		}
 		if ann.Live && ann.Audio && !m.pubAudio[n.From] {
 			m.pubAudio[n.From] = true
-			if changed == "" {
-				changed = describePublisherChange(n.From, ann)
-			}
+			changed = describePublisherChange(n.From, ann)
 		}
 		t2 := m.transport
-		videoTo, audioTo := m.videoTo[n.From], m.audioTo[n.From]
+		audioTo := m.audioTo[n.From]
 		m.mu.Unlock()
 		// Reply with our coords whenever the session isn't up: the
 		// one-shot `replied` flag is not enough — if our reply or their
 		// dial was lost, only a fresh reply re-opens the publisher side.
 		// Replies are idempotent (coords + mask), so repeats are cheap.
 		needReply := ann.Live && (t2 == nil || !t2.peerReady(n.From)) &&
-			!videoTo && !audioTo
+			!audioTo
 		m.mu.Lock()
 		if needReply {
 			m.replied[n.From] = true
 		}
 		// Fresh announce coordinates + retry budget reset: re-announces
 		// are the recovery signal for both sides.
-		if ann.Live && (ann.Video || ann.Audio) {
+		if ann.Live && ann.Audio {
 			m.peerAnn[n.From] = ann
 			m.joinTries[n.From] = 0
 			m.joinVerdict[n.From] = false
@@ -853,20 +705,15 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 		go m.joinPeer(n.From, ann)
 
 	case mediaStop:
+		// Any stop note ends audio from this peer (local stops always
+		// carry audio; the video kind is retired).
 		var st mediaAnnouncePayload
-		_ = json.Unmarshal([]byte(n.Payload), &st) // bare {} = stop all
+		_ = json.Unmarshal([]byte(n.Payload), &st)
 		m.mu.Lock()
-		wasVideo := m.pubVideo[n.From]
 		wasAudio := m.pubAudio[n.From]
-		if st.Video || (!st.Video && !st.Audio) {
-			delete(m.pubVideo, n.From)
-		}
-		if st.Audio || (!st.Video && !st.Audio) {
-			delete(m.pubAudio, n.From)
-		}
-		nowVideo := m.pubVideo[n.From]
+		delete(m.pubAudio, n.From)
 		nowAudio := m.pubAudio[n.From]
-		if !nowVideo && !nowAudio {
+		if !nowAudio {
 			delete(m.peerAnn, n.From)
 			delete(m.joinTries, n.From)
 			delete(m.lastJoinAt, n.From)
@@ -874,31 +721,15 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 			delete(m.annRxAt, n.From)
 			delete(m.lastWantSent, n.From)
 		}
-		if !nowVideo {
-			m.dropVideoFeedLocked(n.From)
-		}
 		if !nowAudio {
 			delete(m.rxJbs, n.From)
 			delete(m.rxDecs, n.From)
 		}
-		watching := len(m.pubVideo) > 0
 		hearing := len(m.pubAudio) > 0
-		var rdone chan struct{}
-		if !watching && !m.videoOn {
-			rdone = m.rxDone
-			m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
-			m.videoFeeds = map[string]*videoFeed{}
-		}
 		stopPlayout := !hearing && !m.audioOn && m.audioRxStop != nil
 		m.mu.Unlock()
-		if rdone != nil {
-			close(rdone)
-		}
 		if stopPlayout {
 			m.stopAudioPlayout()
-		}
-		if wasVideo && !nowVideo {
-			m.emit(n.From + " stopped video")
 		}
 		if wasAudio && !nowAudio {
 			m.emit(n.From + " stopped audio")
@@ -907,14 +738,7 @@ func (m *mediaManager) onSignalNote(n signalNote) {
 }
 
 func describePublisherChange(from string, ann mediaAnnouncePayload) string {
-	switch {
-	case ann.Video && ann.Audio:
-		return from + " is sharing video + audio"
-	case ann.Video:
-		return from + " is sharing video"
-	default:
-		return from + " is sharing audio"
-	}
+	return from + " is sharing audio"
 }
 
 // ─── Transport dispatch ─────────────────────────────────────────────────────
@@ -923,7 +747,6 @@ func describePublisherChange(from string, ann mediaAnnouncePayload) string {
 func (m *mediaManager) mediaCB() mediaCallbacks {
 	return mediaCallbacks{
 		onAudio: m.onRemoteAudio,
-		onVideo: m.onVideoFrag,
 		onReady: func(peer, code string) {
 			m.mu.Lock()
 			m.lastHeal[peer] = time.Now() // fresh session: full heal window
@@ -944,377 +767,6 @@ func (m *mediaManager) onTransportReady(peer string) {
 	m.mu.Lock()
 	m.lastHeal[peer] = time.Now() // fresh session: give it a full window
 	m.mu.Unlock()
-}
-
-// ─── Camera TX ──────────────────────────────────────────────────────────────
-
-// startCameraTx is the single-flight camera loop (cameraStop guards).
-func (m *mediaManager) startCameraTx() error {
-	m.mu.Lock()
-	if m.cameraStop != nil {
-		m.mu.Unlock()
-		return nil
-	}
-	srcFn := m.videoSrcFn
-	if srcFn == nil {
-		srcFn = cameraFrames
-	}
-	m.mu.Unlock()
-
-	frames, stopSrc, err := srcFn()
-	if err != nil {
-		return err
-	}
-	stop := make(chan struct{})
-	m.mu.Lock()
-	m.cameraStop = stop
-	m.stopCameraSrc = stopSrc
-	m.cameraGen++
-	gen := m.cameraGen
-	if m.previewQ == nil {
-		m.previewQ = make(chan vidFrame, 4)
-	}
-	m.mu.Unlock()
-
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		defer func() {
-			m.mu.Lock()
-			// Only the current generation clears the flag: a stale
-			// loop exiting late must not mark a fresh stream dead.
-			if m.cameraGen == gen {
-				m.videoOnFlag = false
-			}
-			m.mu.Unlock()
-		}()
-		var n uint64
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			// Generation gate: a loop superseded by a fast off→on
-			// toggle exits instead of double-sending on the new frames
-			// channel (duplicate seq/ts traffic + double preview).
-			m.mu.Lock()
-			stale := m.cameraGen != gen
-			m.mu.Unlock()
-			if stale {
-				return
-			}
-			select {
-			case <-stop:
-				return
-			case f, ok := <-frames:
-				if !ok {
-					return
-				}
-				n++
-				// Self-view at half rate (drop-if-full queue): halves
-				// local render cost, zero network effect.
-				if n%2 == 0 {
-					select {
-					case m.previewQ <- f:
-					default:
-					}
-				}
-				payloads, err := fragVideoFrame(f.Jpeg)
-				if err != nil {
-					continue
-				}
-				m.mu.Lock()
-				t := m.transport
-				m.videoTs++
-				ts := m.videoTs
-				m.txFrames++
-				m.mu.Unlock()
-				if t == nil {
-					return
-				}
-				for i, p := range payloads {
-					m.mu.Lock()
-					m.videoSeq++
-					seq := m.videoSeq
-					m.mu.Unlock()
-					pkt := encodeVideoFrag(seq, uint16(i), uint16(len(payloads)), ts, p)
-					for _, peer := range t.readyPeers() {
-						m.mu.Lock()
-						inScope := m.videoTo[peer]
-						m.mu.Unlock()
-						if !inScope {
-							continue
-						}
-						_ = t.sendMedia(peer, mediaKindVideo, pkt)
-					}
-				}
-			}
-		}
-	}()
-	m.mu.Lock()
-	m.videoOnFlag = true
-	if m.rxDone == nil {
-		m.rxDone = make(chan struct{})
-	}
-	if !m.rxPump {
-		m.rxPump = true
-		m.startRenderPump()
-	}
-	m.mu.Unlock()
-	return nil
-}
-
-// ─── Video RX (per-peer feeds, tiled grid) ──────────────────────────────────
-
-// ensureVideoRxLocked builds the render pump on first expected video.
-// Runs under m.mu; returns true once the pump exists.
-func (m *mediaManager) ensureVideoRxLocked() bool {
-	if m.rxDone == nil {
-		m.rxDone = make(chan struct{})
-	}
-	if !m.rxPump {
-		m.rxPump = true
-		m.startRenderPump()
-	}
-	return true
-}
-
-// teardownVideoRxLocked drops the remote pipeline when nobody publishes
-// and our own camera is off. Runs under m.mu; returns the closeables.
-func (m *mediaManager) teardownVideoRxLocked() (rdone chan struct{}) {
-	if m.rxDone == nil {
-		return nil
-	}
-	rdone = m.rxDone
-	m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
-	m.videoFeeds = map[string]*videoFeed{}
-	return rdone
-}
-
-// videoFeedFor returns the RX state for one publisher, creating it on
-// first contact. Runs under m.mu (or with m.mu held by the caller).
-func (m *mediaManager) videoFeedForLocked(peer string) *videoFeed {
-	if m.videoFeeds == nil {
-		m.videoFeeds = map[string]*videoFeed{}
-	}
-	fd := m.videoFeeds[peer]
-	if fd == nil {
-		fd = &videoFeed{peer: peer, asm: newFragAssembler(), frames: make(chan vidFrame, 4)}
-		m.videoFeeds[peer] = fd
-	}
-	return fd
-}
-
-// dropVideoFeedLocked removes one publisher's RX state (stop notes,
-// pin expiry). Runs under m.mu.
-func (m *mediaManager) dropVideoFeedLocked(peer string) {
-	delete(m.videoFeeds, peer)
-}
-
-// onVideoFrag reassembles + decodes + queues one remote JPEG frame into
-// that sender's own feed. Per-peer assemblers mean concurrent publishers
-// never corrupt each other (the old single pin discarded everyone but
-// one sender).
-func (m *mediaManager) onVideoFrag(peer string, frag videoFrag) {
-	m.mu.Lock()
-	if len(m.pubVideo) == 0 {
-		m.mu.Unlock()
-		return // nobody we know is publishing: ignore strays
-	}
-	fd := m.videoFeedForLocked(peer)
-	fd.lastRx = time.Now()
-	if m.rxDone == nil {
-		m.rxDone = make(chan struct{})
-	}
-	if !m.rxPump {
-		m.rxPump = true
-		m.startRenderPump()
-	}
-	m.mu.Unlock()
-
-	complete := fd.asm.push(frag)
-	if complete == nil {
-		return
-	}
-	frame, err := jpegToRGB(complete)
-	if err != nil {
-		return
-	}
-	m.mu.Lock()
-	m.rxFrames++
-	m.mu.Unlock()
-	select {
-	case fd.frames <- frame:
-	default: // drop-if-full: decode keeps pace or sheds load
-	}
-}
-
-// startRenderPump paints a tiled grid: one tile per active remote feed
-// (sorted by peer, labeled), plus the throttled paint clock. The local
-// self-view paints only while no remote feed is live, so the publisher
-// still sees their camera when alone. Stale feeds (no frags, publisher
-// gone) are reaped here.
-func (m *mediaManager) startRenderPump() {
-	m.wg.Add(1)
-	go func() {
-		defer m.wg.Done()
-		tick := time.NewTicker(videoRenderMinInterval)
-		defer tick.Stop()
-		last := map[string]vidFrame{}
-		for {
-			m.mu.Lock()
-			done := m.rxDone
-			preview := m.previewQ
-			type feedSnap struct {
-				peer string
-				q    chan vidFrame
-			}
-			var feeds []feedSnap
-			for peer, fd := range m.videoFeeds {
-				feeds = append(feeds, feedSnap{peer, fd.frames})
-			}
-			cols, rows := m.renderCols, m.renderRows
-			m.mu.Unlock()
-			if done == nil {
-				return
-			}
-			select {
-			case <-done:
-				return
-			case <-tick.C:
-			}
-			// Drain latest frame per feed (non-blocking; keep last known).
-			m.mu.Lock()
-			for _, fs := range feeds {
-			drain:
-				for {
-					select {
-					case f, ok := <-fs.q:
-						if !ok {
-							break drain
-						}
-						last[fs.peer] = f
-					default:
-						break drain
-					}
-				}
-			}
-			// Reap feeds with no frames ever and no recent traffic whose
-			// publisher is gone.
-			for peer := range last {
-				fd := m.videoFeeds[peer]
-				if fd == nil {
-					delete(last, peer)
-					continue
-				}
-				if _, publishing := m.pubVideo[peer]; !publishing && time.Since(fd.lastRx) > 10*time.Second {
-					delete(m.videoFeeds, peer)
-					delete(last, peer)
-				}
-			}
-			peers := make([]string, 0, len(last))
-			for peer := range last {
-				if _, ok := m.videoFeeds[peer]; ok {
-					peers = append(peers, peer)
-				} else {
-					delete(last, peer)
-				}
-			}
-			slices.Sort(peers)
-			cols, rows = m.renderCols, m.renderRows
-			m.mu.Unlock()
-
-			if len(peers) == 0 {
-				// Nobody remote: self-view keeps the publisher's pane alive.
-				select {
-				case f, ok := <-preview:
-					if !ok {
-						return
-					}
-					m.mu.Lock()
-					m.selfShows++
-					m.mu.Unlock()
-					if cb := m.callbacks(); cb.onSelfFrame != nil {
-						cb.onSelfFrame(asciiFrame(f.RGB, f.Width, f.Height, cols, rows, videoStyle()))
-					}
-				default:
-				}
-				continue
-			}
-			tiles := make([]namedFrame, 0, len(peers))
-			for _, peer := range peers {
-				tiles = append(tiles, namedFrame{peer, last[peer]})
-			}
-			grid := renderGrid(tiles, cols, rows)
-			m.mu.Lock()
-			m.rxOnFlag = true
-			m.remoteShows++
-			m.mu.Unlock()
-			if cb := m.callbacks(); cb.onVideoFrame != nil {
-				cb.onVideoFrame(grid)
-			}
-		}
-	}()
-}
-
-// namedFrame is one tile's worth of picture.
-type namedFrame struct {
-	peer  string
-	frame vidFrame
-}
-
-// renderGrid lays frames out in a stable labeled grid: tilesPerRow =
-// ceil(sqrt(n)), each tile labeled with its peer. Pure (testable).
-func renderGrid(tiles []namedFrame, cols, rows int) []string {
-	n := len(tiles)
-	if n == 0 || cols < 10 || rows < 3 {
-		return nil
-	}
-	perRow := 1
-	for perRow*perRow < n {
-		perRow++
-	}
-	tileCols := cols / perRow
-	if tileCols < 8 {
-		tileCols = 8
-	}
-	bands := (n + perRow - 1) / perRow
-	tileRows := rows / bands
-	if tileRows < 3 {
-		tileRows = 3
-	}
-	style := videoStyle()
-	var out []string
-	for b := 0; b < bands; b++ {
-		var bandTiles [][]string
-		for c := 0; c < perRow; c++ {
-			idx := b*perRow + c
-			if idx >= n {
-				break
-			}
-			label := " " + tiles[idx].peer
-			f := tiles[idx].frame
-			body := asciiFrame(f.RGB, f.Width, f.Height, tileCols, tileRows-1, style)
-			// Pad body to exactly tileRows-1 rows.
-			for len(body) < tileRows-1 {
-				body = append(body, strings.Repeat(" ", tileCols))
-			}
-			if len(body) > tileRows-1 {
-				body = body[:tileRows-1]
-			}
-			tile := append([]string{truncateVisible(label, tileCols)}, body...)
-			bandTiles = append(bandTiles, tile)
-		}
-		for r := 0; r < tileRows; r++ {
-			var sb strings.Builder
-			for _, t := range bandTiles {
-				sb.WriteString(t[r])
-			}
-			out = append(out, sb.String())
-		}
-	}
-	return out
 }
 
 // truncateVisible clips s to width visible cells (ANSI-aware).
@@ -1348,17 +800,6 @@ func truncateVisible(s string, width int) string {
 	return sb.String()
 }
 
-// SetVideoSize snapshots the true pane geometry for the render pump
-// (kills the fixed-width crop: frames render at the pane's real width).
-func (m *mediaManager) SetVideoSize(cols, rows int) {
-	if cols < 10 || rows < 3 {
-		return // degenerate pane: keep the last sane geometry
-	}
-	m.mu.Lock()
-	m.renderCols, m.renderRows = cols, rows
-	m.mu.Unlock()
-}
-
 // ─── Mic TX + audio RX ──────────────────────────────────────────────────────
 
 // startMicTx runs the mic → Opus → fan-out loop while audio is on. Single
@@ -1378,7 +819,7 @@ func (m *mediaManager) startMicTx() {
 		// Announce already went out in ToggleAudio: withdraw it, or
 		// watchers handshake and wait on silence (heal churn).
 		for _, to := range scope {
-			m.sendStop(to, false, true)
+			m.sendStop(to, true)
 		}
 		m.emit("mic unavailable: " + err.Error())
 		return
@@ -1391,7 +832,7 @@ func (m *mediaManager) startMicTx() {
 		m.audioTo = map[string]bool{}
 		m.mu.Unlock()
 		for _, to := range scope {
-			m.sendStop(to, false, true)
+			m.sendStop(to, true)
 		}
 		m.emit("opus init failed: " + err.Error())
 		return
@@ -1730,43 +1171,6 @@ func (m *mediaManager) onRemoteAudio(peer string, pkt audioPacket) {
 
 // ─── Stops ──────────────────────────────────────────────────────────────────
 
-// stopVideoPublish: camera off — media-stop to scope; keep watching others.
-func (m *mediaManager) stopVideoPublish() {
-	m.mu.Lock()
-	scope := sortedKeys(m.videoTo)
-	m.videoTo = map[string]bool{}
-	m.videoOn = false
-	m.mu.Unlock()
-	for _, to := range scope {
-		m.sendStop(to, true, false)
-	}
-	m.stopVideoStream()
-}
-
-// stopVideoStream stops the camera loop; remote RX survives if watching.
-func (m *mediaManager) stopVideoStream() {
-	m.mu.Lock()
-	stop := m.cameraStop
-	srcStop := m.stopCameraSrc
-	m.cameraStop, m.stopCameraSrc = nil, nil
-	m.videoOnFlag = false
-	keepRx := len(m.pubVideo) > 0
-	var rdone chan struct{}
-	if !keepRx {
-		rdone = m.teardownVideoRxLocked()
-	}
-	m.mu.Unlock()
-	if stop != nil {
-		close(stop)
-	}
-	if rdone != nil {
-		close(rdone)
-	}
-	if srcStop != nil {
-		srcStop()
-	}
-}
-
 // stopAudioPublish: mic off — media-stop to scope; keep hearing others.
 func (m *mediaManager) stopAudioPublish() {
 	m.mu.Lock()
@@ -1786,7 +1190,7 @@ func (m *mediaManager) stopAudioPublish() {
 	}
 	m.mu.Unlock()
 	for _, to := range scope {
-		m.sendStop(to, false, true)
+		m.sendStop(to, true)
 	}
 	if stop != nil {
 		close(stop)
@@ -1823,48 +1227,35 @@ func (m *mediaManager) stopAll() {
 	m.mu.Lock()
 	stop := m.healStop
 	m.healStop = nil
-	cameraStop := m.cameraStop
 	audioStop := m.audioStop
 	audioRxStop := m.audioRxStop
-	rdone := m.rxDone
 	stopMic := m.stopMic
 	stopPlay := m.stopPlayFn
-	m.cameraStop, m.stopCameraSrc = nil, nil
 	m.audioStop, m.audioRxStop, m.stopMic, m.stopPlayFn = nil, nil, nil, nil
-	m.videoOn, m.audioOn = false, false
-	m.videoTo, m.audioTo = map[string]bool{}, map[string]bool{}
-	m.pubVideo, m.pubAudio, m.replied = map[string]bool{}, map[string]bool{}, map[string]bool{}
-	m.videoFeeds = map[string]*videoFeed{}
+	m.audioOn = false
+	// Snapshot the scope BEFORE clearing: stop notes must reach everyone
+	// we were publishing to, otherwise peers wait on silence + heal churn.
+	audioScope := sortedKeys(m.audioTo)
+	m.audioTo = map[string]bool{}
+	m.pubAudio, m.replied = map[string]bool{}, map[string]bool{}
 	m.rxDecs = map[string]*opusVoice{}
-	m.rxDone, m.rxPump, m.rxOnFlag = nil, false, false
 	m.peerAnn, m.joinTries, m.lastJoinAt, m.joinVerdict = map[string]mediaAnnouncePayload{}, map[string]int{}, map[string]time.Time{}, map[string]bool{}
 	m.annRxAt, m.lastWantSent = map[string]time.Time{}, map[string]time.Time{}
 	m.healPingAt = map[string]time.Time{}
 	m.started = false
-	scope := sortedKeys(m.videoTo)
-	audioScope := sortedKeys(m.audioTo)
 	m.mu.Unlock()
-	// Best-effort stop notes so watchers do not freeze on our last frame.
-	for _, to := range scope {
-		m.sendStop(to, true, false)
-	}
+	// Best-effort stop notes so listeners do not wait on silence.
 	for _, to := range audioScope {
-		m.sendStop(to, false, true)
+		m.sendStop(to, true)
 	}
 	if stop != nil {
 		close(stop)
-	}
-	if cameraStop != nil {
-		close(cameraStop)
 	}
 	if audioStop != nil {
 		close(audioStop)
 	}
 	if audioRxStop != nil {
 		close(audioRxStop)
-	}
-	if rdone != nil {
-		close(rdone)
 	}
 	m.wg.Wait()
 	if stopMic != nil {
@@ -1921,13 +1312,7 @@ func (m *mediaManager) expectedPeers() []string {
 			out = append(out, p)
 		}
 	}
-	for p := range m.videoTo {
-		add(p)
-	}
 	for p := range m.audioTo {
-		add(p)
-	}
-	for p := range m.pubVideo {
 		add(p)
 	}
 	for p := range m.pubAudio {
@@ -1964,8 +1349,8 @@ func (m *mediaManager) healthCheck() {
 	for _, p := range expected {
 		// Still relevant? (stops and leavers clear the sets before this.)
 		m.mu.Lock()
-		weSend := m.videoTo[p] || m.audioTo[p]
-		theySend := m.pubVideo[p] || m.pubAudio[p]
+		weSend := m.audioTo[p]
+		theySend := m.pubAudio[p]
 		ann, haveAnn := m.peerAnn[p]
 		if !weSend && !theySend {
 			delete(m.peerAnn, p)
@@ -2036,19 +1421,14 @@ func (m *mediaManager) healthCheck() {
 	// lost — or who arrived between ticks — would otherwise wait for the
 	// next join/leave. Cheap: a few small notes per peer per interval.
 	m.mu.Lock()
-	renotify := (m.videoOn || m.audioOn) && time.Since(m.lastRenotify) >= publishRenotify
+	renotify := m.audioOn && time.Since(m.lastRenotify) >= publishRenotify
 	if renotify {
 		m.lastRenotify = now
 	}
 	var scope []string
 	if renotify {
-		for p := range m.videoTo {
-			scope = append(scope, p)
-		}
 		for p := range m.audioTo {
-			if !m.videoTo[p] {
-				scope = append(scope, p)
-			}
+			scope = append(scope, p)
 		}
 	}
 	m.mu.Unlock()
@@ -2079,7 +1459,7 @@ const healProbeWait = 4 * time.Second
 func (m *mediaManager) healPeer(peer string) {
 	m.mu.Lock()
 	t := m.transport
-	weSend := m.videoTo[peer] || m.audioTo[peer]
+	weSend := m.audioTo[peer]
 	ann, haveAnn := m.peerAnn[peer]
 	lastPing := m.healPingAt[peer]
 	m.mu.Unlock()

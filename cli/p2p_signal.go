@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // ─── Signaling client (Vercel-native architecture) ──────────────────────────
@@ -87,6 +88,51 @@ func apiStatusCode(err error) int {
 		return se.Code
 	}
 	return 0
+}
+
+// serverDownMsg is the single alert shown whenever the signaling server is
+// unreachable: every user action that needs the server surfaces exactly
+// this, and the roster tick holds it until heartbeats succeed again.
+const serverDownMsg = "services are down, try again later"
+
+// isServerDown classifies errors that mean the server is gone (crashed,
+// stopped, or network-dead) as opposed to application rejections (4xx,
+// rate limits). Transport errors carry status 0; only gateway 502/503/504
+// count as down among real HTTP statuses.
+func isServerDown(err error) bool {
+	if err == nil {
+		return false
+	}
+	if code := apiStatusCode(err); code != 0 {
+		return code == 502 || code == 503 || code == 504
+	}
+	s := strings.ToLower(err.Error())
+	// Mesh/WebRTC path failures (ICE, offer/answer, DTLS, STUN) are local
+	// connectivity problems, never proof the server is down — a symmetric
+	// NAT must not raise the server banner.
+	for _, sub := range []string{
+		"ice", "offer", "answer", "dtls", "stun", "turn", "webrtc",
+		"safety code", "handshake",
+	} {
+		if strings.Contains(s, sub) {
+			return false
+		}
+	}
+	for _, sub := range []string{
+		"connection refused",
+		"connection reset",
+		"no such host",
+		"network is unreachable",
+		"connection aborted",
+		"timeout",
+		"deadline exceeded",
+		"unexpected eof",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // createRoom mints a session code. password empty = open room.

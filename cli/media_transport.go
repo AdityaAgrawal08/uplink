@@ -140,7 +140,6 @@ type mediaTransport struct {
 
 type mediaCallbacks struct {
 	onAudio  func(peer string, pkt audioPacket)
-	onVideo  func(peer string, frag videoFrag)
 	onKeyReq func(peer string)
 	onReady  func(peer string, safetyCode string)
 	onLost   func(peer string)

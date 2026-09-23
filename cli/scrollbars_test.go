@@ -8,22 +8,15 @@ import (
 )
 
 // geomScreen builds a screen with an overflowing chat list at 140x40.
-// Video frames still flow (they render in the bottom Live Cameras strip).
 func geomScreen(t *testing.T) (*chatScreen, layout) {
 	t.Helper()
 	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena", "mallory", "nina", "olga", "peggy", "sybil", "trent", "uma"}
 	users := append([]string{"bob"}, names...)
 	c := newFilterScreen("bob", "", users...)
 	c.vp = *viewportPtr(60, 20)
-	c.call = &mediaManager{videoOn: true}
-	lines := make([]string, 0, videoPaneDefaultRows)
-	for i := 0; i < videoPaneDefaultRows; i++ {
-		lines = append(lines, "row")
-	}
+	c.call = &mediaManager{audioOn: true}
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
 	sc := m.(chatScreen)
-	m2, _ := sc.Update(netVideoMsg{lines: lines})
-	sc = m2.(chatScreen)
 	return &sc, sc.layoutFor()
 }
 
@@ -42,13 +35,7 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	c, l := geomScreen(t)
 	view := c.View()
 	rows := strings.Split(view, "\n")
-	chatG, videoG, rosterG := c.scrollBarGeoms(l)
-
-	// No sidebar video box: feeds live in the bottom strip, so the video
-	// geom stays zero.
-	if videoG != (barGeom{}) {
-		t.Fatalf("sidebar video geom must be zero, got %+v", videoG)
-	}
+	chatG, rosterG := c.scrollBarGeoms(l)
 
 	// Chat bar: inside the transcript border, last interior column.
 	// Interior top = frame + top bar + room header + call card + border;
@@ -60,7 +47,7 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	if l.showHeader {
 		headOff = 1
 	}
-	arrowRow := frameOff + headOff + l.headRows + l.callRows + 1
+	arrowRow := frameOff + headOff + l.headRows + 1
 	if got := colAt(rows[arrowRow], chatG.x); got != "│" && got != "▲" && got != "█" {
 		t.Fatalf("chat bar column mismatch: got %q at x=%d,y=%d", got, chatG.x, arrowRow)
 	}
@@ -109,7 +96,7 @@ func TestIndependentScrollPanes(t *testing.T) {
 
 	// Drag the chat scrollbar thumb: chat moves, sidebar stays.
 	chatG := c.thumbFor(secChat, func() barGeom {
-		g, _, _ := c.scrollBarGeoms(l)
+		g, _ := c.scrollBarGeoms(l)
 		return g
 	}())
 	down := 0

@@ -165,12 +165,8 @@ type layout struct {
 	rosterX         int  // leftmost column of the sidebar (LEFT column)
 	rosterY0        int  // first terminal row inside the sidebar that holds content
 	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
-	videoRows       int  // legacy sidebar video box (0: feeds live in panel/strip)
 	headRows        int  // room-header rows above the transcript (0/1/2 by space)
-	callRows        int  // live-call status card rows (0 when no call)
 	hintRows        int  // composer key-hints row (0 when collapsed)
-	camRows         int  // bottom Live Cameras strip rows (0 when panel/none)
-	vidPanelW       int  // right video panel outer width (0 = off/strip mode)
 	statusRows      int  // extra rows consumed by the status line (0 or 1)
 	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
 	showHeader      bool // staged degradation: hide banner on tiny heights
@@ -183,7 +179,7 @@ type layout struct {
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
-	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.camRows + l.callRows + l.hintRows
+	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.hintRows
 	if l.boxedTranscript {
 		h += transcriptBorder
 	}
@@ -356,6 +352,19 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// tryEnqueue inserts into the UI event queue without blocking: true when
+// the main loop will see the message. Chat acks ride on acceptance — an
+// acked-but-dropped message would graduate the sender's backstop and
+// vanish forever.
+func tryEnqueue(ch chan tea.Msg, m tea.Msg) bool {
+	select {
+	case ch <- m:
+		return true
+	default:
+		return false
+	}
+}
+
 // truncateStringPlain hard-cuts a string to n cells (runes), no styling.
 func truncateStringPlain(s string, n int) string {
 	if n <= 0 {
@@ -372,8 +381,9 @@ func truncateStringPlain(s string, n int) string {
 
 // The engine pushes network events from its own goroutines; they arrive here
 // through netCh (see drainNetCmd) because bubbletea Update must stay on the
-// main loop. Buffer is generous; drops are safe (inbox redelivers unacked,
-// P2P is already reliably delivered — a dropped paint is just a missed row).
+// main loop. Buffer is generous; a dropped paint is only a missed row when
+// the sender still retries — so chat acks ride on successful enqueue (see
+// onChat), never before it. P2P is otherwise reliably delivered.
 type netChatMsg struct{ chat engineChat }
 type netFileMsg struct{ file engineFile }
 type netFileErrMsg struct {
@@ -412,6 +422,9 @@ type roleDoneMsg struct {
 // immediate repaint on ANY change. Shared by the 2s render tick and the
 // engine's roster-changed push.
 func (c *chatScreen) syncRosterFromEngine() {
+	if c.eng == nil {
+		return // bare/test screens carry no engine
+	}
 	roster := c.eng.peers()
 	users := onlineNames(roster, c.me)
 	changed := len(users) != len(c.users)
@@ -472,25 +485,6 @@ type netDeliveredMsg struct{ msgId string }
 // Media UI messages: publish status lines + VU level.
 type mediaInfoMsg struct{ info string }
 type callLevelMsg struct{ level float64 }
-
-// netVideoMsg carries one decoded ASCII video frame for the drawer pane.
-type netVideoMsg struct{ lines []string }
-
-// netSelfVideoMsg carries one local-camera preview frame.
-type netSelfVideoMsg struct{ lines []string }
-
-// paneContent paints ONE feed: the remote publisher's video. The local
-// self-view shows only when nobody else is publishing (it never stacks
-// under a remote feed — two pictures in one small pane read as a glitch).
-func (c *chatScreen) paneContent() []string {
-	if len(c.videoLines) > 0 {
-		return append([]string(nil), c.videoLines...)
-	}
-	if len(c.selfLines) == 0 {
-		return nil
-	}
-	return append([]string{tuiPaletteHintStyle.Render("— you —")}, c.selfLines...)
-}
 
 // netIdleMsg keeps the drain pump alive: drainNetCmd always leads to either
 // a network event or one of these, and both handlers re-arm the pump, so
@@ -558,13 +552,7 @@ type chatScreen struct {
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
 	call         *mediaManager
 	callLevel    float64 // mic loudness for the status meter
-	videoLines   []string
-	selfLines    []string
 	callStart    time.Time // latched while a call is live (timer source)
-	cameraOffset int
-	vidCols      int // last tile geometry pushed via SetVideoSize (change-gated)
-	vidRows      int
-	videoVp      viewport.Model // scrollable video pane (wheel + scrollbar)
 	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
 	vp           viewport.Model
 	drag         barDrag // scrollbar drag state (any of the three panes)
@@ -584,7 +572,6 @@ type scrollSection int
 
 const (
 	secChat scrollSection = iota
-	secVideo
 	secRoster
 )
 
@@ -687,7 +674,11 @@ const maxHistory = 5000
 // without limit. Dropped file cards stay reachable in the files drawer.
 const maxLocalLines = 500
 
+// maxOutbox bounds queued unsent lines while a send is in flight.
+const maxOutbox = 100
+
 func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
+	leftSent.Store(false) // fresh screen, fresh leave guard (tests reuse processes)
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
 	ti.Focus()
@@ -695,34 +686,30 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
-	videoVp := viewport.New(40, 10)
 	netCh := make(chan tea.Msg, 256)
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	// Engine callbacks only ever push into netCh (never touch the screen:
 	// they run on network goroutines). The drain command below feeds them
 	// into Update on the main loop.
 	push := func(m tea.Msg) {
-		select {
-		case netCh <- m:
-		default:
-		}
+		tryEnqueue(netCh, m)
 	}
 	var eng *engine
 	callMgr := newMediaManager(me, id,
 		func(to, noteType, payload string) error { return sig.signalSend(to, noteType, payload) },
 		nil, // roster bound below once eng exists
 		mediaUICallbacks{
-			onInfo:       func(info string) { push(mediaInfoMsg{info: info}) },
-			onLevel:      func(level float64) { push(callLevelMsg{level: level}) },
-			onVideoFrame: func(lines []string) { push(netVideoMsg{lines: lines}) },
-			onSelfFrame:  func(lines []string) { push(netSelfVideoMsg{lines: lines}) },
+			onInfo:  func(info string) { push(mediaInfoMsg{info: info}) },
+			onLevel: func(level float64) { push(callLevelMsg{level: level}) },
 		})
 	eng = newEngine(me, id, sig, engineCallbacks{
 		onChat: func(c engineChat) {
-			// Ack at receipt, not at paint: a dropped queue slot must not
-			// silence the sender's backstop (the paint path still dedups).
-			_ = eng.sendAck(c.From, c.MsgId)
-			push(netChatMsg{chat: c})
+			// Ack only what the queue accepted: a dropped slot stays
+			// unacked so the sender's retry redelivers it (paint dedups
+			// via seenMsg — at-least-once in, exactly-once shown).
+			if tryEnqueue(netCh, netChatMsg{chat: c}) {
+				_ = eng.sendAck(c.From, c.MsgId)
+			}
 		},
 		onFile:       func(f engineFile) { push(netFileMsg{file: f}) },
 		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
@@ -742,7 +729,6 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		key:         key,
 		me:          me,
 		vp:          vp,
-		videoVp:     videoVp,
 		input:       ti,
 		netCh:       netCh,
 		rendered:    map[int]bool{},
@@ -1275,7 +1261,13 @@ func (c chatScreen) statusView() string {
 	if c.status == "" {
 		return ""
 	}
-	return tuiErrStyle.Render(c.status)
+	// Width-clamped: statuses now carry command output (/help lists) and
+	// must never break the exact-width frame contract.
+	w := c.width
+	if c.layoutFor().frameOn {
+		w -= frameChrome
+	}
+	return truncateByWidth(tuiErrStyle.Render(c.status), maxInt(w, 1))
 }
 
 // circledNum maps 1..50 onto Unicode circled digits (①…⑳ ㉑…㉟ ㊱…㊿).
@@ -1321,7 +1313,7 @@ func searchHeightFor(headRows, inner int) int {
 // Mirrors View()'s assembly exactly — paint, scrollbar, and viewport sync
 // share it so the list never over/under-fills its box.
 func (c chatScreen) sidebarFill(l layout) int {
-	h := l.headRows + l.callRows
+	h := l.headRows
 	if l.vpHeight > 0 {
 		h += l.vpHeight
 		if l.boxedTranscript {
@@ -1540,23 +1532,15 @@ func (c chatScreen) rosterRow(u string, inner int, trunc func(string) string) st
 	}
 	line := dot + " " + name
 
-	// Media badges: publishing state at a glance — my row shows what
-	// I send (▶ camera, ♪ mic), others' rows show what they share.
+	// Media badges: publishing state at a glance — my row shows the mic
+	// when live (♪), others' rows show what they share.
 	if c.call != nil {
 		mark := ""
 		if u == c.me {
-			if c.call.VideoOn() {
-				mark += " ▶"
-			}
 			if c.call.AudioOn() {
 				mark += " ♪"
 			}
 		} else {
-			for _, p := range c.call.VideoPublishers() {
-				if p == u {
-					mark += " ▶"
-				}
-			}
 			for _, p := range c.call.AudioPublishers() {
 				if p == u {
 					mark += " ♪"
@@ -1685,7 +1669,7 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 }
 
-// ---- media publishing (/video + /audio) --------------------------------------
+// ---- media publishing (/audio voice calls) ------------------------------------
 
 // currentScope resolves "wherever the user is": their DM peer, or the
 // room's online members.
@@ -1700,36 +1684,21 @@ func (c *chatScreen) currentScope() []string {
 	return c.call.scopeFor(c.targetUser, room)
 }
 
-// toggleVideo runs the /video command: publish/stop camera to the scope.
-func (c *chatScreen) toggleVideo() tea.Cmd {
-	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
-		return nil
-	}
-	if err := c.call.ToggleVideo(c.currentScope()); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video failed: "+err.Error()))
-	}
-	return nil
-}
-
 // toggleAudio runs the /audio command: publish/stop mic to the scope.
 func (c *chatScreen) toggleAudio() tea.Cmd {
 	if c.call == nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* media unavailable here"))
+		c.status = "media unavailable here"
 		return nil
 	}
 	if err := c.call.ToggleAudio(c.currentScope()); err != nil {
-		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio failed: "+err.Error()))
+		c.status = "audio failed: " + err.Error()
 	}
+	c.rebuildView()
 	return nil
 }
 
-// callCardRows is the live-call status card height: sender line + two
-// green-bar rows, pinned above the transcript while a call runs.
-const callCardRows = 3
-
 // callActive reports whether this client is in a call right now:
-// publishing camera/mic or receiving a remote feed.
+// publishing mic or receiving a remote feed.
 func (c *chatScreen) callActive() bool {
 	return c.call != nil && c.call.MediaActive()
 }
@@ -1757,7 +1726,7 @@ func (c *chatScreen) callElapsed() string {
 }
 
 // callParties counts distinct call participants: self (when live) plus all
-// video/audio publishers.
+// audio publishers.
 func (c *chatScreen) callParties() int {
 	seen := map[string]bool{}
 	n := 0
@@ -1766,12 +1735,6 @@ func (c *chatScreen) callParties() int {
 		n = 1
 	}
 	if c.call != nil {
-		for _, p := range c.call.VideoPublishers() {
-			if !seen[p] {
-				seen[p] = true
-				n++
-			}
-		}
 		for _, p := range c.call.AudioPublishers() {
 			if !seen[p] {
 				seen[p] = true
@@ -1782,64 +1745,18 @@ func (c *chatScreen) callParties() int {
 	return n
 }
 
-// peerInCall reports whether a peer has a live video/audio feed right now,
+// peerInCall reports whether a peer has a live audio feed right now,
 // or is the current target of our own publishing.
 func (c *chatScreen) peerInCall(peer string) bool {
 	if peer == "" || c.call == nil {
 		return false
-	}
-	for _, p := range c.call.VideoPublishers() {
-		if p == peer {
-			return true
-		}
 	}
 	for _, p := range c.call.AudioPublishers() {
 		if p == peer {
 			return true
 		}
 	}
-	return peer == c.targetUser && (c.call.VideoOn() || c.call.AudioOn())
-}
-
-// pressCallButton runs one video control-bank button: M toggles the mic,
-// V toggles the camera, X hangs up (stops our publishing); S/P have no
-// screen-share or people panel behind them, so they say so honestly.
-func (c *chatScreen) pressCallButton(id string) tea.Cmd {
-	switch id {
-	case "M":
-		return c.toggleAudio()
-	case "V":
-		return c.toggleVideo()
-	case "X":
-		return c.hangupCall()
-	case "S":
-		c.status = "screen sharing is not supported in this build"
-	case "P":
-		c.status = "the chat list on the left is the people panel"
-	}
-	return nil
-}
-
-// hangupCall leaves the call: stops our camera/mic publishing (composes the
-// same toggles the buttons and /video + /audio run — no backend change).
-// Watching ends when peers reap the withdrawn feeds.
-func (c *chatScreen) hangupCall() tea.Cmd {
-	if c.call == nil {
-		return nil
-	}
-	var cmds []tea.Cmd
-	scope := c.currentScope()
-	if c.call.VideoOn() {
-		if err := c.call.ToggleVideo(scope); err != nil {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* video stop failed: "+err.Error()))
-		}
-	}
-	if c.call.AudioOn() {
-		if err := c.call.ToggleAudio(scope); err != nil {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* audio stop failed: "+err.Error()))
-		}
-	}
-	return tea.Batch(cmds...)
+	return peer == c.targetUser && c.call.AudioOn()
 }
 
 // mediaStatus renders the header chips for active media ("" when idle).
@@ -1848,12 +1765,6 @@ func (c *chatScreen) mediaStatus() string {
 		return ""
 	}
 	var parts []string
-	if scope := c.call.VideoScope(); scope != "" {
-		parts = append(parts, "● VID → "+scope)
-	}
-	if c.call.Watching() {
-		parts = append(parts, "● VID ← "+strings.Join(c.call.VideoPublishers(), ","))
-	}
 	if scope := c.call.AudioScope(); scope != "" {
 		parts = append(parts, "● MIC → "+scope)
 	}
@@ -1931,6 +1842,12 @@ func (c *chatScreen) submitLine(text string) tea.Cmd {
 		}
 	}
 	if c.pending != nil {
+		// Cap the queue: offline/slow peers plus fast typing must not
+		// grow memory without bound. Oldest queued line drops first.
+		if len(c.outbox) >= maxOutbox {
+			c.outbox = c.outbox[1:]
+			c.status = "outbox full — oldest queued message dropped"
+		}
 		c.outbox = append(c.outbox, queuedLine{conv: c.activeConv(), text: text})
 		return nil
 	}
@@ -2002,29 +1919,14 @@ func (c *chatScreen) syncViewport() {
 	if l.vpHeight > 0 && vpW > 10 {
 		vpW--
 	}
-	// Tiles own the render size now (the retired sidebar pane used to):
-	// push the TRUE painted tile geometry (panel or strip) into the manager
-	// so frames render at the tile's real size with full truecolor.
-	// Change-gated: re-rendering the pump on every keystroke would churn.
-	if c.call != nil {
-		inner, rows := c.videoTileGeom(l, c.camFeeds())
-		if inner > 0 && rows > 0 {
-			if inner != c.vidCols || rows != c.vidRows {
-				c.call.SetVideoSize(inner, rows)
-				c.vidCols, c.vidRows = inner, rows
-			}
-		} else {
-			c.vidCols, c.vidRows = 0, 0
-		}
-	} else {
-		c.vidCols, c.vidRows = 0, 0
-	}
 	// Chat list gets its own viewport (scrollable like the transcript);
 	// the search box lives outside the viewport.
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
 		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
-		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()-1), 1)
+		// Same inner width the painter uses (rosterBody): a divergent value
+		// desyncs the search-box row count and misroutes roster clicks.
+		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()), 1)
 	}
 	atBottom := c.vp.AtBottom()
 	offset := c.vp.YOffset
@@ -2087,6 +1989,16 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// ONLY in the Online sidebar — no join/leave lines in the
 		// transcript by product direction.
 		c.syncRosterFromEngine()
+		// Server watchdog: while heartbeats fail with the server gone,
+		// hold the down alert on the status line; clear it on recovery.
+		// Guarded: bare test screens carry no engine.
+		if c.eng != nil {
+			if isServerDown(c.eng.beatErr()) {
+				c.status = serverDownMsg
+			} else if c.status == serverDownMsg {
+				c.status = ""
+			}
+		}
 		// Delivery-receipt sweep: warn on messages unacked past
 		// unconfirmedAfter; forget entries past receiptExpiry (the engine's
 		// own retries are long over by then — most likely a lost ack frame,
@@ -2123,10 +2035,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case kickDoneMsg:
 		if msg.err != nil {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* kick failed: "+msg.err.Error()))
+			if isServerDown(msg.err) {
+				c.status = serverDownMsg
+			} else {
+				c.status = "kick failed: " + msg.err.Error()
+			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* kicked "+msg.target))
+			c.status = "kicked " + msg.target
 			c.syncRosterFromEngine()
 		}
 		cmds = append(cmds, c.drainNetCmd())
@@ -2137,10 +2053,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			what = "is no longer an admin"
 		}
 		if msg.err != nil {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("* admin change failed: "+msg.err.Error()))
+			if !isServerDown(msg.err) {
+				c.status = "admin change failed: " + msg.err.Error()
+			} else {
+				c.status = serverDownMsg
+			}
 		} else {
 			c.eng.applyPushedRoster(msg.roster, msg.epoch)
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.target+" "+what))
+			c.status = msg.target + " " + what
 			c.syncRosterFromEngine()
 		}
 		cmds = append(cmds, c.drainNetCmd())
@@ -2240,8 +2160,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case mediaInfoMsg:
+		// Media chatter never reaches the transcript: the latest event
+		// parks on the status line, conversation stays clean.
 		if msg.info != "" {
-			c.appendLocal(c.activeConv(), tuiSystemStyle.Render("* "+msg.info))
+			c.status = msg.info
 		}
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
@@ -2250,22 +2172,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.callLevel = msg.level
 		cmds = append(cmds, c.drainNetCmd())
 
-	case netVideoMsg:
-		c.videoLines = msg.lines
-		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
-		c.syncViewport()
-		c.rebuildView()
-		cmds = append(cmds, c.drainNetCmd())
-
-	case netSelfVideoMsg:
-		c.selfLines = msg.lines
-		c.videoVp.SetContent(strings.Join(c.paneContent(), "\n"))
-		c.syncViewport()
-		c.rebuildView()
-		cmds = append(cmds, c.drainNetCmd())
-
 	case netFileErrMsg:
-		c.appendLocal(c.activeConv(), tuiErrStyle.Render(fmt.Sprintf("✗ file from %s failed: %s", msg.from, msg.reason)))
+		c.status = fmt.Sprintf("file from %s failed: %s", msg.from, msg.reason)
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netReadyMsg:
@@ -2280,7 +2188,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netErrMsg:
-		c.appendLocal(c.activeConv(), tuiErrStyle.Render("* "+msg.err.Error()))
+		// Engine errors surface on the status line, never as chat rows.
+		// Server outages hold the down alert; everything else parks once.
+		if isServerDown(msg.err) {
+			c.status = serverDownMsg
+		} else {
+			c.status = msg.err.Error()
+		}
+		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netIdleMsg:
@@ -2448,10 +2363,15 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiSystemStyle.Render("* Session has ended")}
 		}
 	case msg.err != nil:
-		if echoIdx >= 0 {
+		if isServerDown(msg.err) {
+			c.status = serverDownMsg
+			if echoIdx >= 0 {
+				c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ " + serverDownMsg)}
+			}
+		} else if echoIdx >= 0 {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ send failed: " + msg.err.Error())}
 		} else {
-			c.appendLocal(c.activeConv(), tuiErrStyle.Render("✗ send failed: "+msg.err.Error()))
+			c.status = "send failed: " + msg.err.Error()
 		}
 	default:
 		to := ""
@@ -2495,7 +2415,13 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	c.rebuildView()
 
 	if msg.code == 410 {
-		return nil // room ended; nothing further to promote
+		// Room ended: fail everything still queued so lines never strand
+		// invisibly in the outbox.
+		if len(c.outbox) > 0 {
+			c.status = "Session has ended"
+		}
+		c.outbox = nil
+		return nil
 	}
 	if n := len(c.outbox); n > 0 {
 		next := c.outbox[0]
@@ -2598,7 +2524,7 @@ func transcriptX0(l layout) int {
 
 // scrollBarGeoms is the paint-verified track geometry for the scrollbars
 // (constants validated against View() by TestScrollbarDrag).
-func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
+func (c chatScreen) scrollBarGeoms(l layout) (chat, roster barGeom) {
 	frameOff := 0
 	if l.frameOn {
 		frameOff = 1
@@ -2611,17 +2537,8 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
 	// + border; the track starts one row below the up-arrow.
 	chat = barGeom{
 		x:       transcriptX0(l) + l.vpWidth,
-		trackY0: frameOff + headOff + l.headRows + l.callRows + 2,
+		trackY0: frameOff + headOff + l.headRows + 2,
 		trackH:  maxInt(l.vpHeight-2, 0),
-	}
-	// Sidebar video box is gone (feeds live in the bottom strip): the
-	// video geom stays zero so wheel/drag routing skips it.
-	if l.videoRows > 0 {
-		video = barGeom{
-			x:       l.rosterX + l.sidebarWidth - 2,
-			trackY0: l.rosterY0 - l.videoRows + 1,
-			trackH:  maxInt(l.videoRows-4, 0),
-		}
 	}
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
@@ -2631,7 +2548,7 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, video, roster barGeom) {
 			trackH:  maxInt(fill-3, 0),
 		}
 	}
-	return chat, video, roster
+	return chat, roster
 }
 
 // thumbFor computes the thumb position for one pane's scrollbar.
@@ -2639,8 +2556,6 @@ func (c chatScreen) thumbFor(sec scrollSection, g barGeom) barGeom {
 	switch sec {
 	case secChat:
 		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.vp.TotalLineCount(), c.vp.Height, c.vp.YOffset, g.trackH+2)
-	case secVideo:
-		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.videoVp.TotalLineCount(), c.videoVp.Height, c.videoVp.YOffset, g.trackH+2)
 	case secRoster:
 		g.thumbTop, g.thumbH, _, _ = thumbGeom(c.rosterVp.TotalLineCount(), c.rosterVp.Height, c.rosterVp.YOffset, g.trackH+2)
 	}
@@ -2702,31 +2617,16 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			}
 			return nil
 		}
-		// Video call controls: M mic, V camera, X hang up (wired); S/P are
-		// dimmed (unsupported here) and explain themselves on click.
-		if l.vidPanelW > 0 {
-			pg := videoPanelGeom(c, l, c.camFeeds())
-			if msg.X >= pg.fsX0 && msg.X < pg.fsX1 && msg.Y == pg.fsY {
-				c.status = "the video panel follows your terminal: fullscreen the window for a bigger picture"
-				return nil
-			}
-			for _, b := range pg.btns {
-				if msg.X >= b.x0 && msg.X < b.x1 && msg.Y >= b.y0 && msg.Y < b.y1 {
-					return c.pressCallButton(b.id)
-				}
-			}
-		}
 		if !l.sidebarOn {
 			break
 		}
-		chatG, videoG, rosterG := c.scrollBarGeoms(l)
+		chatG, rosterG := c.scrollBarGeoms(l)
 		chatG = c.thumbFor(secChat, chatG)
-		videoG = c.thumbFor(secVideo, videoG)
 		rosterG = c.thumbFor(secRoster, rosterG)
 		for _, g := range []struct {
 			sec scrollSection
 			b   barGeom
-		}{{secChat, chatG}, {secVideo, videoG}, {secRoster, rosterG}} {
+		}{{secChat, chatG}, {secRoster, rosterG}} {
 			if g.b.trackH <= 0 {
 				continue
 			}
@@ -2768,13 +2668,10 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 
 	case tea.MouseActionMotion:
 		if c.drag.active {
-			_, videoG, rosterG := c.scrollBarGeoms(l)
-			chatG, _, _ := c.scrollBarGeoms(l)
+			chatG, rosterG := c.scrollBarGeoms(l)
 			switch c.drag.sec {
 			case secChat:
 				c.dragTo(secChat, msg.Y, c.thumbFor(secChat, chatG), l)
-			case secVideo:
-				c.dragTo(secVideo, msg.Y, c.thumbFor(secVideo, videoG), l)
 			case secRoster:
 				c.dragTo(secRoster, msg.Y, c.thumbFor(secRoster, rosterG), l)
 			}
@@ -2805,34 +2702,6 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		up := msg.Type == tea.MouseWheelUp
-		frameOffset, headerOffset := 0, 0
-		if l.frameOn {
-			frameOffset = 1
-		}
-		if l.showHeader {
-			headerOffset = headerHeight
-		}
-		cameraY := frameOffset + headerOffset + l.headRows + l.callRows + l.vpHeight
-		if l.boxedTranscript && l.vpHeight > 0 {
-			cameraY += transcriptBorder
-		} else if (l.headRows > 0 || l.callRows > 0) && l.vpHeight == 0 {
-			// body holds header/card only; no transcript border
-		}
-		if l.camRows > 0 && msg.Y >= cameraY && msg.Y < cameraY+l.camRows {
-			// Wheels over an overflowing strip pan it horizontally;
-			// otherwise they fall through to the transcript.
-			width := camStripContentW(c.width, l.frameOn)
-			count := len(c.camFeeds())
-			inner := max(tileMinFor(width), camTileInner(width, count))
-			if maxOffset := max(0, count*(inner+3)-1-width); maxOffset > 0 {
-				step := wheelStepFor(l.camRows) * 4
-				if up {
-					step = -step
-				}
-				c.cameraOffset = min(maxOffset, max(0, c.cameraOffset+step))
-				return nil
-			}
-		}
 		// Route by pane: sidebar list vs transcript — each scrolls only
 		// itself with steps proportional to its own height.
 		if l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth &&
@@ -2875,9 +2744,6 @@ func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
 	case secChat:
 		vp = &c.vp
 		total = c.vp.TotalLineCount()
-	case secVideo:
-		vp = &c.videoVp
-		total = c.videoVp.TotalLineCount()
 	case secRoster:
 		vp = &c.rosterVp
 		total = c.rosterVp.TotalLineCount()
@@ -2945,15 +2811,10 @@ func (c chatScreen) View() string {
 	} else if l.headRows >= 2 {
 		roomHead = c.roomHeaderView(transcriptOuter)
 	}
-	// Center column: room header, live-call card, transcript box.
-	parts := make([]string, 0, 3)
+	// Center column: room header, transcript box.
+	parts := make([]string, 0, 2)
 	if roomHead != "" {
 		parts = append(parts, roomHead)
-	}
-	callCard := ""
-	if l.callRows > 0 {
-		callCard = c.callCardView(transcriptOuter)
-		parts = append(parts, callCard)
 	}
 	if transcript != "" {
 		parts = append(parts, transcript)
@@ -3024,28 +2885,12 @@ func (c chatScreen) View() string {
 		right += "\n" + inputCore
 		body = lipgloss.JoinHorizontal(lipgloss.Top, col, " ", right)
 	}
-	// RIGHT video panel: call header, tile grid, controls, note. Same body
-	// row, same height — the three columns share top and bottom edges.
-	if l.vidPanelW > 0 && body != "" {
-		feeds := c.camFeeds()
-		pg := videoPanelGeom(&c, l, feeds)
-		body = lipgloss.JoinHorizontal(lipgloss.Top, body, " ", c.rightPanelView(l, pg, feeds))
-	}
 	rows := make([]string, 0, 10)
 	if l.showHeader {
 		rows = append(rows, c.headerView())
 	}
 	if body != "" {
 		rows = append(rows, body)
-	}
-	// Bottom Live Cameras strip (full content width, budgeted in layout;
-	// only when the right panel is off).
-	if l.camRows > 0 {
-		w := c.width
-		if l.frameOn {
-			w -= frameChrome
-		}
-		rows = append(rows, c.camerasStripView(maxInt(w, 0)))
 	}
 	// Hints, drawer, and composer ride the right stack beside the full-height
 	// sidebar when it is on; otherwise they paint below, indented past it.

@@ -829,3 +829,224 @@ func errTestSinkNew() error {
 type errTestSinkVal struct{}
 
 func (errTestSinkVal) Error() string { return "sink" }
+
+// ---------------------------------------------------------------------------
+// Server-down alert + silent media chatter
+// ---------------------------------------------------------------------------
+
+func refusedErr() error {
+	return fmt.Errorf(`Post "http://127.0.0.1:1/api/v1/session/x/heartbeat": dial tcp 127.0.0.1:1: connection refused`)
+}
+
+func TestMediaInfoStaysOutOfTranscript(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(mediaInfoMsg{info: "alice is sharing video"})
+	sc := m.(chatScreen)
+	if len(sc.localLines) != 0 {
+		t.Fatalf("media chatter must not reach the transcript: %+v", sc.localLines)
+	}
+	if sc.status != "alice is sharing video" {
+		t.Fatalf("media event must park on the status line, got %q", sc.status)
+	}
+	for _, ln := range sc.lines {
+		if strings.Contains(ln, "sharing") {
+			t.Fatalf("painted rows must not carry media chatter: %q", ln)
+		}
+	}
+}
+
+func TestServerDownAlertAcrossActions(t *testing.T) {
+	// Idle watchdog: a dead beat holds the alert on the tick.
+	srv := httptest.NewServer(newFakeSignalServer())
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "alice")
+	srv.Close()
+	c.eng.beatOnce()
+	if !isServerDown(c.eng.beatErr()) {
+		t.Fatal("killed server must record a down beat error")
+	}
+	m, _ := c.Update(rosterTickMsg{})
+	sc := m.(chatScreen)
+	if sc.status != serverDownMsg {
+		t.Fatalf("tick must hold the down alert, got %q", sc.status)
+	}
+	// Recovery clears it.
+	sc.eng.mu.Lock()
+	sc.eng.lastBeatErr = nil
+	sc.eng.mu.Unlock()
+	m2, _ := sc.Update(rosterTickMsg{})
+	if m2.(chatScreen).status != "" {
+		t.Fatalf("recovery must clear the alert, got %q", m2.(chatScreen).status)
+	}
+	// Sending while down alerts on the echo and the status line.
+	c2 := newFilterScreen("bob", "")
+	c2.vp = *viewportPtr(40, 10)
+	c2.submitLine("hello?")
+	idx := c2.pending.lineIdx
+	c2.settleSend(sendDoneMsg{text: "hello?", err: refusedErr()})
+	if c2.status != serverDownMsg {
+		t.Fatalf("failed send must raise the alert, got %q", c2.status)
+	}
+	if !strings.Contains(c2.lines[idx], serverDownMsg) {
+		t.Fatalf("failed echo must carry the alert, got %q", c2.lines[idx])
+	}
+	// Engine errors from a dead server alert instead of chatting.
+	c3 := newFilterScreen("bob", "")
+	c3.vp = *viewportPtr(40, 10)
+	m3, _ := c3.Update(netErrMsg{err: refusedErr()})
+	sc3 := m3.(chatScreen)
+	if sc3.status != serverDownMsg {
+		t.Fatalf("dead-server engine error must alert, got %q", sc3.status)
+	}
+	if len(sc3.localLines) != 0 {
+		t.Fatalf("dead-server engine error must not chat: %+v", sc3.localLines)
+	}
+	// Moderation failures while down alert too.
+	c4 := newFilterScreen("bob", "")
+	c4.vp = *viewportPtr(40, 10)
+	m4, _ := c4.Update(kickDoneMsg{target: "mallory", err: refusedErr()})
+	if m4.(chatScreen).status != serverDownMsg {
+		t.Fatal("dead-server kick failure must alert")
+	}
+}
+
+func TestRosterTickBareScreen(t *testing.T) {
+	// Bare screens (no engine) must survive the render tick: sync is a
+	// no-op, and the watchdog must not fire without a beat source.
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(rosterTickMsg{})
+	if m.(chatScreen).status != "" {
+		t.Fatalf("bare tick must leave status empty, got %q", m.(chatScreen).status)
+	}
+}
+
+func TestTryEnqueue(t *testing.T) {
+	full := make(chan tea.Msg, 1)
+	full <- netIdleMsg{}
+	if tryEnqueue(full, netIdleMsg{}) {
+		t.Fatal("full queue must reject")
+	}
+	empty := make(chan tea.Msg, 1)
+	if !tryEnqueue(empty, netIdleMsg{}) {
+		t.Fatal("empty queue must accept")
+	}
+	if <-empty == nil {
+		t.Fatal("accepted message must arrive")
+	}
+}
+
+func TestSettle410DrainsOutbox(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.submitLine("first")
+	c.submitLine("second")
+	c.submitLine("third")
+	if len(c.outbox) != 2 {
+		t.Fatalf("outbox = %d; want 2 queued", len(c.outbox))
+	}
+	c.settleSend(sendDoneMsg{text: "first", code: 410})
+	if c.pending != nil {
+		t.Fatal("pending must clear on 410")
+	}
+	if len(c.outbox) != 0 {
+		t.Fatalf("410 must drain the outbox, left %d", len(c.outbox))
+	}
+	if c.status != "Session has ended" {
+		t.Fatalf("410 drain must hold the status, got %q", c.status)
+	}
+	// Only the in-flight echo keeps its in-place annotation (like 429);
+	// queued lines vanish without painting new rows.
+	n := 0
+	for _, ln := range c.lines {
+		if strings.Contains(ln, "Session has ended") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("only the echo row may carry the annotation, got %d", n)
+	}
+}
+
+func TestOutboxCap(t *testing.T) {
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	c.submitLine("in-flight")
+	for i := 0; i < maxOutbox+5; i++ {
+		c.submitLine("queued")
+	}
+	if len(c.outbox) > maxOutbox {
+		t.Fatalf("outbox = %d exceeds cap %d", len(c.outbox), maxOutbox)
+	}
+	if c.status != "outbox full — oldest queued message dropped" {
+		t.Fatalf("overflow must warn on the status line, got %q", c.status)
+	}
+}
+
+func TestLeaveGuardResets(t *testing.T) {
+	leftSent.Store(true)
+	ida, err := generateIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = newChatScreen("http://127.0.0.1:1", "ABC123", "bob", ida, "")
+	if leftSent.Load() {
+		t.Fatal("new screen must reset the leave guard")
+	}
+}
+
+func TestSearchHeightAgreement(t *testing.T) {
+	// Paint, viewport sync, and hit-test must derive the search-box rows
+	// from the same inner width at every terminal size.
+	for w := 66; w <= 200; w += 2 {
+		c := newFilterScreen("bob", "", "bob", "alice")
+		c.vp = *viewportPtr(60, 20)
+		m, _ := c.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		sc := m.(chatScreen)
+		l := sc.layoutFor()
+		if !l.sidebarOn {
+			continue
+		}
+		inner := sc.sidebarInnerWidth()
+		paintH := searchHeightFor(l.headRows, inner)
+		syncH := searchHeightFor(l.headRows, sc.sidebarInnerWidth())
+		hitH := searchHeightFor(l.headRows, l.sidebarWidth-2)
+		if paintH != syncH || paintH != hitH {
+			t.Fatalf("w=%d: paint=%d sync=%d hit=%d", w, paintH, syncH, hitH)
+		}
+	}
+}
+
+func TestNotesParkOnStatusLine(t *testing.T) {
+	// Moderation results, usage hints, and engine errors must surface on
+	// the status line — never as transcript rows.
+	srv := httptest.NewServer(newFakeSignalServer())
+	defer srv.Close()
+	c := newFilterScreen("bob", "")
+	c.vp = *viewportPtr(40, 10)
+	wireTestEngine(t, c, srv, "bob", "mallory")
+	m, _ := c.Update(kickDoneMsg{target: "mallory", roster: nil, err: nil})
+	sc := m.(chatScreen)
+	if sc.status != "kicked mallory" {
+		t.Fatalf("kick result must park on status, got %q", sc.status)
+	}
+	m, _ = sc.Update(roleDoneMsg{target: "mallory", admin: true, err: nil})
+	sc = m.(chatScreen)
+	if sc.status != "mallory is now an admin" {
+		t.Fatalf("admin result must park on status, got %q", sc.status)
+	}
+	m, _ = sc.Update(netErrMsg{err: fmt.Errorf("rejoin failed (boom)")})
+	sc = m.(chatScreen)
+	if sc.status != "rejoin failed (boom)" {
+		t.Fatalf("engine error must park on status, got %q", sc.status)
+	}
+	if len(sc.localLines) != 0 {
+		t.Fatalf("no note may reach the transcript: %+v", sc.localLines)
+	}
+	use, _ := sc.Update(roleDoneMsg{target: "x", admin: false, err: fmt.Errorf("nope")})
+	if use.(chatScreen).status != "admin change failed: nope" {
+		t.Fatal("admin failure must park on status")
+	}
+}

@@ -51,12 +51,10 @@ jobs:
             echo "built uplink-${os}-${arch}"
           done
         working-directory: cli
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: cli-binaries
-          path: cli/dist/
-          retention-days: 7
+        # NOTE: no artifact upload here. The cross-compile above is a pure
+        # validity gate (release.yml builds the real assets); uploading
+        # per-run binaries burns the account artifact quota and fails CI
+        # once it is hit. Failure logs are uploaded by the e2e job below.
 
   web-lint-test-build:
     name: Web · lint · typecheck · unit · build
@@ -193,7 +191,7 @@ jobs:
         with:
           name: e2e-server-log
           path: server.log
-          retention-days: 7
+          retention-days: 1
 
   # Single rolling gate for branch protection: require exactly this one
   # check ("pipeline") on main and every feature PR stays one setting.

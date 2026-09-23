@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// Field regression: alice publishes audio+video to the room; carol
+// Field regression: alice publishes audio to the room; carol
 // joins LATE over the real signal path (fake server, real 2s polls).
-// Asserts carol ends up with a ready session AND actually renders/hears.
-// The camera/mic feed continuously (like production); a finite feed would
+// Asserts carol ends up with a ready session AND actually hears.
+// The mic feeds continuously (like production); a finite feed would
 // end before carol's multi-round-trip handshake completes.
 func TestLateJoinerThreePartySignal(t *testing.T) {
 	fs := newFakeSignalServer()
@@ -33,14 +33,12 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	}
 
 	feedA := make(chan []int16, 64)
-	framesA := make(chan vidFrame, 8)
 	ma := newMediaManager("alice", ida,
 		func(to, typ, payload string) error { return sigA.signalSend(to, typ, payload) },
 		func() map[string][]byte { return map[string][]byte{"bob": idb.publicKey()} },
 		mediaUICallbacks{onInfo: func(i string) { fmt.Println("A:", i) }})
 	ma.dialIP = "127.0.0.1"
 	ma.micSrc = func() (<-chan []int16, func(), error) { return feedA, func() {}, nil }
-	ma.videoSrcFn = func() (<-chan vidFrame, func(), error) { return framesA, func() {}, nil }
 	ea := newEngineWithStun("alice", ida, sigA, engineCallbacks{
 		onSignalNote: func(n signalNote) { ma.onSignalNote(n) },
 	}, []string{})
@@ -54,10 +52,7 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	if err := ma.ToggleAudio([]string{"bob"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ma.ToggleVideo([]string{"bob"}); err != nil {
-		t.Fatal(err)
-	}
-	// Continuous media (like a real camera/mic): carol must catch the
+	// Continuous audio (like a real mic): carol must catch the
 	// running stream whenever her session completes.
 	stopFeed := make(chan struct{})
 	defer close(stopFeed)
@@ -66,7 +61,6 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 		for i := range tone {
 			tone[i] = 5000
 		}
-		f := jpegFrame(t, 10, 200, 10)
 		for {
 			select {
 			case <-stopFeed:
@@ -75,10 +69,6 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 			}
 			select {
 			case feedA <- append([]int16(nil), tone...):
-			default:
-			}
-			select {
-			case framesA <- f:
 			default:
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -93,7 +83,6 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	if _, _, err := sigC.joinRoom("carol", base64.StdEncoding.EncodeToString(idc.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
-	rendered := make(chan []string, 8)
 	var heardMu sync.Mutex
 	heard := 0
 	mc := newMediaManager("carol", idc,
@@ -105,8 +94,7 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 			}
 		},
 		mediaUICallbacks{
-			onInfo:       func(i string) { fmt.Println("C:", i) },
-			onVideoFrame: func(lines []string) { rendered <- lines },
+			onInfo: func(i string) { fmt.Println("C:", i) },
 		})
 	mc.playSink = func() (*speaker, error) {
 		// File speaker, not the default device sink: CI runners have no
@@ -140,7 +128,7 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		mc.mu.Lock()
-		w := len(mc.pubVideo) > 0 && len(mc.pubAudio) > 0
+		w := len(mc.pubAudio) > 0
 		mc.mu.Unlock()
 		if w {
 			break
@@ -154,15 +142,6 @@ func TestLateJoinerThreePartySignal(t *testing.T) {
 	waitMediaPeer(t, ma, "carol")
 	waitMediaPeer(t, mc, "alice")
 	fmt.Println("SESSION READY BOTH SIDES")
-	select {
-	case lines := <-rendered:
-		if len(lines) == 0 {
-			t.Fatal("empty render")
-		}
-		fmt.Println("CAROL RENDERED, rows:", len(lines))
-	case <-time.After(25 * time.Second):
-		t.Fatal("carol never rendered")
-	}
 	deadline = time.Now().Add(20 * time.Second)
 	for {
 		heardMu.Lock()

@@ -77,8 +77,13 @@ type fileAssembly struct {
 	meta     frame
 	chunks   map[int][]byte
 	received int
+	total    int64 // bytes stored (bounded by meta.Size)
 	started  time.Time
 }
+
+// maxFileAssemblies bounds concurrent inbound file reassemblies: each can
+// hold megabytes, so count must be capped as well as bytes.
+const maxFileAssemblies = 16
 
 type engine struct {
 	me     string
@@ -143,6 +148,9 @@ type engine struct {
 	// room reports once, a failing rejoin backs off to 60s.
 	endedNotified bool
 	lastRejoinErr time.Time
+	// lastBeatErr is the latest heartbeat failure (nil after any success).
+	// The TUI polls it on its render tick to hold the server-down alert.
+	lastBeatErr error
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 }
@@ -288,6 +296,14 @@ func (e *engine) peers() []rosterMember {
 	return out
 }
 
+// beatErr reports the latest heartbeat failure (nil after any success).
+// The TUI holds the server-down alert while this classifies as down.
+func (e *engine) beatErr() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastBeatErr
+}
+
 // ─── lifecycle ──────────────────────────────────────────────────────────────
 
 func (e *engine) start() {
@@ -430,6 +446,7 @@ func (e *engine) beatOnce() {
 			if _, _, jerr := e.sig.joinRoom(e.me, base64.StdEncoding.EncodeToString(e.id.publicKey()), e.joinPassword); jerr != nil {
 				e.mu.Lock()
 				e.lastRejoinErr = time.Now()
+				e.lastBeatErr = jerr
 				e.mu.Unlock()
 				if !recentErr {
 					e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
@@ -441,6 +458,9 @@ func (e *engine) beatOnce() {
 			e.mu.Unlock()
 			roster, epoch, err = e.sig.heartbeat("", nil)
 			if err != nil {
+				e.mu.Lock()
+				e.lastBeatErr = err
+				e.mu.Unlock()
 				return
 			}
 		} else if apiStatusCode(err) == 404 {
@@ -449,18 +469,23 @@ func (e *engine) beatOnce() {
 			e.mu.Lock()
 			notified := e.endedNotified
 			e.endedNotified = true
+			e.lastBeatErr = err
 			e.mu.Unlock()
 			if !notified {
 				e.emitErr(fmt.Errorf("session ended — rooms vanish when emptied; create or join a new one"))
 			}
 			return
 		} else {
+			e.mu.Lock()
+			e.lastBeatErr = err
+			e.mu.Unlock()
 			return // transient; next tick retries
 		}
 	}
 	e.mu.Lock()
 	e.presence = roster
 	e.lastEpoch = epoch
+	e.lastBeatErr = nil
 	before := make(map[string]bool, len(e.roster))
 	for u := range e.roster {
 		before[u] = true
@@ -1375,6 +1400,24 @@ func (e *engine) onFileFrame(f frame) {
 			e.mu.Unlock()
 			return // absurd sizes fail closed
 		}
+		// Chunks must agree with Size: 4096×64KB of 64KB chunks against a
+		// 1MB Size is a memory-exhaustion lie, not a file.
+		maxChunks := int((f.Size+frameChunkSize-1)/frameChunkSize) + 1
+		if int(f.Chunks) > maxChunks {
+			e.mu.Unlock()
+			return
+		}
+		// Cap concurrent assemblies: evict the oldest started one first.
+		if len(e.files) >= maxFileAssemblies {
+			var oldest string
+			var oldestAt time.Time
+			for id, fa := range e.files {
+				if oldest == "" || fa.started.Before(oldestAt) {
+					oldest, oldestAt = id, fa.started
+				}
+			}
+			delete(e.files, oldest)
+		}
 		a = &fileAssembly{meta: f, chunks: map[int][]byte{}, started: time.Now()}
 		e.files[f.MsgId] = a
 	}
@@ -1386,7 +1429,13 @@ func (e *engine) onFileFrame(f frame) {
 		if _, dup := a.chunks[f.ChunkIndex]; !dup {
 			raw, err := base64.StdEncoding.DecodeString(f.Data)
 			if err == nil && len(raw) <= frameChunkSize {
+				// Running total can never exceed the declared Size:
+				// oversize chunks are dropped before they accumulate.
+				if a.total+int64(len(raw)) > a.meta.Size {
+					break
+				}
 				a.chunks[f.ChunkIndex] = raw
+				a.total += int64(len(raw))
 				a.received++
 			}
 		}
@@ -1418,7 +1467,23 @@ func (e *engine) onFileFrame(f frame) {
 // saveVerifiedFile checks the SHA-256 fingerprint and atomically saves the
 // blob to ~/Downloads, then reports it. Shared by streamed and single-box
 // receives; integrity failure discards, never displays.
+// safeDestName maps a peer-supplied filename to a leaf name inside the
+// download directory: traversal-proof, never empty, never dot-dot.
+func safeDestName(filename string) string {
+	safe := filepath.Base(filename)
+	if safe == "" || safe == "." || safe == ".." {
+		safe = "file"
+	}
+	return safe
+}
+
 func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, shaHex string, blob []byte) {
+	if int64(len(blob)) != size {
+		if e.cb.onFileErr != nil {
+			e.cb.onFileErr(msgId, from, "size mismatch — file discarded")
+		}
+		return
+	}
 	sum := sha256.Sum256(blob)
 	if hex.EncodeToString(sum[:]) != shaHex {
 		if e.cb.onFileErr != nil {
@@ -1433,10 +1498,7 @@ func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, 
 		}
 		return
 	}
-	safe := filepath.Base(filename)
-	if safe == "" || safe == "." {
-		safe = "file"
-	}
+	safe := safeDestName(filename)
 	dest := uniquePath(dir, safe)
 	tmp := dest + ".part"
 	if err := os.WriteFile(tmp, blob, 0o644); err != nil {

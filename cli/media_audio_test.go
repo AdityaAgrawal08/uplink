@@ -214,3 +214,20 @@ func TestJitterResyncCapsMemory(t *testing.T) {
 		t.Fatalf("backlog unbounded: %d", n)
 	}
 }
+
+func TestMicSourceFailureNilSafe(t *testing.T) {
+	// No capture backend can exist for a bogus explicit device: micSource
+	// must return (nil, nil, err), never panic on mc.frames.
+	t.Setenv("UPLINK_MIC", "/nonexistent/deviceXYZ")
+	frames, stop, err := micSource()
+	if err == nil {
+		// A real backend unexpectedly claimed the bogus device; release it.
+		if stop != nil {
+			stop()
+		}
+		t.Skip("bogus device unexpectedly produced a backend")
+	}
+	if frames != nil || stop != nil {
+		t.Fatalf("failed micSource must return nils, got %v %v", frames != nil, stop != nil)
+	}
+}
