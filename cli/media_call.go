@@ -761,14 +761,6 @@ func (m *mediaManager) mediaCB() mediaCallbacks {
 	}
 }
 
-// onTransportReady anchors healing (session live ⇒ silence after this is
-// a path problem, not handshake timing).
-func (m *mediaManager) onTransportReady(peer string) {
-	m.mu.Lock()
-	m.lastHeal[peer] = time.Now() // fresh session: give it a full window
-	m.mu.Unlock()
-}
-
 // truncateVisible clips s to width visible cells (ANSI-aware).
 func truncateVisible(s string, width int) string {
 	var sb strings.Builder

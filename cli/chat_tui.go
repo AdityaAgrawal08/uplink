@@ -1515,61 +1515,6 @@ func (c *chatScreen) syncRosterVp() {
 	c.rosterVp.SetYOffset(y) // preserve scroll across roster churn
 }
 
-// rosterRow paints one users-list row: presence dot, name, media badges,
-// unread chip, hover highlight. Extracted so the scrollable viewport and
-// the hit-test (peerAtY) read the same truth.
-func (c chatScreen) rosterRow(u string, inner int, trunc func(string) string) string {
-	dot := "○"
-	switch u {
-	case c.me:
-		dot = "●"
-	case c.targetUser:
-		dot = "●"
-	}
-	name := u
-	if u == c.me {
-		name += " (you)"
-	}
-	line := dot + " " + name
-
-	// Media badges: publishing state at a glance — my row shows the mic
-	// when live (♪), others' rows show what they share.
-	if c.call != nil {
-		mark := ""
-		if u == c.me {
-			if c.call.AudioOn() {
-				mark += " ♪"
-			}
-		} else {
-			for _, p := range c.call.AudioPublishers() {
-				if p == u {
-					mark += " ♪"
-				}
-			}
-		}
-		line += tuiPaletteHintStyle.Render(mark)
-	}
-
-	if badge := c.unreadBadge(u); badge != "" {
-		// Right-align the chip with a guaranteed gap from the name.
-		bw := lipgloss.Width(badge)
-		nameW := lipgloss.Width(line)
-		gap := inner - nameW - bw - 1
-		if gap < 2 {
-			gap = 2 // minimum distance even on narrow columns
-		}
-		if nameW+gap+bw > inner {
-			line = trunc(line[:maxInt(inner-bw-gap, 1)]) // hard clip name
-		}
-		line += strings.Repeat(" ", gap) + badge
-	}
-
-	if u == c.hoverPeer {
-		line = tuiHoverStyle.Render(line) // pink on THIS row only
-	}
-	return line
-}
-
 // sidebarInnerWidth is the writable width inside the sidebar border.
 func (c chatScreen) sidebarInnerWidth() int {
 	l := c.layoutFor()

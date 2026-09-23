@@ -130,8 +130,6 @@ var (
 				BorderForeground(lipgloss.Color(thOwnBg)).
 				Padding(0, 1)
 
-	thBubbleTimeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#c3cede"))
-
 	thSendBtnStyle = lipgloss.NewStyle().
 			Background(lipgloss.Color(thBlue)).
 			Foreground(lipgloss.Color("#ffffff")).
@@ -406,21 +404,6 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 	return st.Render(line1) + "\n" + st.Render(line2)
 }
 
-// roomTabsLine appends the right-aligned Chat/Files tabs + menu to the room
-// header's name row. Geometry mirrors roomTabsGeoms (hit-testing): the Chat
-// chip is 6 cells, Files 7, ⋮ 3, single-space separated.
-func roomTabsLine(outerW int, line1 string) string {
-	chat := thTabActiveStyle.Render(" Chat ")
-	files := thTabInactiveStyle.Render(" Files ")
-	more := thTabStyle.Render(" ⋮ ")
-	tabs := chat + " " + files + " " + more
-	gap := outerW - lipgloss.Width(stripForWidth(line1)) - lipgloss.Width(tabs)
-	if gap < 1 || outerW < 40 {
-		return line1 // cramped: no tabs painted, none hit-testable either
-	}
-	return line1 + strings.Repeat(" ", gap) + tabs
-}
-
 // roomHeaderCompact paints the 1-row room heading for short/narrow
 // terminals: avatar + name + context on a single line.
 func (c *chatScreen) roomHeaderCompact(outerW int) string {
@@ -512,43 +495,6 @@ func composerGeoms(l layout, termW, termH int) (clipX, y0, y1 int) {
 	_ = termW
 	_ = termH
 	return
-}
-
-// roomTabsGeoms maps the Chat/Files/⋮ tab hit rects in terminal coords.
-// Mirrors roomTabsLine exactly: right-aligned tabs, none when cramped.
-func roomTabsGeoms(c *chatScreen, l layout) (chat, files, more tabRect, ok bool) {
-	if l.headRows < 2 || c.width == 0 || c.height == 0 {
-		return tabRect{}, tabRect{}, tabRect{}, false
-	}
-	outerW := l.vpWidth + 2
-	if outerW < 40 {
-		return tabRect{}, tabRect{}, tabRect{}, false
-	}
-	frameOff := 0
-	if l.frameOn {
-		frameOff = 1
-	}
-	headOff := 0
-	if l.showHeader {
-		headOff = headerHeight
-	}
-	y := frameOff + headOff // first room-header row
-	tx0 := transcriptX0(l)
-	x1 := tx0 + outerW
-	more = tabRect{x0: x1 - 3, x1: x1, y: y}
-	files = tabRect{x0: x1 - 3 - 1 - 7, x1: x1 - 3 - 1, y: y}
-	chat = tabRect{x0: x1 - 3 - 1 - 7 - 1 - 6, x1: x1 - 3 - 1 - 7 - 1, y: y}
-	return chat, files, more, true
-}
-
-// tabRect is one clickable tab (x1 exclusive, single row y).
-type tabRect struct {
-	x0, x1, y int
-}
-
-// hit reports whether a terminal point lands in the tab.
-func (t tabRect) hit(x, y int) bool {
-	return y == t.y && x >= t.x0 && x < t.x1
 }
 
 // composerIndent is the left indent of the composer row (blank above the
