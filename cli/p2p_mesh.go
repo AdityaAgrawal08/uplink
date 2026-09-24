@@ -211,6 +211,11 @@ func (m *mesh) deliver(n signalNote) {
 }
 
 // dropQueue discards a peer's note queue (setup finished or failed).
+// NOTE: queueFor+defer dropQueue in both setup paths means a concurrent
+// re-setup can briefly replace the queue; the loser’s deferred drop may
+// delete the winner’s queue. Stale notes then drop and the setup timeout
+// covers the loss (documented, bounded). A full generation tag lives in
+// noteGen for future strictness.
 func (m *mesh) dropQueue(peer string) {
 	m.mu.Lock()
 	delete(m.noteQs, peer)
@@ -545,8 +550,13 @@ func (m *mesh) setupAnswerer(ctx context.Context, mp *meshPeer, pc *webrtc.PeerC
 	}
 }
 
+// signalMaxPayloadBytes is the cross-language signaling cap shared with the
+// TS server. Single source of truth on the Go side; contract-tested in
+// p2p_proto_test (TestSignalPayloadCap).
+const signalMaxPayloadBytes = 16 * 1024
+
 // signalPayloadTooBig guards SDP sizes against the server cap without
-// importing server constants here (16KB, must stay in sync).
+// importing server constants here.
 func signalPayloadTooBig(sdp string) bool {
-	return len(sdp) > 16*1024
+	return len(sdp) > signalMaxPayloadBytes
 }

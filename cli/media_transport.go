@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -665,18 +666,34 @@ func (m *mediaTransport) sendMedia(peer string, kind byte, payload []byte) error
 func (m *mediaTransport) readLoop() {
 	defer m.wg.Done()
 	buf := make([]byte, 65536)
+	consecErr := 0
 	for {
 		n, src, err := m.conn.ReadFromUDP(buf)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			select {
 			case <-m.stopCh:
 				return
 			default:
-				continue
 			}
+			consecErr++
+			if consecErr > 50 {
+				time.Sleep(time.Duration(min(consecErr, 500)) * time.Millisecond)
+			}
+			continue
 		}
+		consecErr = 0
 		m.onDatagram(src, append([]byte(nil), buf[:n]...))
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (m *mediaTransport) onDatagram(src *net.UDPAddr, raw []byte) {

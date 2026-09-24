@@ -713,7 +713,9 @@ func (m *landingModel) submit() tea.Cmd {
 	m.submitting = true
 	m.errMsg = ""
 	username := strings.TrimSpace(m.userInput.Value())
-	password := strings.TrimSpace(m.passInput.Value())
+	// Do not TrimSpace secrets: spaces are significant and must match the
+	// sender's --password value verbatim.
+	password := m.passInput.Value()
 	if m.tab == tabCreate {
 		return m.doCreate(username, password)
 	}

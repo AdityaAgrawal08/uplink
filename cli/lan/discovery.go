@@ -24,6 +24,11 @@ type ServiceInfo struct {
 	PasswordRequired bool
 }
 
+// NOTE: InfoFields broadcast filename/size/sha/fingerprint in plaintext to
+// the LAN segment (mDNS TXT). Only the share code is hashed (8 hex chars /
+// 32 bits — brute-forceable locally). The TLS fingerprint pin protects the
+// transfer itself, not the metadata. For sensitive names, callers should
+// pass an opaque session token as Hostname/FileName or document the exposure.
 func RegisterService(info ServiceInfo) (func(), error) {
 	// 1. Hash shareCode to prevent exposure in local broadcast networks
 	sum := sha256.Sum256([]byte(info.ShareCode))
@@ -88,9 +93,15 @@ func DiscoverService(ctx context.Context, shareCode string) (string, string, int
 				return "", "", 0, "", "", false, fmt.Errorf("peer not found on LAN (mDNS search completed)")
 			}
 			if len(entry.InfoFields) >= 6 && entry.InfoFields[0] == expectedHashedCode {
-				host := entry.AddrV4.String()
-				if entry.AddrV4 == nil {
-					host = entry.Host
+				// Test AddrV4 for nil BEFORE String(): nil.String() yields "<nil>"
+				// which would become the literal host. Prefer IPv4, then IPv6.
+				var host string
+				if entry.AddrV4 != nil {
+					host = entry.AddrV4.String()
+				} else if entry.AddrV6 != nil {
+					host = entry.AddrV6.String()
+				} else {
+					host = strings.TrimSuffix(entry.Host, ".")
 				}
 				host = strings.TrimSuffix(host, ".")
 				addr := net.JoinHostPort(host, strconv.Itoa(entry.Port))

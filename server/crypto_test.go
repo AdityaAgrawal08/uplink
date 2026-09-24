@@ -52,8 +52,14 @@ func TestDeriveEncryptionKey(t *testing.T) {
 	shared := make([]byte, 32)
 	rand.Read(shared)
 
-	key1 := DeriveEncryptionKey(shared, "salt", "info")
-	key2 := DeriveEncryptionKey(shared, "salt", "info")
+	key1, err := DeriveEncryptionKey(shared, "salt", "info")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key2, err := DeriveEncryptionKey(shared, "salt", "info")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(key1, key2) {
 		t.Fatal("same inputs should produce same key")
 	}
@@ -62,7 +68,10 @@ func TestDeriveEncryptionKey(t *testing.T) {
 	}
 
 	// Different salt should produce different key.
-	key3 := DeriveEncryptionKey(shared, "other-salt", "info")
+	key3, err := DeriveEncryptionKey(shared, "other-salt", "info")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if bytes.Equal(key1, key3) {
 		t.Fatal("different salt should produce different key")
 	}
@@ -73,7 +82,10 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 	kp2, _ := GenerateKeyPair()
 
 	shared, _ := kp1.DeriveSharedSecret(kp2.PublicB64())
-	encKey := DeriveEncryptionKey(shared, "uplink-chat-v1", "message")
+	encKey, err := DeriveEncryptionKey(shared, "uplink-chat-v1", "message")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	plaintext := []byte("hello, world! this is a test message 🔐")
 
@@ -86,7 +98,10 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 
 	// Decrypt with derived key from the other side.
 	shared2, _ := kp2.DeriveSharedSecret(kp1.PublicB64())
-	encKey2 := DeriveEncryptionKey(shared2, "uplink-chat-v1", "message")
+	encKey2, err := DeriveEncryptionKey(shared2, "uplink-chat-v1", "message")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	block2, _ := aes.NewCipher(encKey2)
 	gcm2, _ := cipher.NewGCM(block2)

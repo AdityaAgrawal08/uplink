@@ -173,7 +173,7 @@ var avatarPalette = []string{
 func avatarColorFor(name string) lipgloss.Color {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(strings.ToLower(name)))
-	return lipgloss.Color(avatarPalette[int(h.Sum32())%len(avatarPalette)])
+	return lipgloss.Color(avatarPalette[int(h.Sum32()%uint32(len(avatarPalette)))])
 }
 
 // avatarCell renders the 1-row coloured initial chip, e.g. " A ".

@@ -336,7 +336,9 @@ func handleUpdate() {
 	fmt.Printf("✓ Updated to v%s (%s)\n", latestTag, selfPath)
 }
 
-// installBinary places the new binary (rename, else copy for cross-device).
+// installBinary places the new binary atomically: rename when possible,
+// else copy to selfPath+".new" in the SAME directory + fsync + rename.
+// The old in-place TRUNCATE could brick the install on crash/disk-full.
 func installBinary(binPath, selfPath string) error {
 	if err := os.Rename(binPath, selfPath); err == nil {
 		return nil
@@ -346,13 +348,32 @@ func installBinary(binPath, selfPath string) error {
 		return fmt.Errorf("cannot read new binary: %w", err)
 	}
 	defer in.Close()
-	out, err := os.OpenFile(selfPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	tmp := selfPath + ".new"
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("install failed: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		out.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("install sync: %w", err)
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0755); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, selfPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	os.Remove(binPath)
 	return nil

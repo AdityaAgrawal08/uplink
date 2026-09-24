@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -48,6 +49,45 @@ func promptChatUsername(reader *bufio.Reader) string {
 		}
 		fmt.Printf("Invalid username (%s). Try again.\n", chatUsernameHint)
 	}
+}
+
+func postJSONCtx(ctx context.Context, url string, payload any, headers map[string]string) (int, []byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", url, strings.NewReader(string(body)))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
+}
+
+func getJSONCtx(ctx context.Context, url string, headers map[string]string) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
 }
 
 func postJSON(url string, payload any, headers map[string]string) (int, []byte, error) {
@@ -109,10 +149,15 @@ func cmdCreateSession(args []string, cfg *Config) {
 	password := *passwordFlag
 	if password == "" && term.IsTerminal(int(os.Stdin.Fd())) {
 		fmt.Print("Session password (optional, press Enter to skip): ")
-		pwdBytes, err := reader.ReadString('\n')
-		if err == nil {
-			password = strings.TrimSpace(pwdBytes)
+		pwdBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Println()
+		if err != nil {
+			fmt.Printf("\nError reading password: %v\n", err)
+			os.Exit(1)
 		}
+		// Do not TrimSpace secrets: leading/trailing spaces are significant
+		// and must match the sender's --password value verbatim.
+		password = string(pwdBytes)
 	}
 
 	// Device identity: the public half is advertised in the roster so peers
@@ -187,12 +232,13 @@ func cmdJoinChat(args []string, cfg *Config) {
 		switch code := apiStatusCode(err); {
 		case code == 401:
 			fmt.Print("Password required or incorrect. Enter password: ")
-			pwdBytes, perr := reader.ReadString('\n')
+			pwdBytes, perr := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Println()
 			if perr != nil {
 				fmt.Printf("Error reading password: %v\n", perr)
 				os.Exit(1)
 			}
-			password = strings.TrimSpace(pwdBytes)
+			password = string(pwdBytes)
 			transientFails = 0
 			continue
 		case code == 409:

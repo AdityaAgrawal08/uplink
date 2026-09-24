@@ -22,6 +22,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdityaAgrawal08/uplink-delta/cli/lan"
@@ -33,6 +34,18 @@ import (
 )
 
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+
+var shortCodeRegex = regexp.MustCompile(`^\d{10}$`)
+
+// uploadHTTPClient bounds the header phase for bulk PUTs without killing
+// slow-but-healthy large bodies (no full Client.Timeout).
+var uploadHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	},
+}
 
 type InitRequest struct {
 	Filename          string `json:"filename"`
@@ -208,8 +221,10 @@ func normalizeFlagOrder(args []string, valueFlags map[string]bool) []string {
 		if len(arg) > 1 && arg[0] == '-' && arg != "-" {
 			flags = append(flags, arg)
 			name := strings.TrimLeft(arg, "-")
-			// A "--flag value" pair consumes the next token; "--flag=value" does not.
-			if !strings.Contains(name, "=") && valueFlags[name] && i+1 < len(args) {
+			if eq := strings.Index(name, "="); eq != -1 {
+				name = name[:eq]
+			} else if valueFlags[name] && i+1 < len(args) {
+				// A "--flag value" pair consumes the next token; "--flag=value" does not.
 				i++
 				flags = append(flags, args[i])
 			}
@@ -257,6 +272,19 @@ func sanitizeFilename(name string) string {
 		return "file"
 	}
 	return base
+}
+
+func isHexKey(s string) bool {
+	if len(s) == 0 || len(s) > 256 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeServerUrl(serverUrl string) string {
@@ -414,19 +442,27 @@ func handleSend(args []string) {
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		wanErr := make(chan error, 1)
 		go func() {
 			err := wan.ServeFileWAN(ctx, shareCode, filePath, *passwordFlag, nil)
 			if err != nil && err != context.Canceled {
 				fmt.Printf("\n✗ WAN Server Error: %v\n", err)
 			}
+			wanErr <- err
 		}()
 		fmt.Println("Publishing to DHT... waiting for peer (Ctrl+C to stop)")
-		<-make(chan struct{})
-		os.Exit(0)
+		select {
+		case err := <-wanErr:
+			if err != nil && err != context.Canceled {
+				os.Exit(1)
+			}
+		}
 	}
 
-	// Perform actual upload
-	code, shareLink, filename, _, err := performCloudUploadWrapper(context.Background(), inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
+	// Perform actual upload (bounded: uploads can stall on presigned PUTs).
+	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer uploadCancel()
+	code, shareLink, filename, _, err := performCloudUploadWrapper(uploadCtx, inputPath, *passwordFlag, expirySeconds, serverUrl, *encryptFlag, *lanFlag, *qrFlag, *noQrFlag)
 	if err != nil {
 		fmt.Printf("\n✗ Upload failed: %v\n", err)
 		notifyTransferFailed(inputPath, err)
@@ -619,7 +655,8 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 				shutdownMDNS, mdnsErr := lan.RegisterService(serviceInfo)
 				if mdnsErr == nil {
 					ctx, cancel := context.WithCancel(context.Background())
-					serverDone := make(chan struct{})
+					serverDone := make(chan error, 1)
+					transferDone := make(chan struct{})
 					lanPrinter := &ProgressPrinter{
 						title:      "Sending (LAN)...",
 						total:      fileInfo.Size(),
@@ -631,25 +668,45 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 							lanPrinter.Print(written)
 						}, func() {
 							fmt.Println("\n✓ LAN Transfer completed successfully!")
+							select {
+							case <-transferDone:
+							default:
+								close(transferDone)
+							}
 							cancel()
-							os.Exit(0)
 						})
 						if err != nil && err != context.Canceled {
 							fmt.Printf("\n✗ LAN Server Error: %v\n", err)
 						}
-						close(serverDone)
+						serverDone <- err
 					}()
 
 					time.Sleep(1 * time.Second)
 					if lan.GetActiveConnections() > 0 {
 						fmt.Println("Local peer connected! Performing LAN transfer...")
-						<-ctx.Done()
-						shutdownMDNS()
-						os.Exit(0)
+						select {
+						case <-transferDone:
+							shutdownMDNS()
+							return shareCode, shareUrl, originalName, fileInfo.Size(), nil
+						case err := <-serverDone:
+							shutdownMDNS()
+							if err != nil && err != context.Canceled {
+								return "", "", "", 0, fmt.Errorf("LAN server: %w", err)
+							}
+							// Server ended without completion: fall through to cloud.
+						case <-ctx.Done():
+							shutdownMDNS()
+							return shareCode, shareUrl, originalName, fileInfo.Size(), nil
+						}
 					} else {
 						fmt.Println("No peer connected on LAN yet. Proceeding with fallback upload to cloud...")
 						cancel()
 						shutdownMDNS()
+						// Drain server goroutine to avoid leak.
+						select {
+						case <-serverDone:
+						default:
+						}
 					}
 				}
 			}
@@ -711,10 +768,25 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 	}
 
 	if isResume {
-		initResp.ShareId = resumeState.ShareId
-		initResp.UploadId = resumeState.UploadId
-		initResp.UploadUrls = resumeState.UploadUrls
-	} else {
+		// Layout guard: resume state was minted for a specific chunkSize.
+		// If the re-measured size differs, byte ranges shift and presigned
+		// URLs no longer match — discard and re-init instead of panicking
+		// on UploadUrls[partIdx] or uploading wrong ranges.
+		if resumeState.ChunkSize != 0 && resumeState.ChunkSize != chunkSize {
+			isResume = false
+			resumeState = nil
+			serverParts = nil
+		} else if len(resumeState.UploadUrls) < partsCount {
+			isResume = false
+			resumeState = nil
+			serverParts = nil
+		} else {
+			initResp.ShareId = resumeState.ShareId
+			initResp.UploadId = resumeState.UploadId
+			initResp.UploadUrls = resumeState.UploadUrls
+		}
+	}
+	if !isResume {
 		fmt.Print("Initializing upload (Pass 2/2)... ")
 		initReq := InitRequest{
 			Filename:         originalName,
@@ -775,6 +847,7 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 				SHA256:     hashHex,
 				Done:       []int{},
 				TotalParts: partsCount,
+				ChunkSize:  chunkSize,
 				Timestamp:  time.Now().Format(time.RFC3339),
 			}
 			_ = resumeState.Save(stateFilename)
@@ -795,13 +868,21 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 		}
 
 		completedBytes := int64(0)
-		for _, p := range resumeState.Done {
-			partIdx := p - 1
-			pSize := chunkSize
-			if int64(partIdx+1)*chunkSize > fileInfo.Size() {
-				pSize = fileInfo.Size() - int64(partIdx)*chunkSize
+		if resumeState != nil {
+			for _, p := range resumeState.Done {
+				partIdx := p - 1
+				if partIdx < 0 || partIdx >= partsCount {
+					continue
+				}
+				pSize := chunkSize
+				if int64(partIdx+1)*chunkSize > fileInfo.Size() {
+					pSize = fileInfo.Size() - int64(partIdx)*chunkSize
+				}
+				if pSize < 0 {
+					pSize = 0
+				}
+				completedBytes += pSize
 			}
-			completedBytes += pSize
 		}
 		printer.resumeOffset = completedBytes
 		printer.resumeTime = time.Now()
@@ -833,6 +914,9 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 				base:    sentBytes,
 			}
 
+			if partIdx < 0 || partIdx >= len(initResp.UploadUrls) {
+				return "", "", "", 0, fmt.Errorf("upload URLs mismatch (part %d of %d)", i, partsCount)
+			}
 			uploadUrl := initResp.UploadUrls[partIdx]
 			putReq, err := http.NewRequestWithContext(ctx, "PUT", uploadUrl, progReader)
 			if err != nil {
@@ -841,8 +925,7 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 			putReq.ContentLength = partSize
 			putReq.Header.Set("Content-Type", "application/octet-stream")
 
-			client := &http.Client{}
-			putResp, err := client.Do(putReq)
+			putResp, err := uploadHTTPClient.Do(putReq)
 			if err != nil {
 				return "", "", "", 0, err
 			}
@@ -888,8 +971,7 @@ func performCloudUploadWrapper(ctx context.Context, inputPath string, password s
 		putReq.ContentLength = fileInfo.Size()
 		putReq.Header.Set("Content-Type", mimeType)
 
-		client := &http.Client{}
-		putResp, err := client.Do(putReq)
+		putResp, err := uploadHTTPClient.Do(putReq)
 		if err != nil {
 			return "", "", "", 0, err
 		}
@@ -1013,9 +1095,20 @@ func handleReceive(args []string) {
 		destPath = cfg.DownloadDir
 	}
 
-	// Client-side E2EE decryption key check
+	// Client-side E2EE decryption key check (URL-first: only split the key
+	// off the last path segment so "https://host/share/abc:KEY" survives).
 	keyHex := ""
-	if idx := strings.Index(shareInput, ":"); idx != -1 {
+	if strings.Contains(shareInput, "://") {
+		if idx := strings.LastIndex(shareInput, ":"); idx != -1 && idx > strings.LastIndex(shareInput, "/") {
+			candidate := shareInput[idx+1:]
+			// Hex keys are long; accept only plausible key suffixes.
+			if len(candidate) >= 32 && isHexKey(candidate) {
+				keyHex = candidate
+				shareInput = shareInput[:idx]
+			}
+		}
+	} else if idx := strings.Index(shareInput, ":"); idx != -1 {
+		// Bare "code:KEY" form.
 		keyHex = shareInput[idx+1:]
 		shareInput = shareInput[:idx]
 	}
@@ -1026,7 +1119,7 @@ func handleReceive(args []string) {
 		serverUrl = cfg.Server
 	}
 
-	isShortCode, _ := regexp.MatchString(`^\d{10}$`, shareInput)
+	isShortCode := shortCodeRegex.MatchString(shareInput)
 	if isShortCode {
 		shareId = shareInput
 	} else if strings.Contains(shareInput, "/share/") {
@@ -1071,7 +1164,7 @@ func handleReceive(args []string) {
 					os.Exit(1)
 				}
 				fmt.Println()
-				pwdToUse = strings.TrimSpace(string(pwdBytes))
+				pwdToUse = string(pwdBytes)
 			}
 
 			sanitizedName := sanitizeFilename(filename)
@@ -1167,7 +1260,7 @@ func handleReceive(args []string) {
 				} else {
 					fmt.Printf("\n✓ LAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n\nSize:\n%s\n", filename, outputFilepath, formatBytes(size))
 				}
-				os.Exit(0)
+				return
 			}
 			fmt.Printf("LAN download failed: %v. Falling back to cloud...\n", err)
 		} else {
@@ -1186,6 +1279,10 @@ func handleReceive(args []string) {
 				outputFilepath = destPath
 			}
 		}
+		if _, err := os.Stat(outputFilepath); err == nil {
+			fmt.Printf("Error: Target '%s' already exists. Use --force/-f or --rename/-r.\n", outputFilepath)
+			os.Exit(1)
+		}
 		fmt.Printf("Discovering WAN peer for share %s...\n", shareId)
 		printer := &ProgressPrinter{
 			title:      "Downloading (WAN)...",
@@ -1193,7 +1290,9 @@ func handleReceive(args []string) {
 			startTime:  time.Now(),
 			firstPrint: true,
 		}
-		err := wan.DownloadFileWAN(context.Background(), shareId, outputFilepath, *passwordFlag, "", func(written int64) {
+		wanCtx, wanCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer wanCancel()
+		err := wan.DownloadFileWAN(wanCtx, shareId, outputFilepath, *passwordFlag, "", func(written int64) {
 			if printer.total == 0 && written > 0 {
 				// Unknown total: show bytes downloaded without percentage
 				elapsed := time.Since(printer.startTime).Seconds()
@@ -1212,7 +1311,7 @@ func handleReceive(args []string) {
 		}
 		fmt.Printf("\n✓ WAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n", sanitizedName, outputFilepath)
 		notifyTransferComplete(sanitizedName)
-		os.Exit(0)
+		return
 	}
 
 	// Fetch Share Metadata
@@ -1255,7 +1354,7 @@ func handleReceive(args []string) {
 			os.Exit(1)
 		}
 		fmt.Println()
-		password = strings.TrimSpace(string(pwdBytes))
+		password = string(pwdBytes)
 	}
 
 	// Authorize Download
@@ -1381,16 +1480,18 @@ func handleReceive(args []string) {
 	}
 
 	rangeSupported := false
-	probeReq, err := http.NewRequest("HEAD", authData.DownloadUrl, nil)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	probeReq, err := http.NewRequestWithContext(probeCtx, "HEAD", authData.DownloadUrl, nil)
 	if err == nil {
 		probeResp, err := client.Do(probeReq)
 		if err == nil {
-			defer probeResp.Body.Close()
+			probeResp.Body.Close()
 			if probeResp.Header.Get("Accept-Ranges") == "bytes" {
 				rangeSupported = true
 			}
 		}
 	}
+	probeCancel()
 
 	printer := &ProgressPrinter{
 		title:      "Downloading...",
@@ -1423,7 +1524,7 @@ func handleReceive(args []string) {
 			os.Exit(1)
 		}
 
-		outFd, err := os.OpenFile(tempTarFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		outFd, err := os.OpenFile(tempTarFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 		if err != nil {
 			fmt.Printf("✗ Error: Creating output file failed: %v\n", err)
 			os.Exit(1)
@@ -1493,6 +1594,7 @@ func handleReceive(args []string) {
 }
 
 type ProgressPrinter struct {
+	mu           sync.Mutex
 	title        string
 	total        int64
 	startTime    time.Time
@@ -1504,6 +1606,8 @@ type ProgressPrinter struct {
 }
 
 func (pp *ProgressPrinter) Print(read int64) {
+	pp.mu.Lock()
+	defer pp.mu.Unlock()
 	now := time.Now()
 	if !pp.isFinished && read < pp.total && now.Sub(pp.lastPrint) < 100*time.Millisecond {
 		return

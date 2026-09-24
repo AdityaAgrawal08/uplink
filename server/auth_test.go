@@ -10,8 +10,14 @@ import (
 
 func TestHashPasswordRandomSalt(t *testing.T) {
 	// Same password must produce different hashes (random per-password salt).
-	h1 := hashPassword("correct horse battery staple")
-	h2 := hashPassword("correct horse battery staple")
+	h1, err := hashPassword("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := hashPassword("correct horse battery staple")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if h1 == h2 {
 		t.Fatal("expected different hashes due to random salt")
 	}
@@ -24,7 +30,10 @@ func TestHashPasswordRandomSalt(t *testing.T) {
 }
 
 func TestVerifyPasswordRoundTrip(t *testing.T) {
-	h := hashPassword("s3cr3t!")
+	h, err := hashPassword("s3cr3t!")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !verifyPassword("s3cr3t!", h) {
 		t.Fatal("correct password should verify")
 	}

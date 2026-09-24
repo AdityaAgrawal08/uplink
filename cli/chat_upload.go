@@ -238,13 +238,16 @@ func runSessionUpload(ctx context.Context, eng *engine, job uploadJob, prog chan
 	var tmpTar string
 	isDir := info.IsDir()
 	if isDir {
+		// Receiver-visible name comes from the ORIGINAL directory, not the
+		// temp tarball (uplink-<nano>-<dir>.tar.gz).
+		origBase := filepath.Base(path)
 		tmpTar, err = tarballDir(path)
 		if err != nil {
 			return display, 0, fmt.Errorf("folder prep: %w", err)
 		}
 		defer os.Remove(tmpTar)
 		path = tmpTar
-		display = filepath.Base(path)
+		display = origBase + tarballSuffix
 		info, err = os.Stat(path)
 		if err != nil {
 			return display, 0, err

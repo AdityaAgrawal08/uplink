@@ -7,7 +7,8 @@ import "sync"
 // Hides network jitter behind a small playout delay: frames queue by
 // sequence and release in order on a 20ms tick. Gaps emit a repair request
 // (FEC from the next packet, else resync) instead of stalling. Target delay
-// adapts between bounds from observed jitter.
+// is currently fixed (jitterTargetFrames); adaptive tuning from observed
+// jitter is future work (see jitterBuffer.target).
 
 const (
 	jitterTargetFrames = 3  // 60ms nominal playout delay

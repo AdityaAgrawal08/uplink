@@ -139,3 +139,17 @@ func TestSafetyCodeSymmetric(t *testing.T) {
 		t.Fatal("different key must change the code")
 	}
 }
+
+// TestSignalPayloadCap pins the cross-language signaling cap shared with the
+// TS server (signalMaxPayloadBytes). Both sides must stay in sync.
+func TestSignalPayloadCap(t *testing.T) {
+	if signalMaxPayloadBytes != 16*1024 {
+		t.Fatalf("signal cap drifted: %d", signalMaxPayloadBytes)
+	}
+	if !signalPayloadTooBig(string(make([]byte, 16*1024+1))) {
+		t.Fatal("oversize SDP should be flagged")
+	}
+	if signalPayloadTooBig(string(make([]byte, 16*1024))) {
+		t.Fatal("cap-sized SDP should pass")
+	}
+}

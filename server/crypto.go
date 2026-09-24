@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
+	"io"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -58,9 +59,11 @@ func (kp *KeyPair) DeriveSharedSecret(peerPubB64 string) ([]byte, error) {
 
 // DeriveEncryptionKey derives a 32-byte AES-256 key from a shared secret
 // using HKDF-SHA256.
-func DeriveEncryptionKey(sharedSecret []byte, salt, info string) []byte {
+func DeriveEncryptionKey(sharedSecret []byte, salt, info string) ([]byte, error) {
 	hkdfReader := hkdf.New(sha256.New, sharedSecret, []byte(salt), []byte(info))
 	key := make([]byte, 32)
-	_, _ = hkdfReader.Read(key)
-	return key
+	if _, err := io.ReadFull(hkdfReader, key); err != nil {
+		return nil, fmt.Errorf("hkdf read: %w", err)
+	}
+	return key, nil
 }
