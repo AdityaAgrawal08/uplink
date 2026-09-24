@@ -9,7 +9,7 @@ const https = require("https");
 const os = require("os");
 const path = require("path");
 
-const REPO = "AdityaAgrawal08/uplink-delta";
+const REPO = "AdityaAgrawal08/uplink";
 const ASSETS = {
   "linux-x64": "uplink-linux-amd64.tar.gz",
   "linux-arm64": "uplink-linux-arm64.tar.gz",
@@ -20,13 +20,13 @@ const ASSETS = {
 };
 
 function fail(msg) {
-  console.error(`uplink-chat postinstall: ${msg}`);
+  console.error(`@aditya/uplink postinstall: ${msg}`);
   process.exit(1);
 }
 
 function get(url, binary) {
   return new Promise((resolve, reject) => {
-    const headers = { "User-Agent": "uplink-chat-installer" };
+    const headers = { "User-Agent": "@aditya/uplink-installer" };
     if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     https
       .get(url, { headers }, (res) => {
@@ -35,7 +35,7 @@ function get(url, binary) {
           return get(res.headers.location, binary).then(resolve, reject);
         }
         if (res.statusCode === 404 && !process.env.GITHUB_TOKEN) {
-          reject(new Error("asset not found (404). This repo's releases are private: set GITHUB_TOKEN and retry."));
+          reject(new Error("asset not found (404) for this version — it may not be released yet."));
           res.resume();
           return;
         }
@@ -99,7 +99,7 @@ async function main() {
     const dest = path.join(binDir, process.platform === "win32" ? "uplink.exe" : "uplink");
     fs.copyFileSync(found[0], dest);
     if (process.platform !== "win32") fs.chmodSync(dest, 0o755);
-    console.log(`uplink-chat: installed ${asset} (${tag})`);
+    console.log(`@aditya/uplink: installed ${asset} (${tag})`);
   } catch (err) {
     fail(err.message);
   } finally {
