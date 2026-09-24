@@ -986,14 +986,17 @@ func TestOutboxCap(t *testing.T) {
 }
 
 func TestLeaveGuardResets(t *testing.T) {
-	leftSent.Store(true)
 	ida, err := generateIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
+	c := newChatScreen("http://127.0.0.1:1", "ABC123", "bob", ida, "")
+	c.leftSent.Store(true)
 	_ = newChatScreen("http://127.0.0.1:1", "ABC123", "bob", ida, "")
-	if leftSent.Load() {
-		t.Fatal("new screen must reset the leave guard")
+	// Per-screen guard: a fresh screen starts unset (no global to reset).
+	fresh := newChatScreen("http://127.0.0.1:1", "ABC123", "bob", ida, "")
+	if fresh.leftSent.Load() {
+		t.Fatal("new screen must start with leave guard unset")
 	}
 }
 

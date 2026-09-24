@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -49,6 +50,10 @@ func writePartialMetadata(sha256Path string, offset int64, hashHex string) error
 }
 
 func DownloadResumable(url, dest string, expectedHash string, progressPrinter func(int64, int64)) error {
+	return DownloadResumableWithContext(context.Background(), url, dest, expectedHash, progressPrinter)
+}
+
+func DownloadResumableWithContext(ctx context.Context, url, dest string, expectedHash string, progressPrinter func(int64, int64)) error {
 	partialFile := dest + ".uplink.partial"
 	metadataFile := partialFile + ".sha256"
 
@@ -67,13 +72,23 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 
 					h := sha256.New()
 					pf, err := os.Open(partialFile)
-					if err == nil {
-						_, _ = io.CopyN(h, pf, metaOffset)
+					if err != nil {
+						return fmt.Errorf("resume reseed open: %w", err)
+					}
+					if _, err := io.CopyN(h, pf, metaOffset); err != nil {
+						pf.Close()
+						// Corrupt/truncated partial: restart cleanly, say so.
+						fmt.Printf("Partial file corrupt, restarting download...\n")
+						offset = 0
+					} else {
 						pf.Close()
 						computedHash := hex.EncodeToString(h.Sum(nil))
 						if computedHash == savedHash {
 							offset = metaOffset
 							fmt.Printf("Resuming download from offset %s...\n", formatBytes(offset))
+						} else {
+							fmt.Printf("Partial hash mismatch, restarting download...\n")
+							offset = 0
 						}
 					}
 				}
@@ -89,7 +104,7 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 	// B53 FIX: handle the request-construction error. The old `req, _ := ...`
 	// ignored it, so a malformed URL meant a nil-pointer panic on the next
 	// line instead of an error return.
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("download request: %w", err)
 	}
@@ -111,7 +126,7 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 		_ = os.Remove(metadataFile)
 	}
 
-	f, err := os.OpenFile(partialFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(partialFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
@@ -120,10 +135,14 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 	runningHasher := sha256.New()
 	if offset > 0 {
 		pf, err := os.Open(partialFile)
-		if err == nil {
-			_, _ = io.Copy(runningHasher, pf)
-			pf.Close()
+		if err != nil {
+			return fmt.Errorf("resume hasher reseed: %w", err)
 		}
+		if _, err := io.Copy(runningHasher, pf); err != nil {
+			pf.Close()
+			return fmt.Errorf("resume hasher reseed copy: %w", err)
+		}
+		pf.Close()
 	}
 
 	buffer := make([]byte, 32*1024)
@@ -131,6 +150,11 @@ func DownloadResumable(url, dest string, expectedHash string, progressPrinter fu
 	var totalWritten int64 = offset
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		nr, readErr := resp.Body.Read(buffer)
 		if nr > 0 {
 			nw, writeErr := f.Write(buffer[:nr])

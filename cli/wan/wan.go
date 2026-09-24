@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/ipfs/go-cid"
@@ -71,6 +73,46 @@ func (p *WANPeer) Close() {
 	}
 }
 
+// writeFrame writes a length-prefixed frame (uvarint len + bytes).
+func writeFrame(w io.Writer, b []byte) error {
+	var lb [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(lb[:], uint64(len(b)))
+	if _, err := w.Write(lb[:n]); err != nil {
+		return err
+	}
+	_, err := w.Write(b)
+	return err
+}
+
+// readFrame reads one length-prefixed frame, capped at max bytes.
+func readFrame(r io.Reader, max int) ([]byte, error) {
+	br, ok := r.(io.ByteReader)
+	var uv uint64
+	var err error
+	if ok {
+		uv, err = binary.ReadUvarint(br)
+	} else {
+		uv, err = binary.ReadUvarint(byteReader{r})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if uv > uint64(max) {
+		return nil, fmt.Errorf("frame too large: %d", uv)
+	}
+	buf := make([]byte, uv)
+	_, err = io.ReadFull(r, buf)
+	return buf, err
+}
+
+type byteReader struct{ r io.Reader }
+
+func (b byteReader) ReadByte() (byte, error) {
+	var one [1]byte
+	_, err := io.ReadFull(b.r, one[:])
+	return one[0], err
+}
+
 func ServeFileWAN(ctx context.Context, shareCode string, filePath string, password string, onComplete func()) error {
 	p, err := StartWANPeer(ctx)
 	if err != nil {
@@ -78,17 +120,43 @@ func ServeFileWAN(ctx context.Context, shareCode string, filePath string, passwo
 	}
 	defer p.Close()
 
+	// Pre-stat + hash the file so receivers get an integrity binding.
+	// Without this the receiver cannot verify (previously the hash check
+	// was unsatisfiable and every WAN download deleted itself).
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+	fileSHA, err := hashFileSHA256(filePath)
+	if err != nil {
+		return err
+	}
+
 	p.Host.SetStreamHandler("/uplink-p2p/1.0.0", func(s network.Stream) {
 		defer s.Close()
+		_ = s.SetDeadline(time.Now().Add(60 * time.Second))
 
-		buf := make([]byte, 256)
-		n, err := s.Read(buf)
-		if err != nil || subtle.ConstantTimeCompare(buf[:n], []byte(shareCode)) != 1 {
+		codeFrame, err := readFrame(s, 256)
+		if err != nil || subtle.ConstantTimeCompare(codeFrame, []byte(shareCode)) != 1 {
 			return
 		}
 
-		n, err = s.Read(buf)
-		if err != nil || subtle.ConstantTimeCompare(buf[:n], []byte(password)) != 1 {
+		pwFrame, err := readFrame(s, 256)
+		if err != nil || subtle.ConstantTimeCompare(pwFrame, []byte(password)) != 1 {
+			return
+		}
+
+		// Metadata header: filename, size, sha256 (all framed).
+		base := filepath.Base(filePath)
+		if err := writeFrame(s, []byte(base)); err != nil {
+			return
+		}
+		var sb [8]byte
+		binary.BigEndian.PutUint64(sb[:], uint64(fi.Size()))
+		if err := writeFrame(s, sb[:]); err != nil {
+			return
+		}
+		if err := writeFrame(s, []byte(fileSHA)); err != nil {
 			return
 		}
 
@@ -98,7 +166,9 @@ func ServeFileWAN(ctx context.Context, shareCode string, filePath string, passwo
 		}
 		defer f.Close()
 
-		_, _ = io.Copy(s, f)
+		if _, err := io.Copy(s, f); err != nil {
+			return
+		}
 
 		if onComplete != nil {
 			onComplete()
@@ -106,15 +176,38 @@ func ServeFileWAN(ctx context.Context, shareCode string, filePath string, passwo
 	})
 
 	c, err := deriveCID(shareCode)
-	if err == nil {
-		_ = p.DHT.Provide(ctx, c, true)
+	if err != nil {
+		return fmt.Errorf("derive CID: %w", err)
+	}
+	if err := p.DHT.Provide(ctx, c, true); err != nil {
+		return fmt.Errorf("DHT provide failed (peer unfindable): %w", err)
 	}
 
 	<-ctx.Done()
 	return nil
 }
 
+func hashFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 func DownloadFileWAN(ctx context.Context, shareCode string, dest string, password string, expectedFileSHA256 string, progressCallback func(int64)) error {
+	// Bound the whole operation: Connect + stream previously used
+	// context.Background() with no deadline and could hang forever.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
+	}
 	p, err := StartWANPeer(ctx)
 	if err != nil {
 		return err
@@ -123,10 +216,10 @@ func DownloadFileWAN(ctx context.Context, shareCode string, dest string, passwor
 
 	c, err := deriveCID(shareCode)
 	if err != nil {
-		return nil
+		return fmt.Errorf("derive CID: %w", err)
 	}
 
-	ctxSearch, cancelSearch := context.WithTimeout(ctx, 10*time.Second)
+	ctxSearch, cancelSearch := context.WithTimeout(ctx, 30*time.Second)
 	providers, err := p.DHT.FindProviders(ctxSearch, c)
 	cancelSearch()
 	if err != nil || len(providers) == 0 {
@@ -134,56 +227,100 @@ func DownloadFileWAN(ctx context.Context, shareCode string, dest string, passwor
 	}
 
 	targetPeer := providers[0]
-	err = p.Host.Connect(ctx, targetPeer)
+	connCtx, cancelConn := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelConn()
+	err = p.Host.Connect(connCtx, targetPeer)
 	if err != nil {
 		return fmt.Errorf("failed to connect to WAN peer: %w", err)
 	}
 
-	s, err := p.Host.NewStream(ctx, targetPeer.ID, "/uplink-p2p/1.0.0")
+	streamCtx, cancelStream := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelStream()
+	s, err := p.Host.NewStream(streamCtx, targetPeer.ID, "/uplink-p2p/1.0.0")
 	if err != nil {
 		return fmt.Errorf("failed to open stream: %w", err)
 	}
 	defer s.Close()
+	_ = s.SetDeadline(time.Now().Add(5 * time.Minute))
 
-	_, _ = s.Write([]byte(shareCode))
-	time.Sleep(100 * time.Millisecond)
-	_, _ = s.Write([]byte(password))
+	// Framed auth (no 100ms sleep coupling; writes are checked).
+	if err := writeFrame(s, []byte(shareCode)); err != nil {
+		return fmt.Errorf("auth write share: %w", err)
+	}
+	if err := writeFrame(s, []byte(password)); err != nil {
+		return fmt.Errorf("auth write password: %w", err)
+	}
 
-	f, err := os.Create(dest)
+	// Framed metadata header.
+	_, err = readFrame(s, 1024)
+	if err != nil {
+		return fmt.Errorf("read filename header: %w", err)
+	}
+	sizeFrame, err := readFrame(s, 8)
+	if err != nil || len(sizeFrame) != 8 {
+		return fmt.Errorf("read size header: %w", err)
+	}
+	_ = binary.BigEndian.Uint64(sizeFrame)
+	shaFrame, err := readFrame(s, 128)
+	if err != nil {
+		return fmt.Errorf("read sha header: %w", err)
+	}
+	advertisedSHA := string(shaFrame)
+	if expectedFileSHA256 == "" {
+		expectedFileSHA256 = advertisedSHA
+	} else if advertisedSHA != "" && advertisedSHA != expectedFileSHA256 {
+		return fmt.Errorf("WAN metadata hash mismatch")
+	}
+
+	// Never truncate the destination directly: stream to .part, verify,
+	// then rename. A failed download must not destroy a pre-existing file.
+	tmp := dest + ".part"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	h := sha256.New()
 	tee := io.TeeReader(s, h)
 
 	buf := make([]byte, 32*1024)
 	var totalWritten int64
-	for {
-		nr, readErr := tee.Read(buf)
-		if nr > 0 {
-			nw, writeErr := f.Write(buf[:nr])
-			if writeErr != nil {
-				return writeErr
+	streamErr := func() error {
+		defer f.Close()
+		for {
+			nr, readErr := tee.Read(buf)
+			if nr > 0 {
+				nw, writeErr := f.Write(buf[:nr])
+				if writeErr != nil {
+					return writeErr
+				}
+				totalWritten += int64(nw)
+				if progressCallback != nil {
+					progressCallback(totalWritten)
+				}
 			}
-			totalWritten += int64(nw)
-			if progressCallback != nil {
-				progressCallback(totalWritten)
+			if readErr != nil {
+				if readErr == io.EOF {
+					return nil
+				}
+				return readErr
 			}
 		}
-		if readErr != nil {
-			if readErr == io.EOF {
-				break
-			}
-			return readErr
-		}
+	}()
+	if streamErr != nil {
+		_ = os.Remove(tmp)
+		return streamErr
 	}
 
 	computedHash := hex.EncodeToString(h.Sum(nil))
-	if computedHash != expectedFileSHA256 {
-		os.Remove(dest)
+	if expectedFileSHA256 != "" && computedHash != expectedFileSHA256 {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("integrity check failed (SHA-256 mismatch)")
+	}
+
+	if err := os.Rename(tmp, dest); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 
 	return nil

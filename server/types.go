@@ -64,6 +64,7 @@ type Outbound struct {
 	SessionId      string `json:"sessionId,omitempty"`
 	SessionPubKey  string `json:"sessionPublicKey,omitempty"`
 	Users          []string `json:"users,omitempty"`
+	History      []ChatMessage `json:"history,omitempty"`
 
 	// keys (E2E public-key distribution)
 	Keys []UserKey `json:"keys,omitempty"`
@@ -157,20 +158,96 @@ func (r *RingBuffer) Snapshot() []ChatMessage {
 	return out
 }
 
+// OwnedBy reports whether msgId exists in the buffer and was authored by
+// username (used to authorize deletes).
+func (r *RingBuffer) OwnedBy(msgId, username string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := 0; i < r.count; i++ {
+		m := r.msgs[(r.head-r.count+i+r.capacity*2)%r.capacity]
+		if m.MsgId == msgId {
+			return m.Username == username
+		}
+	}
+	return false
+}
+
 // ─── Connection (one per WebSocket client) ──────────────────────────────────
 
 // Connection wraps a single WebSocket client.
+//
+// Lifecycle: the writer goroutine (writePump) owns close(Send) and runs it
+// exactly once on exit under SendMu. Evictors/removers never close(Send);
+// they call shutdown() which closes done once and closes the network conn.
+// Senders use trySend(), which holds SendMu across the closed-check and the
+// channel send, so a send can never race the writer's close.
 type Connection struct {
 	Username   string
 	Conn       *websocket.Conn
 	Send       chan []byte
 	LastBeat   time.Time
 	SendMu     sync.Mutex
+	done       chan struct{}
+	closed     bool
+	closeOnce  sync.Once
 	ServerPubKey string // X25519 public key distributed to this client
 	ClientPubKey string // X25519 public key sent by this client
 }
 
+// newConnection builds a Connection with lifecycle channels initialized.
+func newConnection(username string, ws *websocket.Conn) *Connection {
+	return &Connection{
+		Username: username,
+		Conn:     ws,
+		Send:     make(chan []byte, 256),
+		LastBeat: time.Now(),
+		done:     make(chan struct{}),
+	}
+}
+
+// shutdown signals the writer to exit and closes the network connection.
+// It never closes Send (writer-owned). Safe for concurrent use.
+func (c *Connection) shutdown() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		_ = c.Conn.Close()
+	})
+}
+
+// trySend queues one message unless the connection is shutting down.
+// Never panics: the closed-check and the send share SendMu with the
+// writer's close(Send).
+func (c *Connection) trySend(data []byte) bool {
+	c.SendMu.Lock()
+	defer c.SendMu.Unlock()
+	if c.closed {
+		return false
+	}
+	select {
+	case <-c.done:
+		return false
+	default:
+	}
+	select {
+	case c.Send <- data:
+		return true
+	case <-c.done:
+		return false
+	default:
+		// channel full — drop (slow consumer)
+		return false
+	}
+}
+
 // ─── Session (one per chat room) ───────────────────────────────────────────
+
+// announcedUpload tracks a file meta announcement so later chunks can be
+// validated (owner, bounds) instead of relayed blindly.
+type announcedUpload struct {
+	Owner       string
+	TotalChunks int
+	Size        int64
+}
 
 // Session is an in-memory chat room.
 type Session struct {
@@ -178,6 +255,7 @@ type Session struct {
 	PasswordHash string // argon2id hash; empty = no password
 	ExpiresAt    time.Time
 	Users        map[string]*Connection // username → connection
+	Uploads      map[string]*announcedUpload // "username\x00msgId" → meta
 	Buffer       *RingBuffer
 	ServerKeyPair *KeyPair // ephemeral X25519 keypair for this session
 	Mu           sync.RWMutex
@@ -203,16 +281,16 @@ func (s *Session) Broadcast(msg Outbound, excludeUser string) {
 		return
 	}
 	s.Mu.RLock()
-	defer s.Mu.RUnlock()
+	conns := make([]*Connection, 0, len(s.Users))
 	for _, c := range s.Users {
 		if c.Username == excludeUser {
 			continue
 		}
-		select {
-		case c.Send <- data:
-		default:
-			// channel full — drop (slow consumer)
-		}
+		conns = append(conns, c)
+	}
+	s.Mu.RUnlock()
+	for _, c := range conns {
+		c.trySend(data)
 	}
 }
 
@@ -228,10 +306,7 @@ func (s *Session) SendTo(username string, msg Outbound) {
 	if !ok {
 		return
 	}
-	select {
-	case c.Send <- data:
-	default:
-	}
+	c.trySend(data)
 }
 
 // SendSystem broadcasts a system event (join/leave) to all participants.

@@ -565,6 +565,8 @@ type chatScreen struct {
 	received     []receivedFile  // files arrived this session (for /download)
 	status       string
 	targetUser   string // private-chat peer; "" = general room
+	leftSent     *atomic.Bool // per-screen leave guard (pointer: screen is copied by value)
+	drainTimer   *time.Timer // reused pump timer (no time.After alloc per cycle)
 }
 
 // scrollSection identifies one independently scrollable pane.
@@ -678,7 +680,7 @@ const maxLocalLines = 500
 const maxOutbox = 100
 
 func newChatScreen(serverURL, key, me string, id *identityKey, password string) chatScreen {
-	leftSent.Store(false) // fresh screen, fresh leave guard (tests reuse processes)
+	// fresh screen, fresh leave guard (no global reset needed)
 	ti := textinput.New()
 	ti.Placeholder = composerPlaceholder
 	ti.Focus()
@@ -692,6 +694,20 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	// they run on network goroutines). The drain command below feeds them
 	// into Update on the main loop.
 	push := func(m tea.Msg) {
+		// Control/notice messages (ready/lost/error/file) must not be
+		// silently dropped under burst while chat backpressures: retry
+		// once synchronously before falling back to drop.
+		if _, ok := m.(netChatMsg); !ok {
+			if tryEnqueue(netCh, m) {
+				return
+			}
+			select {
+			case netCh <- m:
+			default:
+				// Still full: drop with a diagnostic on the next drain.
+			}
+			return
+		}
 		tryEnqueue(netCh, m)
 	}
 	var eng *engine
@@ -731,6 +747,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		vp:          vp,
 		input:       ti,
 		netCh:       netCh,
+		leftSent:    &atomic.Bool{},
 		rendered:    map[int]bool{},
 		renderCache: map[int]string{},
 		tsCache:     map[int]time.Time{},
@@ -1536,11 +1553,29 @@ func scheduleRoster() tea.Cmd {
 // engine traffic always reaches Update within ~100ms. (A one-shot drain
 // would strand later events in netCh forever: nothing else schedules it.)
 func (c chatScreen) drainNetCmd() tea.Cmd {
+	timer := c.drainTimer
+	if timer == nil {
+		timer = time.NewTimer(100 * time.Millisecond)
+	} else {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(100 * time.Millisecond)
+	}
 	return func() tea.Msg {
 		select {
 		case m := <-c.netCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return m
-		case <-time.After(100 * time.Millisecond):
+		case <-timer.C:
 			return netIdleMsg{}
 		}
 	}
@@ -1568,13 +1603,11 @@ func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
 	}
 }
 
-// leftSent guards the leave POST exactly-once across the in-loop leave,
-// repeat Ctrl+C presses, and the post-Run backup below.
-var leftSent atomic.Bool
-
+// doLeave guards the leave POST exactly-once per screen across the
+// in-loop leave, repeat Ctrl+C presses, and the post-Run backup.
 func (c chatScreen) doLeave() tea.Cmd {
 	return func() tea.Msg {
-		if leftSent.Swap(true) {
+		if c.leftSent.Swap(true) {
 			return leaveDoneMsg{}
 		}
 		if c.call != nil {
@@ -2878,7 +2911,7 @@ func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 		os.Exit(1)
 	}
 	scr.eng.stop()
-	if !leftSent.Load() {
+	if !scr.leftSent.Load() {
 		// Backup for abnormal exits where doLeave never ran; normally a no-op.
 		if err := scr.sig.leaveRoom(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)

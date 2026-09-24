@@ -124,6 +124,7 @@ type engine struct {
 	// arrival and tear down a healthy session. Guarded by e.mu.
 	sendMu    map[string]*sync.Mutex
 	files     map[string]*fileAssembly
+	seenFiles map[string]struct{} // msgId dedup at save boundary (redelivery no-op)
 	announced map[string]bool // safety codes already shown
 	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
 	// joinPassword lets the engine rejoin by itself after being pruned for
@@ -240,6 +241,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		unacked:        map[string]*pendingAck{},
 		sendMu:         map[string]*sync.Mutex{},
 		files:          map[string]*fileAssembly{},
+		seenFiles:      map[string]struct{}{},
 		announced:      map[string]bool{},
 		stopCh:         make(chan struct{}),
 	}
@@ -391,7 +393,10 @@ func (e *engine) setRoster(members []rosterMember) {
 		delete(e.lastFail, u)
 		delete(e.failCount, u)
 		delete(e.announced, u)
-		delete(e.sendMu, u)
+		// NOTE: sendMu entries are never deleted. Deleting while a send
+		// holds the old mutex breaks the Noise nonce-ordering invariant
+		// (next sendMuFor creates a different mutex). Peer cardinality is
+		// small and bounded, so retention is safe.
 		e.mu.Unlock()
 	}
 }
@@ -1382,8 +1387,16 @@ func (e *engine) onFileFrame(f frame) {
 	// Single-box files (inbox path) skip reassembly entirely.
 	if f.Type == frameFile {
 		blob, err := base64.StdEncoding.DecodeString(f.Data)
-		if err != nil || int64(len(blob)) != f.Size || f.Size <= 0 || f.Size > fallbackFileMax {
+		if err != nil || int64(len(blob)) != f.Size || f.Size > fallbackFileMax {
+			if e.cb.onFileErr != nil {
+				e.cb.onFileErr(f.MsgId, f.From, "corrupt file frame — discarded")
+			}
 			return // corrupt or absurd: drop (fail closed)
+		}
+		if f.Size == 0 {
+			// Empty file: complete on meta (no chunks needed).
+			e.saveVerifiedFile(f.MsgId, f.From, f.To, f.Filename, 0, f.SHA256, []byte{})
+			return
 		}
 		e.saveVerifiedFile(f.MsgId, f.From, f.To, f.Filename, f.Size, f.SHA256, blob)
 		return
@@ -1396,9 +1409,19 @@ func (e *engine) onFileFrame(f frame) {
 			e.mu.Unlock()
 			return // chunk before meta: drop (sender always sends meta first)
 		}
-		if f.Size <= 0 || f.Size > uploadMaxBytes || f.Chunks <= 0 || f.Chunks > 4096 {
+		if f.Size < 0 || f.Size > uploadMaxBytes || f.Chunks < 0 || f.Chunks > 4096 {
 			e.mu.Unlock()
+			if e.cb.onFileErr != nil {
+				e.cb.onFileErr(f.MsgId, f.From, "absurd file size — discarded")
+			}
 			return // absurd sizes fail closed
+		}
+		if f.Size == 0 || f.Chunks == 0 {
+			// Empty payload completes on meta alone.
+			metaCopy := f
+			e.mu.Unlock()
+			e.saveVerifiedFile(metaCopy.MsgId, metaCopy.From, metaCopy.To, metaCopy.Filename, 0, metaCopy.SHA256, []byte{})
+			return
 		}
 		// Chunks must agree with Size: 4096×64KB of 64KB chunks against a
 		// 1MB Size is a memory-exhaustion lie, not a file.
@@ -1478,6 +1501,27 @@ func safeDestName(filename string) string {
 }
 
 func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, shaHex string, blob []byte) {
+	// Idempotency at the side-effect boundary: redelivered inbox boxes
+	// (ack lost, backstop re-send) must be a no-op on disk, not a second
+	// "report (1).pdf". Consumer seenSets are not enough — the write happens
+	// at dispatch time, before consumers run.
+	e.mu.Lock()
+	if e.seenFiles == nil {
+		e.seenFiles = make(map[string]struct{})
+	}
+	if _, dup := e.seenFiles[msgId]; dup {
+		e.mu.Unlock()
+		return
+	}
+	e.seenFiles[msgId] = struct{}{}
+	// Bound the set (2000 recent, like consumers).
+	if len(e.seenFiles) > 2000 {
+		for k := range e.seenFiles {
+			delete(e.seenFiles, k)
+			break
+		}
+	}
+	e.mu.Unlock()
 	if int64(len(blob)) != size {
 		if e.cb.onFileErr != nil {
 			e.cb.onFileErr(msgId, from, "size mismatch — file discarded")
@@ -1499,21 +1543,24 @@ func (e *engine) saveVerifiedFile(msgId, from, to, filename string, size int64, 
 		return
 	}
 	safe := safeDestName(filename)
-	dest := uniquePath(dir, safe)
-	tmp := dest + ".part"
-	if err := os.WriteFile(tmp, blob, 0o644); err != nil {
+	// Atomic claim (O_EXCL, 0600): no Stat/rename TOCTOU, no world-readable
+	// E2EE payloads on shared machines.
+	f, dest, err := claimUniquePath(dir, safe, 1000)
+	if err != nil {
 		if e.cb.onFileErr != nil {
 			e.cb.onFileErr(msgId, from, err.Error())
 		}
 		return
 	}
-	if err := os.Rename(tmp, dest); err != nil {
-		os.Remove(tmp)
+	if _, err := f.Write(blob); err != nil {
+		f.Close()
+		os.Remove(dest)
 		if e.cb.onFileErr != nil {
 			e.cb.onFileErr(msgId, from, err.Error())
 		}
 		return
 	}
+	f.Close()
 	if e.cb.onFile != nil {
 		e.cb.onFile(engineFile{MsgId: msgId, From: from, To: to, Filename: filename, Path: dest, Size: size})
 	}

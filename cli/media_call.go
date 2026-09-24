@@ -84,6 +84,7 @@ type mediaManager struct {
 	transport *mediaTransport
 	started   bool
 	healStop  chan struct{}
+	stopped   bool // set by stopAll: ensureTransport must not allocate after teardown
 	wg        sync.WaitGroup
 
 	// audio live-cycle
@@ -95,6 +96,7 @@ type mediaManager struct {
 	rxVoice     *opusVoice // kept for compat; decode is per-peer (rxDecs)
 	rxJbs       map[string]*jitterBuffer
 	rxDecs      map[string]*opusVoice
+	playoutGen  int // generation: exiting playout only clears current gen
 
 	// render counters (diagnostics on toggle lines)
 	txFrames    uint64
@@ -531,6 +533,10 @@ func (m *mediaManager) sendStop(to string, audio bool) {
 // first use (publish needs media without any call).
 func (m *mediaManager) ensureTransport() (*mediaTransport, error) {
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("media stopped")
+	}
 	if m.transport != nil {
 		t := m.transport
 		m.mu.Unlock()
@@ -544,6 +550,11 @@ func (m *mediaManager) ensureTransport() (*mediaTransport, error) {
 	}
 	t.start()
 	m.mu.Lock()
+	if m.stopped {
+		m.mu.Unlock()
+		t.stop()
+		return nil, fmt.Errorf("media stopped")
+	}
 	if m.transport != nil {
 		existing := m.transport
 		m.mu.Unlock()
@@ -991,6 +1002,8 @@ func (m *mediaManager) ensureAudioRx() {
 		return
 	}
 	m.rxVoice = rxVoice
+	m.playoutGen++
+	rxGen := m.playoutGen
 	if m.rxJbs == nil {
 		m.rxJbs = map[string]*jitterBuffer{}
 	}
@@ -1003,13 +1016,19 @@ func (m *mediaManager) ensureAudioRx() {
 	m.mu.Unlock()
 
 	m.wg.Add(1)
-	go func() {
+	go func(gen int, voice *opusVoice) {
 		defer m.wg.Done()
 		defer func() {
 			m.mu.Lock()
-			m.rxVoice = nil
-			m.rxJbs = map[string]*jitterBuffer{}
-			m.rxDecs = map[string]*opusVoice{}
+			// Generation guard: do not clobber a freshly-created pipeline
+			// if playout was restarted while this goroutine exited.
+			if m.playoutGen == gen {
+				if m.rxVoice == voice {
+					m.rxVoice = nil
+				}
+				m.rxJbs = map[string]*jitterBuffer{}
+				m.rxDecs = map[string]*opusVoice{}
+			}
 			m.mu.Unlock()
 		}()
 		ticker := time.NewTicker(20 * time.Millisecond)
@@ -1125,7 +1144,7 @@ func (m *mediaManager) ensureAudioRx() {
 				play(mixed)
 			}
 		}
-	}()
+	}(rxGen, rxVoice)
 }
 
 // onRemoteAudio routes a peer's audio into their jitter buffer. Every
@@ -1134,7 +1153,10 @@ func (m *mediaManager) ensureAudioRx() {
 // overlapping talkers into garbage. The playout tick mixes all talkers.
 func (m *mediaManager) onRemoteAudio(peer string, pkt audioPacket) {
 	m.mu.Lock()
-	if len(m.pubAudio) == 0 {
+	// Only buffer for publishers we actually watch; otherwise any peer
+	// with a live session can grow rxJbs/rxDecs unboundedly (bounded today
+	// by peer count, reclaimed only on mediaStop).
+	if !m.pubAudio[peer] {
 		m.mu.Unlock()
 		return
 	}
@@ -1202,6 +1224,7 @@ func (m *mediaManager) stopAudioPlayout() {
 	m.audioRxStop = nil
 	closeFn := m.stopPlayFn
 	m.stopPlayFn = nil
+	m.playoutGen++ // invalidate exiting goroutine's deferred reset
 	m.rxVoice = nil
 	m.rxJbs = map[string]*jitterBuffer{}
 	m.rxDecs = map[string]*opusVoice{}
@@ -1224,6 +1247,11 @@ func (m *mediaManager) stopAll() {
 	stopMic := m.stopMic
 	stopPlay := m.stopPlayFn
 	m.audioStop, m.audioRxStop, m.stopMic, m.stopPlayFn = nil, nil, nil, nil
+	m.playoutGen++ // invalidate any exiting playout reset
+	m.stopped = true
+	m.healTries = 0
+	m.absentTicks = map[string]int{}
+	m.lastHeal = map[string]time.Time{}
 	m.audioOn = false
 	// Snapshot the scope BEFORE clearing: stop notes must reach everyone
 	// we were publishing to, otherwise peers wait on silence + heal churn.
@@ -1388,7 +1416,20 @@ func (m *mediaManager) healthCheck() {
 				// publisher can also re-dial us. Async: nominate blocks
 				// up to 600ms and must never stall the 2s health tick
 				// (with N peers the tick would drift seconds behind).
-				go m.joinPeer(p, ann)
+				// Tracked on wg + stopped-guarded so stopAll cannot be
+				// resurrected after teardown.
+				m.mu.Lock()
+				stopped := m.stopped
+				if !stopped {
+					m.wg.Add(1)
+				}
+				m.mu.Unlock()
+				if !stopped {
+					go func(peer string, a mediaAnnouncePayload) {
+						defer m.wg.Done()
+						m.joinPeer(peer, a)
+					}(p, ann)
+				}
 				_ = m.sendAnnounce(p, false)
 			}
 			// They publish (or published) but their last announce is
@@ -1404,8 +1445,19 @@ func (m *mediaManager) healthCheck() {
 		case d.LastRxAge > callWatchdogAfter:
 			// Live session gone quiet: heal runs every tick; healPeer
 			// itself throttles probes vs restarts (async: nominate can
-			// block up to 600ms per peer).
-			go m.healPeer(p)
+			// block up to 600ms per peer). Tracked + stopped-guarded.
+			m.mu.Lock()
+			stopped := m.stopped
+			if !stopped {
+				m.wg.Add(1)
+			}
+			m.mu.Unlock()
+			if !stopped {
+				go func(peer string) {
+					defer m.wg.Done()
+					m.healPeer(peer)
+				}(p)
+			}
 		}
 	}
 	// Scope-wide re-announce (the missing periodic path): roster ticks
@@ -1497,8 +1549,13 @@ func (m *mediaManager) healPeer(peer string) {
 	}
 	m.lastHeal[peer] = time.Now()
 	m.healTries++
+	tries := m.healTries
 	delete(m.healPingAt, peer)
 	m.mu.Unlock()
+	if tries > 10 {
+		m.emit("media to " + peer + " unstable — giving up auto-heal, toggle /audio to retry")
+		return
+	}
 	t.sendRestart(peer)
 	if weSend {
 		_ = m.sendAnnounce(peer, true)

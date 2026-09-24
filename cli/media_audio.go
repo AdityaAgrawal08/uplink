@@ -372,7 +372,7 @@ func openTestMic() (*micCapture, error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(out)
-		defer cmd.Process.Kill()
+		defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 		chunker := &frameChunker{}
 		buf := make([]byte, voiceFrameLen*2*4)
 		for {
@@ -422,7 +422,7 @@ func openPulseMic() (*micCapture, error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(out)
-		defer cmd.Process.Kill()
+		defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 		chunker := &frameChunker{}
 		buf := make([]byte, voiceFrameLen*2*4)
 		for {
@@ -477,7 +477,7 @@ func openFFmpegMic() (*micCapture, error) {
 	done := make(chan struct{})
 	go func() {
 		defer close(out)
-		defer cmd.Process.Kill()
+		defer func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() }()
 		chunker := &frameChunker{}
 		buf := make([]byte, voiceFrameLen*2*4)
 		for {

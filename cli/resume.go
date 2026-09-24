@@ -19,6 +19,7 @@ type ResumeState struct {
 	Done       []int      `json:"done"`
 	Parts      []PartInfo `json:"parts,omitempty"`
 	TotalParts int        `json:"total"`
+	ChunkSize  int64      `json:"chunkSize,omitempty"`
 	Timestamp  string     `json:"ts"`
 }
 
@@ -38,13 +39,21 @@ func (s *ResumeState) Save(filename string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	err = json.NewEncoder(f).Encode(s)
 	if err != nil {
+		f.Close()
 		return err
 	}
-	f.Close()
+	// Sync before rename so a crash cannot leave a valid-named but
+	// truncated state file.
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
 	return os.Rename(tmp, filepath.Join(dir, filename))
 }
 
@@ -67,7 +76,7 @@ func DeleteResumeState(filename string) error {
 }
 
 func (s *ResumeState) Valid() bool {
-	if s.TotalParts <= 0 || len(s.Done) >= s.TotalParts {
+	if s.TotalParts <= 0 {
 		return false
 	}
 	t, err := time.Parse(time.RFC3339, s.Timestamp)
@@ -75,7 +84,15 @@ func (s *ResumeState) Valid() bool {
 		return false
 	}
 	// Expire after 2 hours (S3 presigned URL expiration)
-	return time.Since(t) < 2*time.Hour
+	if time.Since(t) >= 2*time.Hour {
+		return false
+	}
+	// All parts done but confirm never ran (crash after final part):
+	// still resumable — caller skips straight to confirm.
+	if len(s.Done) >= s.TotalParts {
+		return true
+	}
+	return true
 }
 
 // ComputeSHA256Stream computes the SHA-256 hash of a file using a streaming approach

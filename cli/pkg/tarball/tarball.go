@@ -163,6 +163,13 @@ func UnpackLimit(reader io.Reader, destDir string, maxBytes int64) error {
 			return err
 		}
 
+		// Pre-check size before writing anything (bomb still capped).
+		if header.Size > maxBytes {
+			return fmt.Errorf("security error: entry %s size %d exceeds %d bytes", header.Name, header.Size, maxBytes)
+		}
+		if written+header.Size > maxBytes {
+			return fmt.Errorf("security error: archive unpacked size exceeds %d bytes (possible decompression bomb)", maxBytes)
+		}
 		// Clean path and calculate resolved path
 		targetPath := filepath.Join(absDestDir, header.Name)
 		absTargetPath, err := filepath.Abs(targetPath)
@@ -174,11 +181,24 @@ func UnpackLimit(reader io.Reader, destDir string, maxBytes int64) error {
 		if !strings.HasPrefix(absTargetPath, absDestDir+string(filepath.Separator)) && absTargetPath != absDestDir {
 			return fmt.Errorf("security error: blocked tar-slip path traversal attempt: %s", header.Name)
 		}
+		// Symlink-aware containment: lexical Abs does not resolve symlinks.
+		// Resolve the parent's real path and re-verify.
+		if parentReal, err := filepath.EvalSymlinks(filepath.Dir(absTargetPath)); err == nil {
+			if !strings.HasPrefix(parentReal, absDestDir+string(filepath.Separator)) && parentReal != absDestDir {
+				return fmt.Errorf("security error: blocked symlink escape: %s", header.Name)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("security error: cannot resolve parent: %w", err)
+		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			// Preserve mode bits for directory creation
-			err = os.MkdirAll(absTargetPath, os.FileMode(header.Mode))
+			// Mask mode bits (never world-writable from archive).
+			mode := os.FileMode(header.Mode) & 0o755
+			if mode == 0 {
+				mode = 0o755
+			}
+			err = os.MkdirAll(absTargetPath, mode)
 			if err != nil {
 				return err
 			}
@@ -191,8 +211,12 @@ func UnpackLimit(reader io.Reader, destDir string, maxBytes int64) error {
 				return err
 			}
 
-			// Open file for writing, preserving mode bits
-			file, err := os.OpenFile(absTargetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			// Mask mode bits (never world-writable/executable surprise).
+			fmode := os.FileMode(header.Mode) & 0o644
+			if fmode == 0 {
+				fmode = 0o644
+			}
+			file, err := os.OpenFile(absTargetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fmode)
 			if err != nil {
 				return err
 			}

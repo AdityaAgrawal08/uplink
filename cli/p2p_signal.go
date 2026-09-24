@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -105,6 +106,28 @@ func isServerDown(err error) bool {
 	}
 	if code := apiStatusCode(err); code != 0 {
 		return code == 502 || code == 503 || code == 504
+	}
+	// Prefer typed net errors over substring matching (user content may
+	// contain tokens like "ice"/"timeout"). Fall back to substrings only
+	// for opaque transport errors.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Timeout() {
+			return true
+		}
+		// Refused/reset/unreachable => server/network down; ICE/DTLS
+		// handshake failures are local connectivity, not server-down.
+		s := strings.ToLower(opErr.Err.Error())
+		for _, sub := range []string{"connection refused", "connection reset", "no such host", "network is unreachable", "connection aborted"} {
+			if strings.Contains(s, sub) {
+				return true
+			}
+		}
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
 	}
 	s := strings.ToLower(err.Error())
 	// Mesh/WebRTC path failures (ICE, offer/answer, DTLS, STUN) are local

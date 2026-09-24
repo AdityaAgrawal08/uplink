@@ -30,13 +30,24 @@ func main() {
 	go srv.cleanerLoop()
 
 	log.Printf("uplink WebSocket server listening on %s", addr)
+	listenErr := make(chan error, 1)
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+			listenErr <- err
+		} else {
+			listenErr <- nil
 		}
 	}()
 
-	waitForShutdown(httpServer)
+	select {
+	case err := <-listenErr:
+		if err != nil {
+			log.Fatalf("listen: %v", err)
+		}
+		// Server closed without shutdown signal (should not happen via
+		// ListenAndServe alone); fall through to graceful stop.
+	case <-waitForShutdownSignal():
+	}
 
 	// Give in-flight connections a moment to drain.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

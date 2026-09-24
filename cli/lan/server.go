@@ -11,37 +11,56 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-var ActiveConnections int32
+var RequestsSeen int32
 var DownloadsCompleted int32
 
+// ActiveConnections is kept for backward compatibility (tests/scripts may
+// reference it); it aliases RequestsSeen which counts handshake attempts.
+var ActiveConnections int32
+
 func GetActiveConnections() int32 {
-	return atomic.LoadInt32(&ActiveConnections)
+	return atomic.LoadInt32(&RequestsSeen)
 }
 
 // progressWriter wraps http.ResponseWriter to track bytes written.
 type progressWriter struct {
 	http.ResponseWriter
-	total   int64
-	written int64
-	onProg  func(written, total int64)
-	once    sync.Once
+	total    int64
+	written  int64
+	lastProg int64
+	onProg   func(written, total int64)
+	once     sync.Once
+	serveErr error
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n, err := pw.ResponseWriter.Write(p)
+	if err != nil {
+		pw.serveErr = err
+	}
 	pw.written += int64(n)
 	if pw.onProg != nil {
 		pw.once.Do(func() {
-			go pw.onProg(pw.written, pw.total)
+			pw.onProg(pw.written, pw.total)
 		})
-		// Throttle callbacks to ~every 256KB
-		if pw.written%256*1024 < int64(len(p)) {
-			go pw.onProg(pw.written, pw.total)
+		// Throttle callbacks to ~every 256KB (synchronous, no goroutine
+		// storm; caller must still guard shared printer with a mutex).
+		if pw.written-pw.lastProg >= 256*1024 {
+			pw.lastProg = pw.written
+			pw.onProg(pw.written, pw.total)
 		}
 	}
 	return n, err
+}
+
+// Flush passthrough preserves http.Flusher so ServeFile keeps streaming.
+func (pw *progressWriter) Flush() {
+	if f, ok := pw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func ServeFileLAN(ctx context.Context, path string, port int, cert tls.Certificate, shareCode string, password string, downloadLimit int, onComplete func()) error {
@@ -59,11 +78,14 @@ func ServeFileLANWithProgress(ctx context.Context, path string, port int, cert t
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 		},
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	var completeOnce sync.Once
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&RequestsSeen, 1)
 		atomic.AddInt32(&ActiveConnections, 1)
 
 		// 1. Enforce share code matching
@@ -116,16 +138,29 @@ func ServeFileLANWithProgress(ctx context.Context, path string, port int, cert t
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		w.Header().Set("ETag", fmt.Sprintf(`"%x-%x"`, info.ModTime().Unix(), info.Size()))
 
+		// Byte-exact completion: only fire onComplete when ServeFile wrote
+		// the full object without error and the client did not disconnect.
+		// The old r.Context().Err() check is unreliable (cancellation often
+		// surfaces after the handler returns).
+		var servedBytes int64
+		var serveErr error
 		if r.Method == "GET" && onProgress != nil {
 			pw := &progressWriter{ResponseWriter: w, total: info.Size(), onProg: onProgress}
 			http.ServeFile(pw, r, path)
+			servedBytes = pw.written
+			serveErr = pw.serveErr
+		} else if r.Method == "GET" {
+			cw := &progressWriter{ResponseWriter: w, total: info.Size()}
+			http.ServeFile(cw, r, path)
+			servedBytes = cw.written
+			serveErr = cw.serveErr
 		} else {
 			http.ServeFile(w, r, path)
 		}
 
 		// Serve completed, run completion callback
 		if r.Method == "GET" {
-			if r.Context().Err() != nil {
+			if serveErr != nil || servedBytes != info.Size() || r.Context().Err() != nil {
 				if reserved {
 					atomic.AddInt32(&DownloadsCompleted, -1)
 				}

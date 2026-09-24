@@ -28,23 +28,31 @@ type Server struct {
 	sessions map[string]*Session
 	mu       sync.RWMutex
 	limiter  *RateLimiter
+	// pendingKeys stashes pubkeys supplied via HTTP create/join
+	// ("sessionId\x00username" → pubkey) until the WS upgrade registers
+	// the live Connection. Prevents silent pubkey drops.
+	pendingKeys map[string]string
 }
 
 // NewServer creates a server with the given configuration.
 func NewServer(cfg Config) *Server {
 	return &Server{
-		cfg:      cfg,
-		sessions: make(map[string]*Session),
-		limiter:  NewRateLimiter(cfg.RateLimitPerSec),
+		cfg:         cfg,
+		sessions:    make(map[string]*Session),
+		limiter:     NewRateLimiter(cfg.RateLimitPerSec),
+		pendingKeys: make(map[string]string),
 	}
 }
 
 // ─── HTTP routing ───────────────────────────────────────────────────────────
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	n := len(s.sessions)
+	s.mu.RUnlock()
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"sessions": len(s.sessions),
+		"status":   "ok",
+		"sessions": n,
 	})
 }
 
@@ -83,6 +91,8 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password,omitempty"`
+		Pubkey   string `json:"pubkey,omitempty"`
+		PubKey   string `json:"publicKey,omitempty"`
 		Duration int    `json:"duration,omitempty"` // seconds
 	}
 	if err := readJSON(r, &req); err != nil {
@@ -106,7 +116,13 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	var passwordHash string
 	if req.Password != "" {
-		passwordHash = hashPassword(req.Password)
+		var err error
+		passwordHash, err = hashPassword(req.Password)
+		if err != nil {
+			log.Printf("password hashing failed: %v", err)
+			jsonError(w, http.StatusInternalServerError, "password setup failed")
+			return
+		}
 	}
 
 	session := &Session{
@@ -114,6 +130,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		PasswordHash: passwordHash,
 		ExpiresAt:    now.Add(duration),
 		Users:        make(map[string]*Connection),
+		Uploads:      make(map[string]*announcedUpload),
 		Buffer:       NewRingBuffer(s.cfg.MessageBufSize),
 	}
 
@@ -126,8 +143,29 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	}
 	session.ServerKeyPair = kp
 
+	// Validate optional pubkey (never silently drop): stash for the WS
+	// upgrade if well-formed, reject if malformed.
+	if pk := firstNonEmpty(req.Pubkey, req.PubKey); pk != "" {
+		if _, err := decodeClientPubkey(strings.TrimSpace(pk)); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid pubkey (expected base64 32-byte key)")
+			return
+		}
+		s.mu.Lock()
+		s.pendingKeys[sessionId+"\x00"+req.Username] = strings.TrimSpace(pk)
+		s.mu.Unlock()
+	}
+
+	// Atomic reserve: generate + insert under one Lock so concurrent
+	// creates cannot collide on the same 6-digit ID.
 	s.mu.Lock()
-	s.sessions[sessionId] = session
+	for {
+		if _, exists := s.sessions[sessionId]; !exists {
+			s.sessions[sessionId] = session
+			break
+		}
+		sessionId = drawSessionId()
+		session.Id = sessionId
+	}
 	s.mu.Unlock()
 
 	// Creator is auto-joined (they don't need to call join separately).
@@ -141,10 +179,17 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// generateSessionId generates a 6-digit numeric code.
+// drawSessionId draws one candidate 6-digit code (lock-free).
+func drawSessionId() string {
+	return genNumericId(6)
+}
+
+// generateSessionId returns an unused code, reserving it atomically is done
+// by the caller (see handleCreateSession which generates + inserts under one
+// Lock). Kept for tests and single-threaded callers.
 func (s *Server) generateSessionId() string {
-	for i := 0; i < 20; i++ {
-		id := genNumericId(6)
+	for i := 0; i < 50; i++ {
+		id := drawSessionId()
 		s.mu.RLock()
 		_, exists := s.sessions[id]
 		s.mu.RUnlock()
@@ -152,17 +197,39 @@ func (s *Server) generateSessionId() string {
 			return id
 		}
 	}
-	// Fallback: use timestamp-based ID
-	return time.Now().Format("010204")
+	// Exhausted retries: keep drawing from crypto/rand (never a
+	// date-derived fallback that collides for a full minute).
+	for {
+		id := drawSessionId()
+		s.mu.RLock()
+		_, exists := s.sessions[id]
+		s.mu.RUnlock()
+		if !exists {
+			return id
+		}
+	}
 }
 
 func genNumericId(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	for i := range b {
-		b[i] = '0' + b[i]%10
+	// Rejection-sample each digit to avoid modulo bias (256 % 10 != 0).
+	digits := make([]byte, n)
+	for i := range digits {
+		for {
+			var b [1]byte
+			if _, err := rand.Read(b[:]); err != nil {
+				// crypto/rand failure is effectively impossible here
+				// (getrandom on modern kernels); fall back to time-nano
+				// mixing rather than returning a colliding constant.
+				digits[i] = byte(time.Now().UnixNano()%10) + '0'
+				break
+			}
+			if b[0] < 250 { // 250 is the largest multiple of 10 below 256
+				digits[i] = '0' + b[0]%10
+				break
+			}
+		}
 	}
-	return string(b)
+	return string(digits)
 }
 
 // ─── HTTP join (non-WebSocket, for legacy clients) ─────────────────────────
@@ -171,6 +238,8 @@ func (s *Server) handleJoinSessionHTTP(w http.ResponseWriter, r *http.Request, s
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password,omitempty"`
+		Pubkey   string `json:"pubkey,omitempty"`
+		PubKey   string `json:"publicKey,omitempty"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		jsonError(w, http.StatusBadRequest, "invalid JSON body")
@@ -191,6 +260,11 @@ func (s *Server) handleJoinSessionHTTP(w http.ResponseWriter, r *http.Request, s
 		return
 	}
 	if session.PasswordHash != "" {
+		// Rate-limit auth attempts (argon2id cost) per session.
+		if !s.limiter.Allow("auth:"+sessionId) {
+			jsonError(w, http.StatusTooManyRequests, "slow down — rate limited")
+			return
+		}
 		if req.Password == "" {
 			jsonError(w, http.StatusUnauthorized, "password required")
 			return
@@ -201,12 +275,32 @@ func (s *Server) handleJoinSessionHTTP(w http.ResponseWriter, r *http.Request, s
 		}
 	}
 
+	if pk := firstNonEmpty(req.Pubkey, req.PubKey); pk != "" {
+		pk = strings.TrimSpace(pk)
+		if _, err := decodeClientPubkey(pk); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid pubkey (expected base64 32-byte key)")
+			return
+		}
+		s.mu.Lock()
+		s.pendingKeys[sessionId+"\x00"+req.Username] = pk
+		s.mu.Unlock()
+	}
+
 	// For HTTP join, we just validate and return the roster.
 	// The actual real-time connection happens via WebSocket.
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"sessionId":   sessionId,
 		"participants": session.ActiveUsernames(),
 	})
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // ─── HTTP leave (fallback for clients without WebSocket) ───────────────────
@@ -226,6 +320,10 @@ func (s *Server) handleLeaveHTTP(w http.ResponseWriter, r *http.Request, session
 	session.Mu.RLock()
 	conn := session.Users[username]
 	session.Mu.RUnlock()
+	if conn == nil {
+		jsonError(w, http.StatusNotFound, "no active connection for user")
+		return
+	}
 	s.removeUser(session, conn)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -251,12 +349,37 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request, session
 
 	// Check password from query param (WebSocket can't send custom headers
 	// easily on reconnect, so we accept it as a query parameter too).
+	// NOTE: query strings can land in proxy/access logs; prefer the
+	// X-Uplink-Password header when the client can set it.
 	password := r.URL.Query().Get("password")
-	if session.PasswordHash != "" && password != "" {
+	if password == "" {
+		password = r.Header.Get("X-Uplink-Password")
+	}
+	if session.PasswordHash != "" {
+		if password == "" {
+			jsonError(w, http.StatusUnauthorized, "password required")
+			return
+		}
+		// Rate-limit authentication attempts per session to blunt CPU-DoS
+		// via argon2id (16 MiB x 3) on every join attempt.
+		if !s.limiter.Allow("auth:"+sessionId) {
+			jsonError(w, http.StatusTooManyRequests, "slow down — rate limited")
+			return
+		}
 		if !verifyPassword(password, session.PasswordHash) {
 			jsonError(w, http.StatusUnauthorized, "incorrect password")
 			return
 		}
+	}
+
+	// Enforce MaxSessionUsers (allow same-username reconnect to replace).
+	session.Mu.RLock()
+	_, isReconnect := session.Users[username]
+	nUsers := len(session.Users)
+	session.Mu.RUnlock()
+	if !isReconnect && s.cfg.MaxSessionUsers > 0 && nUsers >= s.cfg.MaxSessionUsers {
+		jsonError(w, http.StatusServiceUnavailable, "session is full")
+		return
 	}
 
 	// Upgrade to WebSocket.
@@ -266,29 +389,44 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request, session
 		return
 	}
 
-	conn := &Connection{
-		Username: username,
-		Conn:     ws,
-		Send:     make(chan []byte, 256),
-		LastBeat: time.Now(),
+	conn := newConnection(username, ws)
+	// Carry the pubkey supplied at HTTP join/create time (if any) so the
+	// WS-only join frame is not the sole key path. Clients encode padded
+	// StdEncoding; accept both dialects.
+	if pk := strings.TrimSpace(r.Header.Get("X-Uplink-Pubkey")); pk != "" {
+		if _, err := decodeClientPubkey(pk); err == nil {
+			conn.ClientPubKey = pk
+		}
+	} else {
+		s.mu.Lock()
+		if pk, ok := s.pendingKeys[sessionId+"\x00"+username]; ok {
+			conn.ClientPubKey = pk
+			delete(s.pendingKeys, sessionId+"\x00"+username)
+		}
+		s.mu.Unlock()
 	}
 
 	// Register in session (replaces existing connection if same username).
+	// Never close(old.Send) here: Send is writer-owned. Signal the old
+	// writer via shutdown() and let it close Send on exit.
 	session.Mu.Lock()
 	if old, exists := session.Users[username]; exists {
-		// Close old connection.
-		close(old.Send)
-		_ = old.Conn.Close()
+		old.shutdown()
 	}
 	session.Users[username] = conn
 	session.Mu.Unlock()
 
-	// Send welcome with roster and session public key.
+	// Send welcome with roster, session public key, and recent history so
+	// the RingBuffer is actually consumed by late-joiners. History rides
+	// inside the welcome frame (not as separate chat frames) so existing
+	// frame sequencing (welcome → system/users) is preserved.
+	history := session.Buffer.Snapshot()
 	welcome := Outbound{
 		Type:          msgTypeWelcome,
 		SessionId:     sessionId,
 		SessionPubKey: session.ServerKeyPair.PublicB64(),
 		Users:         session.ActiveUsernames(),
+		History:       history,
 	}
 	_ = ws.WriteJSON(welcome)
 
@@ -300,6 +438,11 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request, session
 		Type:  msgTypeUsers,
 		Users: session.ActiveUsernames(),
 	}, "")
+	// If this connection arrived with a key, distribute immediately so E2E
+	// does not depend solely on the WS join frame.
+	if conn.ClientPubKey != "" {
+		s.broadcastUserKeys(session)
+	}
 
 	log.Printf("[%s] %s connected (users: %d)", sessionId, username, len(session.ActiveUsernames()))
 
@@ -343,6 +486,10 @@ func (s *Server) readPump(session *Session, conn *Connection) {
 
 		var in Inbound
 		if err := jsonUnmarshal(raw, &in); err != nil {
+			safeSend(conn, Outbound{
+				Type:    msgTypeError,
+				Message: "invalid message encoding",
+			})
 			continue
 		}
 
@@ -373,6 +520,14 @@ func (s *Server) writePump(session *Session, conn *Connection) {
 	ticker := time.NewTicker(s.cfg.HeartbeatTimeout / 3)
 	defer func() {
 		ticker.Stop()
+		// Single owner of close(Send): mutually exclusive with trySend
+		// via SendMu so a send can never race this close.
+		conn.SendMu.Lock()
+		if !conn.closed {
+			conn.closed = true
+			close(conn.Send)
+		}
+		conn.SendMu.Unlock()
 		_ = conn.Conn.Close()
 	}()
 
@@ -388,6 +543,9 @@ func (s *Server) writePump(session *Session, conn *Connection) {
 				return
 			}
 
+		case <-conn.done:
+			return
+
 		case <-ticker.C:
 			_ = conn.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -399,6 +557,19 @@ func (s *Server) writePump(session *Session, conn *Connection) {
 
 // ─── Message handlers ──────────────────────────────────────────────────────
 
+// decodeClientPubkey accepts both padded StdEncoding (what every CLI/
+// landing client sends) and RawStdEncoding, returning 32 raw bytes.
+func decodeClientPubkey(key string) ([]byte, error) {
+	if raw, err := base64.StdEncoding.DecodeString(key); err == nil && len(raw) == 32 {
+		return raw, nil
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(key)
+	if err != nil || len(raw) != 32 {
+		return nil, fmt.Errorf("expected base64-encoded 32-byte X25519 key")
+	}
+	return raw, nil
+}
+
 func (s *Server) handleJoin(session *Session, conn *Connection, in *Inbound) {
 	// Client sends its public key after receiving the welcome.
 	key := strings.TrimSpace(in.ClientPubKey)
@@ -406,8 +577,7 @@ func (s *Server) handleJoin(session *Session, conn *Connection, in *Inbound) {
 		return
 	}
 	// Validate: must be base64 that decodes to a 32-byte X25519 public key.
-	raw, err := base64.RawStdEncoding.DecodeString(key)
-	if err != nil || len(raw) != 32 {
+	if _, err := decodeClientPubkey(key); err != nil {
 		safeSend(conn, Outbound{
 			Type:    msgTypeError,
 			Message: "invalid clientPublicKey (expected base64-encoded 32-byte X25519 key)",
@@ -422,7 +592,14 @@ func (s *Server) handleJoin(session *Session, conn *Connection, in *Inbound) {
 
 func (s *Server) handleChat(session *Session, conn *Connection, in *Inbound) {
 	text := strings.TrimSpace(in.Text)
-	if text == "" || len(text) > 500 {
+	if text == "" {
+		return
+	}
+	if len(text) > 500 {
+		safeSend(conn, Outbound{
+			Type:    msgTypeError,
+			Message: "message exceeds 500 byte limit",
+		})
 		return
 	}
 
@@ -468,6 +645,11 @@ func (s *Server) handleChat(session *Session, conn *Connection, in *Inbound) {
 
 func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound) {
 	if in.Filename == "" || in.Size <= 0 || in.TotalChunks <= 0 {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "invalid file metadata"})
+		return
+	}
+	if in.TotalChunks > 4096 {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "too many chunks"})
 		return
 	}
 	if in.Size > s.cfg.MaxFileSize {
@@ -475,6 +657,10 @@ func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound)
 			Type:    msgTypeError,
 			Message: "file exceeds maximum size limit",
 		})
+		return
+	}
+	if s.cfg.FileChunkSize > 0 && in.Size > int64(in.TotalChunks)*int64(s.cfg.FileChunkSize)*4 {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "file size inconsistent with chunk count"})
 		return
 	}
 
@@ -485,6 +671,18 @@ func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound)
 	if msgId == "" {
 		msgId = genId()
 	}
+
+	// Register the announced upload so chunks can be validated.
+	session.Mu.Lock()
+	if session.Uploads == nil {
+		session.Uploads = make(map[string]*announcedUpload)
+	}
+	session.Uploads[conn.Username+"\x00"+msgId] = &announcedUpload{
+		Owner:       conn.Username,
+		TotalChunks: in.TotalChunks,
+		Size:        in.Size,
+	}
+	session.Mu.Unlock()
 
 	msg := ChatMessage{
 		MsgId:       msgId,
@@ -520,6 +718,30 @@ func (s *Server) handleFileMeta(session *Session, conn *Connection, in *Inbound)
 }
 
 func (s *Server) handleFileChunk(session *Session, conn *Connection, in *Inbound) {
+	// Validate against the announced upload; require ownership and bounds.
+	// Rate-limit separately from chat so bulk data cannot amplify at line rate.
+	if in.MsgId == "" || in.Data == "" {
+		return
+	}
+	session.Mu.RLock()
+	meta, ok := session.Uploads[conn.Username+"\x00"+in.MsgId]
+	session.Mu.RUnlock()
+	if !ok {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "chunk for unknown file announcement"})
+		return
+	}
+	if in.ChunkIndex < 0 || in.ChunkIndex >= meta.TotalChunks {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "chunk index out of range"})
+		return
+	}
+	if len(in.Data) > 1<<20 {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "chunk too large"})
+		return
+	}
+	if !s.limiter.Allow("chunk:"+session.Id+":"+conn.Username) {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "slow down — file rate limited"})
+		return
+	}
 	// Relay the encrypted chunk to the appropriate recipients.
 	out := Outbound{
 		Type:       "file-chunk",
@@ -553,8 +775,12 @@ func (s *Server) handleDelete(session *Session, conn *Connection, in *Inbound) {
 	if in.DeleteMsgId == "" {
 		return
 	}
-	// Broadcast the delete event. Any client can delete their own messages;
-	// the server doesn't enforce ownership (trust-based for v1).
+	// Only the original author may delete their message: look it up in the
+	// recent buffer. Unknown IDs are rejected instead of broadcast blindly.
+	if !session.Buffer.OwnedBy(in.DeleteMsgId, conn.Username) {
+		safeSend(conn, Outbound{Type: msgTypeError, Message: "cannot delete unknown or foreign message"})
+		return
+	}
 	out := Outbound{
 		Type:       "delete",
 		DeleteMsgId: in.DeleteMsgId,
@@ -574,16 +800,14 @@ func (s *Server) handleHeartbeat(session *Session, conn *Connection) {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 // safeSend sends a JSON message through the connection's send channel.
-// Non-blocking: drops the message if the channel is full (slow consumer).
+// Non-blocking: drops the message if the channel is full (slow consumer)
+// or the connection is shutting down. Never panics.
 func safeSend(conn *Connection, msg Outbound) {
 	data, err := jsonMarshal(msg)
 	if err != nil {
 		return
 	}
-	select {
-	case conn.Send <- data:
-	default:
-	}
+	conn.trySend(data)
 }
 
 func (s *Server) getSession(id string) *Session {
@@ -597,32 +821,23 @@ func (s *Server) removeUser(session *Session, conn *Connection) {
 		return
 	}
 	session.Mu.Lock()
-	// B37 FIX: only remove the map entry if it is still THIS connection.
+	// Only remove the map entry if it is still THIS connection.
 	// After a reconnect the same username maps to a new Connection; the old
 	// connection's readPump returning would otherwise evict the live one.
 	cur, ok := session.Users[conn.Username]
 	if ok && cur == conn {
-		close(conn.Send)
-		_ = conn.Conn.Close()
 		delete(session.Users, conn.Username)
 	}
 	empty := len(session.Users) == 0
 	session.Mu.Unlock()
 
+	// Signal the writer to exit; it owns close(Send). Never close(Send) here.
+	conn.shutdown()
+
 	if empty {
-		// Schedule session cleanup after a grace period.
-		go func() {
-			time.Sleep(5 * time.Minute)
-			session.Mu.RLock()
-			stillEmpty := len(session.Users) == 0
-			session.Mu.RUnlock()
-			if stillEmpty && time.Now().After(session.ExpiresAt) {
-				s.mu.Lock()
-				delete(s.sessions, session.Id)
-				s.mu.Unlock()
-				log.Printf("session %s cleaned up (empty + expired)", session.Id)
-			}
-		}()
+		// Defer to cleanerLoop for expiry sweeps; no per-departure sleeper
+		// goroutine (previously one unsupervised 5-min sleeper per leave
+		// that survived shutdown and raced cleanerLoop).
 	}
 }
 
@@ -641,19 +856,34 @@ func (s *Server) broadcastUserKeys(session *Session) {
 	session.Broadcast(Outbound{Type: msgTypeKeys, Keys: keys}, "")
 }
 
-// cleanerLoop periodically sweeps expired sessions.
+// cleanerLoop periodically sweeps expired sessions, notifying connected
+// clients with msgTypeEnded before disconnecting them.
 func (s *Server) cleanerLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
-		// Clean expired sessions.
 		s.mu.Lock()
 		for id, sess := range s.sessions {
-			sess.Mu.RLock()
-			empty := len(sess.Users) == 0
-			sess.Mu.RUnlock()
-			if empty && now.After(sess.ExpiresAt) {
+			if now.After(sess.ExpiresAt) {
+				// Notify + disconnect live members, then drop the room.
+				sess.Mu.RLock()
+				conns := make([]*Connection, 0, len(sess.Users))
+				for _, c := range sess.Users {
+					conns = append(conns, c)
+				}
+				empty := len(conns) == 0
+				sess.Mu.RUnlock()
+				if !empty {
+					ended, _ := jsonMarshal(Outbound{Type: msgTypeEnded, Reason: "session expired"})
+					for _, c := range conns {
+						c.trySend(ended)
+						c.shutdown()
+					}
+					sess.Mu.Lock()
+					sess.Users = make(map[string]*Connection)
+					sess.Mu.Unlock()
+				}
 				delete(s.sessions, id)
 				log.Printf("cleaner: removed expired session %s", id)
 			}
@@ -666,15 +896,17 @@ func (s *Server) cleanerLoop() {
 
 // hashPassword hashes a password with argon2id using a per-password random
 // salt, encoded as $argon2id$v=19$m=16384,t=3,p=1$<salt-b64>$<hash-b64>.
-func hashPassword(password string) string {
+// Returns an error instead of silently producing "" (the "no password"
+// sentinel) when crypto/rand fails — callers must fail closed.
+func hashPassword(password string) (string, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
-		return ""
+		return "", fmt.Errorf("rand.Read salt: %w", err)
 	}
 	hash := argon2.IDKey([]byte(password), salt, 3, 16*1024, 1, 32)
 	return fmt.Sprintf("$argon2id$v=19$m=16384,t=3,p=1$%s$%s",
 		base64.RawStdEncoding.EncodeToString(salt),
-		base64.RawStdEncoding.EncodeToString(hash))
+		base64.RawStdEncoding.EncodeToString(hash)), nil
 }
 
 func verifyPassword(password, hash string) bool {

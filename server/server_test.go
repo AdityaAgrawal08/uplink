@@ -145,9 +145,12 @@ func TestRateLimiter_WindowReset(t *testing.T) {
 	if rl.Allow("k") {
 		t.Fatal("should be rate-limited")
 	}
-	// Manually expire the window.
+	// Manually expire the bucket (drain + backdate fill).
 	rl.mu.Lock()
-	rl.windows["k"].resetAt = time.Now().Add(-time.Second)
+	if b, ok := rl.buckets["k"]; ok {
+		b.tokens = 0
+		b.lastFill = time.Now().Add(-2 * time.Second)
+	}
 	rl.mu.Unlock()
 	if !rl.Allow("k") {
 		t.Fatal("should be allowed after window reset")

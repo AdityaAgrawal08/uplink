@@ -128,10 +128,14 @@ func sanitizeHeader(v string) string {
 
 // ─── Graceful shutdown ─────────────────────────────────────────────────────
 
-func waitForShutdown(server *http.Server) {
+func waitForShutdownSignal() <-chan os.Signal {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigCh
+	return sigCh
+}
+
+func waitForShutdown(server *http.Server) {
+	sig := <-waitForShutdownSignal()
 	log.Printf("received %s, shutting down...", sig)
 	_ = server.Close()
 }

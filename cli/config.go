@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,7 +29,10 @@ func defaultConfig() *Config {
 }
 
 func getConfigPath() string {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(".", ".uplink", "config.json")
+	}
 	return filepath.Join(home, ".uplink", "config.json")
 }
 
@@ -47,7 +51,9 @@ func LoadConfig() *Config {
 			ShowQR         *string `json:"show_qr"`
 		}
 		var fileCfg fileConfig
-		if json.Unmarshal(data, &fileCfg) == nil {
+		if err := json.Unmarshal(data, &fileCfg); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ignoring malformed config %s: %v\n", path, err)
+		} else {
 			if fileCfg.Server != nil {
 				cfg.Server = *fileCfg.Server
 			}
