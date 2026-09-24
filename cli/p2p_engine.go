@@ -122,7 +122,11 @@ type engine struct {
 	// from the chat and file-upload goroutines could otherwise swap two
 	// frames on the wire, and the receiver would fail-decrypt the first
 	// arrival and tear down a healthy session. Guarded by e.mu.
-	sendMu    map[string]*sync.Mutex
+	// Refcounted: setRoster only deletes a departed peer's entry when no
+	// send holds it (refs==0); otherwise deletion is deferred to the
+	// matching release, so a leave/rejoin overlapping an in-flight send
+	// can never swap in a second mutex mid-span.
+	sendMu    map[string]*sendEntry
 	files     map[string]*fileAssembly
 	seenFiles map[string]struct{} // msgId dedup at save boundary (redelivery no-op)
 	announced map[string]bool     // safety codes already shown
@@ -239,7 +243,7 @@ func newEngineWithStun(me string, id *identityKey, sig *signalClient, cb engineC
 		lastFail:       map[string]time.Time{},
 		failCount:      map[string]int{},
 		unacked:        map[string]*pendingAck{},
-		sendMu:         map[string]*sync.Mutex{},
+		sendMu:         map[string]*sendEntry{},
 		files:          map[string]*fileAssembly{},
 		seenFiles:      map[string]struct{}{},
 		announced:      map[string]bool{},
@@ -393,10 +397,16 @@ func (e *engine) setRoster(members []rosterMember) {
 		delete(e.lastFail, u)
 		delete(e.failCount, u)
 		delete(e.announced, u)
-		// NOTE: sendMu entries are never deleted. Deleting while a send
-		// holds the old mutex breaks the Noise nonce-ordering invariant
-		// (next sendMuFor creates a different mutex). Peer cardinality is
-		// small and bounded, so retention is safe.
+		// Refcounted delete: drop the departed peer's serializer only
+		// when no send holds it; otherwise the in-flight send's release
+		// cleans it up. Prevents a leave/rejoin from swapping in a
+		// second mutex mid encrypt+send (Noise nonce-order break).
+		if ent, ok := e.sendMu[u]; ok {
+			if ent.refs == 0 {
+				delete(e.sendMu, u)
+			}
+			// else: deferred to sendMuRelease
+		}
 		e.mu.Unlock()
 	}
 }
@@ -1016,14 +1026,15 @@ func (e *engine) sendOne(peer string, f frame, raw []byte) error {
 	// the wire out of Noise nonce order (the receiver would fail-decrypt
 	// the first arrival and tear down a healthy session).
 	if ok && ps.isReady() {
-		sm := e.sendMuFor(peer)
-		sm.Lock()
+		sm := e.sendMuAcquire(peer)
+		sm.mu.Lock()
 		ct, encErr := ps.encrypt(raw)
 		var sendErr error
 		if encErr == nil {
 			sendErr = e.mesh.send(peer, ct)
 		}
-		sm.Unlock()
+		sm.mu.Unlock()
+		e.sendMuRelease(peer, sm)
 		if encErr == nil && sendErr == nil {
 			// Mesh delivery is NOT assumed: the frame may land in a
 			// dead or cross-generation session and be dropped on
@@ -1081,18 +1092,58 @@ func (e *engine) sendInbox(peer string, key []byte, f frame, raw []byte) error {
 	return e.sig.inboxSend(peer, f.MsgId, inboxBoxKind, box)
 }
 
+// sendEntry is a refcounted per-peer serializer for the mesh fast path.
+type sendEntry struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // sendMuFor returns the per-peer mesh fast-path serializer, creating it.
-// Callers hold it across encrypt+send so frame order on the wire matches
-// Noise nonce order for that peer.
-func (e *engine) sendMuFor(peer string) *sync.Mutex {
+// Pure getter (no refcount change); used by tests and by code that only
+// needs identity, not a hold across encrypt+send. Send path must use
+// sendMuAcquire/sendMuRelease so setRoster can never delete the entry
+// out from under an in-flight span.
+func (e *engine) sendMuFor(peer string) *sendEntry {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	sm, ok := e.sendMu[peer]
 	if !ok {
-		sm = &sync.Mutex{}
+		sm = &sendEntry{}
 		e.sendMu[peer] = sm
 	}
 	return sm
+}
+
+// sendMuAcquire returns the entry and holds one reference across the
+// caller's encrypt+send span.
+func (e *engine) sendMuAcquire(peer string) *sendEntry {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sm, ok := e.sendMu[peer]
+	if !ok {
+		sm = &sendEntry{}
+		e.sendMu[peer] = sm
+	}
+	sm.refs++
+	return sm
+}
+
+// sendMuRelease drops one acquire reference; when the last holder of a
+// departed peer's entry releases, the entry is deleted.
+func (e *engine) sendMuRelease(peer string, sm *sendEntry) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	sm.refs--
+	if sm.refs < 0 {
+		sm.refs = 0
+	}
+	if sm.refs == 0 {
+		if cur, ok := e.sendMu[peer]; ok && cur == sm {
+			if _, member := e.roster[peer]; !member {
+				delete(e.sendMu, peer)
+			}
+		}
+	}
 }
 
 // trackUnacked records a mesh-sent frame for the ack backstop.
