@@ -1,9 +1,7 @@
 # UPLINK-Delta — Documentation
 
-> Describes the repository as of the `UI` branch tip (`3765ba5`).
+> Describes the repository as of the `UI` branch tip.
 > Companion file: `FILEMAP.md` (per-file index of the whole tree).
-> `main` may still contain the pre-cleanup video-calling code; this document
-> describes `UI`, which is audio-only.
 
 ## 1. What this project is
 
@@ -38,7 +36,7 @@ The server sees only metadata (usernames, pubkeys, presence, sizes, timing).
   inbox fallback, file chunking/reassembly, delivery acks + retries,
   roster/heartbeat beat loop.
 - **Inbox fallback:** pairwise static-static X25519 → HKDF-SHA256 →
-  AES-256-GCM boxes (`cli/p2p_box.go`), deposited/fetched via the server
+  AES-GCM boxes (`cli/p2p_box.go`), deposited/fetched via the server
   inbox routes. No forward secrecy on this path by design.
 - **Voice calls (CLI, audio-only):** publish model in `cli/media_call.go`.
   `/audio` toggles mic publish to DM peer or room; solo use runs a local
@@ -55,20 +53,19 @@ The server sees only metadata (usernames, pubkeys, presence, sizes, timing).
 
 ```text
 cli/            Go CLI (chat TUI, media, P2P engine, transfers, update)
-cli/lan/        mDNS discovery + TLS file server + LAN download client
-cli/wan/        libp2p DHT WAN transfer
-cli/pkg/crc64   NVMe CRC64 helper (+ test)
-cli/pkg/tarball Directory pack/unpack with slip + bomb limits (+ test)
-src/app/api/v1  19 Next.js API routes (admin, cleanup, mock-r2, session, share, speedtest)
+cli/lan/        mDNS discovery + ephemeral-TLS file server/client
+cli/wan/        libp2p DHT wide-area transfer
+cli/pkg/crc64   NVMe CRC64 helper
+cli/pkg/tarball Safe directory pack/unpack
+src/app/api/v1  19 Next.js API routes (admin/cleanup/mock-r2/session/share/speedtest)
 src/app/share   Share landing/preview pages
-src/components  FilePreview (QR, password, download), SyntaxHighlighter
+src/components  FilePreview, SyntaxHighlighter (React)
 src/lib         auth, rooms, redis (+mock), r2 (+mock), crypto, quota, mongodb,
                 env, api-utils, crc64 (+ 3 vitest suites)
-server/         SHELVED Go WebSocket relay (own go.mod) — not deployed
-scratch/        Dev e2e shell scripts + R2/quota debug probes (44K, untracked-tooling)
+server/         SHELVED Go WebSocket relay (own module) — not deployed
+scratch/        Dev e2e shell scripts + R2/quota debug probes (not shipped)
 packaging/      Arch Linux PKGBUILD
-.github/workflows  ci.yml (lint/test/build/e2e gate), release.yml (GoReleaser),
-                    npm.yml (tag-gated npm publish)
+.github/workflows  ci.yml, release.yml, npm.yml
 Makefile        build/install/clean/5-target release tarballs
 install.sh / install.ps1  checksum-verified installers (fail closed)
 DEPLOY.md       Vercel/Redis/R2 setup + verification steps
@@ -100,19 +97,20 @@ make build && sudo make install
 | `version` | Print version/commit/date (bake via `-X main.version=…`) |
 | `update` | Self-update from GitHub releases (checksums.txt verified, fail closed) |
 
-Flags support interspersed order (`normalizeFlagOrder`); `--` terminator is
-stripped, so dash-prefixed filenames need `./-file` workaround.
-
 ### Chat TUI
 
-Three regions: left chat list (search + General room + DM threads), center
-transcript + composer, no right panel (removed). Keybindings: `Enter` send,
-`Ctrl+K` command palette, `Ctrl+L` clear, `↑↓` scroll, mouse supported.
+Left chat list (search + General room + DM threads), center transcript +
+composer. Keybindings: `Enter` send, `Ctrl+K` command palette, `Ctrl+L`
+clear, `↑↓` scroll, mouse supported. There is no right video panel and no
+pinned call card (both removed); liveness shows in the sidebar (`Live now`,
+`Voice call • MM:SS`) and header mic chips.
 
 Slash commands: `/help`, `/upload`, `/download`, `/audio`, `/kick`,
 `/admin`, `/unadmin` (last three role-gated: creator/admin only; `/admin`
-creator-only). Moderation needs a live server; failures surface on the
-status line.
+creator-only). Notices (command results, moderation outcomes, engine/media
+events, server-down alert) surface on the **status line**, never as
+transcript rows — only peer messages, own echoes, and file cards paint
+the transcript.
 
 ### Environment variables (CLI)
 
@@ -125,8 +123,8 @@ status line.
 | `UPLINK_EXPIRY`, `UPLINK_DOWNLOAD_DIR`, `UPLINK_LAN_PORT`, `UPLINK_ADAPTIVE_CHUNKS`, `UPLINK_SHOW_QR` | Misc behavior overrides |
 | `GITHUB_TOKEN` | Private-repo self-update auth |
 
-`UPLINK_CAMERA` / video-style variables are **retired** (video calling
-removed). Config lives in `~/.uplink/` (identity `0600`, rest `0700/0600`).
+Video variables are **retired** (video calling removed). Config lives in
+`~/.uplink/` (identity `0600`, rest `0700/0600`).
 
 ## 5. Web app guide
 
@@ -140,7 +138,7 @@ removed). Config lives in `~/.uplink/` (identity `0600`, rest `0700/0600`).
   [id]/preview-text}`, `GET /api/v1/admin/quota` (bearer `ADMIN_API_KEY`),
   `GET /api/v1/speedtest`, mock R2 routes (dev only).
 - Identity model: signaling callers present `X-Uplink-Username` (no bearer
-  token — known limitation, see audit); file shares are bearer
+  token — known limitation); file shares are bearer
   (`shareId`/`downloadCode`/`uploadId`); admin uses `ADMIN_API_KEY`.
 - Deploy: Vercel (`vercel.json`: region, function timeouts, daily session
   cleanup cron). See `DEPLOY.md`.
@@ -154,56 +152,48 @@ npx tsc --noEmit && npm run lint && npx vitest run            # web: 39 tests
 make release                                                  # 5-target tarballs
 ```
 
-CI (`ci.yml`, runs on every push): Go vet + `go test -race ./...` +
-6-target cross-builds; web lint + typecheck + unit + build; e2e matrix
-(real Mongo service container + mock R2). Single `pipeline` gate for branch
-protection. Per-run binary artifacts are intentionally NOT uploaded
-(quota); only failure-only `e2e-server-log` (1-day retention).
-Release (`release.yml`, tags `v*`): GoReleaser → versioned tarballs +
-`checksums.txt`, which both installers and `uplink update` verify.
+CI (`ci.yml`, every push): Go vet + `go test -race ./...` +
+cross-builds; web lint + typecheck + unit + build; e2e matrix (real Mongo
+service container + mock R2); single `pipeline` gate. No per-run binary
+artifacts are uploaded (quota); only failure-only `e2e-server-log`
+(1-day retention). Release (`release.yml`, tags `v*`): GoReleaser →
+versioned tarballs + `checksums.txt`, verified by both installers and
+`uplink update`.
 
 ## 7. Protocols and crypto (summary)
 
 - Peer identity: long-lived X25519 key, `~/.uplink/identity` (`0600`).
 - Live chat/files: `Noise_XX` handshake per peer pair over WebRTC data
-  channels; frames are JSON (`p2p_proto.go`: chat/ack/file-meta/chunk...),
-  per-peer send serialization preserves nonce order; decrypt failure tears
-  the session down (fail closed).
+  channels; JSON frames (`p2p_proto.go`); per-peer send serialization;
+  decrypt failure tears the session down (fail closed).
 - Offline: AES-256-GCM boxes via server inbox, at-least-once delivery with
   sender retries, consumer-side dedup (`seenMsg` 5000), fetch-then-ACK.
 - Voice: Opus over UDP Noise sessions, jitter buffer, mic-level gate.
-- Share links: `id:KEY` (AES-256 file key, never sent to server in clear);
-  QR encodes the receive command.
+- Share links: `id:KEY` (AES-256 file key, never sent to server in clear).
 
 ## 8. Implementation conventions (read before changing code)
 
 - **TUI exact-row contract:** every painted frame is exactly `H` rows ×
   `≤W` cols; `layout` (chat_tui.go) is the single geometry truth shared by
-  paint, viewport sync, and mouse hit-test. Keep the three in lockstep;
-  `scrollbars_test.go` and `TestResizeSweep*` enforce it.
-- **Status line vs transcript:** user-facing notices (command results,
-  usage, moderation outcomes, engine/media events, server-down alert) go to
-  the **status line**, never as transcript rows. Only real peer messages,
-  own echoes (with delivery annotations), and file cards paint the
-  transcript.
+  paint, viewport sync, and mouse hit-test. `scrollbars_test.go` and
+  `TestResizeSweep*` enforce it.
+- **Status line vs transcript:** notices go to the status line, never as
+  transcript rows (see §4).
 - **Server-down alert:** `isServerDown(err)` (transport errors + 502/503/504
   only; mesh/WebRTC-local failures excluded) → `serverDownMsg` held by the
   2s roster tick via engine `lastBeatErr`, cleared on recovery.
-- **Tests:** colocated `*_test.go`, `newFilterScreen` (bare UI) vs
-  `wireTestEngine` (fake `httptest` signaling server); `tea` program loop
-  is driven via `Update` messages, never run headless in tests.
+- **Tests:** colocated `*_test.go`; `newFilterScreen` (bare UI) vs
+  `wireTestEngine` (fake `httptest` signaling server); drive the `tea`
+  loop via `Update` messages, never headless.
 - **Go style:** `nil`-then-close channel teardown, fail-closed validation,
-  bounded queues/channels everywhere new code is added.
-- **Branch state:** active work is on `UI` (≈25 commits ahead of
-  `origin/audio-video-integration`); `main` is the last merged base.
+  bounded queues/channels for all new code.
+- **Branches:** active work is on `UI`; `main` is the last merged base.
   Push branches with `git push --all origin`; the maintainer merges.
 
 ## 9. Known limitations (audit-backed, not yet fixed)
 
 Member auth is header-only (no join tokens); quota `confirm` trusts
 declared size; LAN discovery is mDNS-trust-on-first-use; WAN receive path
-is non-functional; unbounded-download and P2P caps are partially bounded
-(chat assembly capped, cloud/LAN/WAN streams are not); no forward secrecy
-on inbox boxes; no key-continuity store. Details live in the audit thread;
-fix in priority order: signaling auth → quota lifecycle → LAN trust →
-transfer bounds.
+is non-functional; cloud/LAN/WAN download streams are unbounded; no
+forward secrecy on inbox boxes; no key-continuity store. Fix in priority
+order: signaling auth → quota lifecycle → LAN trust → transfer bounds.
