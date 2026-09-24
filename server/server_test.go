@@ -175,14 +175,17 @@ func TestDefaultConfig(t *testing.T) {
 // ─── Helper tests ──────────────────────────────────────────────────────────
 
 func TestIsValidUsername(t *testing.T) {
-	tests := []struct{ u string; ok bool }{
+	tests := []struct {
+		u  string
+		ok bool
+	}{
 		{"alice", true},
 		{"bob123", true},
-		{"a", false},         // too short
-		{"ab", false},        // too short
-		{"a]b", false},       // invalid char
+		{"a", false},           // too short
+		{"ab", false},          // too short
+		{"a]b", false},         // invalid char
 		{"hello world", false}, // space
-		{"", false},          // empty
+		{"", false},            // empty
 	}
 	for _, tt := range tests {
 		if got := isValidUsername(tt.u); got != tt.ok {

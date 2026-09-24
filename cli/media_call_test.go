@@ -28,7 +28,7 @@ func testSpeaker(t *testing.T, mu *sync.Mutex, heard *int) (*speaker, error) {
 // publishPair wires two managers note-to-note (no server, no hardware):
 // synthetic mic + camera, counted playback, drained state/info lines.
 type publishPair struct {
-	a, b       *mediaManager
+	a, b   *mediaManager
 	feedA  chan []int16
 	heardB func() int
 	states chan string

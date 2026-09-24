@@ -18,11 +18,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sync"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AdityaAgrawal08/uplink-delta/cli/lan"
@@ -41,7 +41,7 @@ var shortCodeRegex = regexp.MustCompile(`^\d{10}$`)
 // slow-but-healthy large bodies (no full Client.Timeout).
 var uploadHTTPClient = &http.Client{
 	Transport: &http.Transport{
-		DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 	},
@@ -221,9 +221,9 @@ func normalizeFlagOrder(args []string, valueFlags map[string]bool) []string {
 		if len(arg) > 1 && arg[0] == '-' && arg != "-" {
 			flags = append(flags, arg)
 			name := strings.TrimLeft(arg, "-")
-				if eq := strings.Index(name, "="); eq != -1 {
-					name = name[:eq]
-				} else if valueFlags[name] && i+1 < len(args) {
+			if eq := strings.Index(name, "="); eq != -1 {
+				name = name[:eq]
+			} else if valueFlags[name] && i+1 < len(args) {
 				// A "--flag value" pair consumes the next token; "--flag=value" does not.
 				i++
 				flags = append(flags, args[i])
@@ -1260,7 +1260,7 @@ func handleReceive(args []string) {
 				} else {
 					fmt.Printf("\n✓ LAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n\nSize:\n%s\n", filename, outputFilepath, formatBytes(size))
 				}
-				os.Exit(0)
+				return
 			}
 			fmt.Printf("LAN download failed: %v. Falling back to cloud...\n", err)
 		} else {
@@ -1280,10 +1280,10 @@ func handleReceive(args []string) {
 			}
 		}
 		if _, err := os.Stat(outputFilepath); err == nil {
-				fmt.Printf("Error: Target '%s' already exists. Use --force/-f or --rename/-r.\n", outputFilepath)
-				os.Exit(1)
-			}
-			fmt.Printf("Discovering WAN peer for share %s...\n", shareId)
+			fmt.Printf("Error: Target '%s' already exists. Use --force/-f or --rename/-r.\n", outputFilepath)
+			os.Exit(1)
+		}
+		fmt.Printf("Discovering WAN peer for share %s...\n", shareId)
 		printer := &ProgressPrinter{
 			title:      "Downloading (WAN)...",
 			total:      0,
@@ -1291,8 +1291,8 @@ func handleReceive(args []string) {
 			firstPrint: true,
 		}
 		wanCtx, wanCancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer wanCancel()
-			err := wan.DownloadFileWAN(wanCtx, shareId, outputFilepath, *passwordFlag, "", func(written int64) {
+		defer wanCancel()
+		err := wan.DownloadFileWAN(wanCtx, shareId, outputFilepath, *passwordFlag, "", func(written int64) {
 			if printer.total == 0 && written > 0 {
 				// Unknown total: show bytes downloaded without percentage
 				elapsed := time.Since(printer.startTime).Seconds()
@@ -1311,7 +1311,7 @@ func handleReceive(args []string) {
 		}
 		fmt.Printf("\n✓ WAN Download completed\n\nFile:\n%s\n\nDestination:\n%s\n", sanitizedName, outputFilepath)
 		notifyTransferComplete(sanitizedName)
-		os.Exit(0)
+		return
 	}
 
 	// Fetch Share Metadata
@@ -1480,16 +1480,18 @@ func handleReceive(args []string) {
 	}
 
 	rangeSupported := false
-	probeReq, err := http.NewRequest("HEAD", authData.DownloadUrl, nil)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	probeReq, err := http.NewRequestWithContext(probeCtx, "HEAD", authData.DownloadUrl, nil)
 	if err == nil {
 		probeResp, err := client.Do(probeReq)
 		if err == nil {
-			defer probeResp.Body.Close()
+			probeResp.Body.Close()
 			if probeResp.Header.Get("Accept-Ranges") == "bytes" {
 				rangeSupported = true
 			}
 		}
 	}
+	probeCancel()
 
 	printer := &ProgressPrinter{
 		title:      "Downloading...",

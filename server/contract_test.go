@@ -26,7 +26,10 @@ func TestSignalingContractDivergence(t *testing.T) {
 		{"POST", "/api/v1/session/abc123/join"},
 		{"POST", "/api/v1/session/abc123/leave"},
 	} {
-		req, _ := http.NewRequest(tc.method, ts.URL+tc.path, nil)
+		req, err := http.NewRequest(tc.method, ts.URL+tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -46,7 +49,10 @@ func TestSignalingContractDivergence(t *testing.T) {
 		"/api/v1/session/abc/kick",
 		"/api/v1/session/abc/admin",
 	} {
-		req, _ := http.NewRequest("POST", ts.URL+p, nil)
+		req, err := http.NewRequest("POST", ts.URL+p, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)

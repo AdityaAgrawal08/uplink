@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +17,34 @@ import (
 )
 
 // upgrader configures the WebSocket handshake.
+//
+// CheckOrigin: same-origin policy for browsers. Default allow-all preserves
+// the relay's native-client behavior (non-browser WS has no Origin), but a
+// hostile web page could otherwise drive a victim's browser to join rooms.
+// Set UPLINK_ALLOWED_ORIGINS (comma-separated, e.g.
+// "https://app.example.com") to enforce an allowlist; empty means allow-all
+// with this warning logged at startup.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  64 * 1024,
 	WriteBufferSize: 64 * 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     checkWSOrigin,
+}
+
+func checkWSOrigin(r *http.Request) bool {
+	allow := os.Getenv("UPLINK_ALLOWED_ORIGINS")
+	if strings.TrimSpace(allow) == "" {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true // non-browser client
+	}
+	for _, a := range strings.Split(allow, ",") {
+		if strings.TrimSpace(a) != "" && origin == strings.TrimSpace(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // Server holds all in-memory state.
@@ -261,7 +286,7 @@ func (s *Server) handleJoinSessionHTTP(w http.ResponseWriter, r *http.Request, s
 	}
 	if session.PasswordHash != "" {
 		// Rate-limit auth attempts (argon2id cost) per session.
-		if !s.limiter.Allow("auth:"+sessionId) {
+		if !s.limiter.Allow("auth:" + sessionId) {
 			jsonError(w, http.StatusTooManyRequests, "slow down — rate limited")
 			return
 		}
@@ -289,7 +314,7 @@ func (s *Server) handleJoinSessionHTTP(w http.ResponseWriter, r *http.Request, s
 	// For HTTP join, we just validate and return the roster.
 	// The actual real-time connection happens via WebSocket.
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"sessionId":   sessionId,
+		"sessionId":    sessionId,
 		"participants": session.ActiveUsernames(),
 	})
 }
@@ -362,7 +387,7 @@ func (s *Server) handleWSUpgrade(w http.ResponseWriter, r *http.Request, session
 		}
 		// Rate-limit authentication attempts per session to blunt CPU-DoS
 		// via argon2id (16 MiB x 3) on every join attempt.
-		if !s.limiter.Allow("auth:"+sessionId) {
+		if !s.limiter.Allow("auth:" + sessionId) {
 			jsonError(w, http.StatusTooManyRequests, "slow down — rate limited")
 			return
 		}
@@ -738,7 +763,7 @@ func (s *Server) handleFileChunk(session *Session, conn *Connection, in *Inbound
 		safeSend(conn, Outbound{Type: msgTypeError, Message: "chunk too large"})
 		return
 	}
-	if !s.limiter.Allow("chunk:"+session.Id+":"+conn.Username) {
+	if !s.limiter.Allow("chunk:" + session.Id + ":" + conn.Username) {
 		safeSend(conn, Outbound{Type: msgTypeError, Message: "slow down — file rate limited"})
 		return
 	}
@@ -782,9 +807,9 @@ func (s *Server) handleDelete(session *Session, conn *Connection, in *Inbound) {
 		return
 	}
 	out := Outbound{
-		Type:       "delete",
+		Type:        "delete",
 		DeleteMsgId: in.DeleteMsgId,
-		Username:   conn.Username,
+		Username:    conn.Username,
 	}
 	session.Broadcast(out, "")
 }

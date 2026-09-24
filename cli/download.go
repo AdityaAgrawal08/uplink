@@ -46,7 +46,7 @@ func readPartialMetadata(sha256Path string) (int64, string, error) {
 
 func writePartialMetadata(sha256Path string, offset int64, hashHex string) error {
 	content := fmt.Sprintf("%d:%s", offset, hashHex)
-	return os.WriteFile(sha256Path, []byte(content), 0644)
+	return os.WriteFile(sha256Path, []byte(content), 0600)
 }
 
 func DownloadResumable(url, dest string, expectedHash string, progressPrinter func(int64, int64)) error {

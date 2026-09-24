@@ -54,26 +54,26 @@ func isValidUsername(u string) bool {
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 type Config struct {
-	Port            int
-	MaxSessionUsers int
-	MessageBufSize  int
-	SessionTTL      time.Duration
+	Port             int
+	MaxSessionUsers  int
+	MessageBufSize   int
+	SessionTTL       time.Duration
 	HeartbeatTimeout time.Duration
-	RateLimitPerSec int
-	FileChunkSize   int
-	MaxFileSize     int64
+	RateLimitPerSec  int
+	FileChunkSize    int
+	MaxFileSize      int64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		Port:            8080,
-		MaxSessionUsers: 50,
-		MessageBufSize:  100,
-		SessionTTL:      30 * time.Minute,
+		Port:             8080,
+		MaxSessionUsers:  50,
+		MessageBufSize:   100,
+		SessionTTL:       30 * time.Minute,
 		HeartbeatTimeout: 45 * time.Second,
-		RateLimitPerSec: 20,
-		FileChunkSize:   65536, // 64 KB
-		MaxFileSize:     256 * 1024 * 1024, // 256 MB
+		RateLimitPerSec:  20,
+		FileChunkSize:    65536,             // 64 KB
+		MaxFileSize:      256 * 1024 * 1024, // 256 MB
 	}
 }
 

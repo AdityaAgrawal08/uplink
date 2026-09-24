@@ -551,8 +551,8 @@ type chatScreen struct {
 	users      []string
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
 	call         *mediaManager
-	callLevel    float64 // mic loudness for the status meter
-	callStart    time.Time // latched while a call is live (timer source)
+	callLevel    float64        // mic loudness for the status meter
+	callStart    time.Time      // latched while a call is live (timer source)
 	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
 	vp           viewport.Model
 	drag         barDrag // scrollbar drag state (any of the three panes)
@@ -564,9 +564,9 @@ type chatScreen struct {
 	uploadQ      uploadState     // sequential session-file transfer queue
 	received     []receivedFile  // files arrived this session (for /download)
 	status       string
-	targetUser   string // private-chat peer; "" = general room
+	targetUser   string       // private-chat peer; "" = general room
 	leftSent     *atomic.Bool // per-screen leave guard (pointer: screen is copied by value)
-	drainTimer   *time.Timer // reused pump timer (no time.After alloc per cycle)
+	drainTimer   *time.Timer  // reused pump timer (no time.After alloc per cycle)
 }
 
 // scrollSection identifies one independently scrollable pane.

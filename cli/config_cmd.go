@@ -72,7 +72,7 @@ func writeConfigFile(m map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return os.WriteFile(path, data, 0o600)
 }
 
 func handleConfigGet(args []string) {

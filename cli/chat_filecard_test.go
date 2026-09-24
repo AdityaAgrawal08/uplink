@@ -6,7 +6,6 @@ import (
 	"unicode/utf8"
 )
 
-
 func TestTruncateFilenameRuneSafe(t *testing.T) {
 	name := strings.Repeat("😀", 40) + ".png"
 	got := truncateFilename(name, 20)

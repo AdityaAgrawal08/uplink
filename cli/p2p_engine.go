@@ -125,8 +125,8 @@ type engine struct {
 	sendMu    map[string]*sync.Mutex
 	files     map[string]*fileAssembly
 	seenFiles map[string]struct{} // msgId dedup at save boundary (redelivery no-op)
-	announced map[string]bool // safety codes already shown
-	presence  []rosterMember  // last heartbeat roster (presence truth for UI)
+	announced map[string]bool     // safety codes already shown
+	presence  []rosterMember      // last heartbeat roster (presence truth for UI)
 	// joinPassword lets the engine rejoin by itself after being pruned for
 	// missed heartbeats (e.g. laptop sleep). Memory-only, never logged.
 	joinPassword string
@@ -152,8 +152,8 @@ type engine struct {
 	// lastBeatErr is the latest heartbeat failure (nil after any success).
 	// The TUI polls it on its render tick to hold the server-down alert.
 	lastBeatErr error
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
 }
 
 // rosterFreshTTL bounds how stale the send path's roster may be. 2s keeps

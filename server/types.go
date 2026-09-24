@@ -11,13 +11,13 @@ import (
 
 // Inbound message types from client.
 const (
-	msgTypeJoin    = "join"
-	msgTypeChat    = "chat"
-	msgTypeFile    = "file"
-	msgTypeFileChunk = "file-chunk"
+	msgTypeJoin         = "join"
+	msgTypeChat         = "chat"
+	msgTypeFile         = "file"
+	msgTypeFileChunk    = "file-chunk"
 	msgTypeFileComplete = "file-complete"
-	msgTypeDelete  = "delete"
-	msgTypeHeartbeat = "heartbeat"
+	msgTypeDelete       = "delete"
+	msgTypeHeartbeat    = "heartbeat"
 )
 
 // Outbound message types to client.
@@ -61,21 +61,21 @@ type Outbound struct {
 	Type string `json:"type"`
 
 	// welcome
-	SessionId      string `json:"sessionId,omitempty"`
-	SessionPubKey  string `json:"sessionPublicKey,omitempty"`
-	Users          []string `json:"users,omitempty"`
-	History      []ChatMessage `json:"history,omitempty"`
+	SessionId     string        `json:"sessionId,omitempty"`
+	SessionPubKey string        `json:"sessionPublicKey,omitempty"`
+	Users         []string      `json:"users,omitempty"`
+	History       []ChatMessage `json:"history,omitempty"`
 
 	// keys (E2E public-key distribution)
 	Keys []UserKey `json:"keys,omitempty"`
 
 	// chat / file / delete
-	MsgId      string `json:"msgId,omitempty"`
-	Username   string `json:"username,omitempty"`
-	Text       string `json:"text,omitempty"`
-	To         string `json:"to,omitempty"`
-	Kind       string `json:"kind,omitempty"`
-	CreatedAt  string `json:"createdAt,omitempty"`
+	MsgId     string `json:"msgId,omitempty"`
+	Username  string `json:"username,omitempty"`
+	Text      string `json:"text,omitempty"`
+	To        string `json:"to,omitempty"`
+	Kind      string `json:"kind,omitempty"`
+	CreatedAt string `json:"createdAt,omitempty"`
 
 	// file
 	Filename    string `json:"filename,omitempty"`
@@ -102,16 +102,16 @@ type UserKey struct {
 
 // ChatMessage is a single transcript entry held in the ring buffer.
 type ChatMessage struct {
-	MsgId     string    `json:"msgId"`
-	Username  string    `json:"username"`
-	Kind      string    `json:"kind"` // "chat", "system", "file", "delete"
-	Text      string    `json:"text,omitempty"`
-	To        string    `json:"to,omitempty"`
-	Filename  string    `json:"filename,omitempty"`
-	Size      int64     `json:"size,omitempty"`
-	SHA256    string    `json:"sha256,omitempty"`
-	TotalChunks int     `json:"totalChunks,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
+	MsgId       string    `json:"msgId"`
+	Username    string    `json:"username"`
+	Kind        string    `json:"kind"` // "chat", "system", "file", "delete"
+	Text        string    `json:"text,omitempty"`
+	To          string    `json:"to,omitempty"`
+	Filename    string    `json:"filename,omitempty"`
+	Size        int64     `json:"size,omitempty"`
+	SHA256      string    `json:"sha256,omitempty"`
+	TotalChunks int       `json:"totalChunks,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 
 // ─── Ring buffer (fixed-capacity, thread-safe) ──────────────────────────────
@@ -182,14 +182,14 @@ func (r *RingBuffer) OwnedBy(msgId, username string) bool {
 // Senders use trySend(), which holds SendMu across the closed-check and the
 // channel send, so a send can never race the writer's close.
 type Connection struct {
-	Username   string
-	Conn       *websocket.Conn
-	Send       chan []byte
-	LastBeat   time.Time
-	SendMu     sync.Mutex
-	done       chan struct{}
-	closed     bool
-	closeOnce  sync.Once
+	Username     string
+	Conn         *websocket.Conn
+	Send         chan []byte
+	LastBeat     time.Time
+	SendMu       sync.Mutex
+	done         chan struct{}
+	closed       bool
+	closeOnce    sync.Once
 	ServerPubKey string // X25519 public key distributed to this client
 	ClientPubKey string // X25519 public key sent by this client
 }
@@ -251,14 +251,14 @@ type announcedUpload struct {
 
 // Session is an in-memory chat room.
 type Session struct {
-	Id           string
-	PasswordHash string // argon2id hash; empty = no password
-	ExpiresAt    time.Time
-	Users        map[string]*Connection // username → connection
-	Uploads      map[string]*announcedUpload // "username\x00msgId" → meta
-	Buffer       *RingBuffer
+	Id            string
+	PasswordHash  string // argon2id hash; empty = no password
+	ExpiresAt     time.Time
+	Users         map[string]*Connection      // username → connection
+	Uploads       map[string]*announcedUpload // "username\x00msgId" → meta
+	Buffer        *RingBuffer
 	ServerKeyPair *KeyPair // ephemeral X25519 keypair for this session
-	Mu           sync.RWMutex
+	Mu            sync.RWMutex
 }
 
 // ActiveUsernames returns a sorted list of connected usernames.
