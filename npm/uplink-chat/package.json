@@ -1,6 +1,6 @@
 {
   "name": "uplink-chat",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "E2E-encrypted terminal chat (WebRTC P2P + serverless relay). Installs the uplink binary for your platform.",
   "license": "MIT",
   "repository": {
