@@ -173,7 +173,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `.goreleaser.yaml` | Multi-OS builds, archives, checksums for tags `v*`. |
 - `.github/workflows/ci.yml` | Push/PR: Go vet + `go test -race` + cross-builds; web lint/typecheck/unit/build; e2e matrix; single `pipeline` gate. No per-run artifact uploads. |
 - `.github/workflows/release.yml` | Tag push → GoReleaser publish. |
-- `.github/workflows/npm.yml` | Tag push → tag-gated npm publish (`uplink-chat` shim). |
+- `.github/workflows/npm.yml` | Tag push → tag-gated npm publish (`@aditya/uplink` shim). |
 - `install.sh` / `install.ps1` | Checksum-verified installers (fail closed, sudo fallback). |
 - `packaging/archlinux/PKGBUILD` | Git-snapshot pacman package. |
 - `scratch/` | `e2e_phase0.sh`, `session_flow_test.sh`, `chat_two_clients.sh`, `probe_r2.ts`, `test_quota.ts`, `run_tests.ts` — dev e2e/debug scripts (not shipped). |
