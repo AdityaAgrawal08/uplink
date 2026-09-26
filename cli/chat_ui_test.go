@@ -65,18 +65,19 @@ func TestFullScreenFrame(t *testing.T) {
 	if len(lines) != H {
 		t.Fatalf("frame rows = %d; want exactly %d", len(lines), H)
 	}
-	if !strings.HasPrefix(lines[0], "╭") || !strings.HasSuffix(lines[0], "╮") {
-		t.Errorf("top frame edge missing: %q", lines[0])
+	if !strings.Contains(stripANSI(v), "UPLINK") {
+		t.Error("app banner missing from the top row")
 	}
-	last := lines[len(lines)-1]
-	if !strings.HasPrefix(last, "╰") || !strings.HasSuffix(last, "╯") {
-		t.Errorf("bottom frame edge missing: %q", last)
-	}
-	if lw := lipglossWidth(lines[0]); lw != W {
-		t.Errorf("frame width = %d; want %d", lw, W)
+	for i, ln := range lines {
+		if lw := lipglossWidth(ln); lw != W {
+			t.Fatalf("row %d width = %d; want exactly %d (edge-to-edge shell)", i, lw, W)
+		}
 	}
 	if !strings.Contains(v, "❯") {
 		t.Error("composer prompt missing")
+	}
+	if !strings.Contains(stripANSI(v), "General") {
+		t.Error("conversation rail missing")
 	}
 }
 
@@ -93,24 +94,24 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 	c.width, c.height = 100, 30
 	c.vp = *viewportPtr(60, 16)
 
-	l := computeLayout(100, 30, false)
-	out := c.rosterBody(l.rosterSlots)
+	l := c.layoutFor()
+	out := c.rosterBody(c.sidebarFill(l))
 
-	if !strings.Contains(out, "Search chats") || !strings.Contains(out, "General") {
-		t.Errorf("chat list missing search/room:\n%s", out)
+	if !strings.Contains(out, "conversations") || !strings.Contains(out, "General") {
+		t.Errorf("chat list missing filter header/room:\n%s", out)
 	}
 	// Self (alice) has no chat row of its own; peers do.
 	if !strings.Contains(out, "bob") || !strings.Contains(out, "carol") {
 		t.Errorf("peers missing from chat list:\n%s", out)
 	}
-	if strings.Contains(out, "THREADS") && l.rosterSlots < 4 {
-		t.Error("threads section rendered without room")
+	if strings.Contains(out, "THREADS") {
+		t.Error("retired THREADS section rendered")
 	}
 
 	// THREADS panel is intentionally gone: the transcript + header carry all
 	// conversation context. Opening a thread must not resurrect any section.
 	c.enterPrivate("bob")
-	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
+	out = c.rosterBody(c.sidebarFill(c.layoutFor()))
 	if strings.Contains(out, "THREADS") || strings.Contains(out, "▸ · bob") || strings.Contains(out, "# general") {
 		t.Errorf("thread panel remnants after removal:\n%s", out)
 	}
@@ -120,7 +121,7 @@ func TestSidebarSectionsAndNavigation(t *testing.T) {
 
 	// Back to general: still the same chat list.
 	c.exitPrivate()
-	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
+	out = c.rosterBody(c.sidebarFill(c.layoutFor()))
 	if !strings.Contains(out, "General") || !strings.Contains(out, "bob") {
 		t.Errorf("chat list damaged by mode switches:\n%s", out)
 	}

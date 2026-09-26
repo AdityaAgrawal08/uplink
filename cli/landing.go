@@ -12,91 +12,72 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// exact colors from screenshot
-const (
-	landSelectedBg     = "#0a2a52"
-	landSelectedBorder = "#1a7af0"
-)
-
+// Landing shares the chat shell's adaptive palette (same package), so the
+// entry screen and the conversation behind it are unmistakably one product:
+// a tinted card, a dim hairline border, and the accent reserved for
+// whatever currently holds focus.
 var (
-	landPlusBorder = lipgloss.Border{
-		Top:         "─",
-		Bottom:      "─",
-		Left:        "│",
-		Right:       "│",
-		TopLeft:     "+",
-		TopRight:    "+",
-		BottomLeft:  "+",
-		BottomRight: "+",
-		MiddleLeft:  "+",
-		MiddleRight: "+",
-		Middle:      "+",
-	}
-
 	landOuterStyle = lipgloss.NewStyle().
-			Border(landPlusBorder).
-			BorderForeground(lipgloss.Color("15"))
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(colEdge).
+			Background(colPanel)
 
 	landTabSelectedStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(landSelectedBg)).
-				Foreground(lipgloss.Color("15")).
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color(landSelectedBorder)).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colAccent).
+				Foreground(colAccent).
 				Bold(true).
 				Align(lipgloss.Center)
 
 	landTabUnselectedStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#3a3a3a")).
-				Foreground(lipgloss.Color("15")).
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color("#555555")).
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colEdge).
+				Foreground(colDim).
 				Align(lipgloss.Center)
 
 	landLabelStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("15")).
+			Foreground(colText).
 			Bold(true)
 
+	landLabelFocusStyle = lipgloss.NewStyle().
+				Foreground(colAccent).
+				Bold(true)
+
 	landInputFocusedStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color(landSelectedBorder))
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colAccent)
 
 	landInputBlurStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color("15"))
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colEdge)
 
 	landButtonSelectedStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(landSelectedBg)).
-				Foreground(lipgloss.Color("15")).
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color(landSelectedBorder)).
+				Background(colAccent).
+				Foreground(lipgloss.AdaptiveColor{Light: "15", Dark: "16"}).
 				Bold(true).
 				Align(lipgloss.Center)
 
 	landButtonBlurStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(landSelectedBg)).
-				Foreground(lipgloss.Color("15")).
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color(landSelectedBorder)).
+				Background(colPanel2).
+				Foreground(colText).
 				Align(lipgloss.Center)
 
 	landErrorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("203"))
+			Foreground(colRed).
+			Bold(true)
 
 	landTitleStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#1a7af0")).
-			Background(lipgloss.Color("#0a2a52")).
+			Foreground(colAccent).
 			Bold(true).
 			Padding(0, 1).
 			Align(lipgloss.Center)
 
 	landSubtitleStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("#8aa0c8")).
-				Faint(true).
+				Foreground(colDim).
 				Align(lipgloss.Center)
 
 	landHintStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("#6b7280")).
-			Faint(true).
+			Foreground(colFaint).
 			Align(lipgloss.Center)
 )
 
@@ -146,8 +127,8 @@ func newLandingModel(serverURL string) landingModel {
 	ui.Prompt = "> "
 	ui.Width = 40
 	ui.Focus()
-	ui.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	ui.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
+	ui.TextStyle = lipgloss.NewStyle().Foreground(colText)
+	ui.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
 
 	pi := textinput.New()
 	pi.Placeholder = "••••••••"
@@ -156,16 +137,16 @@ func newLandingModel(serverURL string) landingModel {
 	pi.EchoMode = textinput.EchoPassword
 	pi.EchoCharacter = '•'
 	pi.Width = 40
-	pi.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	pi.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
+	pi.TextStyle = lipgloss.NewStyle().Foreground(colText)
+	pi.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
 
 	ci := textinput.New()
 	ci.Placeholder = "482716"
 	ci.Prompt = "> "
 	ci.CharLimit = 6
 	ci.Width = 40
-	ci.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	ci.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#6b7280")).Faint(true)
+	ci.TextStyle = lipgloss.NewStyle().Foreground(colText)
+	ci.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
 
 	return landingModel{
 		tab:       tabCreate,
@@ -584,9 +565,19 @@ func (m landingModel) View() string {
 	// divider handled by outer border; tabsRow already has borders
 	// form content
 	// labels aligned to same width
-	labelUser := landLabelStyle.Width(l.labelW).Render("UserName :")
-	labelPass := landLabelStyle.Width(l.labelW).Render("Password :")
-	labelCode := landLabelStyle.Width(l.labelW).Render("Code     :")
+	// The focused field's label joins the accent border as the one visible
+	// focus indicator; every label keeps its fixed width, so geometry and
+	// mouse hit-testing never move.
+	labelOf := func(text string, f landingFocus) string {
+		st := landLabelStyle
+		if m.focus == f {
+			st = landLabelFocusStyle
+		}
+		return st.Width(l.labelW).Render(text)
+	}
+	labelUser := labelOf("UserName :", focusUser)
+	labelPass := labelOf("Password :", focusPass)
+	labelCode := labelOf("Code     :", focusCode)
 
 	// input boxes
 	userBox := landInputBlurStyle.Render(m.userInput.View())
@@ -633,7 +624,8 @@ func (m landingModel) View() string {
 	btnRow := lipgloss.NewStyle().Width(outerW - 2).Align(lipgloss.Center).Render(btn)
 	rows = append(rows, "", btnRow)
 	// hint
-	hint := landHintStyle.Width(outerW - 4).Render("Tab / Click to move  •  Enter to submit  •  ← → switch tabs  •  Esc quit")
+	hint := landHintStyle.Width(outerW - 4).Render(
+		truncateByWidth("Tab moves  ·  Enter submits  ·  ← → switch tab  ·  Esc quits", maxInt(outerW-4, 1)))
 	rows = append(rows, hint)
 
 	if m.errMsg != "" {
@@ -654,8 +646,9 @@ func (m landingModel) View() string {
 	// outer container with + border — Width is content width (innerW)
 	outer := landOuterStyle.Width(outerW - 2).Render(inner)
 	// header above outer — more attractive
-	title := landTitleStyle.Render("◆ UPLINK ◆")
-	subtitle := landSubtitleStyle.Render("secure  •  ephemeral  •  p2p")
+	title := landTitleStyle.Render("◆ UPLINK")
+	subtitle := landSubtitleStyle.Render(truncateByWidth(
+		"end-to-end encrypted  ·  peer-to-peer  ·  rooms vanish when empty", maxInt(m.w-2, 1)))
 	header := lipgloss.JoinVertical(lipgloss.Center, title, subtitle, "")
 	content := lipgloss.JoinVertical(lipgloss.Center, header, outer)
 	// center on screen

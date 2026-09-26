@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // Regression: the camera strip must paint engine frames VERBATIM (truecolor
@@ -154,8 +155,9 @@ func TestWheelStepProportional(t *testing.T) {
 }
 
 func TestComposerFullWidthNoSend(t *testing.T) {
-	// No Send button anywhere: the message box spans the full column and
-	// Enter (not a click target) sends.
+	// No Send button anywhere: the message box spans the full main column
+	// (right border on the terminal's last content column) and Enter — not
+	// a click target — sends.
 	const W, H = 120, 40
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(60, 20)
@@ -165,16 +167,21 @@ func TestComposerFullWidthNoSend(t *testing.T) {
 	if strings.Contains(got, "Send") {
 		t.Fatalf("Send button must be gone:\n%s", got)
 	}
+	l := sc.layoutFor()
 	found := false
 	for _, r := range strings.Split(got, "\n") {
-		if strings.Contains(r, "Type a message") {
-			found = true
-			// Message box runs to the frame edge (box border + frame
-			// border adjacent), with no button column carved out.
-			if !strings.HasSuffix(r, "││") {
-				t.Fatalf("composer must span the full column, row ends %q",
-					string([]rune(r)[len([]rune(r))-4:]))
-			}
+		if !strings.Contains(r, "Type a message") {
+			continue
+		}
+		found = true
+		cells := []rune(r)
+		if cells[l.sidebarWidth+1] != '│' {
+			t.Fatalf("composer left border missing at column %d: %q",
+				l.sidebarWidth+1, string(cells[l.sidebarWidth:l.sidebarWidth+3]))
+		}
+		if cells[len(cells)-1] != '│' {
+			t.Fatalf("composer must run to the last column, row ends %q",
+				string(cells[len(cells)-4:]))
 		}
 	}
 	if !found {
@@ -189,7 +196,7 @@ func TestClipOpensPicker(t *testing.T) {
 	m, _ := c.Update(tea.WindowSizeMsg{Width: W, Height: H})
 	sc := m.(chatScreen)
 	l := sc.layoutFor()
-	clipX, y0, y1 := composerGeoms(l, W, H)
+	clipX, y0, y1 := composerGeoms(l)
 	if clipX < 0 || y1-y0 != 1 {
 		t.Fatalf("clip must hit-test exactly one row, got x=%d y=[%d,%d)", clipX, y0, y1)
 	}
@@ -285,8 +292,9 @@ func TestSidebarRunsFullHeight(t *testing.T) {
 	if len(rows) != H {
 		t.Fatalf("painted %d rows; want exactly %d", len(rows), H)
 	}
-	// Composer input rides beside the sidebar (frame + sidebar borders),
-	// not under a blank indent.
+	l := sc.layoutFor()
+	// The conversation rail runs the FULL height: it is still there on the
+	// composer row, and the composer sits to its RIGHT (not underneath).
 	comp := -1
 	for i, r := range rows {
 		if strings.Contains(r, "Type a message") {
@@ -296,16 +304,20 @@ func TestSidebarRunsFullHeight(t *testing.T) {
 	if comp < 0 {
 		t.Fatal("composer row missing")
 	}
-	if !strings.HasPrefix(rows[comp], "││") {
-		t.Fatalf("composer must sit beside the sidebar, row %d starts %q",
-			comp, string([]rune(rows[comp])[:4]))
+	cells := []rune(rows[comp])
+	if len(cells) <= l.sidebarWidth+1 || cells[l.sidebarWidth+1] != '│' {
+		t.Fatalf("composer must sit beside the rail, row %d col %d = %q",
+			comp, l.sidebarWidth+1, string(cells[maxInt(l.sidebarWidth, 0):]))
 	}
-	// Sidebar bottom border closes on the composer's bottom row instead of
-	// floating above it: sidebar ╯ then transcript ╰ on the last body row.
+	// The rail is still painted below the transcript: its filter header is
+	// row 1 (right under the banner) and its column is present on the last
+	// body row too.
+	if !strings.Contains(rows[1], "conversations") {
+		t.Fatalf("rail header missing on row 1: %q", rows[1])
+	}
 	lastBody := rows[H-2]
-	if !strings.HasPrefix(lastBody, "│╰") || !strings.Contains(lastBody, "╯ ╰") {
-		t.Fatalf("sidebar must close on the composer bottom row, got %q",
-			string([]rune(lastBody)[:16]))
+	if lipgloss.Width(lastBody) != W {
+		t.Fatalf("last body row width = %d; want %d", lipgloss.Width(lastBody), W)
 	}
 }
 
@@ -376,14 +388,29 @@ func TestSidebarSelectedBorderAndCallIcon(t *testing.T) {
 }
 
 func TestKeyHintsNeverClipMidWord(t *testing.T) {
-	for _, w := range []int{20, 40, 57, 58, 80, 120} {
-		got := stripANSI(keyHintsView(w))
-		if lw := lipgloss.Width(got); lw > w {
-			t.Fatalf("hints width %d exceeds %d: %q", lw, w, got)
+	for _, f := range []focusPane{focusComposer, focusSidebar, focusTranscript} {
+		for _, w := range []int{20, 40, 57, 58, 80, 120} {
+			got := stripANSI(keyHintsView(w, f))
+			if lw := lipgloss.Width(got); lw > w {
+				t.Fatalf("focus=%d hints width %d exceeds %d: %q", f, lw, w, got)
+			}
 		}
-		if w >= 58 && !strings.Contains(got, "Ctrl+k commands") {
-			t.Fatalf("wide hints must spell out bindings: %q", got)
-		}
+	}
+	// The resting (composer) footer spells out its bindings when there is
+	// room, and always names the keys the invariant sweep greps for.
+	resting := stripANSI(keyHintsView(120, focusComposer))
+	if !strings.Contains(resting, "Ctrl+k commands") {
+		t.Fatalf("wide composer hints must spell out bindings: %q", resting)
+	}
+	if !strings.Contains(resting, "Enter send") {
+		t.Fatalf("wide composer hints must name the send key: %q", resting)
+	}
+	// Each focus teaches the keys that work right now.
+	if rail := stripANSI(keyHintsView(120, focusSidebar)); !strings.Contains(rail, "filters") {
+		t.Fatalf("rail hints must teach the inline filter: %q", rail)
+	}
+	if tr := stripANSI(keyHintsView(120, focusTranscript)); !strings.Contains(tr, "pgup") {
+		t.Fatalf("transcript hints must teach paging: %q", tr)
 	}
 }
 
@@ -409,17 +436,49 @@ func TestCtrlLClearsInput(t *testing.T) {
 	}
 }
 
-func TestSystemCardGreenBar(t *testing.T) {
+func TestSystemLineCentredAndQuiet(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
 	c := newFilterScreen("bob", "", "bob", "alice")
 	c.vp = *viewportPtr(60, 20)
 	m := chatMessage{Seq: 9, Username: "", Kind: "system", Text: "alice joined",
 		ConvID: generalConv, CreatedAt: "2026-09-15T19:21:00Z"}
-	out := stripANSI(c.renderLine(m))
-	if !strings.Contains(out, "System") || !strings.Contains(out, "▌") {
-		t.Fatalf("system line must carry green sender + bar:\n%s", out)
+	out := c.renderLine(m)
+	if strings.Contains(out, "\n") {
+		t.Fatalf("a system event is ONE row, got:\n%s", out)
 	}
-	if !strings.Contains(out, "alice joined") {
-		t.Fatalf("system text lost:\n%s", out)
+	plain := stripANSI(out)
+	if !strings.Contains(plain, "alice joined") {
+		t.Fatalf("system text lost:\n%s", plain)
+	}
+	if w := lipgloss.Width(out); w != 60 {
+		t.Fatalf("system row width = %d; want the full transcript width 60", w)
+	}
+	if plain == strings.TrimSpace(plain) {
+		t.Fatalf("system line must be centred (padded both sides): %q", plain)
+	}
+	// Never mistakable for chat: faint + italic, no sender chip, no bubble.
+	if !strings.Contains(out, "\x1b[") {
+		t.Fatalf("system line must carry its own styling: %q", out)
+	}
+	seq := out[strings.Index(out, "\x1b"):]
+	seq = seq[:strings.Index(seq, "m")]
+	params := strings.Split(strings.TrimPrefix(seq, "\x1b["), ";")
+	has := func(p string) bool {
+		for _, v := range params {
+			if v == p {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("3") || !has("2") {
+		t.Fatalf("system line must read as italic (3) + faint (2), got %q", out)
+	}
+	if strings.Contains(plain, "System") {
+		t.Fatalf("system line must not impersonate a sender: %q", plain)
 	}
 }
 

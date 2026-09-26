@@ -8,77 +8,35 @@ import (
 	"sync/atomic"
 	"time"
 
+	bkeys "github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 )
 
 // ---- styling ---------------------------------------------------------------
+//
+// Shared primitives only: the design language itself lives in chat_theme.go.
+// Every colour below is adaptive so the shell reads on light and dark
+// terminals alike.
 
 var (
-	tuiHeaderStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")).
-			Background(lipgloss.Color("62")).
-			Padding(0, 1)
-
 	tuiSystemStyle = lipgloss.NewStyle().Faint(true).Italic(true)
-	tuiMeStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
-	tuiNameStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	tuiErrStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	tuiTimeStyle   = lipgloss.NewStyle().Faint(true)
-	tuiBorderStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("#1e293b"))
-
-	tuiSectionTitleStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("250"))
-
-	tuiDimStyle = lipgloss.NewStyle().Faint(true)
-
-	tuiRosterBoxStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#1e293b"))
-
-	tuiHoverStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("213")) // pink — hover only, one row max
+	tuiNameStyle   = lipgloss.NewStyle().Foreground(colAccent)
+	tuiMeStyle     = lipgloss.NewStyle().Foreground(colAmber)
+	tuiErrStyle    = lipgloss.NewStyle().Foreground(colRed)
+	tuiDimStyle    = lipgloss.NewStyle().Foreground(colDim)
 
 	tuiUnreadStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("15")). // white digits
-			Background(lipgloss.Color("27"))  // blue disc: unread dot
-
-	tuiComposerStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#1e293b")).
-				Padding(0, 1)
+			Foreground(colBadgeFg).
+			Background(colBadgeBg)
 
 	tuiScrollbarStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("240"))
+				Foreground(colEdge)
 	tuiScrollbarThumbStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("245")).
-				Background(lipgloss.Color("240"))
-
-	// Bubble styles mirror the theme: own = blue right, other = navy left.
-	tuiOwnBubbleStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#1d4ed8")).
-				Foreground(lipgloss.Color("#ffffff")).
-				Padding(0, 1).
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#1d4ed8"))
-
-	tuiOtherBubbleStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#131b2e")).
-				Foreground(lipgloss.Color("15")).
-				Padding(0, 1).
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("#1e293b"))
-
-	tuiBubbleTimeStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("250")).
-				Faint(true)
+				Foreground(colAccent).
+				Background(colEdge)
 )
 
 // ---- layout constants --------------------------------------------------------
@@ -102,20 +60,19 @@ func progressBar(label string, done, total int64) string {
 }
 
 const (
-	rosterTotalWidth = 24 // DEFAULT sidebar outer width (density scales it)
+	rosterTotalWidth = 24 // DEFAULT sidebar column width (density scales it)
 	rosterWidthInner = rosterTotalWidth - 2
-	rosterMaxVisible = 16 // cap on user rows before "... +N more"
-	composerRowsMax  = 3  // tall composer on roomy terminals
+	rosterMaxVisible = 16 // cap on chat rows before the list scrolls
 	headerHeight     = 1  // top banner line
-	frameChrome      = 2  // outer app-frame border (top+bottom / left+right)
-	transcriptBorder = 2  // rows consumed by the transcript box border
+	frameChrome      = 2  // reserved shell margin (the chat shell is edge-to-edge)
+	transcriptBorder = 2  // columns reserved in the main column: focus gutter + scroll rail
 	minSidebarTermW  = 66 // below this width the sidebar collapses entirely
 )
 
 // sidebarWidthFor picks a reading column that grows FLUIDLY with the
 // terminal: ~1 extra cell per 10 terminal columns, clamped to a usable
 // chat list (narrow enough to leave the transcript room, wide enough for
-// avatar + name + time + preview). Every resize step visibly rebalances.
+// presence + name + time + preview). Every resize step visibly rebalances.
 func sidebarWidthFor(termW int) int {
 	w := 22 + (termW-minSidebarTermW)/10
 	if w < 22 {
@@ -123,18 +80,6 @@ func sidebarWidthFor(termW int) int {
 	}
 	if w > 38 {
 		w = 38
-	}
-	return w
-}
-
-// videoSidebarWidthFor is the boosted column while video streams (room for
-// a ~40-cell braille picture; roster still fits beneath).
-const videoSidebarWidth = 44
-
-func sidebarWidthVideo(termW int, videoOn bool) int {
-	w := sidebarWidthFor(termW)
-	if videoOn && termW >= 100 {
-		return videoSidebarWidth
 	}
 	return w
 }
@@ -155,34 +100,28 @@ func composerRowsFor(termH int) int {
 //
 // Height invariant (the contract that keeps us inside the terminal):
 //
-//	headerHeight + (vpHeight + transcriptBorder) + inputChromeHeight + statusRows
-//	    + paletteRows
+//	headerHeight + headRows + vpHeight + paletteRows + composerRows(+border)
+//	    + hintRows + statusRows
 //	    == termH   (exactly; never more)
 type layout struct {
-	vpWidth         int  // transcript viewport inner width
-	vpHeight        int  // transcript viewport visible rows (inside its border)
-	sidebarOn       bool // false on narrow terminals — panel collapses
-	rosterX         int  // leftmost column of the sidebar (LEFT column)
-	rosterY0        int  // first terminal row inside the sidebar that holds content
-	rosterSlots     int  // legacy: how many roster rows fit (peerAtY now mirrors rosterBody directly)
-	headRows        int  // room-header rows above the transcript (0/1/2 by space)
-	hintRows        int  // composer key-hints row (0 when collapsed)
-	statusRows      int  // extra rows consumed by the status line (0 or 1)
-	paletteRows     int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
-	showHeader      bool // staged degradation: hide banner on tiny heights
-	boxedTranscript bool // staged degradation: drop border rows on tiny heights
-	inputBoxed      bool // false => bare one-line prompt
-	sidebarWidth    int  // density-scaled reading column (outer, incl border)
-	composerRows    int  // writable rows inside the composer box (3/2/1/0)
-	frameOn         bool // full-screen app frame (dropped only on tiny H)
+	vpWidth      int  // transcript content width (inside the gutter + rail)
+	vpHeight     int  // transcript visible rows
+	sidebarOn    bool // false on narrow terminals — the rail collapses
+	rosterX      int  // leftmost column of the sidebar (LEFT column)
+	rosterY0     int  // first terminal row of the sidebar conversation list
+	headRows     int  // chat-header rows above the transcript (0/1/2 by space)
+	hintRows     int  // composer key-hints row under the composer (0 when collapsed)
+	statusRows   int  // extra rows consumed by the status line (0 or 1)
+	paletteRows  int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
+	showHeader   bool // staged degradation: hide banner on tiny heights
+	sidebarWidth int  // density-scaled conversation column
+	composerRows int  // writable rows inside the composer box (1/0)
+	frameOn      bool // reserved shell margin; the chat shell is edge-to-edge
 }
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
 	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.hintRows
-	if l.boxedTranscript {
-		h += transcriptBorder
-	}
 	if l.composerRows > 0 {
 		h += l.composerRows + 2 // composer border
 	} else {
@@ -207,22 +146,21 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 // computeLayoutWithPalette reserves paletteRows extra rows for the "/" drawer
 // before handing the remainder to the viewport. Guarantees, in order:
 //  1. totalRows() <= termH always (staged chrome degradation on tiny screens;
-//     the drawer itself is sacrificed late — only after the frame is gone)
-//  2. full-screen app frame whenever height allows (OpenCode-style shell)
-//  3. sidebar collapses below minSidebarTermW / tiny content, else its width
+//     the drawer itself is sacrificed last)
+//  2. sidebar collapses below minSidebarTermW / tiny content, else its width
 //     scales with terminal width for comfortable reading
-//  4. composer gets a tall writable box on roomy terminals, shrinking to a
+//  3. composer keeps a writable box on roomy terminals, shrinking to a
 //     bare prompt on absurd heights
-//  5. viewport absorbs all remaining space (floors at zero rows)
+//  4. viewport absorbs all remaining space (floors at zero rows)
 //
 // Pure function => trivially unit-testable.
 func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int) layout {
-	return computeLayoutMedia(termW, termH, showStatus, paletteRows, false)
+	return computeLayoutMedia(termW, termH, showStatus, paletteRows)
 }
 
-// computeLayoutMedia is the full layout: videoOn widens the sidebar column
-// so the ASCII video pane gets a picture-width that matches its viewport.
-func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, videoOn bool) layout {
+// computeLayoutMedia is THE pure geometry pass: terminal size + status +
+// drawer budget in, every pane's rectangle out.
+func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int) layout {
 	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
@@ -233,26 +171,27 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, vide
 	}
 	l.paletteRows = paletteRows
 	l.showHeader = true
-	l.boxedTranscript = true
-	l.frameOn = termH >= 12 // below this the shell cannot fit its own border
+	// The chat shell is EDGE-TO-EDGE: no outer frame, no margin — every row
+	// and column belongs to content. frameOn/frameChrome stay in the layout
+	// contract (the invariant sweep reads them) but the shell never claims
+	// the reserved margin.
+	l.frameOn = false
 	l.composerRows = composerRowsFor(termH)
-	l.sidebarWidth = sidebarWidthVideo(termW, videoOn)
+	l.sidebarWidth = sidebarWidthFor(termW)
 
-	innerW := termW - frameChrome
-	if !l.frameOn {
-		innerW = termW
-	}
+	innerW := widthInsideFrame(termW, l.frameOn)
 
 	// --- width pass ---------------------------------------------------------
-	// The sidebar is the LEFT column (chat list); the transcript paints to
-	// its right. rosterX is therefore the frame inset, not the right edge.
+	// The sidebar is the LEFT column (conversation list); the transcript
+	// paints to its right. rosterX is therefore the left inset, not the
+	// right edge.
 	l.sidebarOn = termW >= minSidebarTermW
 	if l.sidebarOn {
 		l.rosterX = 0
 		if l.frameOn {
-			l.rosterX++ // shift past the left frame border
+			l.rosterX++ // shift past the left frame margin
 		}
-		l.vpWidth = innerW - l.sidebarWidth - 1 - transcriptBorder // spacer + own border
+		l.vpWidth = innerW - l.sidebarWidth - 1 - transcriptBorder
 	} else {
 		l.rosterX = 0
 		l.vpWidth = innerW - transcriptBorder
@@ -270,25 +209,6 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, vide
 			l.statusRows = 0
 		case l.composerRows == 1:
 			l.composerRows = 0 // bare prompt
-		case l.boxedTranscript:
-			l.boxedTranscript = false
-			if l.sidebarOn { // nothing to sit beside once unframed
-				l.sidebarOn = false
-				l.rosterX = 0
-				l.vpWidth = widthInsideFrame(termW, l.frameOn) - transcriptBorder
-			}
-		case l.frameOn:
-			l.frameOn = false
-			innerW = termW
-			if l.sidebarOn { // recompute width pass without the frame inset
-				l.rosterX = innerW - l.sidebarWidth
-				l.vpWidth = innerW - l.sidebarWidth - 1 - transcriptBorder
-			} else {
-				l.vpWidth = innerW - transcriptBorder
-			}
-			if l.vpWidth < 10 {
-				l.vpWidth = 10
-			}
 		case l.paletteRows > 0:
 			l.paletteRows = 0 // absurdly tiny terminal: dissolve the drawer
 		default:
@@ -307,16 +227,8 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, vide
 		l.vpHeight = 0
 	}
 
-	// Roster adapts to the transcript height: title row eats one slot.
-	l.rosterSlots = l.vpHeight - 1
-	if l.rosterSlots > rosterMaxVisible {
-		l.rosterSlots = rosterMaxVisible
-	}
-	if l.rosterSlots < 0 || !l.sidebarOn {
-		l.rosterSlots = 0
-	}
 	if l.vpHeight < 3 && l.sidebarOn {
-		l.sidebarOn = false // no room for border+title+even one user
+		l.sidebarOn = false // no room for header + even one conversation row
 		l.rosterX = 0
 		l.vpWidth = widthInsideFrame(termW, l.frameOn) - transcriptBorder
 		if l.vpWidth < 10 {
@@ -324,20 +236,21 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int, vide
 		}
 	}
 
-	// Sidebar stack above the first user row: [optional header] + sidebar-box
-	// top border + "ONLINE" title (+1 if app frame is on).
-	l.rosterY0 = 2
+	// Sidebar list starts below the app banner and its own header block:
+	// [banner] + [filter row + hairline].
+	l.rosterY0 = 0
 	if l.showHeader {
 		l.rosterY0 += headerHeight
 	}
-	if l.frameOn {
-		l.rosterY0++
+	if l.sidebarOn {
+		l.rosterY0 += searchHeightFor(0, l.sidebarWidth)
 	}
 	return l
 }
 
-// widthInsideFrame is the usable content width before the transcript border:
-// the full terminal when unframed, minus the shell's side borders otherwise.
+// widthInsideFrame is the usable content width before the main column's
+// gutter + rail: the full terminal for the edge-to-edge chat shell, minus
+// the reserved shell margin should one ever be turned on.
 func widthInsideFrame(termW int, frameOn bool) int {
 	if frameOn {
 		return termW - frameChrome
@@ -514,7 +427,9 @@ type chatScreen struct {
 	localLines []localLine          // echoes & notes
 	netCh      chan tea.Msg         // engine -> Update bridge (non-blocking)
 	nextSeq    int                  // local display sequence counter
-	hoverPeer  string               // sidebar row under the mouse ("" = none)
+	hoverPeer  string               // conversation row under the mouse / keyboard cursor ("" = none)
+	focus      focusPane            // which pane owns the keyboard (zero = composer)
+	sideFilter string               // inline rail filter ("" = show everything)
 	unread     map[string]int       // peer -> unread DM count (cleared on open)
 	lastDMAt   map[string]time.Time // peer -> newest incoming DM (recency sort)
 	lines      []string             // DERIVED paint buffer: rebuildView() owns it
@@ -532,6 +447,7 @@ type chatScreen struct {
 	// re-measures the entire transcript (grapheme segmentation dominates
 	// profiles) — O(n) per message, ~90ms at 5000 lines.
 	renderCache map[int]string
+	hdrCache    map[int]string // sender-group headers (see renderedSender)
 	tsCache     map[int]time.Time
 	wrapCache   map[string]string
 	cacheWidth  int
@@ -567,6 +483,43 @@ type chatScreen struct {
 	targetUser   string       // private-chat peer; "" = general room
 	leftSent     *atomic.Bool // per-screen leave guard (pointer: screen is copied by value)
 	drainTimer   *time.Timer  // reused pump timer (no time.After alloc per cycle)
+}
+
+// focusPane names the one component that owns keyboard focus. Exactly one
+// pane is focused at a time and exactly one visual indicator marks it: an
+// accent bar on the conversation rail, an accent gutter on the transcript,
+// or the composer's accent border. There is no focus manager in bubbles v1,
+// so this enum + key.Matches IS the routing table.
+type focusPane int
+
+const (
+	// focusComposer is the resting focus: the app opens ready to type.
+	focusComposer focusPane = iota
+	focusSidebar
+	focusTranscript
+)
+
+// next/prev walk the ring sidebar → transcript → composer → sidebar.
+func (f focusPane) next() focusPane {
+	switch f {
+	case focusComposer:
+		return focusSidebar
+	case focusSidebar:
+		return focusTranscript
+	default:
+		return focusComposer
+	}
+}
+
+func (f focusPane) prev() focusPane {
+	switch f {
+	case focusComposer:
+		return focusTranscript
+	case focusTranscript:
+		return focusSidebar
+	default:
+		return focusComposer
+	}
 }
 
 // scrollSection identifies one independently scrollable pane.
@@ -688,6 +641,16 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	ti.Prompt = "❯ "
 	ti.Width = 36
 	vp := viewport.New(80, 20)
+	// The composer owns text; the transcript owns arrows and paging. Left
+	// with the library defaults, typing "j"/"k"/"f"/space would scroll the
+	// transcript while the user is writing — so the viewport's vi/letter
+	// bindings are dropped and only the dedicated scroll keys remain.
+	vp.KeyMap = viewport.KeyMap{
+		Up:       bkeys.NewBinding(bkeys.WithKeys("up")),
+		Down:     bkeys.NewBinding(bkeys.WithKeys("down")),
+		PageUp:   bkeys.NewBinding(bkeys.WithKeys("pgup")),
+		PageDown: bkeys.NewBinding(bkeys.WithKeys("pgdown")),
+	}
 	netCh := make(chan tea.Msg, 256)
 	sig := &signalClient{serverURL: serverURL, key: key, me: me}
 	// Engine callbacks only ever push into netCh (never touch the screen:
@@ -815,29 +778,62 @@ func (c *chatScreen) shouldRender(m chatMessage) bool {
 	return m.ConvID == c.activeConv()
 }
 
-func (c *chatScreen) renderLine(m chatMessage) string {
-	// Timestamp - used for system lines and as bubble timestamp
-	tsPlain := "--:--"
-	if t, err := time.Parse(time.RFC3339, m.CreatedAt); err == nil {
-		tsPlain = t.Local().Format("15:04")
+// chatTimeLabel formats a message timestamp for the transcript ("" when the
+// message carries no parseable time).
+func chatTimeLabel(created string) string {
+	if t, err := time.Parse(time.RFC3339, created); err == nil {
+		return t.Local().Format("15:04")
 	}
-	if m.Kind == "system" {
-		if isOwnPresence(m.Text, c.me) {
-			return "" // never announce my own join/leave to me
-		}
-		w := c.vp.Width
-		if w <= 0 {
-			w = 60
-		}
-		return renderSystemCard("System", tsPlain, m.Text, w)
-	}
-	isOwn := m.Username == c.me
-	textRendered := renderMarkdown(m.Text)
+	return "--:--"
+}
 
-	availWidth := c.vp.Width
-	if availWidth <= 0 {
-		availWidth = 60
+// transcriptW is the width every transcript block is measured against: the
+// live viewport width, with the same fallback the wrap pass uses so a block
+// built before the first resize can never disagree with it.
+func (c *chatScreen) transcriptW() int {
+	if w := c.vp.Width; w > 0 {
+		return w
 	}
+	return 60
+}
+
+// senderLabel paints the group header above a run of messages from one
+// sender: name in the sender's hue plus a subdued timestamp. Own messages
+// put the time first and right-align the whole line so the two sides of the
+// conversation read as two sides.
+func (c *chatScreen) senderLabel(name, tsPlain string, isOwn bool) string {
+	w := c.transcriptW()
+	display := name
+	var nameStyle lipgloss.Style
+	if isOwn {
+		display = "You"
+		nameStyle = lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	} else {
+		nameStyle = lipgloss.NewStyle().Bold(true).Foreground(avatarColorFor(name))
+	}
+	var line string
+	if isOwn {
+		line = thMsgTimeStyle.Render(tsPlain) + "  " + nameStyle.Render(display)
+	} else {
+		line = nameStyle.Render(display) + "  " + thMsgTimeStyle.Render(tsPlain)
+	}
+	if isOwn {
+		return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(line)
+	}
+	return truncateByWidth(line, w)
+}
+
+// renderSender is the chatMessage-flavoured wrapper over senderLabel.
+func (c *chatScreen) renderSender(m chatMessage) string {
+	return c.senderLabel(m.Username, chatTimeLabel(m.CreatedAt), m.Username == c.me)
+}
+
+// chatBubble renders one chat message block: a tinted bubble that hugs its
+// text, right-aligned when it is ours so the two sides of the conversation
+// read as two sides. dim marks a send still waiting for its delivery ack,
+// so "sent" is never confused with "received".
+func chatBubble(text string, isOwn, dim bool, availWidth int) string {
+	textRendered := renderMarkdown(text)
 	// Fluid bubbles: near-full-width on narrow transcripts, tighter
 	// columns when space abounds. Pure function of width, so the width
 	// cache key stays sufficient.
@@ -848,10 +844,6 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if maxBubbleW > availWidth-2 {
 		maxBubbleW = availWidth - 2
 	}
-
-	// Bubble holds text only: the sender line above already carries name +
-	// time, so no interior timestamp clutters the bubble (reference look).
-	// Compact hug: needed = content width + padding/border
 	needed := lipgloss.Width(textRendered) + 4
 	if needed < 12 {
 		needed = 12
@@ -860,40 +852,57 @@ func (c *chatScreen) renderLine(m chatMessage) string {
 	if bubbleW > maxBubbleW {
 		bubbleW = maxBubbleW
 	}
-	bubbleInner := textRendered
-
-	var style lipgloss.Style
+	style := thOtherBubbleStyle
 	if isOwn {
 		style = thOwnBubbleStyle
-		// Unconfirmed own message (sent, no delivery ack yet): render dim
-		// so "sent" is never confused with "received". The ack
-		// (netDeliveredMsg) restores full brightness.
-		if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
+		if dim {
 			style = style.Faint(true)
 		}
-	} else {
-		style = thOtherBubbleStyle
 	}
-	bubble := style.Width(bubbleW).Render(bubbleInner)
+	// Re-assert the bubble's colours after every reset the markdown emits,
+	// then let the bubble itself do the wrapping.
+	bubble := style.Width(bubbleW).Render(retint(textRendered, style))
+	if isOwn {
+		return lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
+	}
+	return truncateByWidth(bubble, availWidth)
+}
 
-	name := m.Username
-	if isOwn {
-		name = "You"
+// renderBody paints just the message itself: a tinted block for chat, one
+// centred faint row for a system event.
+func (c *chatScreen) renderBody(m chatMessage) string {
+	availWidth := c.transcriptW()
+	if m.Kind == "system" {
+		if isOwnPresence(m.Text, c.me) {
+			return "" // never announce my own join/leave to me
+		}
+		return renderSystemLine(m.Text, chatTimeLabel(m.CreatedAt), availWidth)
 	}
-	// Identity rides on the colored name + time (no avatar chips in the
-	// transcript): per-user hues stay readable at every density.
-	nameStyle := lipgloss.NewStyle().Foreground(avatarColorFor(m.Username))
-	if isOwn {
-		nameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
+	dim := false
+	if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
+		dim = true
 	}
-	sender := nameStyle.Render(name) + "  " + thMsgTimeStyle.Render(tsPlain)
+	return chatBubble(m.Text, m.Username == c.me, dim, availWidth)
+}
 
-	if isOwn {
-		// Right side: sender line + bubble both right-aligned.
-		st := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right)
-		return st.Render(sender) + "\n" + st.Render(bubble)
+// renderEntry composes one transcript entry: the group header (when the
+// caller says this message starts a run) over the message body.
+func (c *chatScreen) renderEntry(m chatMessage, withHeader bool) string {
+	body := c.renderedBody(m)
+	if body == "" {
+		return ""
 	}
-	return sender + "\n" + bubble
+	if !withHeader || m.Kind == "system" {
+		return body
+	}
+	return c.renderedSender(m) + "\n" + body
+}
+
+// renderLine renders a message as a complete standalone entry (header +
+// body). rebuildView uses the finer-grained pieces for grouping; this is the
+// single-message view.
+func (c *chatScreen) renderLine(m chatMessage) string {
+	return c.renderEntry(m, true)
 }
 
 // addMessage records a confirmed server message and refreshes the view.
@@ -1011,6 +1020,9 @@ func (c *chatScreen) cacheForWidth(w int) {
 	if c.renderCache == nil {
 		c.renderCache = map[int]string{}
 	}
+	if c.hdrCache == nil {
+		c.hdrCache = map[int]string{}
+	}
 	if c.tsCache == nil {
 		c.tsCache = map[int]time.Time{}
 	}
@@ -1023,6 +1035,7 @@ func (c *chatScreen) cacheForWidth(w int) {
 	}
 	if c.cacheWidth != w || c.cacheAdapt != adaptSig {
 		c.renderCache = map[int]string{}
+		c.hdrCache = map[int]string{}
 		c.tsCache = map[int]time.Time{}
 		c.wrapCache = map[string]string{}
 		c.cacheWidth = w
@@ -1043,15 +1056,51 @@ func (c *chatScreen) evictRenderCache(msgId string) {
 	}
 }
 
-// renderedLine returns the cached bubble for a history message, rendering
-// and memoizing on miss.
-func (c *chatScreen) renderedLine(m chatMessage) string {
+// renderedBody returns the cached message block for a history message,
+// rendering and memoizing on miss.
+func (c *chatScreen) renderedBody(m chatMessage) string {
 	if s, ok := c.renderCache[m.Seq]; ok {
 		return s
 	}
-	s := c.renderLine(m)
+	if c.renderCache == nil {
+		c.renderCache = map[int]string{}
+	}
+	s := c.renderBody(m)
 	c.renderCache[m.Seq] = s
 	return s
+}
+
+// renderedSender returns the cached group header for a history message.
+func (c *chatScreen) renderedSender(m chatMessage) string {
+	if s, ok := c.hdrCache[m.Seq]; ok {
+		return s
+	}
+	if c.hdrCache == nil {
+		c.hdrCache = map[int]string{}
+	}
+	s := c.renderSender(m)
+	c.hdrCache[m.Seq] = s
+	return s
+}
+
+// renderedLine returns the cached message BLOCK for a history message
+// (body only — the sender-group header is composed by rebuildView, which
+// knows whether this message starts a run).
+func (c *chatScreen) renderedLine(m chatMessage) string {
+	return c.renderedBody(m)
+}
+
+// renderedEntry is renderedLine plus the group header when the caller says
+// this message starts a run.
+func (c *chatScreen) renderedEntry(m chatMessage, withHeader bool) string {
+	body := c.renderedBody(m)
+	if body == "" {
+		return ""
+	}
+	if !withHeader || m.Kind == "system" {
+		return body
+	}
+	return c.renderedSender(m) + "\n" + body
 }
 
 // messageTime returns the cached parsed timestamp for a history message.
@@ -1112,6 +1161,37 @@ func (c *chatScreen) rebuildView() {
 	}
 
 	// Merge history + file cards by timestamp (parsed timestamps cached).
+	//
+	// Sender grouping: a sender/kind header is painted only when the run
+	// changes — new sender, new kind, or a gap of groupAfter — so a
+	// conversation reads as conversation instead of a stack of labels.
+	const groupAfter = 5 * time.Minute
+	var lastUser, lastKind string
+	var lastAt time.Time
+	firstEntry := true
+	startGroup := func(user, kind string, at time.Time) bool {
+		if firstEntry {
+			firstEntry = false
+			lastUser, lastKind, lastAt = user, kind, at
+			return true
+		}
+		newRun := user != lastUser || kind != lastKind
+		if !newRun && !at.IsZero() && !lastAt.IsZero() && at.Sub(lastAt) > groupAfter {
+			newRun = true
+		}
+		lastUser, lastKind = user, kind
+		if !at.IsZero() {
+			lastAt = at
+		}
+		return newRun
+	}
+	push := func(entry string) {
+		if entry == "" {
+			return // suppressed (own presence line): leave no blank row
+		}
+		c.lines = append(c.lines, entry)
+	}
+
 	hi, ci := 0, 0
 	for hi < len(visibleHistory) || ci < len(cards) {
 		var histTime time.Time
@@ -1124,14 +1204,24 @@ func (c *chatScreen) rebuildView() {
 		cardBeforeHist := hasCard && hasHist && !histTime.IsZero() && cards[ci].t.Before(histTime)
 		if hasCard && (!hasHist || cardBeforeHist) {
 			fd := cards[ci].ll.fileData
+			who := fd.username
+			if who == "" {
+				who = "File"
+			}
+			header := ""
+			if startGroup(who, "file", cards[ci].t) {
+				header = c.senderLabel(who, fd.time, who == c.me) + "\n"
+			}
 			card := fileAttachmentCard(fd.filename, fd.username, fd.size, fd.time, c.vp.Width)
 			if fd.username == c.me {
-				card = lipgloss.NewStyle().Width(c.vp.Width).Align(lipgloss.Right).Render(card)
+				card = lipgloss.NewStyle().Width(maxInt(c.transcriptW(), 1)).Align(lipgloss.Right).Render(card)
 			}
-			c.lines = append(c.lines, card)
+			push(header + card)
 			ci++
 		} else if hasHist {
-			c.lines = append(c.lines, c.renderedLine(visibleHistory[hi]))
+			m := visibleHistory[hi]
+			withHeader := startGroup(m.Username, m.Kind, c.messageTime(m))
+			push(c.renderedEntry(m, withHeader))
 			hi++
 		} else {
 			break
@@ -1139,7 +1229,7 @@ func (c *chatScreen) rebuildView() {
 	}
 	// Append transient pinned lines (pending echo, progress bars, errors) at bottom.
 	for _, ll := range pinned {
-		c.lines = append(c.lines, ll.text)
+		push(ll.text)
 	}
 	c.syncRosterVp() // users list content lives with the screen, not the copy
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
@@ -1162,6 +1252,16 @@ func (c *chatScreen) refreshViewport() {
 		w = 40
 	}
 	atBottom := c.vp.AtBottom()
+	if len(c.lines) == 0 {
+		// Empty state: a centred, helpful hint — never a blank pane. It is
+		// painted straight into the viewport (never into c.lines) so the
+		// transcript's row model stays message-for-message.
+		c.vp.SetContent(c.emptyStateView(w))
+		if atBottom {
+			c.vp.GotoBottom()
+		}
+		return
+	}
 	st := lipgloss.NewStyle().Width(w)
 	wrapped := make([]string, len(c.lines))
 	for i, ln := range c.lines {
@@ -1185,6 +1285,32 @@ func (c *chatScreen) refreshViewport() {
 	if atBottom {
 		c.vp.GotoBottom()
 	}
+}
+
+// emptyStateView paints the transcript's resting state: a centred, helpful
+// hint occupying exactly the viewport box. Never a blank pane, never a
+// debug dump — the pane always answers "where am I and what do I do".
+func (c *chatScreen) emptyStateView(w int) string {
+	if w <= 0 {
+		w = 40
+	}
+	title := "No messages yet"
+	hint := "Be the first to say something — press Enter to send."
+	switch {
+	case c.sideFilter != "":
+		title = "Nothing matches “" + c.sideFilter + "”"
+		hint = "Press Esc to show every conversation again."
+	case c.targetUser != "":
+		hint = "Private thread with " + c.targetUser + " — press Enter to send."
+	}
+	center := lipgloss.NewStyle().Width(w).Align(lipgloss.Center)
+	block := center.Bold(true).Foreground(colDim).Render(truncateByWidth(title, w)) + "\n" +
+		center.Foreground(colFaint).Render(truncateByWidth(hint, w))
+	if h := c.vp.Height; h > 3 {
+		pad := (h - 2) / 2
+		block = strings.Repeat("\n", pad) + block
+	}
+	return block
 }
 
 // scrollbarView renders a vertical scrollbar for the transcript viewport.
@@ -1255,13 +1381,6 @@ func scrollbarBar(total, visible, offset, h int) (bar string, thumbTop, thumbH, 
 	return strings.Join(rows, "\n"), thumbTop, thumbH, trackH, hasArrows
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func (c chatScreen) headerView() string {
 	// App top bar: logo + promises left, signal/lock/clock right. The
 	// session context (key, peer, version) moved to the room header above
@@ -1278,13 +1397,34 @@ func (c chatScreen) statusView() string {
 	if c.status == "" {
 		return ""
 	}
-	// Width-clamped: statuses now carry command output (/help lists) and
-	// must never break the exact-width frame contract.
-	w := c.width
+	// Width-clamped: statuses carry command output (/help lists) and must
+	// never break the exact-width frame contract.
+	w := maxInt(c.width, 1)
 	if c.layoutFor().frameOn {
 		w -= frameChrome
 	}
-	return truncateByWidth(tuiErrStyle.Render(c.status), maxInt(w, 1))
+	return truncateByWidth(statusStyleFor(c.status).Render(c.status), maxInt(w, 1))
+}
+
+// statusStyleFor classifies the one-line notice strip: quiet for command
+// output, amber for results, red for failures. One clear line either way.
+func statusStyleFor(s string) lipgloss.Style {
+	switch {
+	case strings.HasPrefix(s, "Commands:"), strings.HasPrefix(s, "media"):
+		return thStatusInfoStyle
+	case s == serverDownMsg,
+		strings.HasPrefix(s, "*"),
+		strings.HasPrefix(s, "✗"),
+		strings.HasPrefix(s, "usage:"),
+		strings.Contains(s, "failed"),
+		strings.Contains(s, "Session has ended"),
+		strings.Contains(s, "outbox full"),
+		strings.Contains(s, "unavailable"),
+		strings.Contains(s, "cap is"):
+		return thStatusErrStyle
+	default:
+		return thStatusWarnStyle
+	}
 }
 
 // circledNum maps 1..50 onto Unicode circled digits (①…⑳ ㉑…㉟ ㊱…㊿).
@@ -1313,115 +1453,164 @@ func (c chatScreen) unreadBadge(peer string) string {
 	return tuiUnreadStyle.Render(circledNum(n))
 }
 
-// searchHeightFor is the fixed search-box height: a bordered 3-row box when
-// the room header leaves room above the transcript, else a 1-row hint.
-// Pure: layoutFor and rosterBody share it so paint and hit-test agree.
+// searchHeightFor is the height of the sidebar header block: a single
+// inline filter row that doubles as the "/" affordance. headRows is still
+// part of the signature because paint, viewport sync and hit-test all pass
+// it — but the block height is width-driven only, so the list start line
+// can never drift between those three callers.
 func searchHeightFor(headRows, inner int) int {
-	if headRows >= 2 && inner >= 20 {
-		return 3
+	_ = headRows
+	if inner >= 16 {
+		return 1
 	}
-	return 1
+	return 0
 }
 
-// sidebarFill is the sidebar interior height: the full right-stack height
-// (room header + call card + transcript + hints + drawer + composer) minus
-// the sidebar's own top/bottom border. The search column runs all the way
-// down beside the composer instead of stopping at the transcript.
-// Mirrors View()'s assembly exactly — paint, scrollbar, and viewport sync
-// share it so the list never over/under-fills its box.
+// sidebarFill is the sidebar column height: exactly the height of the main
+// column it sits beside (chat header + transcript + drawer + composer +
+// hints). Paint, scrollbar geometry and viewport sync all read it, so the
+// two columns can never drift apart. Mirrors View()'s assembly order.
 func (c chatScreen) sidebarFill(l layout) int {
 	h := l.headRows
 	if l.vpHeight > 0 {
 		h += l.vpHeight
-		if l.boxedTranscript {
-			h += transcriptBorder
-		}
 	}
 	h += l.hintRows
 	if l.paletteRows > 0 {
 		if pal := c.drawerView(maxInt(l.vpWidth+2, 0)); pal != "" {
-			h += 1 + strings.Count(pal, "\n") + 1 // spacer + panel rows
+			h += 1 + lipgloss.Height(pal) // spacer + panel rows
 		}
 	}
 	if l.composerRows > 0 {
 		h += l.composerRows + 2 // composer box + border
-	} else if l.inputBoxed {
-		h += strings.Count(tuiBorderStyle.Render(c.input.View()), "\n") + 1
 	} else {
 		h++ // bare prompt line
 	}
-	return h - 2 // sidebar top + bottom border
+	return maxInt(h, 0)
 }
 
-// rosterBody paints the chat list: search box, then one item per
-// conversation (General room + DM threads) with avatars, previews, times,
-// unread dots and call icons. fill = interior rows of the sidebar box.
-// Overflow scrolls in the roster viewport with its own scrollbar column.
-func (c chatScreen) rosterBody(fill int) string {
-	inner := c.sidebarInnerWidth()
-	sh := searchHeightFor(c.layoutFor().headRows, inner)
-	search := c.searchBox(inner, sh)
-	if fill <= sh {
-		return strings.Join(search, "\n") // search only; border lives in View
+// sidebarHeader paints the rail's one-row inline filter: the live query (or
+// a faint placeholder) with the "/" affordance right-aligned. It sits on a
+// stronger tint so it reads as a header without spending a row on a rule.
+func (c chatScreen) sidebarHeader(inner int) string {
+	glyph := "⌕ "
+	affordance := " "
+	textBudget := inner - lipgloss.Width(glyph) - 2
+	if textBudget >= 1 {
+		affordance = "/"
 	}
-	bodyH := fill - sh // search owns the first rows
-	items := c.chatItems()
-	rows := c.chatItemRows(items, inner, c.hoverPeer)
-	needBar := len(rows) > bodyH
-	barW := 0
-	if needBar {
-		barW = 1 // chats overflow: the list scrolls, scrollbar joins
-	}
-	if !needBar {
-		out := make([]string, 0, fill)
-		out = append(out, search...)
-		out = append(out, rows...)
-		for len(out) < fill {
-			out = append(out, "")
+	var body string
+	if c.sideFilter != "" {
+		caret := ""
+		if c.focus == focusSidebar && !c.drawerOpen() {
+			caret = thFocusBar.Render("▎")
 		}
-		return strings.Join(out, "\n")
+		body = thSearchStyle.Render(glyph) +
+			lipgloss.NewStyle().Foreground(colText).Render(truncateByWidth(sanitizeDisplay(c.sideFilter), maxInt(textBudget-lipgloss.Width(caret), 1))) +
+			caret
+	} else {
+		hint := "conversations"
+		if textBudget < len(hint) {
+			hint = "chats"
+		}
+		body = thSearchStyle.Render(glyph + truncateByWidth(hint, maxInt(textBudget, 1)))
 	}
-	// Overflow: the chat list scrolls inside its own viewport; the bar
-	// column rides beside it.
-	vp := c.rosterVp
-	vp.Width = maxInt(inner-barW, 8)
-	vp.Height = bodyH
-	vp.SetContent(strings.Join(rows, "\n"))
-	bar, _, _, _, _ := scrollbarBar(len(rows), bodyH, vp.YOffset, bodyH)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
-	return strings.Join(search, "\n") + "\n" + body
-}
-
-// searchBox paints the fixed sidebar search. Roomy terminals get the
-// bordered input look; clicking anywhere in it opens "/".
-func (c chatScreen) searchBox(inner int, sh int) []string {
-	hint := "Search chats or people…"
-	if lipgloss.Width(hint)+6 > inner {
-		hint = "Search chats…"
-	}
-	if sh >= 3 {
-		// Manual border glyphs (NOT the bordered box style: that would
-		// double the border and overflow the sidebar column).
-		bd := lipgloss.NewStyle().Foreground(lipgloss.Color(thPanelEdge))
-		top := bd.Render("╭" + strings.Repeat("─", maxInt(inner-2, 1)) + "╮")
-		bot := bd.Render("╰" + strings.Repeat("─", maxInt(inner-2, 1)) + "╯")
-		mid := "│ " + thSearchStyle.Render(truncateByWidth(hint, maxInt(inner-6, 1)))
-		mid += strings.Repeat(" ", maxInt(inner-4-lipgloss.Width(mid), 1)) + thSearchStyle.Render("/") + " │"
-		return []string{top, truncateVisible(mid, inner), bot}
-	}
-	// 1-row fallback: hint left, "/" right.
-	h := thSearchStyle.Render("⌕ " + hint)
-	slash := thSearchStyle.Render("/")
-	gap := inner - lipgloss.Width("⌕ "+hint) - 1
+	gap := inner - lipgloss.Width(body) - lipgloss.Width(affordance)
 	if gap < 1 {
 		gap = 1
 	}
-	return []string{h + strings.Repeat(" ", gap) + slash}
+	affStyle := thSearchStyle
+	if c.focus == focusSidebar && !c.drawerOpen() {
+		affStyle = thFocusBar
+	}
+	row := body + strings.Repeat(" ", gap) + affStyle.Render(affordance)
+	return tintFit(thSidebarHeaderStyle, row, inner)
 }
 
-// chatItemHeight is the sidebar row budget per chat: two comfortable rows
-// (name, preview) normally, one compact row (name only) when terminal
-// height is scarce. Selection is a side bar + tint (no extra rows).
+// fitRow lives in chat_theme.go (shared with the header and drawer rows).
+
+// rosterBody paints the sidebar column: the filter header row, then one
+// two-line entry per conversation (presence, name, time, unread badge,
+// preview, call glyph). fill is the FULL column height — header included —
+// and the returned block is always exactly fill rows of exactly
+// sidebarInnerWidth() cells. Overflow scrolls inside the roster viewport
+// with its own rail column.
+func (c chatScreen) rosterBody(fill int) string {
+	if fill <= 0 {
+		return ""
+	}
+	inner := c.sidebarInnerWidth()
+	rowW := maxInt(inner-1, 8) // last column belongs to the scroll rail
+	sh := searchHeightFor(c.layoutFor().headRows, inner)
+	if sh > fill {
+		sh = fill
+	}
+	header := make([]string, 0, sh)
+	for i := 0; i < sh; i++ {
+		header = append(header, c.sidebarHeader(rowW))
+	}
+	if fill <= sh {
+		return strings.Join(header, "\n")
+	}
+	bodyH := fill - sh
+	items := c.chatItems()
+	rows := c.chatItemRows(items, rowW, c.hoverPeer)
+	needBar := len(rows) > bodyH
+
+	railRows := make([]string, bodyH)
+	for i := range railRows {
+		railRows[i] = " "
+	}
+	var body []string
+	if !needBar {
+		body = rows
+		for len(body) < bodyH {
+			body = append(body, tintFit(thSidebarStyle, "", rowW))
+		}
+	} else {
+		bar, _, _, _, _ := scrollbarBar(len(rows), bodyH, c.rosterVp.YOffset, bodyH)
+		vp := c.rosterVp
+		vp.Width = rowW
+		vp.Height = bodyH
+		vp.SetContent(strings.Join(rows, "\n"))
+		body = strings.Split(vp.View(), "\n")
+		if len(body) > bodyH {
+			body = body[:bodyH]
+		}
+		for len(body) < bodyH {
+			body = append(body, tintFit(thSidebarStyle, "", rowW))
+		}
+		barLines := strings.Split(bar, "\n")
+		for i := range railRows {
+			if i < len(barLines) {
+				railRows[i] = barLines[i]
+			}
+		}
+	}
+
+	out := make([]string, 0, fill)
+	for _, hr := range header {
+		out = append(out, fitRow(hr, rowW)+" ")
+	}
+	for i, br := range body {
+		rc := " "
+		if i < len(railRows) {
+			rc = railRows[i]
+		}
+		out = append(out, fitRow(br, rowW)+rc)
+	}
+	if len(out) > fill {
+		out = out[:fill]
+	}
+	for len(out) < fill {
+		out = append(out, tintFit(thSidebarStyle, "", inner))
+	}
+	return strings.Join(out, "\n")
+}
+
+// chatItemHeight is the sidebar row budget per chat: two rows (identity
+// over preview) normally, one dense identity row when terminal height is
+// scarce. Selection is an accent bar + tint inside the same rows.
 func (c chatScreen) chatItemHeight() int {
 	if compactItems(c.width, c.height) {
 		return 1
@@ -1430,77 +1619,102 @@ func (c chatScreen) chatItemHeight() int {
 }
 
 // chatItemRows renders every chat item as exactly chatItemHeight() rows.
-// hover names the peer under the mouse ("breadcrumb" highlight).
+// hover names the peer under the mouse / keyboard cursor.
 func (c chatScreen) chatItemRows(items []chatItem, inner int, hover string) []string {
 	h := c.chatItemHeight()
 	rows := make([]string, 0, len(items)*h)
 	for _, it := range items {
-		rows = append(rows, chatItemRow(it, inner, hover, h)...)
+		// The rail only wears the accent while it is focused AND no drawer
+		// is claiming the focused-surface indicator.
+		rows = append(rows, chatItemRow(it, inner, hover, h, c.focus == focusSidebar && !c.drawerOpen())...)
 	}
 	return rows
 }
 
-// chatItemRow paints one sidebar item as exactly h rows (h from
-// chatItemHeight): comfortable name + preview rows, or a compact single
-// name row. The active chat gets a blue side bar + tinted background (same
-// rows, no extra chrome); hover highlights the name. Pure function of
-// inputs; every row is exactly `inner` cells wide (truncateVisible
-// pads/truncates ANSI-safe, never wraps).
-func chatItemRow(it chatItem, inner int, hover string, h int) []string {
-	av := avatarCell(it.name)
-	if it.isRoom {
-		av = roomAvatarCell()
+// chatItemRow paints one sidebar entry as exactly h rows of exactly `inner`
+// cells. Row 1 is the scan line — presence dot, name, time, unread badge;
+// row 2 is the last-message preview plus a call glyph. The ACTIVE entry
+// carries a tint plus an accent bar (bright when the rail owns focus, dim
+// when it does not); hover repaints just the hovered name.
+func chatItemRow(it chatItem, inner int, hover string, h int, focused bool) []string {
+	if inner < 8 {
+		inner = 8
 	}
-	// One leading cell is reserved for the selection bar (blue when active).
-	barW := 1
-	name := truncateStringPlain(it.name, maxInt(inner-barW-13, 1))
-	nameRendered := thChatNameStyle.Render(name)
+	// Presence: the room is always live, peers show online/offline.
+	presence := thPresenceStyle.Render("●")
+	switch {
+	case it.isRoom:
+		presence = thPresenceStyle.Render("●")
+	case it.live:
+		presence = thPresenceStyle.Render("●")
+	default:
+		presence = thPresenceOff.Render("○")
+	}
+
+	name := it.name
+	nameStyle := thChatNameStyle
+	if it.unread > 0 {
+		nameStyle = thChatActive
+	}
+	if !it.live && !it.isRoom {
+		nameStyle = tuiDimStyle
+	}
+	nameRendered := nameStyle.Render(name)
 	if hover == it.peer && it.peer != "" && !it.active {
 		nameRendered = thHoverRowStyle.Render(name)
 	}
-	if !it.live && !it.isRoom {
-		nameRendered = tuiDimStyle.Render(name)
+
+	badge := ""
+	if it.unread > 0 {
+		badge = " " + tuiUnreadStyle.Render(circledNum(it.unread))
 	}
 	timeRendered := thChatTimeStyle.Render(it.timeStr)
-	dot := " "
-	if it.unread > 0 {
-		dot = thUnreadDotStyle.Render("●")
-	}
-	gap1 := inner - barW - (lipgloss.Width(av) + 1 + len([]rune(name)) + 1 + len([]rune(it.timeStr)) + 1 + 1)
+
+	// ---- identity line ---------------------------------------------------
+	gap1 := inner - 1 - (1 + 1 + lipgloss.Width(nameRendered) + 1 + lipgloss.Width(timeRendered) + lipgloss.Width(badge))
 	if gap1 < 1 {
 		gap1 = 1
 	}
-	core1 := av + " " + nameRendered + strings.Repeat(" ", gap1) + timeRendered + " " + dot
+	core1 := presence + " " + nameRendered + strings.Repeat(" ", gap1) + timeRendered + badge
 
+	// ---- preview line ----------------------------------------------------
 	icon := " "
 	if it.inCall {
 		icon = thSignalStyle.Render("◉")
 	}
-	if dot != " " {
-		icon += " " + dot
-	}
-	preview := truncateStringPlain(it.preview, maxInt(inner-barW-8, 1))
-	pvRendered := thPreviewStyle.Render(preview)
+	preview := it.preview
+	pvStyle := thPreviewStyle
 	if it.unread > 0 && !it.isRoom {
-		pvRendered = thUnreadNewStyle.Render(preview)
+		pvStyle = thPreviewUnread
 	}
 	if it.inCall && it.isRoom {
-		pvRendered = thSignalStyle.Render(preview)
+		pvStyle = thSignalStyle
 	}
-	gap2 := inner - barW - (4 + len([]rune(preview)) + 1 + len([]rune(stripForWidth(icon))))
+	pvRendered := pvStyle.Render(preview)
+	gap2 := inner - 1 - (2 + lipgloss.Width(pvRendered) + 1 + lipgloss.Width(icon))
 	if gap2 < 1 {
 		gap2 = 1
 	}
-	core2 := "    " + pvRendered + strings.Repeat(" ", gap2) + icon
+	core2 := "  " + pvRendered + strings.Repeat(" ", gap2) + icon
 
-	selBar := lipgloss.NewStyle().Foreground(lipgloss.Color(thBlue)).Render("┃")
-	plainBar := " "
-	mkRow := func(core string) string {
-		row := truncateVisible(core, inner-barW)
-		if it.active {
-			return selBar + thSelRowStyle.Render(row)
+	// ---- selection / focus bar ------------------------------------------
+	barChar := " "
+	barStyle := thSidebarStyle
+	if it.active {
+		barChar = "┃"
+		if focused {
+			barStyle = thSelBarStyle
+		} else {
+			barStyle = lipgloss.NewStyle().Foreground(colEdge).Background(colSel)
 		}
-		return plainBar + row
+	}
+	bar := barStyle.Render(barChar)
+	rowBase := lipgloss.NewStyle()
+	if it.active {
+		rowBase = lipgloss.NewStyle().Background(colSel)
+	}
+	mkRow := func(core string) string {
+		return bar + tintFit(rowBase, core, inner-1)
 	}
 	if h <= 1 {
 		return []string{mkRow(core1)}
@@ -1508,19 +1722,14 @@ func chatItemRow(it chatItem, inner int, hover string, h int) []string {
 	return []string{mkRow(core1), mkRow(core2)}
 }
 
-// stripForWidth counts visible cells of a short styled fragment for padding
-// math (ANSI sequences contribute nothing).
-func stripForWidth(s string) string {
-	return ansi.Strip(s)
-}
-
 // syncRosterVp bakes the (scrollable) chat list into the roster viewport
 // so wheel + scrollbar drags operate on live content. Content is rebuilt
 // on hover/rebuild/roster changes — few rows, cheap.
 func (c *chatScreen) syncRosterVp() {
-	inner := c.sidebarInnerWidth() - 1
-	rows := c.chatItemRows(c.chatItems(), inner, c.hoverPeer)
+	rowW := maxInt(c.sidebarInnerWidth()-1, 8)
+	rows := c.chatItemRows(c.chatItems(), rowW, c.hoverPeer)
 	y := c.rosterVp.YOffset
+	c.rosterVp.Width = rowW
 	c.rosterVp.SetContent(strings.Join(rows, "\n"))
 	maxOff := c.rosterVp.TotalLineCount() - c.rosterVp.Height
 	if maxOff < 0 {
@@ -1532,13 +1741,14 @@ func (c *chatScreen) syncRosterVp() {
 	c.rosterVp.SetYOffset(y) // preserve scroll across roster churn
 }
 
-// sidebarInnerWidth is the writable width inside the sidebar border.
+// sidebarInnerWidth is the full width of the sidebar column (it carries no
+// border — the tint and the rail do the framing).
 func (c chatScreen) sidebarInnerWidth() int {
 	l := c.layoutFor()
 	if !l.sidebarOn {
 		return rosterWidthInner
 	}
-	return l.sidebarWidth - 2
+	return l.sidebarWidth
 }
 
 // ---- async commands --------------------------------------------------------
@@ -1737,46 +1947,6 @@ func (c *chatScreen) peerInCall(peer string) bool {
 	return peer == c.targetUser && c.call.AudioOn()
 }
 
-// mediaStatus renders the header chips for active media ("" when idle).
-func (c *chatScreen) mediaStatus() string {
-	if c.call == nil {
-		return ""
-	}
-	var parts []string
-	if scope := c.call.AudioScope(); scope != "" {
-		parts = append(parts, "● MIC → "+scope)
-	}
-	if c.call.Hearing() {
-		parts = append(parts, "● MIC ← "+strings.Join(c.call.AudioPublishers(), ","))
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	s := " · " + strings.Join(parts, " · ")
-	if c.call.AudioOn() && c.callLevel > 0.02 {
-		s += " " + vuBar(c.callLevel)
-	}
-	return s
-}
-
-func vuBar(level float64) string {
-	n := int(level*8 + 0.5)
-	if n < 0 {
-		n = 0
-	}
-	if n > 8 {
-		n = 8
-	}
-	full, empty := "", ""
-	for i := 0; i < n; i++ {
-		full += "▂"
-	}
-	for i := n; i < 8; i++ {
-		empty += "·"
-	}
-	return full + empty
-}
-
 // enterPrivate switches to a 1:1 thread. There is no server history to
 // deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
@@ -1851,28 +2021,9 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
-	availWidth := c.vp.Width
-	if availWidth <= 0 {
-		availWidth = 60
-	}
-	textRendered := renderMarkdown(text)
-	maxBubbleW := int(float64(availWidth) * bubbleRatioFor(availWidth))
-	if maxBubbleW < 14 {
-		maxBubbleW = 14
-	}
-	if maxBubbleW > availWidth-2 {
-		maxBubbleW = availWidth - 2
-	}
-	needed := lipgloss.Width(textRendered) + 4
-	if needed < 12 {
-		needed = 12
-	}
-	bubbleW := needed
-	if bubbleW > maxBubbleW {
-		bubbleW = maxBubbleW
-	}
-	bubble := tuiOwnBubbleStyle.Width(bubbleW).Render(textRendered)
-	echo := lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(bubble)
+	// Optimistic echo: the same block a confirmed message will paint, held
+	// faint until the delivery ack lands (netDeliveredMsg).
+	echo := chatBubble(text, true, true, c.transcriptW())
 	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
@@ -1886,24 +2037,27 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 
 // syncViewport re-derives viewport/composer geometry from the live layout.
 // Drawer open/close, status lines, and sidebar collapse all change the
-// transcript box without any resize event; without this, caches, wraps,
+// transcript geometry without any resize event; without this, caches, wraps,
 // and scroll math run on stale dims until the next terminal resize.
 func (c *chatScreen) syncViewport() {
 	if c.width <= 0 || c.height <= 0 {
 		return
 	}
 	l := c.layoutFor()
-	vpW := l.vpWidth
-	if l.vpHeight > 0 && vpW > 10 {
-		vpW--
+	// A pane that just left the screen cannot keep the focus indicator:
+	// the rail collapses on narrow terminals, so hand focus back to the
+	// composer rather than pointing it at a pane that paints nothing.
+	if c.focus == focusSidebar && !l.sidebarOn {
+		c.focus = focusComposer
 	}
+	vpW := l.vpWidth
 	// Chat list gets its own viewport (scrollable like the transcript);
-	// the search box lives outside the viewport.
+	// the filter header row lives outside the viewport.
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
-		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // scrollbar col
+		c.rosterVp.Width = maxInt(c.sidebarInnerWidth()-1, 8) // rail column
 		// Same inner width the painter uses (rosterBody): a divergent value
-		// desyncs the search-box row count and misroutes roster clicks.
+		// desyncs the header row count and misroutes roster clicks.
 		c.rosterVp.Height = maxInt(fill-searchHeightFor(l.headRows, c.sidebarInnerWidth()), 1)
 	}
 	atBottom := c.vp.AtBottom()
@@ -2250,6 +2404,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.SetValue("/")
 			c.palette.sync("/")
 			c.input.Focus()
+			c.focus = focusComposer // the drawer rides on the composer
 			break
 		}
 		// Ctrl+L clears the composer line and repaints the screen.
@@ -2259,15 +2414,58 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return c, tea.ClearScreen
 		}
 		if msg.Type == tea.KeyEsc {
-			// Esc ONLY leaves private view. It must NEVER quit the app.
+			// Esc dismisses transient state — the rail's filter, then the
+			// private view. It must NEVER quit the app.
+			if c.sideFilter != "" {
+				c.clearSideFilter()
+			}
 			c.exitPrivate()
 			break
 		}
-		// Tab / Shift+Tab cycle the roster highlight — the KEYBOARD way to
-		// reach a peer (mouse-less terminals otherwise have no path to DMs).
-		if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
-			c.cycleRosterFocus(msg.Type == tea.KeyShiftTab)
+		// An open drawer keeps focus: Tab is its completion key (handled
+		// above) and neither Tab nor Shift+Tab may wander focus out from
+		// under a panel that is claiming the accent.
+		if c.drawerOpen() && (msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab) {
 			break
+		}
+		// Tab / Shift+Tab walk focus around the ring:
+		// composer → conversation rail → transcript → composer.
+		// Landing on the rail also parks its cursor on the first peer so a
+		// keyboard-only user always has a visible target.
+		if msg.Type == tea.KeyTab || msg.Type == tea.KeyShiftTab {
+			c.cycleFocus(msg.Type == tea.KeyShiftTab)
+			break
+		}
+		// Home / End jump the transcript to the top or bottom (the viewport
+		// does not bind them in bubbles v1).
+		if msg.Type == tea.KeyHome || msg.Type == tea.KeyEnd {
+			if msg.Type == tea.KeyHome {
+				c.vp.GotoTop()
+			} else {
+				c.vp.GotoBottom()
+			}
+			break
+		}
+		// With the conversation rail focused, arrows move its cursor
+		// instead of scrolling the transcript.
+		if c.focus == focusSidebar && (msg.Type == tea.KeyUp || msg.Type == tea.KeyDown) {
+			if msg.Type == tea.KeyUp {
+				c.moveRosterCursor(-1)
+			} else {
+				c.moveRosterCursor(1)
+			}
+			break
+		}
+		// With the rail focused, printable keys narrow the list instead of
+		// reaching the composer — the inline filter the rail advertises.
+		if c.focus == focusSidebar && textEditKey(msg) {
+			c.editSideFilter(msg)
+			break
+		}
+		// Any other key that edits the composer also focuses it, so the
+		// indicator always sits where the text is about to appear.
+		if c.focus != focusComposer && textEditKey(msg) {
+			c.focus = focusComposer
 		}
 		if msg.Type == tea.KeyEnter {
 			text := strings.TrimSpace(c.input.Value())
@@ -2296,10 +2494,24 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ensurePaletteOpen(&c) // plain edits may open/close the "/" drawer
 	}
 
-	// Viewport keeps its own scroll handling for every message.
-	var vpc tea.Cmd
-	c.vp, vpc = c.vp.Update(msg)
-	cmds = append(cmds, vpc)
+	// The transcript viewport keeps its own scroll handling — but only for
+	// messages it should ever see. Mouse is owned exclusively by handleMouse
+	// (per-pane wheel + drag routing), and keys stay away from it while the
+	// conversation rail owns focus so ↑/↓ move the rail cursor instead.
+	forward := true
+	switch msg.(type) {
+	case tea.MouseMsg:
+		forward = false
+	case tea.KeyMsg:
+		if c.focus == focusSidebar {
+			forward = false
+		}
+	}
+	if forward {
+		var vpc tea.Cmd
+		c.vp, vpc = c.vp.Update(msg)
+		cmds = append(cmds, vpc)
+	}
 
 	return c, tea.Batch(cmds...)
 }
@@ -2409,9 +2621,145 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	return nil
 }
 
-// cycleRosterFocus moves the pink highlight through the sidebar roster
-// (skipping me), wrapping at both ends. The highlighted peer is what empty
-// Enter opens — the keyboard twin of clicking a row.
+// cycleFocus walks keyboard focus around the ring (composer → conversation
+// rail → transcript). Landing on the rail parks its cursor on the first
+// peer when nothing is highlighted yet, so Tab always leaves a visible
+// target behind — that target is what an empty Enter opens. A pane that is
+// not on screen (the rail collapses on narrow terminals) is skipped, so
+// focus can never point at something with no indicator to paint.
+func (c *chatScreen) cycleFocus(reverse bool) {
+	for i := 0; i < 3; i++ {
+		if reverse {
+			c.focus = c.focus.prev()
+		} else {
+			c.focus = c.focus.next()
+		}
+		if c.focus != focusSidebar || c.layoutFor().sidebarOn {
+			break
+		}
+	}
+	if c.focus == focusSidebar {
+		if c.hoverPeer == "" || c.hoverPeer == c.me {
+			c.cycleRosterFocus(reverse)
+		}
+		c.scrollRosterToCursor()
+	}
+	c.syncRosterVp()
+}
+
+// moveRosterCursor steps the rail cursor through the conversation list
+// (skipping the room and self, wrapping at both ends) and keeps it in view.
+func (c *chatScreen) moveRosterCursor(step int) {
+	items := c.chatItems()
+	if len(items) == 0 {
+		return
+	}
+	cur := c.itemIndexFor(c.hoverPeer)
+	if cur < 0 {
+		cur = 0
+		if step > 0 {
+			cur = -1
+		}
+	}
+	for i := 0; i < len(items); i++ {
+		cur += step
+		if cur < 0 {
+			cur = len(items) - 1
+		}
+		if cur >= len(items) {
+			cur = 0
+		}
+		if !items[cur].isRoom && items[cur].peer != c.me {
+			c.hoverPeer = items[cur].peer
+			break
+		}
+	}
+	c.scrollRosterToCursor()
+	c.syncRosterVp()
+}
+
+// scrollRosterToCursor slides the rail's scroll window so the cursor row is
+// fully visible (no selection ever parked off-screen).
+func (c *chatScreen) scrollRosterToCursor() {
+	idx := c.itemIndexFor(c.hoverPeer)
+	if idx < 0 || c.rosterVp.Height <= 0 {
+		return
+	}
+	h := c.chatItemHeight()
+	top, bot := idx*h, idx*h+h
+	if top < c.rosterVp.YOffset {
+		c.rosterVp.SetYOffset(top)
+	}
+	if bot > c.rosterVp.YOffset+c.rosterVp.Height {
+		c.rosterVp.SetYOffset(maxInt(bot-c.rosterVp.Height, 0))
+	}
+}
+
+// maxSideFilter bounds the inline rail query (a marathon paste must not
+// grow the sidebar's key state without limit).
+const maxSideFilter = 40
+
+// drawerOpen reports whether the "/" drawer or the file browser owns the
+// slot above the composer — and with it the focused-surface indicator, so
+// nothing else may claim to be focused at the same time.
+func (c chatScreen) drawerOpen() bool {
+	return c.picker.isActive() || c.palette.visible()
+}
+
+// textEditKey reports whether a key is text input: printable characters and
+// the editing keys that reshape a line. Ctrl-combos and navigation are not
+// text, so they never steal focus or narrow the rail.
+func textEditKey(msg tea.KeyMsg) bool {
+	if msg.Alt {
+		return false
+	}
+	switch msg.Type {
+	case tea.KeyRunes:
+		return len(msg.Runes) > 0
+	case tea.KeySpace, tea.KeyBackspace, tea.KeyCtrlH, tea.KeyDelete:
+		return true
+	}
+	return false
+}
+
+// editSideFilter applies one filter edit, re-syncs the list, and drops a
+// cursor that the narrower list no longer contains (so an empty Enter can
+// never open an invisible thread).
+func (c *chatScreen) editSideFilter(msg tea.KeyMsg) {
+	switch msg.Type {
+	case tea.KeyBackspace, tea.KeyCtrlH, tea.KeyDelete:
+		if c.sideFilter != "" {
+			r := []rune(c.sideFilter)
+			c.sideFilter = string(r[:len(r)-1])
+		}
+	case tea.KeySpace:
+		c.sideFilter += " "
+	default:
+		c.sideFilter += strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return -1 // never let control bytes park in the rail
+			}
+			return r
+		}, string(msg.Runes))
+	}
+	if len([]rune(c.sideFilter)) > maxSideFilter {
+		c.sideFilter = string([]rune(c.sideFilter)[:maxSideFilter])
+	}
+	if c.hoverPeer != "" && c.itemIndexFor(c.hoverPeer) < 0 {
+		c.hoverPeer = ""
+	}
+	c.syncRosterVp()
+}
+
+// clearSideFilter widens the rail back to the full list.
+func (c *chatScreen) clearSideFilter() {
+	c.sideFilter = ""
+	c.syncRosterVp()
+}
+
+// cycleRosterFocus moves the highlight through the conversation rail
+// (skipping the room and self), wrapping at both ends. The highlighted peer
+// is what an empty Enter opens — the keyboard twin of clicking a row.
 func (c *chatScreen) cycleRosterFocus(reverse bool) {
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
 	if len(online) <= 1 { // only me in the room
@@ -2447,7 +2795,7 @@ func (c *chatScreen) cycleRosterFocus(reverse bool) {
 // handleMouse translates a click into a sidebar selection using the SAME
 // geometry View() will paint. Returns a tea.Cmd (send-free) or nil.
 // peerAtY maps a terminal Y coordinate onto the sidebar's chat list: the
-// DM peer for thread rows, "" for the General room, search box, or any
+// DM peer for thread rows, "" for the General room, filter row, or any
 // point outside a chat row. itemIsGeneral reports a General-room hit.
 func (c chatScreen) peerAtY(y int, l layout) string {
 	peer, _ := c.itemAtY(y, l)
@@ -2478,17 +2826,49 @@ func (c chatScreen) itemAtY(y int, l layout) (peer string, general bool) {
 	return items[idx].peer, false
 }
 
-// atSearchBox reports a hit on the fixed sidebar search box (the
-// searchHeightFor rows above rosterY0). Clicking it focuses "/" drawer.
+// atSearchBox reports a hit on the sidebar's filter row (the rows above
+// rosterY0). Clicking it focuses the "/" drawer.
 func (c chatScreen) atSearchBox(y int, l layout) bool {
 	if c.width == 0 || c.height == 0 || !l.sidebarOn {
 		return false
 	}
-	sh := searchHeightFor(l.headRows, l.sidebarWidth-2)
+	sh := searchHeightFor(l.headRows, l.sidebarWidth)
 	return y >= l.rosterY0-sh && y < l.rosterY0
 }
 
-// transcriptX0 is the terminal column of the transcript box's left border.
+// focusAtRow maps a click in the main column onto the pane it hit: the
+// composer box, the transcript, or whatever was focused before (banner and
+// drawer rows change nothing). Exactly one pane is ever focused, so exactly
+// one indicator is ever painted.
+func (c chatScreen) focusAtRow(y int, l layout) focusPane {
+	frameOff, headOff := 0, 0
+	if l.frameOn {
+		frameOff = 1
+	}
+	if l.showHeader {
+		headOff = 1
+	}
+	top := frameOff + headOff
+	transcriptTop := top + l.headRows
+	if y >= transcriptTop && y < transcriptTop+maxInt(l.vpHeight, 0) {
+		return focusTranscript
+	}
+	compTop := composerTopRows(l)
+	boxH := l.composerRows + 2
+	if l.composerRows <= 0 {
+		boxH = 1
+	}
+	if y >= compTop && y < compTop+boxH {
+		return focusComposer
+	}
+	if y >= transcriptTop {
+		return focusTranscript // drawer / hint rows belong to the stack
+	}
+	return c.focus
+}
+
+// transcriptX0 is the terminal column where the main column begins (just
+// past the conversation rail and its gutter).
 func transcriptX0(l layout) int {
 	frameOff := 0
 	if l.frameOn {
@@ -2501,7 +2881,8 @@ func transcriptX0(l layout) int {
 }
 
 // scrollBarGeoms is the paint-verified track geometry for the scrollbars
-// (constants validated against View() by TestScrollbarDrag).
+// (validated against View() by TestScrollbarDragGeometry). The transcript
+// rail is the main column's last column; the list rail is the sidebar's.
 func (c chatScreen) scrollBarGeoms(l layout) (chat, roster barGeom) {
 	frameOff := 0
 	if l.frameOn {
@@ -2511,19 +2892,29 @@ func (c chatScreen) scrollBarGeoms(l layout) (chat, roster barGeom) {
 	if l.showHeader {
 		headOff = 1
 	}
-	// Transcript interior top = frame + top bar + room header + call card
-	// + border; the track starts one row below the up-arrow.
+	// Transcript rail top = frame + banner + chat header; the track starts
+	// one row below the up-arrow when there is room for arrows.
+	chatTop := frameOff + headOff + l.headRows
 	chat = barGeom{
-		x:       transcriptX0(l) + l.vpWidth,
-		trackY0: frameOff + headOff + l.headRows + 2,
+		x:       transcriptX0(l) + 1 + l.vpWidth,
+		trackY0: chatTop + 1,
 		trackH:  maxInt(l.vpHeight-2, 0),
+	}
+	if l.vpHeight < 3 {
+		chat.trackY0 = chatTop
+		chat.trackH = maxInt(l.vpHeight, 0)
 	}
 	if l.sidebarOn {
 		fill := c.sidebarFill(l)
+		bodyH := maxInt(fill-searchHeightFor(l.headRows, l.sidebarWidth), 0)
 		roster = barGeom{
-			x:       l.rosterX + l.sidebarWidth - 2,
+			x:       l.rosterX + l.sidebarWidth - 1,
 			trackY0: l.rosterY0 + 1,
-			trackH:  maxInt(fill-3, 0),
+			trackH:  maxInt(bodyH-2, 0),
+		}
+		if bodyH < 3 {
+			roster.trackY0 = l.rosterY0
+			roster.trackH = bodyH
 		}
 	}
 	return chat, roster
@@ -2588,23 +2979,29 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 		// Clip glyph: open the upload browser (same as /upload). Painted
 		// whenever the box fits it — clickable with or without the sidebar.
-		clipX, clipY0, clipY1 := composerGeoms(l, c.width, c.height)
+		clipX, clipY0, clipY1 := composerGeoms(l)
 		if clipX >= 0 && msg.X == clipX && msg.Y >= clipY0 && msg.Y < clipY1 {
 			if !c.picker.isActive() {
+				c.focus = focusComposer // the clip belongs to the composer
 				return c.openPicker()
 			}
 			return nil
 		}
-		if !l.sidebarOn {
-			break
-		}
+		// Scrollbars are drag-only: they never take focus or selection.
 		chatG, rosterG := c.scrollBarGeoms(l)
 		chatG = c.thumbFor(secChat, chatG)
 		rosterG = c.thumbFor(secRoster, rosterG)
-		for _, g := range []struct {
+		bars := []struct {
 			sec scrollSection
 			b   barGeom
-		}{{secChat, chatG}, {secRoster, rosterG}} {
+		}{{secChat, chatG}}
+		if l.sidebarOn {
+			bars = append(bars, struct {
+				sec scrollSection
+				b   barGeom
+			}{secRoster, rosterG})
+		}
+		for _, g := range bars {
 			if g.b.trackH <= 0 {
 				continue
 			}
@@ -2614,34 +3011,49 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				return nil
 			}
 		}
-		inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
-		if !inColumn {
-			return nil // clicks outside the sidebar never select
-		}
-		// Sidebar scrollbar column is drag-only, never selection.
-		if msg.X == l.rosterX+l.sidebarWidth-2 {
-			return nil
-		}
-		// Search row focuses the "/" drawer.
-		if c.atSearchBox(msg.Y, l) {
-			c.input.SetValue("/")
-			c.palette.sync("/")
-			return nil
-		}
-		// Chat row selection: General returns to the room, peers open threads.
-		u, general := c.itemAtY(msg.Y, l)
-		switch {
-		case general:
-			if c.targetUser != "" {
-				c.exitPrivate()
+		sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
+		inColumn := l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
+		if inColumn {
+			if msg.Y < sideTop {
+				return nil // banner row: not ours, focus untouched
 			}
+			// Rail column (last sidebar column) is drag-only, never selection.
+			if msg.X == l.rosterX+l.sidebarWidth-1 {
+				return nil
+			}
+			// Filter row: the "/" glyph at its right edge opens the command
+			// drawer; anywhere else focuses the rail so the inline filter
+			// can be typed.
+			if c.atSearchBox(msg.Y, l) {
+				if msg.X == l.rosterX+l.sidebarWidth-2 {
+					c.input.SetValue("/")
+					c.palette.sync("/")
+					c.focus = focusComposer
+				} else {
+					c.focus = focusSidebar
+				}
+				return nil
+			}
+			// Chat row selection: General returns to the room, peers open threads.
+			u, general := c.itemAtY(msg.Y, l)
+			c.focus = focusSidebar
+			switch {
+			case general:
+				if c.targetUser != "" {
+					c.exitPrivate()
+				}
+				return nil
+			case u == "", u == c.me:
+				return nil // no row / clicking yourself is a no-op
+			case u == c.targetUser:
+				return nil // already chatting privately with them
+			}
+			c.enterPrivate(u)
 			return nil
-		case u == "", u == c.me:
-			return nil // no row / clicking yourself is a no-op
-		case u == c.targetUser:
-			return nil // already chatting privately with them
 		}
-		c.enterPrivate(u)
+		// Main column: clicking focuses what it hit — the composer box or
+		// the transcript.
+		c.focus = c.focusAtRow(msg.Y, l)
 		return nil
 
 	case tea.MouseActionMotion:
@@ -2658,7 +3070,8 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		c.hoverPeer = "" // default: outside every row
 		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
 			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
-			if inColumn && l.sidebarOn && msg.X != l.rosterX+l.sidebarWidth-2 {
+			sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
+			if inColumn && l.sidebarOn && msg.X != l.rosterX+l.sidebarWidth-1 && msg.Y >= sideTop {
 				if peer, _ := c.itemAtY(msg.Y, l); peer != c.hoverPeer {
 					c.hoverPeer = peer
 					c.syncRosterVp() // hover repaint lives in the scroll content
@@ -2680,10 +3093,11 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		up := msg.Type == tea.MouseWheelUp
-		// Route by pane: sidebar list vs transcript — each scrolls only
-		// itself with steps proportional to its own height.
+		// Route by pane: conversation rail vs transcript — each scrolls only
+		// itself, with steps proportional to its own height.
+		sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
 		if l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth &&
-			msg.Y >= l.rosterY0-1 {
+			msg.Y >= sideTop {
 			step := wheelStepFor(c.rosterVp.Height)
 			if up {
 				c.rosterVp.LineUp(step)
@@ -2737,162 +3151,152 @@ func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
 }
 
 func (c chatScreen) View() string {
-	if c.width == 0 || c.height == 0 {
-		return "connecting…"
+	// Degenerate sizes paint nothing: a 0x0 (or otherwise unmeasured)
+	// terminal must never be handed a row it has no room for. bubbletea
+	// delivers the first WindowSizeMsg before the shell has anything to
+	// draw, so this costs only the very first frame.
+	if c.width <= 0 || c.height <= 0 {
+		return ""
 	}
 	l := c.layoutFor()
+	// Main column width: focus gutter + transcript content + scroll rail.
+	colW := l.vpWidth + transcriptBorder
 
-	// Keep viewport dims in lockstep with the painted layout.
-	// Reserve 1 column for the scrollbar inside the transcript border.
-	vp := c.vp
-	scrollW := 1
-	innerW := l.vpWidth
-	if l.vpHeight > 0 && innerW > 10 {
-		vp.Width = innerW - scrollW
-	} else {
-		vp.Width = innerW
-		scrollW = 0
-	}
-	vp.Height = l.vpHeight
-
-	// Transcript box (right of the sidebar).
-	transcriptOuter := l.vpWidth + 2
-	var transcript string
-	switch {
-	case l.vpHeight == 0:
-		// viewport.View() emits one padded blank row even at Height 0;
-		// omitting the block keeps the exact-row contract intact.
-		transcript = ""
-	case l.boxedTranscript:
-		if scrollW > 0 {
-			bar := c.scrollbarView(l.vpHeight)
-			// Viewport content + scrollbar joined, then bordered.
-			inner := lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
-			transcript = tuiBorderStyle.Render(inner)
-		} else {
-			transcript = tuiBorderStyle.Render(vp.View()) // exactly vpHeight+2 rows
+	mainRows := make([]string, 0, l.vpHeight+l.headRows+l.hintRows+8)
+	appendRows := func(block string, n int) {
+		lines := strings.Split(block, "\n")
+		for len(lines) < n {
+			lines = append(lines, "")
 		}
-	default:
-		if scrollW > 0 {
-			bar := c.scrollbarView(l.vpHeight)
-			transcript = lipgloss.JoinHorizontal(lipgloss.Top, vp.View(), bar)
-		} else {
-			transcript = vp.View() // degraded: border dropped on tiny terminals
+		if len(lines) > n {
+			lines = lines[:n]
+		}
+		for _, ln := range lines {
+			mainRows = append(mainRows, fitRow(ln, colW))
 		}
 	}
 
-	// Center column: room header on top of the transcript box. Short or
-	// narrow terminals get the 1-row compact heading (headRows == 1).
-	roomHead := ""
-	if l.headRows == 1 {
-		roomHead = c.roomHeaderCompact(transcriptOuter)
-	} else if l.headRows >= 2 {
-		roomHead = c.roomHeaderView(transcriptOuter)
+	// 1. chat header — one tinted band, no box.
+	if l.headRows > 0 {
+		head := c.roomHeaderCompact(colW)
+		if l.headRows >= 2 {
+			head = c.roomHeaderView(colW)
+		}
+		appendRows(head, l.headRows)
 	}
-	// Center column: room header, transcript box.
-	parts := make([]string, 0, 2)
-	if roomHead != "" {
-		parts = append(parts, roomHead)
-	}
-	if transcript != "" {
-		parts = append(parts, transcript)
-	}
-	chatCol := strings.Join(parts, "\n")
 
-	// Composer core (unindented): the message box spans the full column
-	// width (Enter sends). The sidebar path joins it beside the chat list;
-	// the sidebar-off path indents it below.
-	var inputCore string
-	switch {
-	case l.composerRows > 0:
-		inputOuter := transcriptOuter         // full column width, no Send button
-		contentW := maxInt(inputOuter-2-2, 1) // border + padding, never wrap
-		showClip := inputOuter >= 26
-		clipW := 0
-		if showClip {
-			clipW = lipgloss.Width("📎") + 1
+	// 2. transcript — focus gutter, content, scroll rail.
+	if l.vpHeight > 0 {
+		vp := c.vp
+		vp.Width = l.vpWidth
+		vp.Height = l.vpHeight
+		gutterCh := " "
+		if c.focus == focusTranscript {
+			gutterCh = thFocusBar.Render("▌")
 		}
-		field := c.input.View()
-		if lipgloss.Width(field) > contentW-clipW {
-			field = truncateByWidth(field, contentW-clipW)
-		}
-		tail := ""
-		if showClip {
-			tail = " " + thClipStyle.Render("📎")
-		}
-		pad := contentW - lipgloss.Width(field) - lipgloss.Width(tail)
-		if pad < 0 {
-			pad = 0
-		}
-		inputCore = tuiComposerStyle.
-			Width(inputOuter - 2).
-			Height(l.composerRows).
-			Render(field + strings.Repeat(" ", pad) + tail)
-	case l.inputBoxed:
-		inputCore = tuiBorderStyle.Render(c.input.View())
-	default:
-		inputCore = "❯ " + c.input.View()
+		gutter := strings.TrimSuffix(strings.Repeat(gutterCh+"\n", l.vpHeight), "\n")
+		block := lipgloss.JoinHorizontal(lipgloss.Top, gutter, vp.View(), c.scrollbarView(l.vpHeight))
+		appendRows(block, l.vpHeight)
 	}
-	// Drawer panel core: OpenCode-style pop-out emerging upward out of the
-	// composer (a blank spacer row sells the lift). Empty when budgeted but
-	// nothing matches — never paint unbudgeted rows.
+
+	// 3. drawer — pops out of the composer, above it.
 	pal := ""
 	if l.paletteRows > 0 {
-		pal = c.drawerView(maxInt(l.vpWidth+2, 0))
+		pal = c.drawerView(colW)
+	}
+	if pal != "" {
+		appendRows("", 1) // lift spacer
+		appendRows(pal, lipgloss.Height(pal))
 	}
 
-	body := chatCol
-	fullSide := l.sidebarOn && body != ""
-	if fullSide {
-		// LEFT sidebar column: the chat list, full height. Its outer height
-		// matches the whole right stack (header + call card + transcript +
-		// hints + drawer + composer) so the search column runs all the way
-		// down beside the composer.
-		fill := c.sidebarFill(l)
-		col := tuiRosterBoxStyle.
-			Width(c.sidebarInnerWidth()).
-			Height(fill). // interior rows; border completes the column
-			Render(c.rosterBody(fill))
-		right := chatCol
-		if l.hintRows > 0 {
-			right += "\n" + keyHintsView(transcriptOuter)
-		}
-		if pal != "" {
-			right += "\n\n" + pal
-		}
-		right += "\n" + inputCore
-		body = lipgloss.JoinHorizontal(lipgloss.Top, col, " ", right)
+	// 4. composer — the one persistently bordered surface.
+	composerRows := 1
+	if l.composerRows > 0 {
+		composerRows = l.composerRows + 2 // box border + interior
 	}
-	rows := make([]string, 0, 10)
+	appendRows(c.composerBox(l, colW, pal != ""), composerRows)
+
+	// 5. truthful key hints directly under the composer.
+	if l.hintRows > 0 {
+		appendRows(keyHintsView(colW, c.focus), l.hintRows)
+	}
+
+	// ---- assemble: sidebar | gutter | main -------------------------------
+	fill := len(mainRows)
+	out := make([]string, 0, fill+2)
 	if l.showHeader {
-		rows = append(rows, c.headerView())
+		out = append(out, fitRow(c.headerView(), c.width))
 	}
-	if body != "" {
-		rows = append(rows, body)
-	}
-	// Hints, drawer, and composer ride the right stack beside the full-height
-	// sidebar when it is on; otherwise they paint below, indented past it.
-	if fullSide {
-		// Already joined into body above — nothing more to append.
+	if l.sidebarOn {
+		raw := strings.Split(c.rosterBody(fill), "\n")
+		for i := 0; i < fill; i++ {
+			row := tintFit(thSidebarStyle, "", l.sidebarWidth)
+			if i < len(raw) {
+				row = fitRow(raw[i], l.sidebarWidth)
+			}
+			out = append(out, row+" "+mainRows[i])
+		}
 	} else {
-		// Truthful key hints under the composer (budgeted in layout).
-		indent := strings.Repeat(" ", composerIndent(l))
-		if l.hintRows > 0 {
-			rows = append(rows, indent+keyHintsView(transcriptOuter))
-		}
-		if pal != "" {
-			rows = append(rows, "", pal)
-		}
-		rows = append(rows, indent+strings.ReplaceAll(inputCore, "\n", "\n"+indent))
+		out = append(out, mainRows...)
 	}
 	if l.statusRows == 1 {
-		rows = append(rows, c.statusView())
+		out = append(out, fitRow(c.statusView(), c.width))
 	}
-	out := strings.Join(rows, "\n")
+	// Every row is pinned to the terminal width before it is joined, so the
+	// painted frame can never exceed the window.
+	for i := range out {
+		out[i] = fitRow(out[i], c.width)
+	}
+	result := strings.Join(out, "\n")
 	if l.frameOn {
-		out = tuiBorderStyle.Render(out) // full-screen app shell
+		result = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Render(result)
 	}
-	return out
+	return result
+}
+
+// composerBox renders the message field: a rounded box whose border turns
+// accent when the composer owns focus (and dims while the drawer above it
+// is the focused surface). The clip glyph at the right opens the upload
+// browser and is hit-tested through composerGeoms.
+func (c chatScreen) composerBox(l layout, colW int, drawerOpen bool) string {
+	focused := c.focus == focusComposer && !drawerOpen
+	if l.composerRows <= 0 {
+		// Bare prompt on tiny terminals: the accent block in front of the
+		// caret is the composer's focus indicator (there is no border here
+		// to carry it).
+		prefix := " "
+		if focused {
+			prefix = thFocusBar.Render("▌")
+		}
+		return prefix + c.input.View()
+	}
+	inputOuter := colW
+	contentW := maxInt(inputOuter-2, 1) // border only: no inner padding
+	showClip := inputOuter >= 26
+	clipW := 0
+	if showClip {
+		clipW = lipgloss.Width("📎") + 1
+	}
+	field := c.input.View()
+	if lipgloss.Width(field) > maxInt(contentW-clipW, 1) {
+		field = truncateByWidth(field, maxInt(contentW-clipW, 1))
+	}
+	tail := ""
+	if showClip {
+		tail = " " + thClipStyle.Render("📎")
+	}
+	pad := contentW - lipgloss.Width(field) - lipgloss.Width(tail)
+	if pad < 0 {
+		pad = 0
+	}
+	st := thComposerBoxStyle
+	if focused {
+		st = thComposerFocusStyle
+	}
+	return st.
+		Width(inputOuter - 2).
+		Height(l.composerRows).
+		Render(retint(field+strings.Repeat(" ", pad)+tail, st))
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).

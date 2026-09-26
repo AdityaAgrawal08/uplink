@@ -15,39 +15,9 @@ import (
 // and a download indicator, similar to modern chat apps.
 
 var (
-	// Card container style: subtle rounded border with slight padding.
-	// Width is set dynamically in fileAttachmentCard so the card hugs content.
-	cardStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1)
-
-	// Compact card: fixed small padding, no full-width expansion.
-	cardStyleCompact = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				Padding(0, 1)
-
-	// Card header style: bold filename with accent color.
-	cardHeaderStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("15")) // bright white
-
-	// Card metadata style: faint secondary info (extension, size).
-	cardMetaStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("247")) // light gray
-
-	// Card icon style: colored file-type icon.
-	cardIconStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("39")) // blue
-
-	// Card action style: download indicator.
-	cardActionStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("247")) // light gray
-
-	// Card timestamp style.
+	// cardTimeStyle stamps the file card's timestamp row.
 	cardTimeStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("247")) // light gray
+		Foreground(colFaint)
 )
 
 // fileIcon returns a Unicode icon appropriate for the given file extension.
@@ -234,14 +204,4 @@ func fileKindLabel(ext string) string {
 	default:
 		return "file"
 	}
-}
-
-// alignRight pads s on the left so it appears right-aligned within availWidth.
-func alignRight(s string, availWidth int) string {
-	w := lipgloss.Width(s)
-	if w >= availWidth || availWidth <= 0 {
-		return s
-	}
-	pad := availWidth - w
-	return strings.Repeat(" ", pad) + s
 }

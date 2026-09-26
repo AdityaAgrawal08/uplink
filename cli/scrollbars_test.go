@@ -10,7 +10,9 @@ import (
 // geomScreen builds a screen with an overflowing chat list at 140x40.
 func geomScreen(t *testing.T) (*chatScreen, layout) {
 	t.Helper()
-	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena", "mallory", "nina", "olga", "peggy", "sybil", "trent", "uma"}
+	names := []string{"carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy", "karl", "lena",
+		"mallory", "nina", "olga", "peggy", "sybil", "trent", "uma", "victor", "walter", "xavier",
+		"yusuf", "zoe", "aaron", "bella", "caleb"}
 	users := append([]string{"bob"}, names...)
 	c := newFilterScreen("bob", "", users...)
 	c.vp = *viewportPtr(60, 20)
@@ -22,7 +24,7 @@ func geomScreen(t *testing.T) (*chatScreen, layout) {
 
 func colAt(s string, col int) string {
 	r := []rune(s)
-	if col < len(r) {
+	if col >= 0 && col < len(r) {
 		return string(r[col])
 	}
 	return ""
@@ -37,9 +39,8 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	rows := strings.Split(view, "\n")
 	chatG, rosterG := c.scrollBarGeoms(l)
 
-	// Chat bar: inside the transcript border, last interior column.
-	// Interior top = frame + top bar + room header + call card + border;
-	// the first interior row holds the up-arrow.
+	// Chat rail: the main column's LAST column, starting on the first
+	// transcript row (frame + banner + chat header, no borders anymore).
 	frameOff, headOff := 0, 0
 	if l.frameOn {
 		frameOff = 1
@@ -47,21 +48,29 @@ func TestScrollbarDragGeometry(t *testing.T) {
 	if l.showHeader {
 		headOff = 1
 	}
-	arrowRow := frameOff + headOff + l.headRows + 1
-	if got := colAt(rows[arrowRow], chatG.x); got != "│" && got != "▲" && got != "█" {
-		t.Fatalf("chat bar column mismatch: got %q at x=%d,y=%d", got, chatG.x, arrowRow)
+	firstTranscriptRow := frameOff + headOff + l.headRows
+	if want := transcriptX0(l) + 1 + l.vpWidth; chatG.x != want {
+		t.Fatalf("chat rail x=%d; want %d (main column's last column)", chatG.x, want)
 	}
-	// Track rows: track starts below ▲.
-	if chatG.trackY0 != arrowRow+1 || chatG.trackH != l.vpHeight-2 {
-		t.Fatalf("chat track y0=%d h=%d; want %d/%d", chatG.trackY0, chatG.trackH, arrowRow+1, l.vpHeight-2)
+	if got := colAt(rows[firstTranscriptRow], chatG.x); got != "▲" && got != "│" && got != "█" {
+		t.Fatalf("chat rail column mismatch: got %q at x=%d,y=%d", got, chatG.x, firstTranscriptRow)
 	}
-	// Roster bar: x = rightmost sidebar interior column, track below the
-	// first scroll row's ▲ (search row sits fixed above it).
-	if rosterG.x != l.rosterX+l.sidebarWidth-2 {
-		t.Fatalf("roster bar x=%d; want %d", rosterG.x, l.rosterX+l.sidebarWidth-2)
+	// Track rows: the track starts below the ▲.
+	if chatG.trackY0 != firstTranscriptRow+1 || chatG.trackH != l.vpHeight-2 {
+		t.Fatalf("chat track y0=%d h=%d; want %d/%d",
+			chatG.trackY0, chatG.trackH, firstTranscriptRow+1, l.vpHeight-2)
+	}
+	// Roster rail: rightmost sidebar column, track below the first list
+	// row's ▲ (the filter header sits fixed above it).
+	if rosterG.x != l.rosterX+l.sidebarWidth-1 {
+		t.Fatalf("roster rail x=%d; want %d", rosterG.x, l.rosterX+l.sidebarWidth-1)
 	}
 	if got := colAt(rows[rosterG.trackY0-1], rosterG.x); got != "▲" && got != "│" && got != "█" {
-		t.Fatalf("roster bar must sit below its up-arrow; got %q at y=%d", got, rosterG.trackY0-1)
+		t.Fatalf("roster rail must sit below its up-arrow; got %q at y=%d", got, rosterG.trackY0-1)
+	}
+	// The filter header row carries NO rail — only the list does.
+	if got := colAt(rows[l.rosterY0-1], rosterG.x); got != " " {
+		t.Fatalf("filter header must not carry a rail; got %q", got)
 	}
 }
 

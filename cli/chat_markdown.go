@@ -8,24 +8,23 @@ import (
 )
 
 var (
-	mdBoldRe  = regexp.MustCompile(`\*\*(.+?)\*\*`)
-	mdCodeRe  = regexp.MustCompile("`([^`]+)`")
-	mdBlockRe = regexp.MustCompile("(?s)```(\\w*)\\n(.*?)```")
-	mdLinkRe  = regexp.MustCompile(`\[(.+?)\]\((.+?)\)`)
+	mdBoldRe = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	mdCodeRe = regexp.MustCompile("`([^`]+)`")
+	mdLinkRe = regexp.MustCompile(`\[(.+?)\]\((.+?)\)`)
 )
 
 var (
 	mdCodeInlineStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("212")).
-				Background(lipgloss.Color("237")).
+				Foreground(colCodeFg).
+				Background(colCodeBg).
 				Padding(0, 1)
 	mdCodeBlockStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("252")).
-				Background(lipgloss.Color("235")).
+				Foreground(lipgloss.AdaptiveColor{Light: "#1f2937", Dark: "#dbe4f3"}).
+				Background(colCodeBg).
 				Padding(0, 1).
 				Margin(0, 0)
 	mdLangStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("243")).
+			Foreground(colLangFg).
 			Bold(true)
 )
 
@@ -86,14 +85,15 @@ func renderMarkdown(text string) string {
 		return lipgloss.NewStyle().Bold(true).Render(inner)
 	})
 
-	// Links: [text](url) — render text in accent color
+	// Links: [text](url) — render the label in the accent colour, the URL
+	// subdued behind it.
 	text = mdLinkRe.ReplaceAllStringFunc(text, func(m string) string {
 		parts := mdLinkRe.FindStringSubmatch(m)
 		if len(parts) < 3 {
 			return m
 		}
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("39")).Render(parts[1]) +
-			lipgloss.NewStyle().Foreground(lipgloss.Color("243")).Render(" ("+parts[2]+")")
+		return lipgloss.NewStyle().Foreground(colLinkFg).Render(parts[1]) +
+			lipgloss.NewStyle().Foreground(colFaint).Render(" ("+parts[2]+")")
 	})
 
 	return text

@@ -31,22 +31,17 @@ const pickerMaxTrayRows = 3
 var (
 	tuiPickerCrumbStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("62")) // accent breadcrumb
+				Foreground(colAccent) // accent breadcrumb
 
 	tuiPickerDirStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("39")) // blue-ish directory names
+				Foreground(lipgloss.AdaptiveColor{Light: "#0b62c9", Dark: "#4cc9f0"}) // directories
 
 	tuiPickerBufStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("2")) // green buffered tray rows
+				Foreground(lipgloss.AdaptiveColor{Light: "#0f7a52", Dark: "#34d399"}) // buffered rows
 
 	tuiPickerNoticeStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("203"))
-
-	tuiPickerDetailStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("62")).
-				Padding(1, 2)
+				Foreground(colAmber)
 )
 
 type pickerEntry struct {
@@ -75,7 +70,6 @@ type pickerState struct {
 	home      string // $HOME, for ~/ breadcrumb abbreviation
 	entries   []pickerEntry
 	files     []receivedFile // modeFiles listing (received this session), most recent first
-	loading   bool           // modeFiles: unused (listing is synchronous); kept for shape parity
 	cursor    int
 	offset    int      // first visible row in the scroll window
 	anchor    int      // range anchor (-1 = no active range)
@@ -173,6 +167,7 @@ func xdgDocumentsDir(home string) string {
 
 // openPicker enters browser mode rooted at the OS Documents folder.
 func (c *chatScreen) openPicker() tea.Cmd {
+	c.focus = focusComposer // the browser takes the drawer's focus
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
 		home = "."
@@ -203,6 +198,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 // is disabled (nothing to fetch — everything listed is already saved), so it
 // gets a private empty buffer that closePicker must not sync back.
 func (c *chatScreen) openFilesDrawer() tea.Cmd {
+	c.focus = focusComposer
 	c.palette.close()
 	c.input.SetValue("")
 	c.input.Placeholder = ""
@@ -846,10 +842,8 @@ func (c chatScreen) pickerView(maxW int) string {
 
 	if p.notice != "" {
 		style := tuiPickerNoticeStyle
-		if p.mode == modeFiles && p.loading {
-			style = tuiPaletteHintStyle // loading is not an error
-		} else if p.mode == modeFiles && strings.HasPrefix(p.notice, "no files") {
-			style = tuiDimStyle
+		if p.mode == modeFiles && strings.HasPrefix(p.notice, "no files") {
+			style = tuiDimStyle // the empty state is a hint, not an error
 		}
 		body = append(body, style.Render(pad("· "+p.notice)))
 	}
@@ -864,7 +858,7 @@ func (c chatScreen) pickerView(maxW int) string {
 			continue
 		}
 		if row == p.cursor {
-			body = append(body, tuiPaletteSelStyle.Render(pad(line)))
+			body = append(body, tuiPaletteSelStyle.Render(retint(pad(line), tuiPaletteSelStyle)))
 		} else {
 			body = append(body, pad(line))
 		}
@@ -945,7 +939,7 @@ func (c chatScreen) pickerBufferView(maxW, inner int, pad func(string) string) s
 			}
 			line := fmt.Sprintf("%s✓ %s", marker, tuiPaletteMatchStyle.Render(name))
 			if row == p.cursor {
-				body = append(body, tuiPaletteSelStyle.Render(pad(line)))
+				body = append(body, tuiPaletteSelStyle.Render(retint(pad(line), tuiPaletteSelStyle)))
 			} else {
 				body = append(body, pad(line))
 			}

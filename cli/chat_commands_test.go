@@ -779,3 +779,104 @@ func TestViewHeightContractWithPaletteOpen(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Scroll window: 6 visible rows, window follows the highlight one row at a
+// time in both directions.
+// ---------------------------------------------------------------------------
+
+func TestPaletteWindowScrollsDownOneRowAtATime(t *testing.T) {
+	var p paletteState
+	p.open = true
+	const n = 10
+	// Walk Down from 0: sel 1..5 keep window 0–5; sel 6 shifts to 1–6.
+	for i := 1; i <= 5; i++ {
+		p.moveDown(n)
+		if p.sel != i || p.off != 0 {
+			t.Fatalf("down %d: sel=%d off=%d; want sel=%d off=0", i, p.sel, p.off, i)
+		}
+	}
+	p.moveDown(n) // sel 6: window must scroll to 1–6
+	if p.sel != 6 || p.off != 1 {
+		t.Fatalf("sel=%d off=%d; want sel=6 off=1 (window 2–7)", p.sel, p.off)
+	}
+	p.moveDown(n) // sel 7 → window 2–7
+	if p.sel != 7 || p.off != 2 {
+		t.Fatalf("sel=%d off=%d; want sel=7 off=2 (window 3–8)", p.sel, p.off)
+	}
+}
+
+func TestPaletteWindowScrollsUpOneRowAtATime(t *testing.T) {
+	var p paletteState
+	p.open = true
+	const n = 10
+	p.sel, p.off = 7, 2 // window rows 3-8 (0-based 2-7), highlight on last visible
+	// Walk Up through the window: no scrolling while sel stays inside 2-7.
+	for want := 6; want >= 2; want-- {
+		p.moveUp(n)
+		if p.sel != want || p.off != 2 {
+			t.Fatalf("sel=%d off=%d; want sel=%d off=2", p.sel, p.off, want)
+		}
+	}
+	// sel sits on the 1st visible row (2); one more Up scrolls to 2-7.
+	p.moveUp(n)
+	if p.sel != 1 || p.off != 1 {
+		t.Fatalf("sel=%d off=%d; want sel=1 off=1 (window 2-7)", p.sel, p.off)
+	}
+	p.moveUp(n) // sel 0 -> window 1-6
+	if p.sel != 0 || p.off != 0 {
+		t.Fatalf("sel=%d off=%d; want sel=0 off=0 (window 1-6)", p.sel, p.off)
+	}
+}
+
+func TestPaletteWindowWrapJumpsToFarEnd(t *testing.T) {
+	var p paletteState
+	p.open = true
+	const n = 10
+	p.sel, p.off = 9, 4 // tail: window 5–10
+	p.moveDown(n)       // wrap to 0 → window back to 1–6
+	if p.sel != 0 || p.off != 0 {
+		t.Fatalf("wrap down: sel=%d off=%d; want 0,0", p.sel, p.off)
+	}
+	p.moveUp(n) // wrap to 9 → window 5–10
+	if p.sel != 9 || p.off != 4 {
+		t.Fatalf("wrap up: sel=%d off=%d; want 9,4", p.sel, p.off)
+	}
+}
+
+func TestPaletteWindowClampOnShrink(t *testing.T) {
+	var p paletteState
+	p.open = true
+	p.sel, p.off = 8, 3
+	p.clampSel(10) // no-op: still valid
+	if p.sel != 8 || p.off != 3 {
+		t.Fatalf("sel=%d off=%d; want 8,3", p.sel, p.off)
+	}
+	p.clampSel(4) // list shrank below the window: both pin into range
+	if p.sel != 3 || p.off != 0 {
+		t.Fatalf("shrink: sel=%d off=%d; want 3,0", p.sel, p.off)
+	}
+	p.sel, p.off = 5, 5
+	p.clampSel(0)
+	if p.sel != 0 || p.off != 0 {
+		t.Fatalf("empty: sel=%d off=%d; want 0,0", p.sel, p.off)
+	}
+}
+
+func TestPaletteWindowShortListNeverScrolls(t *testing.T) {
+	var p paletteState
+	p.open = true
+	const n = 4
+	for i := 0; i < 2*n; i++ {
+		p.moveDown(n)
+	}
+	if p.off != 0 {
+		t.Fatalf("off=%d; short lists must never scroll", p.off)
+	}
+	for i := 0; i < 2*n; i++ {
+		p.moveUp(n)
+	}
+	if p.off != 0 || p.sel < 0 || p.sel >= n {
+		t.Fatalf("sel=%d off=%d out of range", p.sel, p.off)
+	}
+}

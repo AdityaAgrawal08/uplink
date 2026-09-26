@@ -1,15 +1,16 @@
 package main
 
-// chat_theme.go — "Uplink" visual theme for the chat TUI.
+// chat_theme.go — the visual language of the Uplink chat shell.
 //
 // PURE PRESENTATION LAYER. Nothing here touches the network, the engine, or
 // any backend state: every helper below only *reads* the already-loaded
-// model (history, roster, media frames) and returns styled strings plus a few
-// deterministic hit-test geometries that View() and handleMouse() share.
+// model (history, roster, media frames) and returns styled strings plus the
+// few deterministic hit-test geometries that View() and handleMouse() share.
 //
-// The reference look: deep-navy app, left chat list with search + avatars,
-// center room header + dark message bubbles (blue for own), composer with
-// clip button, join/leave-free transcript.
+// The reference look: an edge-to-edge chat application. A tinted left rail
+// holds the conversation list, the main column opens with a tinted header
+// line, the transcript reads as grouped conversation, and the composer is
+// the one persistently bordered surface in the whole shell.
 
 import (
 	"fmt"
@@ -25,15 +26,14 @@ import (
 //
 // The terminal owns the true font size; the app answers with DENSITY: every
 // chrome choice below is a pure function of the live terminal size, so each
-// resize visibly rebalances chrome vs content. Thresholds are stepped, but
-// the underlying widths (sidebar, bubbles, tiles) scale fluidly between
-// them — nothing renders identically across sizes except by coincidence.
+// resize visibly rebalances chrome vs content.
 
-// compactTranscript hides sender avatars when the transcript is too narrow
-// for chips + bubbles to coexist.
+// compactTranscript hides the roomier transcript ornaments when the
+// transcript is too narrow for them to coexist with the text.
 func compactTranscript(termW int) bool { return termW > 0 && termW < 80 }
 
-// compactItems collapses sidebar chats to one row when height is scarce.
+// compactItems collapses sidebar conversations to a single row when height
+// is scarce.
 func compactItems(termW, termH int) bool {
 	if termH <= 0 {
 		return false // unknown size: comfortable until measured
@@ -69,112 +69,155 @@ func wheelStepFor(paneH int) int {
 	return s
 }
 
-// ---- palette --------------------------------------------------------------
-
-const (
-	thBg        = "#070b14" // app background (frame fill)
-	thPanel     = "#0b1220" // sidebar / cards
-	thPanelEdge = "#1e293b" // borders
-	thText      = "#e5eaf3" // primary text
-	thDim       = "#8b98b3" // secondary text
-	thFaint     = "#475569" // timestamps, hints
-	thAccent    = "#22d3ee" // cyan highlights
-	thBlue      = "#2563eb" // own bubbles, Send button, unread dot
-	thOwnBg     = "#1d4ed8" // own message bubble
-	thOtherBg   = "#131b2e" // others' message bubble
-	thSelBg     = "#16233d" // selected chat row
-	thGreen     = "#22c55e" // live dot, lock
-	thAmber     = "#fbbf24" // reactions / warnings
-)
+// ---- palette ------------------------------------------------------------------
+//
+// EVERY colour is an AdaptiveColor with both Light and Dark set: the same
+// design has to read on a white-background terminal and on a black one.
+// Greys are ANSI-256 indices (they survive a 256-colour profile without
+// being quantised into a muddy hue); accents are hex so they keep their
+// character on truecolor terminals.
 
 var (
-	thTopbarLogoStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thAccent))
-	thTopbarDimStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
-	thTopbarTimeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
-	thSignalStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
-	thLockStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
+	// surfaces
+	colPanel  = lipgloss.AdaptiveColor{Light: "#e9edf5", Dark: "#0f1524"}
+	colPanel2 = lipgloss.AdaptiveColor{Light: "#e0e6f1", Dark: "#121a2b"}
+	colEdge   = lipgloss.AdaptiveColor{Light: "250", Dark: "236"}
 
-	thSearchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
-	thSearchBox   = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(thPanelEdge)).
-			Foreground(lipgloss.Color(thFaint))
+	// text
+	colText  = lipgloss.AdaptiveColor{Light: "#101728", Dark: "#e7ecf7"}
+	colDim   = lipgloss.AdaptiveColor{Light: "242", Dark: "246"}
+	colFaint = lipgloss.AdaptiveColor{Light: "246", Dark: "240"}
 
-	thChatNameStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thText))
-	thChatTimeStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
-	thPreviewStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
-	thUnreadNewStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
-	thUnreadDotStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thBlue))
+	// accents
+	colAccent = lipgloss.AdaptiveColor{Light: "#0b62c9", Dark: "#4cc9f0"}
+	colOwn    = lipgloss.AdaptiveColor{Light: "#0b62c9", Dark: "#1d4ed8"}
+	colOwnFg  = lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#f2f7ff"}
+	colSel    = lipgloss.AdaptiveColor{Light: "#d7e6ff", Dark: "#152741"}
+	colHover  = lipgloss.AdaptiveColor{Light: "#9d174d", Dark: "#f0abfc"}
+	colGreen  = lipgloss.AdaptiveColor{Light: "#0f7a52", Dark: "#34d399"}
+	colAmber  = lipgloss.AdaptiveColor{Light: "#8a5a00", Dark: "#fbbf24"}
+	colRed    = lipgloss.AdaptiveColor{Light: "#b4232a", Dark: "#f87171"}
 
-	thSelRowStyle   = lipgloss.NewStyle().Background(lipgloss.Color(thSelBg))
-	thSelBarStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent)).Background(lipgloss.Color(thSelBg))
-	thHoverRowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f0abfc"))
+	// unread badge (ANSI indices: white on blue at every colour profile)
+	colBadgeBg = lipgloss.AdaptiveColor{Light: "27", Dark: "27"}
+	colBadgeFg = lipgloss.AdaptiveColor{Light: "15", Dark: "15"}
 
-	thRoomNameStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText))
-	thRoomSubStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
+	// message blocks
+	colOtherBg = lipgloss.AdaptiveColor{Light: "#eef2f9", Dark: "#111a2b"}
+	colOwnBg   = lipgloss.AdaptiveColor{Light: "#dcebff", Dark: "#122444"}
 
-	thMsgNameStyle = lipgloss.NewStyle()
-	thMsgTimeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
+	// markdown
+	colCodeFg = lipgloss.AdaptiveColor{Light: "#9a3412", Dark: "#f0abfc"}
+	colCodeBg = lipgloss.AdaptiveColor{Light: "#e8ecf4", Dark: "#161d2e"}
+	colLangFg = lipgloss.AdaptiveColor{Light: "#64748b", Dark: "#7b8aa5"}
+	colLinkFg = lipgloss.AdaptiveColor{Light: "#0b62c9", Dark: "#4cc9f0"}
+)
+
+// ---- shared styles -------------------------------------------------------------
+
+var (
+	// top bar
+	thTopbarLogoStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{Light: "#0b62c9", Dark: "#4cc9f0"})
+	thTopbarDimStyle  = lipgloss.NewStyle().Foreground(colDim)
+	thTopbarTimeStyle = lipgloss.NewStyle().Foreground(colText)
+	thSignalStyle     = lipgloss.NewStyle().Foreground(colAccent)
+	thLockStyle       = lipgloss.NewStyle().Foreground(colGreen)
+
+	// sidebar
+	thSearchStyle        = lipgloss.NewStyle().Foreground(colFaint)
+	thSidebarStyle       = lipgloss.NewStyle().Background(colPanel)
+	thSidebarHeaderStyle = lipgloss.NewStyle().Background(colPanel2)
+
+	thChatNameStyle = lipgloss.NewStyle().Foreground(colText)
+	thChatActive    = lipgloss.NewStyle().Bold(true).Foreground(colText)
+	thChatTimeStyle = lipgloss.NewStyle().Foreground(colFaint)
+	thPreviewStyle  = lipgloss.NewStyle().Foreground(colDim)
+	thPreviewUnread = lipgloss.NewStyle().Foreground(colText)
+
+	thSelBarStyle   = lipgloss.NewStyle().Foreground(colAccent).Background(colSel)
+	thHoverRowStyle = lipgloss.NewStyle().Foreground(colHover)
+	thPresenceStyle = lipgloss.NewStyle().Foreground(colGreen)
+	thPresenceOff   = lipgloss.NewStyle().Foreground(colFaint)
+
+	// chat header
+	thRoomNameStyle = lipgloss.NewStyle().Bold(true).Foreground(colText)
+	thRoomSubStyle  = lipgloss.NewStyle().Foreground(colDim)
+	thRoomHeadStyle = lipgloss.NewStyle().Background(colPanel)
+
+	// transcript
+	thMsgTimeStyle = lipgloss.NewStyle().Foreground(colFaint)
 
 	thOtherBubbleStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(thOtherBg)).
-				Foreground(lipgloss.Color(thText)).
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color(thPanelEdge)).
+				Background(colOtherBg).
+				Foreground(colText).
 				Padding(0, 1)
 
 	thOwnBubbleStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(thOwnBg)).
-				Foreground(lipgloss.Color("#ffffff")).
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color(thOwnBg)).
+				Background(colOwnBg).
+				Foreground(colText).
 				Padding(0, 1)
 
-	thSendBtnStyle = lipgloss.NewStyle().
-			Background(lipgloss.Color(thBlue)).
-			Foreground(lipgloss.Color("#ffffff")).
-			Bold(true)
+	thSystemLineStyle = lipgloss.NewStyle().Foreground(colFaint).Italic(true).Faint(true)
 
-	thTabActiveStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color(thBlue)).
-				Foreground(lipgloss.Color("#ffffff")).
-				Bold(true)
-	thTabInactiveStyle = lipgloss.NewStyle().
-				Background(lipgloss.Color("#16233d")).
-				Foreground(lipgloss.Color(thDim))
-	thTabStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(thDim))
+	// composer + hints
+	thComposerBoxStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colEdge).
+				Foreground(colText)
 
-	thClipStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
+	thComposerFocusStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(colAccent).
+				Foreground(colText)
 
+	thFocusBar  = lipgloss.NewStyle().Foreground(colAccent)
+	thClipStyle = lipgloss.NewStyle().Foreground(colDim)
+	thHintStyle = lipgloss.NewStyle().Foreground(colFaint)
+
+	// transient notices
+	thStatusErrStyle  = lipgloss.NewStyle().Foreground(colRed)
+	thStatusWarnStyle = lipgloss.NewStyle().Foreground(colAmber)
+	thStatusInfoStyle = lipgloss.NewStyle().Foreground(colDim)
+
+	// file cards
 	thFileCardStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color(thPanelEdge)).
-			Background(lipgloss.Color(thPanel)).
+			BorderForeground(colEdge).
+			Background(colPanel).
 			Padding(0, 1)
 
-	thFileNameStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(thText))
-	thFileMetaStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thDim))
-	thFileDlStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(thAccent))
-
-	thCamLiveStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
-	thCamMetaStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(thFaint))
-	thSystemBarStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
-	thSystemNameStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(thGreen))
+	thFileNameStyle = lipgloss.NewStyle().Bold(true).Foreground(colText)
+	thFileMetaStyle = lipgloss.NewStyle().Foreground(colDim)
+	thFileDlStyle   = lipgloss.NewStyle().Foreground(colAccent)
 )
 
-// avatarPalette assigns each user a stable, distinct avatar colour.
-var avatarPalette = []string{
-	"#14b8a6", "#22c55e", "#f472b6", "#f59e0b", "#8b5cf6",
-	"#0ea5e9", "#ef4444", "#84cc16", "#e879f9", "#fb7185",
-}
+// avatarPalettes assign each user a stable, distinct identity hue: the
+// vivid set reads on dark terminals, the deeper set keeps the same hue
+// family while staying legible on white. The hash picks the slot, so a
+// user's colour never moves between themes — only its lightness adapts.
+var (
+	avatarPaletteDark = []string{
+		"#14b8a6", "#22c55e", "#f472b6", "#f59e0b", "#8b5cf6",
+		"#0ea5e9", "#ef4444", "#84cc16", "#e879f9", "#fb7185",
+	}
+	avatarPaletteLight = []string{
+		"#0f766e", "#15803d", "#be185d", "#a16207", "#6d28d9",
+		"#0369a1", "#b91c1c", "#4d7c0f", "#a21caf", "#be123c",
+	}
+)
 
-// avatarColorFor hashes a username onto the avatar palette (stable per name).
-func avatarColorFor(name string) lipgloss.Color {
+// avatarColorFor hashes a username onto the avatar palette (stable per name)
+// and returns the adaptive pair.
+func avatarColorFor(name string) lipgloss.TerminalColor {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(strings.ToLower(name)))
-	return lipgloss.Color(avatarPalette[int(h.Sum32()%uint32(len(avatarPalette)))])
+	i := int(h.Sum32() % uint32(len(avatarPaletteDark)))
+	return lipgloss.AdaptiveColor{Light: avatarPaletteLight[i], Dark: avatarPaletteDark[i]}
 }
+
+// avatarGlyphFg contrasts with the avatar hue on either theme: dark ink on
+// the light palette's deep hues, near-white on the dark palette's neons.
+var avatarGlyphFg = lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#0b1220"}
 
 // avatarCell renders the 1-row coloured initial chip, e.g. " A ".
 func avatarCell(name string) string {
@@ -184,7 +227,7 @@ func avatarCell(name string) string {
 	}
 	return lipgloss.NewStyle().
 		Background(avatarColorFor(name)).
-		Foreground(lipgloss.Color("#0b1220")).
+		Foreground(avatarGlyphFg).
 		Bold(true).
 		Padding(0, 1).
 		Render(initial)
@@ -193,8 +236,8 @@ func avatarCell(name string) string {
 // roomAvatarCell is the group glyph for the General room.
 func roomAvatarCell() string {
 	return lipgloss.NewStyle().
-		Background(lipgloss.Color(thBlue)).
-		Foreground(lipgloss.Color("#ffffff")).
+		Background(colOwn).
+		Foreground(colOwnFg).
 		Bold(true).
 		Padding(0, 1).
 		Render("◉")
@@ -212,15 +255,17 @@ type chatItem struct {
 	active  bool
 	isRoom  bool
 	live    bool // peer online (room always true)
-	inCall  bool // live video/audio on this conversation
+	inCall  bool // live voice on this conversation
 }
 
-// itemRowsPerChat is the comfortable row height of one chat item: name +
-// preview. Selection is a side bar + tint inside the same rows.
+// itemRowsPerChat is the row height of one chat item: the identity line
+// (presence + name + time + badge) over the preview line. Selection is an
+// accent bar + tint inside the same rows — no extra chrome.
 const itemRowsPerChat = 2
 
 // chatItems builds the sidebar order: General room first, then DM peers in
-// display (recency) order. Read-only: no model mutation.
+// display (recency) order, narrowed by the rail's inline filter. Read-only:
+// no model mutation.
 func (c *chatScreen) chatItems() []chatItem {
 	online := orderedUsers(c.users, c.me, c.lastDMAt)
 	live := map[string]bool{}
@@ -266,8 +311,25 @@ func (c *chatScreen) chatItems() []chatItem {
 			isRoom: false, live: live[u], inCall: peerCall,
 		})
 	}
+	// Inline filter: every list consumer (paint, hit-test, keyboard cursor,
+	// scroll clamp) goes through chatItems, so a filtered list can never
+	// disagree with itself.
+	if c.sideFilter != "" {
+		q := strings.ToLower(c.sideFilter)
+		kept := items[:0]
+		for _, it := range items {
+			if strings.Contains(strings.ToLower(it.name), q) ||
+				strings.Contains(strings.ToLower(it.preview), q) {
+				kept = append(kept, it)
+			}
+		}
+		items = kept
+	}
 	return items
 }
+
+// onlineCount is the member count the chat header advertises.
+func (c *chatScreen) onlineCount() int { return len(c.users) }
 
 // convPreview returns the newest text + time for a conversation bucket.
 // Own messages are prefixed with "You: ". Empty when nothing arrived yet.
@@ -339,7 +401,8 @@ func (c *chatScreen) itemIndexFor(peer string) int {
 
 // topBarView paints the app banner: logo left, signal/lock/clock right.
 // Pure function of width + wall clock. Density collapses in steps: date on
-// wide, essentials in the middle, logo + time only when cramped.
+// wide, essentials in the middle, logo + time only when cramped. The
+// encryption promise lives HERE and nowhere else — one persistent signal.
 func topBarView(w int) string {
 	now := time.Now()
 	enc := thLockStyle.Render("🔒 End-to-End Encrypted")
@@ -373,11 +436,11 @@ func topBarView(w int) string {
 	return left + strings.Repeat(" ", w-lw-rw) + right
 }
 
-// ---- room header ---------------------------------------------------------------
+// ---- chat header ---------------------------------------------------------------
 
-// roomHeaderView paints the 2-row conversation heading for the center column:
-// avatar + name, then membership/type context. outerW is the transcript box
-// outer width so the heading aligns with the box below it.
+// roomHeaderView paints the 2-row conversation heading for the main column:
+// avatar + name over a single context line (kind, key, membership). outerW
+// is the main column width so the heading aligns with everything below it.
 func (c *chatScreen) roomHeaderView(outerW int) string {
 	var av, name, sub string
 	if c.targetUser == "" {
@@ -386,6 +449,9 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		sub = "Public Room"
 		if c.key != "" {
 			sub += "  ·  key " + c.key
+		}
+		if n := c.onlineCount(); n > 0 {
+			sub += fmt.Sprintf("  ·  %d online", n)
 		}
 	} else {
 		av = avatarCell(c.targetUser)
@@ -396,15 +462,14 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		}
 	}
 	// Width() would wrap overlong rows and break the exact-row contract, so
-	// content is hard-truncated to fit instead; the style only pads.
+	// content is hard-truncated to fit instead; the tint pads the row.
 	name = truncateStringPlain(name, maxInt(outerW-lipgloss.Width(av)-4, 1))
 	line1 := av + "  " + thRoomNameStyle.Render(name)
 	line2 := "     " + thRoomSubStyle.Render(truncateStringPlain(sub, maxInt(outerW-6, 0)))
-	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
-	return st.Render(line1) + "\n" + st.Render(line2)
+	return tintFit(thRoomHeadStyle, line1, outerW) + "\n" + tintFit(thRoomHeadStyle, line2, outerW)
 }
 
-// roomHeaderCompact paints the 1-row room heading for short/narrow
+// roomHeaderCompact paints the 1-row conversation heading for short/narrow
 // terminals: avatar + name + context on a single line.
 func (c *chatScreen) roomHeaderCompact(outerW int) string {
 	var av, name, sub string
@@ -415,6 +480,9 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 		if c.key != "" {
 			sub += " · " + c.key
 		}
+		if n := c.onlineCount(); n > 0 {
+			sub += fmt.Sprintf(" · %d online", n)
+		}
 	} else {
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
@@ -424,11 +492,12 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 		}
 	}
 	line := av + "  " + thRoomNameStyle.Render(name) + "  " + thRoomSubStyle.Render(sub)
-	st := lipgloss.NewStyle().Width(maxInt(outerW, 0))
-	return st.Render(truncateByWidth(line, maxInt(outerW, 0)))
+	return tintFit(thRoomHeadStyle, line, outerW)
 }
 
-// ---- composer -------------------------------------------------------------------
+// ---- helpers -------------------------------------------------------------------
+
+// ---- helpers -------------------------------------------------------------------
 
 // truncateByWidth hard-cuts a string to w CELLS (width-aware: wide runes
 // count double). Width-truncation keeps single-row views exact where
@@ -440,9 +509,56 @@ func truncateByWidth(s string, w int) string {
 	return ansi.Truncate(s, w, "")
 }
 
+// fitRow pins a (possibly styled) string to exactly w CELLS: truncate with
+// the ANSI/width-aware cutter (never rune counting — a single emoji is two
+// cells and would otherwise push the row a column past the terminal), then
+// pad.
+func fitRow(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	return padVisible(truncateByWidth(s, w), w)
+}
+
+// styleSeq returns the SGR opener a style emits, or "" when it emits none
+// (an unstyled Render returns its input untouched, so there is nothing to
+// re-assert).
+func styleSeq(st lipgloss.Style) string {
+	probe := st.Render("x")
+	i := strings.Index(probe, "x")
+	if i <= 0 || probe[0] != 0x1b {
+		return ""
+	}
+	if j := strings.IndexByte(probe[:i], 'm'); j > 0 {
+		return probe[:j+1]
+	}
+	return ""
+}
+
+// retint re-asserts an OUTER style after every inner reset inside CONTENT.
+// lipgloss wraps each styled fragment in its own terminator, so a row tint
+// or bubble background would otherwise fall off after the first bold word,
+// inline code chip, avatar or badge. The rewrite does a full reset first
+// (so no stale foreground leaks) and then re-asserts the outer style —
+// each fragment keeps its own attributes exactly where they were written.
+func retint(s string, outer lipgloss.Style) string {
+	seq := styleSeq(outer)
+	if seq == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, "\x1b[0m", "\x1b[0m"+seq)
+}
+
+// tintFit pins a styled row to exactly w cells AND keeps an outer tint
+// applied across the whole row, padding included. Every tinted row in the
+// shell goes through this one helper.
+func tintFit(outer lipgloss.Style, s string, w int) string {
+	return outer.Render(retint(fitRow(s, w), outer))
+}
+
 // composerTopRows counts the terminal rows above the composer box, mirroring
-// View()'s assembly order (header, body, strip, hints, drawer) so
-// hit-testing stays pixel-truthful even with the drawer open.
+// View()'s assembly order (header, body, drawer) so hit-testing stays
+// pixel-truthful even with the drawer open.
 func composerTopRows(l layout) int {
 	top := 0
 	if l.showHeader {
@@ -451,17 +567,13 @@ func composerTopRows(l layout) int {
 	bodyRows := 0
 	if l.vpHeight > 0 {
 		bodyRows = l.vpHeight
-		if l.boxedTranscript {
-			bodyRows += transcriptBorder
-		}
 	}
 	bodyRows += l.headRows
 	if bodyRows > 0 {
 		top += bodyRows
 	}
-	top += l.hintRows
 	if l.paletteRows > 0 {
-		top += l.paletteRows + 1 // drawer panel + its spacer row
+		top += l.paletteRows // drawer panel + its spacer row
 	}
 	if l.frameOn {
 		top++ // frame top edge
@@ -474,7 +586,7 @@ func composerTopRows(l layout) int {
 // column and its single-row y-range [y0,y1) — the clip sits on the composer
 // field row (middle of the box). clipX < 0 when no clip is painted (bare
 // prompt mode, or too narrow to fit it).
-func composerGeoms(l layout, termW, termH int) (clipX, y0, y1 int) {
+func composerGeoms(l layout) (clipX, y0, y1 int) {
 	clipX = -1
 	if l.composerRows <= 0 {
 		return
@@ -492,8 +604,6 @@ func composerGeoms(l layout, termW, termH int) (clipX, y0, y1 int) {
 	if inputOuter >= 26 {
 		clipX = txX0 + inputOuter - 2
 	}
-	_ = termW
-	_ = termH
 	return
 }
 
@@ -506,78 +616,43 @@ func composerIndent(l layout) int {
 	return 0
 }
 
-// interleave splices sep between items for JoinHorizontal calls.
-func interleave(items []string, sep string) []string {
-	out := make([]string, 0, len(items)*2-1)
-	for i, s := range items {
-		if i > 0 {
-			out = append(out, sep)
-		}
-		out = append(out, s)
+// renderSystemLine paints a transcript system event the quiet way: one
+// centred, faint, italic row set apart from chat — never mistakable for a
+// message, never given a box of its own.
+func renderSystemLine(text, tsPlain string, availWidth int) string {
+	if availWidth <= 0 {
+		availWidth = 60
 	}
-	return out
+	body := sanitizeDisplay(text)
+	label := "· " + body
+	if tsPlain != "" && tsPlain != "--:--" {
+		label = "· " + tsPlain + " · " + body
+	}
+	return thSystemLineStyle.
+		Width(availWidth).
+		Align(lipgloss.Center).
+		Render(truncateByWidth(label, availWidth))
 }
 
-// renderSystemCard paints a transcript system line the reference way: green
-// "System" sender, then a rounded card whose text rows carry a green left
-// bar. Width hugs content (capped); every row is exactly cardW+2 cells.
-func renderSystemCard(name, tsPlain, text string, availWidth int) string {
-	sender := thSystemNameStyle.Render(name) + "  " + thMsgTimeStyle.Render(tsPlain)
-	maxW := availWidth - 2
-	if maxW < 10 {
-		maxW = 10
+// keyHintsView paints the 1-row footer under the composer. Every hint names
+// a binding that actually exists, and the SET changes with focus, so the
+// footer always teaches the keys that work right now.
+func keyHintsView(outerW int, f focusPane) string {
+	var wide, narrow string
+	switch f {
+	case focusSidebar:
+		wide = "↑↓ pick  ·  type filters  ·  enter opens  ·  esc clears  ·  tab next"
+		narrow = "↑↓  ·  type  ·  enter  ·  esc"
+	case focusTranscript:
+		wide = "↑↓ scroll  ·  pgup/pgdn page  ·  home/end jump  ·  tab next"
+		narrow = "↑↓  ·  pgup/pgdn  ·  tab"
+	default:
+		wide = "Ctrl+k commands  •  Ctrl+l clear  •  ↑↓ navigate  •  Enter send"
+		narrow = "Ctrl+k  •  Ctrl+l  •  ↑↓  •  Enter"
 	}
-	if maxW > 52 {
-		maxW = 52
+	hints := narrow
+	if outerW >= lipgloss.Width(wide)+2 {
+		hints = wide
 	}
-	// Wrap plain first (ANSI-safe), then dress each row with the bar.
-	words := strings.Fields(text)
-	var wrapped []string
-	cur := ""
-	for _, w := range words {
-		if cur == "" {
-			cur = w
-		} else if len([]rune(cur))+1+len([]rune(w)) <= maxW-4 {
-			cur += " " + w
-		} else {
-			wrapped = append(wrapped, cur)
-			cur = w
-		}
-	}
-	if cur != "" || len(wrapped) == 0 {
-		wrapped = append(wrapped, cur)
-	}
-	bar := thSystemBarStyle.Render("▌")
-	rows := make([]string, 0, len(wrapped))
-	widest := 0
-	for _, ln := range wrapped {
-		if w := len([]rune(ln)); w > widest {
-			widest = w
-		}
-	}
-	for _, ln := range wrapped {
-		rows = append(rows, bar+" "+tuiSystemStyle.Render(ln+strings.Repeat(" ", widest-len([]rune(ln)))))
-	}
-	cardW := widest + 4 // bar + pads
-	if cardW > maxW {
-		cardW = maxW
-	}
-	card := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color(thPanelEdge)).
-		Background(lipgloss.Color(thPanel)).
-		Width(cardW).
-		Render(strings.Join(rows, "\n"))
-	return sender + "\n" + card
-}
-
-// keyHintsView paints the 1-row composer footer. Every hint names a binding
-// that actually exists: Ctrl+K drawer, Ctrl+L clear, ↑↓ scroll, Enter send.
-// Narrow transcripts get the abbreviated variant (never mid-word).
-func keyHintsView(outerW int) string {
-	hints := "Ctrl+k commands  •  Ctrl+l clear  •  ↑↓ navigate  •  Enter send"
-	if outerW < 58 {
-		hints = "Ctrl+k  •  Ctrl+l  •  ↑↓  •  Enter"
-	}
-	return thCamMetaStyle.Render(truncateByWidth(hints, maxInt(outerW, 0)))
+	return thHintStyle.Render(truncateByWidth(hints, maxInt(outerW, 0)))
 }

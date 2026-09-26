@@ -55,27 +55,30 @@ func TestComputeLayout(t *testing.T) {
 	if !l.sidebarOn {
 		t.Fatal("sidebar must be on at wide terminals")
 	}
-	if want := H - frameChrome - headerHeight - transcriptBorder - (composerRowsFor(H) + 2); l.vpHeight != want {
+	if want := H - headerHeight - (composerRowsFor(H) + 2); l.vpHeight != want {
 		t.Errorf("vpHeight = %d; want exact fit %d", l.vpHeight, want)
 	}
 	if l.totalRows() != H {
 		t.Errorf("totalRows = %d; MUST equal termH exactly (%d)", l.totalRows(), H)
 	}
-	// LEFT sidebar: rosterX is the frame inset, not the right edge.
+	// LEFT sidebar: rosterX is the left inset, not the right edge.
 	wantX := 0
 	if l.frameOn {
-		wantX = 1
+		wantX = frameChrome / 2
 	}
 	if l.rosterX != wantX {
-		t.Errorf("rosterX = %d; want %d (frame inset, left column)", l.rosterX, wantX)
+		t.Errorf("rosterX = %d; want %d (left column)", l.rosterX, wantX)
 	}
-	innerW := W - frameChrome
-	if want := innerW - l.sidebarWidth - 1 - transcriptBorder; l.vpWidth != want {
-		t.Errorf("vpWidth = %d; want %d (spacer+own border)", l.vpWidth, want)
-	}
-	wantY0 := headerHeight + 2 // body top border + section title
+	innerW := W
 	if l.frameOn {
-		wantY0++ // left frame border shifts everything down one row
+		innerW = W - frameChrome
+	}
+	if want := innerW - l.sidebarWidth - 1 - transcriptBorder; l.vpWidth != want {
+		t.Errorf("vpWidth = %d; want %d (gutter + content + rail)", l.vpWidth, want)
+	}
+	wantY0 := headerHeight + 1 // banner + the sidebar's one-row filter header
+	if l.frameOn {
+		wantY0++
 	}
 	if l.rosterY0 != wantY0 {
 		t.Errorf("rosterY0 = %d; want %d", l.rosterY0, wantY0)
@@ -92,14 +95,15 @@ func TestComputeLayout(t *testing.T) {
 		}
 	})
 
-	t.Run("roster slots track viewport height", func(t *testing.T) {
-		big := computeLayout(W, 60, false)
-		if big.rosterSlots != rosterMaxVisible {
-			t.Errorf("tall term should cap slots at %d; got %d", rosterMaxVisible, big.rosterSlots)
-		}
-		small := computeLayout(W, 14, false) // vpHeight = 14-6 = 8 → 7 slots
-		if small.rosterSlots != small.vpHeight-1 {
-			t.Errorf("slots %d must equal vpHeight-1 %d", small.rosterSlots, small.vpHeight-1)
+	t.Run("sidebar keeps its filter header at every height", func(t *testing.T) {
+		for _, h := range []int{12, 14, 30, 60} {
+			l := computeLayout(W, h, false)
+			if !l.sidebarOn {
+				continue
+			}
+			if want := headerHeight + 1; l.rosterY0 != want {
+				t.Errorf("h=%d rosterY0 = %d; want %d", h, l.rosterY0, want)
+			}
 		}
 	})
 
@@ -161,7 +165,7 @@ func TestSidebarResponsiveCollapse(t *testing.T) {
 	if collapsed.rosterX != 0 {
 		t.Errorf("collapsed rosterX = %d; want 0", collapsed.rosterX)
 	}
-	wantInner := 50 - frameChrome // frame survives at this height
+	wantInner := 50 // edge-to-edge: no shell margin to subtract
 	if want := wantInner - transcriptBorder; collapsed.vpWidth != want {
 		t.Errorf("collapsed vpWidth = %d; want %d", collapsed.vpWidth, want)
 	}
