@@ -230,7 +230,9 @@ var (
 	tuiPaletteHintStyle = lipgloss.NewStyle().Foreground(colFaint)
 )
 
-// paletteMaxVisible caps how many command rows paint before "+N more".
+// paletteMaxVisible is the scroll-window size: at most this many command
+// rows paint at once. Longer lists scroll one row at a time with the
+// highlight ("… +N more" below, "… +N above" at the tail).
 const paletteMaxVisible = 6
 
 // paletteFooterHints is the dim keymap legend under the list.
@@ -248,6 +250,7 @@ const paletteUserHints = "↑↓ select user · tab complete · enter run · esc
 type paletteState struct {
 	open bool
 	sel  int // highlighted row into the last-ranked list
+	off  int // first visible row of the 6-row scroll window
 }
 
 // sync recomputes visibility from the live composer text.
@@ -258,38 +261,73 @@ func (p *paletteState) sync(text string) {
 // visible reports whether the panel should paint right now.
 func (p *paletteState) visible() bool { return p.open }
 
-// clampSel keeps the highlight inside the list after every re-rank.
+// clampSel keeps the highlight inside the list after every re-rank, and
+// keeps the scroll window valid with the highlight visible inside it.
 func (p *paletteState) clampSel(n int) {
 	if n <= 0 {
 		p.sel = 0
+		p.off = 0
 		return
 	}
 	if p.sel >= n {
 		p.sel = n - 1
 	}
+	if p.sel < 0 {
+		p.sel = 0
+	}
+	maxOff := max(n-paletteMaxVisible, 0)
+	if p.off > maxOff {
+		p.off = maxOff
+	}
+	if p.off < 0 {
+		p.off = 0
+	}
+	if p.sel < p.off {
+		p.off = p.sel
+	}
+	if p.sel > p.off+paletteMaxVisible-1 {
+		p.off = p.sel - paletteMaxVisible + 1
+	}
 }
 
 // moveUp / moveDown shift the highlight with wrap-around (OpenCode behaviour).
+// The 6-row window follows: moving past the last visible row scrolls the
+// window down by one (…5 → 2–7 window), moving above the first visible row
+// scrolls it up by one. Wrapping jumps the window to the far end.
 func (p *paletteState) moveUp(n int) {
 	if n <= 0 {
 		p.sel = 0
+		p.off = 0
 		return
 	}
 	p.sel = ((p.sel-1)%n + n) % n
+	p.followSel()
 }
 
 func (p *paletteState) moveDown(n int) {
 	if n <= 0 {
 		p.sel = 0
+		p.off = 0
 		return
 	}
 	p.sel = (p.sel + 1) % n
+	p.followSel()
+}
+
+// followSel scrolls the window the minimum needed to keep sel visible.
+func (p *paletteState) followSel() {
+	if p.sel < p.off {
+		p.off = p.sel
+	} else if p.sel > p.off+paletteMaxVisible-1 {
+		p.off = p.sel - paletteMaxVisible + 1
+	}
 }
 
 // close hides the drawer and forgets the stale cursor position.
 func (p *paletteState) close() {
 	p.open = false
 	p.sel = 0
+	p.off = 0
 }
 
 // paletteRows is the exact terminal-row budget the drawer consumes right now:
@@ -375,7 +413,8 @@ func (c chatScreen) paletteView(maxW int) string {
 		return ""
 	}
 	c.palette.clampSel(len(ranked))
-	shown := min(len(ranked), paletteMaxVisible)
+	off := c.palette.off
+	end := min(off+paletteMaxVisible, len(ranked))
 
 	inner := maxW - 2 // room for the box border
 	query := strings.ToLower(strings.TrimSpace(c.input.Value()))
@@ -391,16 +430,16 @@ func (c chatScreen) paletteView(maxW int) string {
 	}
 
 	nameCol := 0 // dynamic name column: longest visible name + gap
-	for _, cmd := range ranked[:shown] {
+	for _, cmd := range ranked[off:end] {
 		if w := lipgloss.Width(cmd.Name); w > nameCol {
 			nameCol = w
 		}
 	}
 	nameCol += 2
 
-	rows := make([]string, 0, shown+2)
-	for i := 0; i < shown; i++ {
-		cmd := ranked[i]
+	rows := make([]string, 0, paletteMaxVisible+2)
+	for idx := off; idx < end; idx++ {
+		cmd := ranked[idx]
 		name := cmd.Name
 		// Highlight the typed prefix inside the command name.
 		if len(name) >= len(query) && len(query) > 0 &&
@@ -409,14 +448,21 @@ func (c chatScreen) paletteView(maxW int) string {
 		}
 		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(cmd.Desc))
 		line = padVisible(line, inner) // full-width rows: chip reaches both edges
-		if i == c.palette.sel {
+		if idx == c.palette.sel {
 			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
 		}
 		rows = append(rows, line)
 	}
-	if hidden := len(ranked) - shown; hidden > 0 {
+	// Overflow indicator: items below the window keep the old "+N more"
+	// wording; at the tail (nothing below, items above) it reads "+N above".
+	// The row exists whenever the list exceeds the window, so the painted
+	// height always matches the paletteRows() budget.
+	if below := len(ranked) - end; below > 0 {
 		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", hidden)), inner)))
+			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", below)), inner)))
+	} else if above := off; above > 0 {
+		rows = append(rows, fit(padVisible(
+			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d above", above)), inner)))
 	}
 	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(paletteFooterHints, inner))))
 
@@ -435,7 +481,8 @@ func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
 		return ""
 	}
 	c.palette.clampSel(len(users))
-	shown := min(len(users), paletteMaxVisible)
+	off := c.palette.off
+	end := min(off+paletteMaxVisible, len(users))
 
 	inner := maxW - 2 // room for the box border
 	query := strings.ToLower(strings.TrimSpace(c.input.Value()))
@@ -451,16 +498,16 @@ func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
 	}
 
 	nameCol := 0
-	for _, u := range users[:shown] {
+	for _, u := range users[off:end] {
 		if w := lipgloss.Width(u.Username); w > nameCol {
 			nameCol = w
 		}
 	}
 	nameCol += 2
 
-	rows := make([]string, 0, shown+2)
-	for i := 0; i < shown; i++ {
-		u := users[i]
+	rows := make([]string, 0, paletteMaxVisible+2)
+	for idx := off; idx < end; idx++ {
+		u := users[idx]
 		name := u.Username
 		if len(name) >= len(query) && len(query) > 0 &&
 			strings.EqualFold(name[:len(query)], query) {
@@ -468,14 +515,17 @@ func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
 		}
 		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(userRoleTag(u.Role)))
 		line = padVisible(line, inner)
-		if i == c.palette.sel {
+		if idx == c.palette.sel {
 			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
 		}
 		rows = append(rows, line)
 	}
-	if hidden := len(users) - shown; hidden > 0 {
+	if below := len(users) - end; below > 0 {
 		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", hidden)), inner)))
+			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", below)), inner)))
+	} else if above := off; above > 0 {
+		rows = append(rows, fit(padVisible(
+			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d above", above)), inner)))
 	}
 	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(paletteUserHints, inner))))
 
@@ -487,10 +537,6 @@ func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
 }
 
 // ---- palette key handling ----------------------------------------------------
-
-// visibleCount is how many ranked rows the panel can currently paint; the
-// highlight must never wander into hidden rows.
-func visibleCount(ranked int) int { return min(ranked, paletteMaxVisible) }
 
 // handlePaletteKeys intercepts keys while the drawer is open. It returns
 // handled=true when the key was consumed (the caller must then SKIP normal
@@ -506,20 +552,20 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	if cmd, users, ok := c.paletteUsers(); ok && len(users) > 0 {
 		switch msg.Type {
 		case tea.KeyUp:
-			c.palette.moveUp(visibleCount(len(users)))
+			c.palette.moveUp(len(users))
 			return true, nil
 		case tea.KeyDown:
-			c.palette.moveDown(visibleCount(len(users)))
+			c.palette.moveDown(len(users))
 			return true, nil
 		case tea.KeyTab:
-			c.palette.clampSel(visibleCount(len(users)))
+			c.palette.clampSel(len(users))
 			if c.palette.sel < len(users) {
 				c.input.SetValue(cmd + " " + users[c.palette.sel].Username + " ")
 				c.palette.close()
 			}
 			return true, nil
 		case tea.KeyEnter:
-			c.palette.clampSel(visibleCount(len(users)))
+			c.palette.clampSel(len(users))
 			if c.palette.sel < len(users) {
 				user := users[c.palette.sel].Username
 				c.input.SetValue("")
@@ -536,19 +582,20 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	}
 	switch msg.Type {
 	case tea.KeyUp:
-		c.palette.moveUp(visibleCount(len(c.rankedCommands(c.input.Value()))))
+		c.palette.moveUp(len(c.rankedCommands(c.input.Value())))
 		return true, nil
 	case tea.KeyDown:
-		c.palette.moveDown(visibleCount(len(c.rankedCommands(c.input.Value()))))
+		c.palette.moveDown(len(c.rankedCommands(c.input.Value())))
 		return true, nil
 	case tea.KeyTab:
 		ranked := c.rankedCommands(c.input.Value())
-		c.palette.clampSel(visibleCount(len(ranked)))
+		c.palette.clampSel(len(ranked))
 		if c.palette.sel < len(ranked) {
 			picked := ranked[c.palette.sel]
 			c.input.SetValue(picked.Name + " ") // complete inline
 			if picked.TakesUser {
 				c.palette.sel = 0 // stay open: morph into the member picker
+				c.palette.off = 0
 			} else {
 				c.palette.close()
 			}
@@ -556,7 +603,7 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 		return true, nil
 	case tea.KeyEnter:
 		ranked := c.rankedCommands(c.input.Value())
-		c.palette.clampSel(visibleCount(len(ranked)))
+		c.palette.clampSel(len(ranked))
 		if c.palette.sel < len(ranked) {
 			picked := ranked[c.palette.sel]
 			if picked.TakesUser {
@@ -564,6 +611,7 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 				// complete the command and morph into the member picker.
 				c.input.SetValue(picked.Name + " ")
 				c.palette.sel = 0
+				c.palette.off = 0
 				return true, nil
 			}
 			name := picked.Name
