@@ -121,7 +121,7 @@ func TestSidebarRendersAndClearsBadge(t *testing.T) {
 		Foreground(lipgloss.Color("15")).
 		Background(lipgloss.Color("27"))
 	chip := fresh.Render(circledNum(2))
-	out := c.rosterBody(computeLayout(100, 30, false).rosterSlots)
+	out := c.rosterBody(c.sidebarFill(c.layoutFor()))
 	plain := stripANSI(out)
 	if !strings.Contains(plain, "alice") {
 		t.Fatalf("alice missing from chat list:\n%s", plain)
@@ -139,7 +139,7 @@ func TestSidebarRendersAndClearsBadge(t *testing.T) {
 	}
 
 	c.enterPrivate("alice")
-	out = c.rosterBody(computeLayout(100, 30, false).rosterSlots)
+	out = c.rosterBody(c.sidebarFill(c.layoutFor()))
 	if strings.Contains(out, chip) {
 		t.Fatalf("badge survived open:\n%s", stripANSI(out))
 	}

@@ -136,7 +136,7 @@ func drainUploadProgressCmd(ch <-chan uploadProgressMsg) tea.Cmd {
 // ---- transcript paint --------------------------------------------------------------
 
 var tuiUploadRunStyle = lipgloss.NewStyle().
-	Foreground(lipgloss.Color("214")) // amber while bytes move
+	Foreground(colAmber) // amber while bytes move
 
 // paintUploadLine replaces the in-flight echo row in place, or appends one.
 func (c *chatScreen) paintUploadLine(text string, conv string) {

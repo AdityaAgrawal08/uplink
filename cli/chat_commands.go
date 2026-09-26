@@ -210,22 +210,24 @@ func userRoleTag(role string) string {
 // panel reads as if it lifted straight out of the input box.
 
 var (
+	// The drawer borrows the composer's accent so the panel reads as if it
+	// lifted straight out of the input box.
 	tuiPaletteBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder(), true).
-				BorderForeground(lipgloss.Color("62")) // composer accent
+				BorderForeground(colAccent) // the focused surface wears the accent
 
 	tuiPaletteSelStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("16")).
-				Background(lipgloss.Color("62")) // accent chip: selected row
+				Foreground(lipgloss.AdaptiveColor{Light: "15", Dark: "16"}).
+				Background(colAccent) // accent chip: selected row
 
 	tuiPaletteMatchStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.Color("212")) // the typed prefix inside each name
+				Foreground(lipgloss.AdaptiveColor{Light: "#9d174d", Dark: "#f0abfc"}) // the typed prefix
 
-	tuiPaletteDescStyle = lipgloss.NewStyle().Faint(true)
+	tuiPaletteDescStyle = lipgloss.NewStyle().Foreground(colDim)
 
-	tuiPaletteHintStyle = lipgloss.NewStyle().Faint(true)
+	tuiPaletteHintStyle = lipgloss.NewStyle().Foreground(colFaint)
 )
 
 // paletteMaxVisible caps how many command rows paint before "+N more".
@@ -320,10 +322,8 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), false)
-	// The sidebar column always starts at the room-header top (rosterY0
-	// from the pure pass already accounts for that).
-	// Room header above the transcript (center column only): full two-row
+	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows())
+	// Chat header above the transcript (main column only): full two-row
 	// heading when roomy, compact single row when short or narrow, hidden
 	// when every row counts.
 	l.headRows = 0
@@ -333,10 +333,8 @@ func (c chatScreen) layoutFor() layout {
 			l.headRows = 2
 		}
 	}
-	// The sidebar search box grows into the header zone: its rows sit above
-	// the first scroll row, so rosterY0 shifts with it (paint + hit-test).
-	l.rosterY0 += searchHeightFor(l.headRows, l.sidebarWidth-2) - 1
-	// Composer key-hints footer (truthful bindings only, see keyHintsView).
+	// Composer key-hints footer (truthful bindings only, see keyHintsView);
+	// it rides directly under the composer box.
 	l.hintRows = 0
 	if c.width >= 70 && l.composerRows > 0 && l.vpHeight-l.headRows >= 8 {
 		l.hintRows = 1
@@ -344,14 +342,6 @@ func (c chatScreen) layoutFor() layout {
 	l.vpHeight -= l.headRows + l.hintRows
 	if l.vpHeight < 0 {
 		l.vpHeight = 0
-	}
-	// Roster adapts to the settled viewport: search row eats one slot.
-	l.rosterSlots = l.vpHeight - 1
-	if l.rosterSlots > rosterMaxVisible {
-		l.rosterSlots = rosterMaxVisible
-	}
-	if l.rosterSlots < 0 || !l.sidebarOn {
-		l.rosterSlots = 0
 	}
 	return l
 }
@@ -420,7 +410,7 @@ func (c chatScreen) paletteView(maxW int) string {
 		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(cmd.Desc))
 		line = padVisible(line, inner) // full-width rows: chip reaches both edges
 		if i == c.palette.sel {
-			line = tuiPaletteSelStyle.Render(line)
+			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
 		}
 		rows = append(rows, line)
 	}
@@ -479,7 +469,7 @@ func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
 		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(userRoleTag(u.Role)))
 		line = padVisible(line, inner)
 		if i == c.palette.sel {
-			line = tuiPaletteSelStyle.Render(line)
+			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
 		}
 		rows = append(rows, line)
 	}
