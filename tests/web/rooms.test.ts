@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { redis } from "../redis";
+import { redis } from "../../src/lib/redis";
 import {
   RoomError,
   createRoom,
@@ -16,7 +16,7 @@ import {
   ackBoxes,
   sweepRooms,
   roomExists,
-} from "../rooms";
+} from "../../src/lib/rooms";
 
 const PUBKEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -152,7 +152,7 @@ describe("rooms signaling plane", () => {
   // Redis while MockRedis tests stay green — exactly the outage this
   // guards. Simulates full object-shape roundtrips.
   it("tolerates Upstash auto-parsed object values end to end", async () => {
-    const { parseStored } = await import("../rooms");
+    const { parseStored } = await import("../../src/lib/rooms");
     // unit level: both shapes decode identically
     const doc = { a: 1, b: "x" };
     expect(parseStored<typeof doc>(JSON.stringify(doc))).toEqual(doc);
@@ -179,7 +179,7 @@ describe("rooms signaling plane", () => {
   });
 
   it("rate limiters trip at their budgets with 429", async () => {
-    const { checkJoinLimit, checkReadLimit, checkSendLimit } = await import("../rooms");
+    const { checkJoinLimit, checkReadLimit, checkSendLimit } = await import("../../src/lib/rooms");
     const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
     // join budget: 120 per window
     for (let i = 0; i < 120; i++) await checkJoinLimit(ip);
@@ -197,7 +197,7 @@ describe("rooms signaling plane", () => {
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
     const username = `u_${Math.random().toString(36).slice(2, 10)}`;
     const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");
-    const { getRoomMeta } = await import("../rooms");
+    const { getRoomMeta } = await import("../../src/lib/rooms");
     const meta = await getRoomMeta(sessionId);
     expect(meta?.passwordHash).toBe("argon2id-fake-hash");
     const open = await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, null);

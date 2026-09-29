@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Phase 0 acceptance matrix for uplink send/receive.
-# Usage: SERVER=http://localhost:3000 ./scratch/e2e_phase0.sh
+# Usage: SERVER=http://localhost:3000 ./tests/e2e/e2e_phase0.sh
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../.." || exit 1
 
 SERVER="${SERVER:-http://localhost:3000}"
 BIN="${BIN:-$(pwd)/cli/build/uplink}"

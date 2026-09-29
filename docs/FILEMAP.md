@@ -20,7 +20,7 @@ src/app/share/       Share landing + preview pages
 src/components/      FilePreview, SyntaxHighlighter (React)
 src/lib/             Backend libraries (auth/rooms/redis/r2/crypto/quota/mongo/env/utils/crc64)
 server/              SHELVED Go WebSocket relay (own module) — not deployed
-scratch/             Dev e2e shell scripts + debug probes (not shipped)
+tests/               Web/E2E test suites + manual probes (see tests/README.md)
 packaging/           Arch Linux PKGBUILD
 .github/workflows/  ci.yml, release.yml, npm.yml
 docs/                Documentatio.md (this project manual) + FILEMAP.md (this file)
@@ -155,9 +155,10 @@ Video calling is fully removed on this branch. Audio-only.
 - `lib/r2.ts` | 368 | S3/R2 client, presigned multipart ops (+mock). | `getPresignedUploadUrl, getPresignedDownloadUrl, checkObjectExists, completeMultipartUpload`
 - `lib/redis.ts` | 501 | Upstash client + in-memory mock + lazy wrapper. | `MockRedis, LazyRedisClient, redis`
 - `lib/rooms.ts` | 839 | Redis signaling rooms: presence, messaging, roles. | `createRoom, joinRoom, leaveRoom, heartbeat, depositSignal, drainSignals, depositBox, sweepRooms`
-- `lib/__tests__/crypto.test.ts` | 32 | Filename-sanitization parity with Go. |
-- `lib/__tests__/redis.test.ts` | 167 | MockRedis semantics + prod gating. |
-- `lib/__tests__/rooms.test.ts` | 321 | Rooms plane integration (CRUD, heartbeat, signals). |
+- `tests/web/crypto.test.ts` | 32 | Filename-sanitization parity with Go (vitest). |
+- `tests/web/redis.test.ts` | 167 | MockRedis semantics + prod gating (vitest). |
+- `tests/web/rooms.test.ts` | 321 | Rooms plane integration (CRUD, heartbeat, signals) (vitest). |
+- `tests/web/run_tests.ts` | 54 | node:test runner for crypto/crc64/redis-mock parity. |
 - Root web config: `package.json` (Next.js app; deps: aws-sdk×2, upstash/redis, hash-wasm, highlight.js, mongodb, next, qrcode, react×2; dev: tailwind, vitest, types, eslint), `tsconfig.json`, `next.config.ts` (security headers/CSP), `postcss.config.mjs`, `vercel.json` (region/timeouts/cleanup cron), `eslint.config.mjs`.
 
 ## 8. Shelved server + infra + tooling
@@ -169,12 +170,14 @@ Video calling is fully removed on this branch. Audio-only.
 - `server/util.go` | 137 | ID/JSON helpers, env config, shutdown. | `genId, Config, DefaultConfig, loadConfig, isValidUsername`
 - `server/ratelimit.go` | 63 | Per-key sliding-window limiter + cleanup. | `RateLimiter, Allow`
 - `server/{auth,crypto,server}_test.go` + `integration_test.go` | 62/113/212/456 | Password hashing, crypto round-trips, ring buffer, session e2e. | (own `server/go.mod`, go 1.23, gorilla/websocket + x/crypto)
-- `Makefile` | build/install/clean + 5-target release tarballs. |
+- `Makefile` | build/install/clean + 5-target release tarballs + test targets (`test-go`, `test-web`, `test`, `e2e`, `test-all`). |
 - `.goreleaser.yaml` | Multi-OS builds, archives, checksums for tags `v*`. |
 - `.github/workflows/ci.yml` | Push/PR: Go vet + `go test -race` + cross-builds; web lint/typecheck/unit/build; e2e matrix; single `pipeline` gate. No per-run artifact uploads. |
 - `.github/workflows/release.yml` | Tag push → GoReleaser publish. |
 - `.github/workflows/npm.yml` | Tag push → tag-gated npm publish (`@aditya/uplink` shim). |
 - `install.sh` / `install.ps1` | Checksum-verified installers (fail closed, sudo fallback). |
 - `packaging/archlinux/PKGBUILD` | Git-snapshot pacman package. |
-- `scratch/` | `e2e_phase0.sh`, `session_flow_test.sh`, `chat_two_clients.sh`, `probe_r2.ts`, `test_quota.ts`, `run_tests.ts` — dev e2e/debug scripts (not shipped). |
+- `tests/e2e/` | `e2e_phase0.sh` (transfer matrix), `session_flow_test.sh` (signaling lifecycle), `chat_two_clients.sh` (two-client chat) — need a live server + built CLI; `make e2e`. |
+- `tests/probes/` | `probe_r2.ts`, `test_quota.ts` — manual debug probes (not run by CI; need `.env`/live server). |
+- `tests/README.md` | Layout, runner mapping, exact commands, why Go tests stay colocated. |
 - `DEPLOY.md`, `.env.example`, `.gitignore` | Deploy guide, env template, ignores (node, `.next`, Go binaries, `.env*`, `uploads_dev`). |

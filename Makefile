@@ -1,4 +1,4 @@
-.PHONY: build install clean release
+.PHONY: build install clean release test-go test-web test e2e test-all
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS = -s -w -X main.version=$(VERSION)
@@ -12,6 +12,26 @@ install: build
 clean:
 	rm -f cli/uplink
 	rm -rf cli/build
+
+test-go:
+	cd cli && go test -race ./...
+	cd server && go test -race ./...
+
+test-web:
+	npx tsx tests/web/run_tests.ts
+	npx vitest run
+
+test: test-go test-web
+
+# E2E needs a live server and a built CLI (cli/build/uplink); see tests/README.md first.
+export SERVER ?= http://localhost:3000
+
+e2e:
+	./tests/e2e/e2e_phase0.sh
+	./tests/e2e/session_flow_test.sh
+	./tests/e2e/chat_two_clients.sh
+
+test-all: test e2e
 
 release:
 	mkdir -p cli/build

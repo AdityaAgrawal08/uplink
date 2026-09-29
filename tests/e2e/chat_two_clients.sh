@@ -13,7 +13,7 @@
 # failed 7/8 without anything being broken. Every assertion below is
 # unchanged — only the waiting is deterministic now.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../.." || exit 1
 BIN="${BIN:-$(pwd)/cli/build/uplink}"
 SERVER="${SERVER:-http://localhost:3000}"
 T="$(mktemp -d "${TMPDIR:-/tmp}/chattest.XXXXXX")"

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sanitizeFilename } from "../crypto";
+import { sanitizeFilename } from "../../src/lib/crypto";
 
 // Mirrors the Go CLI table in cli/main_test.go — both ends MUST agree on the
 // same sanitization contract or download names will diverge from uploads.

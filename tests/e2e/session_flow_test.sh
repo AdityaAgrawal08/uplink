@@ -3,7 +3,7 @@
 # create -> join -> heartbeat/roster -> signal rendezvous -> inbox/ack ->
 # guards -> leave (room dies on empty) -> cleanup.
 set -u
-cd "$(dirname "$0")/.." || exit 1
+cd "$(dirname "$0")/../.." || exit 1
 
 SERVER="${SERVER:-http://localhost:3000}"
 BODY="$(mktemp "${TMPDIR:-/tmp}/uplink-sg-body.XXXXXX")"
