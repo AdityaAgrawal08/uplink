@@ -36,9 +36,12 @@ jobs:
         run: go vet ./...
         working-directory: cli
 
-      - name: Unit tests (all packages)
-        run: go test -race ./...
-        working-directory: cli
+      - name: Vet (shelved server module)
+        run: go vet ./...
+        working-directory: server
+
+      - name: Unit tests (all packages, both Go modules)
+        run: make test-go
 
       - name: Cross-compile release targets
         run: |
@@ -77,8 +80,8 @@ jobs:
       - name: TypeScript check
         run: npx tsc --noEmit
 
-      - name: Unit tests (crypto, crc64, redis mock)
-        run: npx tsx scratch/run_tests.ts
+      - name: Unit tests (tsx runner + vitest; crypto, crc64, redis mock, rooms)
+        run: make test-web
 
       - name: Production build
         run: npm run build
@@ -157,13 +160,13 @@ jobs:
           echo "server healthy"
 
       - name: Core transfer matrix (send/receive/folder/E2EE/multipart/idempotency/negative)
-        run: SERVER=http://localhost:3000 ./scratch/e2e_phase0.sh
+        run: SERVER=http://localhost:3000 ./tests/e2e/e2e_phase0.sh
 
       - name: Collaborative session lifecycle (skips if routes absent)
-        run: SERVER=http://localhost:3000 ./scratch/session_flow_test.sh
+        run: SERVER=http://localhost:3000 ./tests/e2e/session_flow_test.sh
 
       - name: Two-client chat E2E (cross-delivery, roster, end-propagation)
-        run: SERVER=http://localhost:3000 ./scratch/chat_two_clients.sh
+        run: SERVER=http://localhost:3000 ./tests/e2e/chat_two_clients.sh
 
       - name: API contract probes
         # NOTE: deliberately NO /share/init calls here — the init rate limiter

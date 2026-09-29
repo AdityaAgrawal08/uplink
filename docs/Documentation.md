@@ -61,12 +61,12 @@ src/app/api/v1  19 Next.js API routes (admin/cleanup/mock-r2/session/share/speed
 src/app/share   Share landing/preview pages
 src/components  FilePreview, SyntaxHighlighter (React)
 src/lib         auth, rooms, redis (+mock), r2 (+mock), crypto, quota, mongodb,
-                env, api-utils, crc64 (+ 3 vitest suites)
+                env, api-utils, crc64 (vitest suites live under tests/web/)
 server/         SHELVED Go WebSocket relay (own module) — not deployed
-scratch/        Dev e2e shell scripts + R2/quota debug probes (not shipped)
+tests/          Web/E2E suites + probes (see tests/README.md; `make test`, `make e2e`)
 packaging/      Arch Linux PKGBUILD
 .github/workflows  ci.yml, release.yml, npm.yml
-Makefile        build/install/clean/5-target release tarballs
+Makefile        build/install/clean/release + test targets (test-go, test-web, test, e2e, test-all)
 install.sh / install.ps1  checksum-verified installers (fail closed)
 DEPLOY.md       Vercel/Redis/R2 setup + verification steps
 docs/           This documentation + FILEMAP.md

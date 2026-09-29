@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import { MockRedis, LazyRedisClient } from "../redis";
+import { MockRedis, LazyRedisClient } from "../../src/lib/redis";
 
 // MockRedis mirrors the tiny Redis surface the app relies on. These tests pin
 // its semantics so the graceful-degradation path behaves identically to real

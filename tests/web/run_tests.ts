@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
-import { sanitizeFilename, anonymizeIp, hashPassword, verifyPassword } from "../src/lib/crypto";
-import { crc64nvme, crc64nvmeBase64 } from "../src/lib/crc64";
+import { sanitizeFilename, anonymizeIp, hashPassword, verifyPassword } from "../../src/lib/crypto";
+import { crc64nvme, crc64nvmeBase64 } from "../../src/lib/crc64";
 
 test("Sanitize Filename traversal and chars", () => {
   assert.strictEqual(sanitizeFilename("../../etc/passwd"), "passwd");
@@ -41,7 +41,7 @@ test("CRC64NVMe computations", () => {
 });
 
 test("MockRedis does not auto-parse strings resembling JSON", async () => {
-  const { redis } = await import("../src/lib/redis");
+  const { redis } = await import("../../src/lib/redis");
   await redis.set("test:num_str", "12345");
   const val = await redis.get("test:num_str");
   assert.strictEqual(typeof val, "string");
