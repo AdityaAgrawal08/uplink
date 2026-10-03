@@ -36,7 +36,27 @@ const (
 	// Size-capped (see fallbackFileMax); larger files need the direct line.
 	frameFile   = "file"
 	frameTyping = "typing"
+	// frameReaction is a live nudge telling peers a message's reactions
+	// moved. It carries no counts: the receiver fetches GET /reactions for
+	// truth (the 2s poll is the floor; the frame just makes it immediate).
+	frameReaction = "reaction"
 )
+
+// reactionEmojis mirrors the server's REACTION_EMOJI allowlist (src/lib/
+// rooms.ts). One user has at most one reaction per message: sending the same
+// emoji removes it, a different one replaces it. Counts are room-scoped and
+// keyed by sender-assigned msgId, so the client only ever shows numbers.
+var reactionEmojis = []string{"👍", "❤️", "😂", "😮", "😢", "🙏"}
+
+// reactionEmojiAllowed reports whether e is on the allowlist.
+func reactionEmojiAllowed(e string) bool {
+	for _, x := range reactionEmojis {
+		if x == e {
+			return true
+		}
+	}
+	return false
+}
 
 // Max plaintext bytes per file chunk (encrypted individually so receivers
 // can stream-verify and the fallback inbox caps stay meaningful).
@@ -55,6 +75,8 @@ type frame struct {
 	Chunks     int    `json:"chunks,omitempty"`     // file-meta: total chunk count
 	ChunkIndex int    `json:"chunkIndex,omitempty"` // file-chunk
 	Active     bool   `json:"active,omitempty"`     // typing
+	Target     string `json:"target,omitempty"`     // reaction: the reacted msgId
+	Emoji      string `json:"emoji,omitempty"`      // reaction
 }
 
 func newFrame(ftype, msgId, from, to string) frame {
@@ -74,7 +96,7 @@ func decodeFrame(raw []byte) (frame, error) {
 		return f, fmt.Errorf("unsupported protocol version %d", f.V)
 	}
 	switch f.Type {
-	case frameChat, frameAck, frameFile, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping:
+	case frameChat, frameAck, frameFile, frameFileMeta, frameFileChunk, frameFileComplete, frameTyping, frameReaction:
 		return f, nil
 	default:
 		return f, fmt.Errorf("unknown frame type %q", f.Type)

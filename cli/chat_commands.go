@@ -340,6 +340,9 @@ func (c chatScreen) paletteRows() int {
 	if c.picker.isActive() {
 		return c.pickerRows()
 	}
+	if c.pendingReactionMsgId != "" {
+		return 2 // one-row reaction bar + its lift spacer
+	}
 	if !c.palette.visible() {
 		return 0
 	}
@@ -386,13 +389,68 @@ func (c chatScreen) layoutFor() layout {
 
 // ---- palette view ------------------------------------------------------------
 
-// drawerView renders whichever mode owns the drawer slot: the file browser
-// (picker) or the "/" command list.
+// drawerView renders whichever mode owns the drawer slot above the composer:
+// the file browser (picker), the reaction bar, or the "/" command list.
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
+	if c.pendingReactionMsgId != "" {
+		return c.reactionBarView(maxW)
+	}
 	return c.paletteView(maxW)
+}
+
+// ---- reaction bar ------------------------------------------------------------
+
+// reactionBarItems is the painted choice order: the six allowlisted emoji
+// plus the trailing "+" affordance.
+func reactionBarItems() []string {
+	out := make([]string, 0, len(reactionEmojis)+1)
+	out = append(out, reactionEmojis...)
+	return append(out, "+")
+}
+
+// reactionCellAt maps a cell offset inside the reaction bar to its choice
+// (ok=false when the offset lands on a bracket or padding). Paint and
+// hit-test share reactionBarItems and the one-space separator, so they can
+// never drift apart.
+func reactionCellAt(offset int) (string, bool) {
+	pos := 1 // past the leading "["
+	for _, item := range reactionBarItems() {
+		w := lipgloss.Width(item)
+		if offset >= pos && offset < pos+w {
+			return item, true
+		}
+		pos += w + 1 // separator space
+	}
+	return "", false
+}
+
+// reactionBarView paints the reaction drawer: one compact row of allowlisted
+// emoji plus the "+" affordance, sitting in the "/" drawer's slot above the
+// composer. The user's current pick wears the palette's selected chip; the
+// brackets reuse the drawer's hint tone. Always one line so the height
+// budget in paletteRows() (bar + spacer) holds exactly.
+func (c chatScreen) reactionBarView(maxW int) string {
+	if c.pendingReactionMsgId == "" {
+		return ""
+	}
+	mine := c.myReactions[c.pendingReactionMsgId]
+	parts := make([]string, 0, len(reactionEmojis)+1)
+	for _, e := range reactionEmojis {
+		st := lipgloss.NewStyle()
+		if e == mine {
+			st = tuiPaletteSelStyle // my current pick reads as the selected chip
+		}
+		parts = append(parts, st.Render(e))
+	}
+	parts = append(parts, tuiPaletteDescStyle.Render("+"))
+	bar := tuiPaletteHintStyle.Render("[") + strings.Join(parts, " ") + tuiPaletteHintStyle.Render("]")
+	if maxW > 0 && lipgloss.Width(bar) > maxW {
+		bar = lipgloss.NewStyle().MaxWidth(maxW).Render(bar)
+	}
+	return bar
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -713,4 +771,7 @@ func padVisible(s string, n int) string {
 // on every non-intercepted KeyMsg so "/" toggling stays instantaneous.
 func ensurePaletteOpen(c *chatScreen) {
 	c.palette.sync(c.input.Value())
+	if c.palette.visible() {
+		c.pendingReactionMsgId = "" // one drawer slot: commands replace the bar
+	}
 }

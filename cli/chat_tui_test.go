@@ -182,16 +182,18 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 	ti.Focus()
 	ti.CharLimit = 500
 	return &chatScreen{
-		me:          me,
-		targetUser:  target,
-		users:       users,
-		rendered:    map[int]bool{},
-		renderCache: map[int]string{},
-		tsCache:     map[int]time.Time{},
-		wrapCache:   map[string]string{},
-		unread:      map[string]int{},
-		lastDMAt:    map[string]time.Time{},
-		input:       ti,
+		me:             me,
+		targetUser:     target,
+		users:          users,
+		rendered:       map[int]bool{},
+		renderCache:    map[int]string{},
+		tsCache:        map[int]time.Time{},
+		wrapCache:      map[string]string{},
+		unread:         map[string]int{},
+		lastDMAt:       map[string]time.Time{},
+		input:          ti,
+		reactionCounts: map[string]map[string]int{},
+		myReactions:    map[string]string{},
 	}
 }
 

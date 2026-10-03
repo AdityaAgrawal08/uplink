@@ -644,8 +644,8 @@ func keyHintsView(outerW int, f focusPane) string {
 		wide = "↑↓ pick  ·  type filters  ·  enter opens  ·  esc clears  ·  tab next"
 		narrow = "↑↓  ·  type  ·  enter  ·  esc"
 	case focusTranscript:
-		wide = "↑↓ scroll  ·  pgup/pgdn page  ·  home/end jump  ·  tab next"
-		narrow = "↑↓  ·  pgup/pgdn  ·  tab"
+		wide = "↑↓ scroll  ·  pgup/pgdn page  ·  home/end jump  ·  r react  ·  tab next"
+		narrow = "↑↓  ·  pgup/pgdn  ·  r react  ·  tab"
 	default:
 		wide = "Ctrl+k commands  •  Ctrl+l clear  •  ↑↓ navigate  •  Enter send"
 		narrow = "Ctrl+k  •  Ctrl+l  •  ↑↓  •  Enter"
