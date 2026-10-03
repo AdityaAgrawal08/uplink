@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -333,15 +334,14 @@ func (p *paletteState) close() {
 // paletteRows is the exact terminal-row budget the drawer consumes right now:
 // one blank spacer above the panel, the visible command rows, the keymap
 // footer, and the panel's own border. In file-browser mode (/upload) the
-// picker's budget takes over. Width never affects it (rows truncate, they do
-// not wrap), so this number is deterministic BEFORE layout math runs — which
-// is what lets computeLayoutWithPalette reserve it up front.
+// picker's budget takes over. The reaction picker is NOT budgeted here: it
+// paints as a transcript row anchored above its message, so the drawer slot
+// stays free for commands. Width never affects the budget (rows truncate,
+// they do not wrap), so this number is deterministic BEFORE layout math runs —
+// which is what lets computeLayoutWithPalette reserve it up front.
 func (c chatScreen) paletteRows() int {
 	if c.picker.isActive() {
 		return c.pickerRows()
-	}
-	if c.pendingReactionMsgId != "" {
-		return 2 // one-row reaction bar + its lift spacer
 	}
 	if !c.palette.visible() {
 		return 0
@@ -390,18 +390,16 @@ func (c chatScreen) layoutFor() layout {
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot above the composer:
-// the file browser (picker), the reaction bar, or the "/" command list.
+// the file browser (picker) or the "/" command list. The reaction picker no
+// longer competes for this slot — it is anchored in the transcript.
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
-	if c.pendingReactionMsgId != "" {
-		return c.reactionBarView(maxW)
-	}
 	return c.paletteView(maxW)
 }
 
-// ---- reaction bar ------------------------------------------------------------
+// ---- reaction picker ---------------------------------------------------------
 
 // reactionBarItems is the painted choice order: the six allowlisted emoji
 // plus the trailing "+" affordance.
@@ -411,46 +409,231 @@ func reactionBarItems() []string {
 	return append(out, "+")
 }
 
-// reactionCellAt maps a cell offset inside the reaction bar to its choice
-// (ok=false when the offset lands on a bracket or padding). Paint and
-// hit-test share reactionBarItems and the one-space separator, so they can
+// reactionCellAt maps a cell offset inside the picker row to its choice
+// (ok=false on the brackets and on chip padding). Paint and hit-test share
+// reactionBarItems and reactionChip's horizontal-only padding, so they can
 // never drift apart.
 func reactionCellAt(offset int) (string, bool) {
 	pos := 1 // past the leading "["
 	for _, item := range reactionBarItems() {
 		w := lipgloss.Width(item)
-		if offset >= pos && offset < pos+w {
+		if offset >= pos+1 && offset < pos+1+w { // +1: the chip's left pad cell
 			return item, true
 		}
-		pos += w + 1 // separator space
+		pos += w + 2 // left pad + item + right pad
 	}
 	return "", false
 }
 
-// reactionBarView paints the reaction drawer: one compact row of allowlisted
-// emoji plus the "+" affordance, sitting in the "/" drawer's slot above the
-// composer. The user's current pick wears the palette's selected chip; the
-// brackets reuse the drawer's hint tone. Always one line so the height
-// budget in paletteRows() (bar + spacer) holds exactly.
-func (c chatScreen) reactionBarView(maxW int) string {
-	if c.pendingReactionMsgId == "" {
-		return ""
-	}
-	mine := c.myReactions[c.pendingReactionMsgId]
+// reactionPickerRow paints the anchored picker: the six allowlisted emoji plus
+// the "+" affordance on one compact row, floating directly above the message
+// it targets (not in the drawer slot). My current pick wears the palette's
+// selected chip; idle chips reuse the timestamp tone; the brackets reuse the
+// drawer's hint tone. Every chip shares the badge's horizontal-only padding
+// (reactionChip), so the two surfaces stay sizewise in lockstep. Always one
+// line — the row is inserted into the transcript as its own entry.
+func (c chatScreen) reactionPickerRow(m chatMessage) string {
+	mine := c.myReactions[m.MsgId]
 	parts := make([]string, 0, len(reactionEmojis)+1)
 	for _, e := range reactionEmojis {
-		st := lipgloss.NewStyle()
+		st := thMsgTimeStyle // idle choice: same faint tone as transcript times
 		if e == mine {
 			st = tuiPaletteSelStyle // my current pick reads as the selected chip
 		}
-		parts = append(parts, st.Render(e))
+		parts = append(parts, reactionChip(e, st))
 	}
-	parts = append(parts, tuiPaletteDescStyle.Render("+"))
-	bar := tuiPaletteHintStyle.Render("[") + strings.Join(parts, " ") + tuiPaletteHintStyle.Render("]")
-	if maxW > 0 && lipgloss.Width(bar) > maxW {
-		bar = lipgloss.NewStyle().MaxWidth(maxW).Render(bar)
+	parts = append(parts, reactionChip("+", tuiPaletteDescStyle))
+	return tuiPaletteHintStyle.Render("[") + strings.Join(parts, "") + tuiPaletteHintStyle.Render("]")
+}
+
+// reactionPickerView aligns the picker row to the side of the bubble it floats
+// above — right for own messages, left for peers — and pins it to the
+// transcript width so it can never wrap into a second (backgrounded) row.
+func (c chatScreen) reactionPickerView(m chatMessage) string {
+	row := c.reactionPickerRow(m)
+	w := c.transcriptW()
+	if lipgloss.Width(row) > w {
+		row = truncateByWidth(row, w) // absurdly narrow: one clipped row beats a wrap
 	}
-	return bar
+	if m.Username == c.me {
+		return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(row)
+	}
+	return row
+}
+
+// ---- reaction detail dropdown ------------------------------------------------
+
+// reactionDetailNames returns the reactor names for one message+emoji from the
+// server breakdown; empty when the breakdown is unknown (old server) or does
+// not cover this emoji, which sends the caller to the counts+mine fallback.
+func (c chatScreen) reactionDetailNames(msgId, emoji string) []string {
+	for _, d := range c.reactionDetails[msgId] {
+		if d.Emoji != emoji {
+			continue
+		}
+		var names []string
+		for _, n := range d.Usernames {
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+		return names
+	}
+	return nil
+}
+
+// reactionDetailAnimFrames is the number of painted stages in the dropdown's
+// open reveal: 0 is the bare border (frame 0), the last stage is fully
+// expanded. reactionDetailAnimStep spaces the tea.Tick frames ~150ms apart.
+const (
+	reactionDetailAnimFrames = 4
+	reactionDetailAnimStep   = 50 * time.Millisecond
+)
+
+// reactionDetailAnimMsg advances the open dropdown to painted stage frame.
+// gen fences out ticks from a superseded open (a dismiss, a reopen, a second
+// chip): only the generation currently anchored may repaint.
+type reactionDetailAnimMsg struct{ gen, frame int }
+
+// scheduleReactionDetailAnim arms the next reveal stage for generation gen.
+func scheduleReactionDetailAnim(gen, frame int) tea.Cmd {
+	return tea.Tick(reactionDetailAnimStep, func(time.Time) tea.Msg {
+		return reactionDetailAnimMsg{gen: gen, frame: frame}
+	})
+}
+
+// reactionDetailPlainRows builds the dropdown card's visible text rows for one
+// message+emoji, final form: a header "<emoji> <count>", then one "• name" per
+// reactor from the server breakdown (which caps names per emoji, so any
+// remainder the counts prove is spelled out as "+N more"). When the breakdown
+// is missing it falls back to counts+mine — my own pick is named, the rest of
+// the tally stays unprovable and is spelled out as the remainder. Empty when
+// the emoji has no reactors left.
+func (c chatScreen) reactionDetailPlainRows(m chatMessage, emoji string) []string {
+	count := c.reactionCounts[m.MsgId][emoji]
+	if count <= 0 {
+		return nil
+	}
+	rows := []string{fmt.Sprintf("%s %d", emoji, count)}
+	named := 0
+	if names := c.reactionDetailNames(m.MsgId, emoji); len(names) > 0 {
+		for _, name := range names {
+			rows = append(rows, "• "+name)
+		}
+		named = len(names)
+	} else if c.myReactions[m.MsgId] == emoji {
+		rows = append(rows, "• "+c.me)
+		named = 1
+	}
+	if extra := count - named; extra > 0 {
+		rows = append(rows, fmt.Sprintf("+%d more", extra))
+	}
+	return rows
+}
+
+// reactionDetailInterior paints the plain rows through the badge/palette
+// styles: the header wears the badge's unread chip tone, my own row takes the
+// palette's selected highlight (padded edge to edge), the cap row stays faint,
+// and a faint divider separates the header from the reactors. Returns the
+// styled rows (header first, divider second) plus the widest visible row so
+// the card border can size itself.
+func (c chatScreen) reactionDetailInterior(m chatMessage, emoji string) ([]string, int) {
+	plain := c.reactionDetailPlainRows(m, emoji)
+	if len(plain) == 0 {
+		return nil, 0
+	}
+	type cardRow struct {
+		text     string
+		rendered string
+		own      bool
+	}
+	rows := make([]cardRow, 0, len(plain))
+	for i, r := range plain {
+		switch {
+		case i == 0:
+			rows = append(rows, cardRow{text: r, rendered: reactionChip(r, tuiUnreadStyle)})
+		case c.me != "" && r == "• "+c.me:
+			rows = append(rows, cardRow{text: r, rendered: tuiPaletteSelStyle.Render(r), own: true})
+		case strings.HasPrefix(r, "+"):
+			rows = append(rows, cardRow{text: r, rendered: tuiPaletteHintStyle.Render(r)})
+		default:
+			rows = append(rows, cardRow{text: r, rendered: r})
+		}
+	}
+	width := 0
+	for _, r := range rows {
+		if w := lipgloss.Width(r.rendered); w > width {
+			width = w
+		}
+	}
+	divider := tuiPaletteHintStyle.Render(strings.Repeat("─", width))
+	out := make([]string, 0, len(rows)+1)
+	for i, r := range rows {
+		if i == 0 {
+			out = append(out, r.rendered, divider)
+			continue
+		}
+		if r.own {
+			out = append(out, tuiPaletteSelStyle.Render(padVisible(r.text, width)))
+			continue
+		}
+		out = append(out, r.rendered)
+	}
+	return out, width
+}
+
+// reactionDetailPaint renders the dropdown card at animation frame: the
+// rounded box anchored below its bubble, showing the first reveal(frame)
+// interior rows — frame 0 paints the bare borders (sized for the full card),
+// the last frame paints everything. The block is right-aligned for own
+// bubbles and flush left for peers, exactly like the picker floating above,
+// and clipped to the transcript width so it can never wrap.
+func (c chatScreen) reactionDetailPaint(m chatMessage, emoji string, frame int) []string {
+	interior, width := c.reactionDetailInterior(m, emoji)
+	if len(interior) == 0 {
+		return nil
+	}
+	if frame < 0 {
+		frame = 0
+	}
+	if frame > reactionDetailAnimFrames-1 {
+		frame = reactionDetailAnimFrames - 1
+	}
+	reveal := len(interior) * frame / (reactionDetailAnimFrames - 1)
+	shown := interior[:reveal]
+
+	avail := c.transcriptW()
+	inner := width
+	if maxInner := avail - 4; inner > maxInner { // 2 border + 2 padding cells
+		inner = maxInner
+	}
+	if inner < 1 {
+		inner = 1
+	}
+	for i, s := range shown {
+		shown[i] = truncateByWidth(s, inner)
+	}
+	box := tuiPaletteBoxStyle.Padding(0, 1).Width(inner + 2).
+		Render(strings.Join(shown, "\n"))
+
+	lines := strings.Split(box, "\n")
+	for i, ln := range lines {
+		if lipgloss.Width(ln) > avail {
+			ln = truncateByWidth(ln, avail)
+		}
+		if m.Username == c.me {
+			ln = lipgloss.NewStyle().Width(avail).Align(lipgloss.Right).Render(ln)
+		}
+		lines[i] = ln
+	}
+	return lines
+}
+
+// reactionDetailRows is the fully expanded dropdown for one message+emoji:
+// one string per painted line, aligned to the side of the bubble it hangs
+// under. Empty when there is nothing to show.
+func (c chatScreen) reactionDetailRows(m chatMessage, emoji string) []string {
+	return c.reactionDetailPaint(m, emoji, reactionDetailAnimFrames-1)
 }
 
 // paletteView renders the pop-out panel for the current composer text. maxW
@@ -772,6 +955,6 @@ func padVisible(s string, n int) string {
 func ensurePaletteOpen(c *chatScreen) {
 	c.palette.sync(c.input.Value())
 	if c.palette.visible() {
-		c.pendingReactionMsgId = "" // one drawer slot: commands replace the bar
+		c.closeReactionAux() // one drawer slot: commands replace the aux rows
 	}
 }

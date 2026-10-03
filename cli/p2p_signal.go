@@ -378,12 +378,89 @@ func (c *signalClient) inboxAck(ids []string) (int, error) {
 	return r.Removed, nil
 }
 
+// reactionDetail breaks one emoji's tally down per reactor: every username
+// that currently picked it. Servers predating the breakdown omit the field,
+// in which case the client falls back to counts+mine.
+type reactionDetail struct {
+	Emoji     string   `json:"emoji"`
+	Usernames []string `json:"usernames"`
+}
+
 // reactionSummary is one message's aggregated reactions: counts per allowlisted
 // emoji plus the requesting user's own picks (at most one by server rule).
+// Details is the optional per-reactor breakdown; nil means unknown.
 type reactionSummary struct {
-	MsgId  string         `json:"msgId"`
-	Counts map[string]int `json:"counts"`
-	Mine   []string       `json:"mine"`
+	MsgId   string           `json:"msgId"`
+	Counts  map[string]int   `json:"counts"`
+	Mine    []string         `json:"mine"`
+	Details []reactionDetail `json:"details"`
+}
+
+// UnmarshalJSON accepts the canonical `details` breakdown plus tolerant
+// aliases (`breakdown`, `reactors`; `users` for `usernames`) so a field-name
+// drift on the server side degrades to counts+mine instead of dropping the
+// reactor list. The count/mine payload is always parsed verbatim.
+func (s *reactionSummary) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MsgId     string          `json:"msgId"`
+		Counts    map[string]int  `json:"counts"`
+		Mine      []string        `json:"mine"`
+		Details   json.RawMessage `json:"details"`
+		Breakdown json.RawMessage `json:"breakdown"`
+		Reactors  json.RawMessage `json:"reactors"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	s.MsgId, s.Counts, s.Mine = raw.MsgId, raw.Counts, raw.Mine
+	for _, blob := range []json.RawMessage{raw.Details, raw.Breakdown, raw.Reactors} {
+		if len(blob) == 0 {
+			continue
+		}
+		if details := parseReactionDetails(blob); len(details) > 0 {
+			s.Details = details
+			break
+		}
+	}
+	return nil
+}
+
+// parseReactionDetails accepts both shapes the breakdown could plausibly take:
+// an array of {emoji, usernames} objects and a flat {emoji: [usernames]} map.
+// Malformed input yields nil (counts+mine stay usable).
+func parseReactionDetails(blob json.RawMessage) []reactionDetail {
+	var arr []struct {
+		Emoji     string   `json:"emoji"`
+		Usernames []string `json:"usernames"`
+		Users     []string `json:"users"`
+	}
+	if err := json.Unmarshal(blob, &arr); err == nil && len(arr) > 0 {
+		out := make([]reactionDetail, 0, len(arr))
+		for _, d := range arr {
+			names := d.Usernames
+			if len(names) == 0 {
+				names = d.Users
+			}
+			if d.Emoji == "" || len(names) == 0 {
+				continue
+			}
+			out = append(out, reactionDetail{Emoji: d.Emoji, Usernames: names})
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	var flat map[string][]string
+	if err := json.Unmarshal(blob, &flat); err == nil && len(flat) > 0 {
+		out := make([]reactionDetail, 0, len(flat))
+		for emoji, names := range flat {
+			if emoji != "" && len(names) > 0 {
+				out = append(out, reactionDetail{Emoji: emoji, Usernames: names})
+			}
+		}
+		return out
+	}
+	return nil
 }
 
 // react toggles one reaction on the server (authoritative): the same emoji

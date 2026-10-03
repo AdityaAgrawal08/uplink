@@ -44,6 +44,13 @@ func runChat(serverURL, key, me string, id *identityKey, password string) {
 	runChatTUI(serverURL, key, me, id, password)
 }
 
+// chatAnimationsEnabled reports whether the TUI may play transient motion
+// (the reactor dropdown's staged reveal). Plain/CI runs stay static: the card
+// paints fully expanded with no timers, so scripted output never flickers.
+func chatAnimationsEnabled() bool {
+	return os.Getenv("UPLINK_CHAT_PLAIN") != "1"
+}
+
 // runChatPlain is the headless twin of the bubbletea UI: identical protocol
 // logic, line-based rendering. Used by tests/CI and non-TTY environments.
 // There is no backlog (the server keeps no transcript) and no local history:

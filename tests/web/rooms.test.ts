@@ -331,13 +331,17 @@ describe("message reactions", () => {
     const on = await toggleReaction(sessionId, username, "m1", "👍");
     expect(on).toEqual({ msgId: "m1", emoji: "👍", reacted: true });
     let { reactions } = await fetchReactions(sessionId, username);
-    expect(reactions).toEqual([{ msgId: "m1", counts: { "👍": 1 }, mine: ["👍"] }]);
+    expect(reactions).toEqual([
+      { msgId: "m1", counts: { "👍": 1 }, mine: ["👍"], details: [{ emoji: "👍", usernames: [username] }] },
+    ]);
 
     // Different emoji replaces the caller's prior one — it never stacks.
     const swapped = await toggleReaction(sessionId, username, "m1", "❤️");
     expect(swapped.reacted).toBe(true);
     ({ reactions } = await fetchReactions(sessionId, username));
-    expect(reactions).toEqual([{ msgId: "m1", counts: { "❤️": 1 }, mine: ["❤️"] }]);
+    expect(reactions).toEqual([
+      { msgId: "m1", counts: { "❤️": 1 }, mine: ["❤️"], details: [{ emoji: "❤️", usernames: [username] }] },
+    ]);
 
     // Same emoji again toggles the caller's reaction off.
     const off = await toggleReaction(sessionId, username, "m1", "❤️");
@@ -359,11 +363,20 @@ describe("message reactions", () => {
 
     const fromAlice = await fetchReactions(sessionId, alice);
     expect(fromAlice.reactions).toEqual([
-      { msgId: "m1", counts: { "👍": 2, "🙏": 1 }, mine: ["👍"] },
+      {
+        msgId: "m1",
+        counts: { "👍": 2, "🙏": 1 },
+        mine: ["👍"],
+        details: [
+          { emoji: "👍", usernames: [bob, alice].sort() },
+          { emoji: "🙏", usernames: [carol] },
+        ],
+      },
     ]);
     const fromBob = await fetchReactions(sessionId, bob);
     expect(fromBob.reactions[0].counts).toEqual({ "👍": 2, "🙏": 1 });
     expect(fromBob.reactions[0].mine).toEqual(["👍"]);
+    expect(fromBob.reactions[0].details).toEqual(fromAlice.reactions[0].details);
     const fromCarol = await fetchReactions(sessionId, carol);
     expect(fromCarol.reactions[0].mine).toEqual(["🙏"]);
   });
@@ -371,7 +384,9 @@ describe("message reactions", () => {
   it("keys counts by msgId across broadcast and DM id spaces", async () => {
     const { sessionId, username: alice } = await makeRoom();
     const bob = `b_${Math.random().toString(36).slice(2, 10)}`;
+    const carol = `c_${Math.random().toString(36).slice(2, 10)}`;
     await joinRoom(sessionId, bob, PUBKEY);
+    await joinRoom(sessionId, carol, PUBKEY);
 
     // Same room, same id space: a broadcast id and a DM id never share counts.
     await toggleReaction(sessionId, alice, "broadcast-1", "👍");
@@ -380,8 +395,26 @@ describe("message reactions", () => {
 
     const { reactions } = await fetchReactions(sessionId, alice);
     expect(reactions).toEqual([
-      { msgId: "broadcast-1", counts: { "👍": 1, "😂": 1 }, mine: ["👍"] },
-      { msgId: "dm-alice-bob-1", counts: { "👍": 1 }, mine: [] },
+      {
+        msgId: "broadcast-1",
+        counts: { "👍": 1, "😂": 1 },
+        mine: ["👍"],
+        details: [
+          { emoji: "👍", usernames: [alice] },
+          { emoji: "😂", usernames: [bob] },
+        ],
+      },
+      { msgId: "dm-alice-bob-1", counts: { "👍": 1 }, mine: [], details: [{ emoji: "👍", usernames: [bob] }] },
+    ]);
+
+    // Documented limitation: details are room-scoped exactly like counts.
+    // Carol is not a participant in the alice-bob DM, but the server cannot
+    // know the msgId is DM-only (bodies are E2E ciphertext, IDs are
+    // sender-assigned), so she sees its reactors too. Fixing this needs a
+    // client-supplied conversation tag on the reaction itself.
+    const fromCarol = await fetchReactions(sessionId, carol);
+    expect(fromCarol.reactions.find((r) => r.msgId === "dm-alice-bob-1")?.details).toEqual([
+      { emoji: "👍", usernames: [bob] },
     ]);
   });
 
@@ -393,7 +426,10 @@ describe("message reactions", () => {
     await expect(toggleReaction(sessionId, username, "", "👍")).rejects.toMatchObject({ status: 400 });
     await expect(toggleReaction(sessionId, username, "x".repeat(129), "👍")).rejects.toMatchObject({ status: 400 });
     await expect(toggleReaction(sessionId, "stranger", "m1", "👍")).rejects.toMatchObject({ status: 403 });
+    // Member-only gate covers the reactor breakdown too: a non-member can
+    // never read who reacted (with or without a msgIds filter).
     await expect(fetchReactions(sessionId, "stranger")).rejects.toMatchObject({ status: 403 });
+    await expect(fetchReactions(sessionId, "stranger", ["m1"])).rejects.toMatchObject({ status: 403 });
     await expect(fetchReactions("999999", username)).rejects.toMatchObject({ status: 404 });
     await expect(fetchReactions(sessionId, username, [])).rejects.toMatchObject({ status: 400 });
     await expect(fetchReactions(sessionId, username, ["x".repeat(129)])).rejects.toMatchObject({ status: 400 });
@@ -406,9 +442,11 @@ describe("message reactions", () => {
     }
     const capped = await fetchReactions(sessionId, username);
     expect(capped.reactions).toHaveLength(50);
+    expect(capped.reactions[0].details).toEqual([{ emoji: "👍", usernames: [username] }]);
 
     const filtered = await fetchReactions(sessionId, username, ["c-59", "c-0"]);
     expect(filtered.reactions.map((r) => r.msgId).sort()).toEqual(["c-0", "c-59"]);
+    expect(filtered.reactions[0].details).toEqual([{ emoji: "👍", usernames: [username] }]);
 
     // Corrupt fields (bad shape / bad emoji / bad username) are ignored and reaped.
     const key = `room:${sessionId}:reactions`;
@@ -417,9 +455,39 @@ describe("message reactions", () => {
     await redis.hset(key, "m|👍|no spaces allowed", "1");
     const after = await fetchReactions(sessionId, username, ["c-0"]);
     expect(after.reactions).toHaveLength(1);
+    expect(after.reactions[0].details).toEqual([{ emoji: "👍", usernames: [username] }]);
     expect(await redis.hget(key, "garbage|||")).toBeNull();
     expect(await redis.hget(key, "m|🔥|alice")).toBeNull();
     expect(await redis.hget(key, "m|👍|no spaces allowed")).toBeNull();
+  });
+
+  it("details sorts usernames ascending and caps at 20 per emoji without touching counts", async () => {
+    const { sessionId, username: creator } = await makeRoom();
+    const reactors = [creator];
+    for (let i = 0; i < 21; i++) {
+      const name = `r${String(i).padStart(2, "0")}`;
+      await joinRoom(sessionId, name, PUBKEY);
+      reactors.push(name);
+    }
+    // React in reverse join order: the response must still come back sorted
+    // (stable UI order regardless of Redis hash iteration order).
+    for (const name of [...reactors].reverse()) {
+      await toggleReaction(sessionId, name, "m1", "👍");
+    }
+
+    const { reactions } = await fetchReactions(sessionId, creator);
+    expect(reactions).toHaveLength(1);
+    const [summary] = reactions;
+    // 22 reactors, but counts stay the full total while details trims to 20.
+    expect(summary.counts).toEqual({ "👍": 22 });
+    expect(summary.details).toHaveLength(1);
+    const [detail] = summary.details;
+    expect(detail.emoji).toBe("👍");
+    expect(detail.usernames).toHaveLength(20);
+    const sorted = [...reactors].sort();
+    expect(detail.usernames).toEqual(sorted.slice(0, 20));
+    expect(detail.usernames).toEqual([...detail.usernames].sort()); // stable/ascending
+    expect(detail.usernames[0]).toBe("r00");
   });
 
   it("departures clear the member's reactions", async () => {
@@ -428,16 +496,22 @@ describe("message reactions", () => {
     await joinRoom(sessionId, bob, PUBKEY);
     await toggleReaction(sessionId, alice, "m1", "👍");
     await toggleReaction(sessionId, bob, "m1", "👍");
-    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 2 });
+    let summary = (await fetchReactions(sessionId, alice)).reactions[0];
+    expect(summary.counts).toEqual({ "👍": 2 });
+    expect(summary.details).toEqual([{ emoji: "👍", usernames: [alice, bob].sort() }]);
 
     await leaveRoom(sessionId, bob);
-    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 1 });
+    summary = (await fetchReactions(sessionId, alice)).reactions[0];
+    expect(summary.counts).toEqual({ "👍": 1 });
+    expect(summary.details).toEqual([{ emoji: "👍", usernames: [alice] }]);
 
     // Kick cleans up too.
     await joinRoom(sessionId, bob, PUBKEY);
     await toggleReaction(sessionId, bob, "m1", "😂");
     await kickMember(sessionId, alice, bob);
-    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 1 });
+    summary = (await fetchReactions(sessionId, alice)).reactions[0];
+    expect(summary.counts).toEqual({ "👍": 1 });
+    expect(summary.details).toEqual([{ emoji: "👍", usernames: [alice] }]);
   });
 
   it("reaction sends trip the send budget with 429", async () => {

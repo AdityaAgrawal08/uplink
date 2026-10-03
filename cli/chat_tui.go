@@ -487,10 +487,41 @@ type chatScreen struct {
 	// unique, so general and DM spaces can never collide — and are replaced
 	// wholesale from GET /reactions every 2s; local toggles are optimistic
 	// until the next fetch. pendingReactionMsgId is the message whose
-	// reaction drawer bar is open ("" = closed).
+	// anchored picker row is open directly above it ("" = closed).
 	reactionCounts       map[string]map[string]int
 	myReactions          map[string]string
 	pendingReactionMsgId string
+	// reactionDetails is the optional per-reactor breakdown from the same
+	// fetch (server field may be absent: fall back to counts+mine). detailMsgId
+	// plus detailEmoji identify the open reactor dropdown card — an extra
+	// block directly BELOW its message. Only one aux row is ever open: the
+	// picker and the dropdown are mutually exclusive.
+	reactionDetails map[string][]reactionDetail
+	detailMsgId     string
+	detailEmoji     string
+	// detailAnim is the painted stage of the open dropdown's reveal (0 = bare
+	// borders .. reactionDetailAnimFrames-1 = fully expanded); detailAnimGen
+	// fences out reveal ticks from a superseded open (dismiss, reopen, a
+	// second chip). Both are ephemeral paint state, never server truth.
+	detailAnim    int
+	detailAnimGen int
+	// animations enables transient motion (the dropdown's staged reveal).
+	// Plain/CI runs construct with it off (UPLINK_CHAT_PLAIN=1): the card
+	// paints fully expanded, identical to the last frame, with no timers.
+	animations bool
+	// The anchored reaction picker is an extra transcript row directly above
+	// its target message, so both indexes live with the paint: reactionLineIdx
+	// is its entry in lines (rebuildView), reactionRow its first viewport
+	// content row (refreshViewport). Together they keep the hit-test glued to
+	// the picker after any rebuild or scroll. -1 = not painted. The detail bar
+	// gets the same treatment (detailLineIdx/detailRow/detailRowH) since it is
+	// a multi-row control block, never a message hit.
+	reactionLineIdx int
+	reactionRow     int
+	detailLineIdx   int
+	detailN         int // lines[] entries the open detail bar occupies
+	detailRow       int // first viewport content row (-1 = not painted)
+	detailRowH      int // content rows the detail block spans
 	// lineMsg is parallel to lines: the MsgId each transcript entry belongs
 	// to ("" for cards/system/pinned rows). refreshViewport expands it into
 	// rowMsg (viewport content row -> MsgId) so a click maps to a message.
@@ -740,24 +771,31 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 	eng.joinPassword = password // enables engine self-rejoin after prune
 	callMgr.SetRoster(func() map[string][]byte { return rosterMap(eng.peers()) })
 	return chatScreen{
-		sig:            sig,
-		eng:            eng,
-		call:           callMgr,
-		key:            key,
-		me:             me,
-		vp:             vp,
-		input:          ti,
-		netCh:          netCh,
-		leftSent:       &atomic.Bool{},
-		rendered:       map[int]bool{},
-		renderCache:    map[int]string{},
-		tsCache:        map[int]time.Time{},
-		wrapCache:      map[string]string{},
-		unread:         map[string]int{},
-		lastDMAt:       map[string]time.Time{},
-		outbox:         nil,
-		reactionCounts: map[string]map[string]int{},
-		myReactions:    map[string]string{},
+		sig:             sig,
+		eng:             eng,
+		call:            callMgr,
+		key:             key,
+		me:              me,
+		vp:              vp,
+		input:           ti,
+		netCh:           netCh,
+		leftSent:        &atomic.Bool{},
+		rendered:        map[int]bool{},
+		renderCache:     map[int]string{},
+		tsCache:         map[int]time.Time{},
+		wrapCache:       map[string]string{},
+		unread:          map[string]int{},
+		lastDMAt:        map[string]time.Time{},
+		outbox:          nil,
+		reactionCounts:  map[string]map[string]int{},
+		myReactions:     map[string]string{},
+		reactionDetails: map[string][]reactionDetail{},
+		animations:      chatAnimationsEnabled(),
+		// No aux row painted yet; -1 keeps stale indexes from ever matching.
+		reactionLineIdx: -1,
+		reactionRow:     -1,
+		detailLineIdx:   -1,
+		detailRow:       -1,
 	}
 }
 
@@ -938,32 +976,115 @@ func (c *chatScreen) renderBody(m chatMessage) string {
 	return body
 }
 
+// reactionChip renders one reaction pill through the shared chip geometry:
+// one cell of horizontal padding — the same sizing the badge has always used —
+// and ZERO vertical padding, so a backgrounded chip is always exactly one row
+// tall (no double-height background when rows are aligned or clipped). The
+// transcript badge and the anchored picker both build every chip through this
+// helper, keeping their sizes in lockstep.
+func reactionChip(content string, st lipgloss.Style) string {
+	return st.Padding(0, 1).Render(content)
+}
+
+// reactionBadgeChip is one painted badge pill plus its span inside the joined
+// badge line: start is the chip's left-pad cell, inner the content cells a
+// click may land on. Paint and hit-test both derive from reactionBadgeCore,
+// so the chips and their click targets can never drift.
+type reactionBadgeChip struct {
+	emoji string
+	start int
+	inner int
+}
+
+// reactionBadgeCore builds the badge's joined chip text (`👍2❤️1`, allowlist
+// order) plus each chip's hit span, clipped to the transcript width so the
+// row can never wrap into a second (backgrounded) row.
+func (c chatScreen) reactionBadgeCore(m chatMessage) (string, []reactionBadgeChip) {
+	if m.MsgId == "" {
+		return "", nil
+	}
+	counts := c.reactionCounts[m.MsgId]
+	if len(counts) == 0 {
+		return "", nil
+	}
+	var chips []string
+	var hits []reactionBadgeChip
+	pos := 0
+	for _, e := range reactionEmojis {
+		n := counts[e]
+		if n <= 0 {
+			continue
+		}
+		content := fmt.Sprintf("%s%d", e, n)
+		chip := reactionChip(content, tuiUnreadStyle)
+		chips = append(chips, chip)
+		hits = append(hits, reactionBadgeChip{emoji: e, start: pos, inner: lipgloss.Width(content)})
+		pos += lipgloss.Width(chip)
+	}
+	if len(chips) == 0 {
+		return "", nil
+	}
+	line := strings.Join(chips, "")
+	if w := c.transcriptW(); lipgloss.Width(line) > w {
+		line = truncateByWidth(line, w)
+	}
+	return line, hits
+}
+
 // reactionBadge renders the chips under a bubble (`👍2 ❤️1`), in allowlist
 // order, aligned to the same side as the bubble. Counts live in the map, so
 // evictRenderCache must run whenever they move.
 func (c *chatScreen) reactionBadge(m chatMessage) string {
-	if m.MsgId == "" {
+	line, _ := c.reactionBadgeCore(m)
+	if line == "" {
 		return ""
 	}
-	counts := c.reactionCounts[m.MsgId]
-	if len(counts) == 0 {
-		return ""
+	if m.Username == c.me {
+		return lipgloss.NewStyle().Width(c.transcriptW()).Align(lipgloss.Right).Render(line)
 	}
-	var chips []string
-	for _, e := range reactionEmojis {
-		if n := counts[e]; n > 0 {
-			chips = append(chips, tuiUnreadStyle.Render(fmt.Sprintf(" %s%d ", e, n)))
+	return line
+}
+
+// reactionBadgeEmojiAt maps a transcript click onto the badge chip painted at
+// that point (`👍2` -> 👍). The badge is the entry's LAST painted row (it fits
+// exactly one row by construction), so a click on a bubble row misses and
+// keeps its old meaning (open the picker).
+func (c chatScreen) reactionBadgeEmojiAt(msgId string, x, y int, l layout) (string, bool) {
+	top := transcriptTopRow(l)
+	if msgId == "" || l.vpHeight <= 0 || y < top || y >= top+l.vpHeight {
+		return "", false
+	}
+	row := y - top + c.vp.YOffset
+	if row < 0 || row >= len(c.rowMsg) || c.rowMsg[row] != msgId {
+		return "", false
+	}
+	if c.pendingReactionMsgId != "" && row == c.reactionRow {
+		return "", false // picker row is a control, never a message hit
+	}
+	if row+1 < len(c.rowMsg) && c.rowMsg[row+1] == msgId {
+		return "", false // inside the entry (header/bubble), not its badge row
+	}
+	m, ok := c.msgById(msgId)
+	if !ok {
+		return "", false
+	}
+	line, hits := c.reactionBadgeCore(m)
+	if line == "" {
+		return "", false
+	}
+	off := x - transcriptX0(l)
+	if m.Username == c.me {
+		off -= maxInt(c.transcriptW()-lipgloss.Width(line), 0)
+	}
+	if off < 0 {
+		return "", false
+	}
+	for _, h := range hits {
+		if off >= h.start+1 && off < h.start+1+h.inner { // +1: skip the left pad
+			return h.emoji, true
 		}
 	}
-	if len(chips) == 0 {
-		return ""
-	}
-	line := strings.Join(chips, " ")
-	w := c.transcriptW()
-	if m.Username == c.me {
-		return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(line)
-	}
-	return truncateByWidth(line, w)
+	return "", false
 }
 
 // renderEntry composes one transcript entry: the group header (when the
@@ -1025,6 +1146,16 @@ func (c *chatScreen) addMessage(m chatMessage) {
 			delete(c.tsCache, dropped.Seq)
 			delete(c.reactionCounts, dropped.MsgId)
 			delete(c.myReactions, dropped.MsgId)
+			delete(c.reactionDetails, dropped.MsgId)
+			if c.pendingReactionMsgId == dropped.MsgId {
+				// Its anchor row fell out of history: no picker row exists
+				// to paint and no target remains.
+				c.pendingReactionMsgId = ""
+			}
+			if c.detailMsgId == dropped.MsgId {
+				// Same for the reactor detail bar hanging under it.
+				c.detailMsgId, c.detailEmoji = "", ""
+			}
 		}
 		c.history = append([]chatMessage(nil), c.history[len(c.history)-maxHistory:]...)
 	}
@@ -1226,8 +1357,38 @@ func reactionCountsEqual(a, b map[string]int) bool {
 	return true
 }
 
+// reactionDetailsEqual compares two breakdowns as sets: ordering of emojis or
+// reactors never forces a repaint. A missing breakdown (nil) equals an empty
+// one so an old server's poll is a no-op.
+func reactionDetailsEqual(a, b []reactionDetail) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	key := func(details []reactionDetail) map[string]string {
+		out := make(map[string]string, len(details))
+		for _, d := range details {
+			names := append([]string(nil), d.Usernames...)
+			sort.Strings(names)
+			out[d.Emoji] = strings.Join(names, "\x00")
+		}
+		return out
+	}
+	ka, kb := key(a), key(b)
+	if len(ka) != len(kb) {
+		return false
+	}
+	for emoji, names := range ka {
+		if kb[emoji] != names {
+			return false
+		}
+	}
+	return true
+}
+
 // applyFetchedReactions replaces the requested scope with the server's
-// aggregate (the truth): ids absent from the response clear to zero.
+// aggregate (the truth): ids absent from the response clear to zero. The
+// optional per-reactor breakdown is stored alongside; a summary without it
+// clears any stale breakdown and leaves the detail bar on its fallback.
 // Returns true when anything changed, so unchanged polls never repaint.
 func (c *chatScreen) applyFetchedReactions(ids []string, summaries []reactionSummary) bool {
 	byID := make(map[string]reactionSummary, len(summaries))
@@ -1245,7 +1406,12 @@ func (c *chatScreen) applyFetchedReactions(ids []string, summaries []reactionSum
 		if len(s.Mine) > 0 {
 			newMine = s.Mine[0] // server keeps one reaction per user
 		}
-		if c.myReactions[id] == newMine && reactionCountsEqual(c.reactionCounts[id], newCounts) {
+		var newDetails []reactionDetail
+		if len(s.Details) > 0 {
+			newDetails = s.Details
+		}
+		if c.myReactions[id] == newMine && reactionCountsEqual(c.reactionCounts[id], newCounts) &&
+			reactionDetailsEqual(c.reactionDetails[id], newDetails) {
 			continue
 		}
 		if newCounts == nil {
@@ -1264,6 +1430,14 @@ func (c *chatScreen) applyFetchedReactions(ids []string, summaries []reactionSum
 			}
 			c.myReactions[id] = newMine
 		}
+		if newDetails == nil {
+			delete(c.reactionDetails, id) // old server / no breakdown: fallback
+		} else {
+			if c.reactionDetails == nil {
+				c.reactionDetails = map[string][]reactionDetail{}
+			}
+			c.reactionDetails[id] = newDetails
+		}
 		changed = append(changed, id)
 	}
 	for _, id := range changed {
@@ -1272,8 +1446,80 @@ func (c *chatScreen) applyFetchedReactions(ids []string, summaries []reactionSum
 	return len(changed) > 0
 }
 
+// closeReactionAux dismisses whichever anchored reaction row is open — the
+// picker above its message and the reactor dropdown below it are mutually
+// exclusive, so one call maintains the single-aux-row discipline. Both are
+// part of the transcript content, so clearing the ids must re-derive the
+// paint buffer or rows would linger on screen.
+func (c *chatScreen) closeReactionAux() {
+	if c.pendingReactionMsgId == "" && c.detailMsgId == "" {
+		return
+	}
+	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = "", ""
+	c.detailAnim = 0
+	c.rebuildView()
+}
+
+// closeReactionDetail dismisses only the reactor dropdown (opening the
+// picker uses this before anchoring above the same message).
+func (c *chatScreen) closeReactionDetail() {
+	if c.detailMsgId == "" && c.detailEmoji == "" {
+		return
+	}
+	c.detailMsgId, c.detailEmoji = "", ""
+	c.detailAnim = 0
+	c.rebuildView()
+}
+
+// openReactionDetail opens the reactor dropdown below msgId for one emoji and
+// returns the open reveal's first tick (nil when motion is off or there is
+// nothing to show). Opening it dismisses the picker (single aux row); an
+// emoji with no remaining reactors stays closed.
+func (c *chatScreen) openReactionDetail(msgId, emoji string) tea.Cmd {
+	m, ok := c.msgById(msgId)
+	if !ok || emoji == "" || len(c.reactionDetailRows(m, emoji)) == 0 {
+		c.closeReactionDetail()
+		return nil
+	}
+	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = msgId, emoji
+	c.detailAnimGen++ // supersede every reveal still in flight
+	c.detailAnim = 0
+	if !c.animations {
+		c.detailAnim = reactionDetailAnimFrames - 1 // plain run: no timers, final paint
+		c.rebuildView()
+		return nil
+	}
+	c.rebuildView()
+	return scheduleReactionDetailAnim(c.detailAnimGen, 1)
+}
+
+// toggleReactionDetail opens the dropdown under a message, or closes it when
+// the same chip is reselected. Returning the reveal command lets the mouse
+// path start the animation without knowing the frame machinery.
+func (c *chatScreen) toggleReactionDetail(msgId, emoji string) tea.Cmd {
+	if c.detailMsgId == msgId && c.detailEmoji == emoji {
+		c.closeReactionDetail()
+		return nil
+	}
+	return c.openReactionDetail(msgId, emoji)
+}
+
+// dismissAuxOnScroll closes the picker and/or detail bar whenever the
+// transcript actually moved (wheel, drag, keyboard pages): both are anchored
+// to their message, so a change of viewport offset would leave them trailing.
+func (c *chatScreen) dismissAuxOnScroll(beforeOffset int) {
+	if c.vp.YOffset == beforeOffset {
+		return
+	}
+	c.closeReactionAux()
+}
+
 // toggleReaction applies the optimistic toggle, evicts the stale bubble and
 // returns the command that persists it (server POST + best-effort peer nudge).
+// One pick closes the anchored picker, WhatsApp-style; it never opens the
+// reactor detail — inspection is an explicit badge-chip click.
 func (c *chatScreen) toggleReaction(msgId, emoji string) tea.Cmd {
 	if msgId == "" || !reactionEmojiAllowed(emoji) {
 		return nil
@@ -1281,6 +1527,8 @@ func (c *chatScreen) toggleReaction(msgId, emoji string) tea.Cmd {
 	prev := c.myReactions[msgId]
 	c.applyLocalReaction(msgId, emoji)
 	c.evictRenderCache(msgId)
+	c.pendingReactionMsgId = "" // one pick: the anchored picker closes
+	c.detailMsgId, c.detailEmoji = "", ""
 	c.rebuildView()
 	return c.doReact(msgId, emoji, prev, c.toForMsgId(msgId))
 }
@@ -1409,6 +1657,9 @@ func (c *chatScreen) messageTime(m chatMessage) time.Time {
 func (c *chatScreen) rebuildView() {
 	c.lines = c.lines[:0]
 	c.lineMsg = c.lineMsg[:0]
+	c.reactionLineIdx = -1 // no anchored picker until one is seen below
+	c.detailLineIdx = -1   // no reactor detail bar until one is seen below
+	c.detailN = 0
 	c.cacheForWidth(c.vp.Width)
 
 	// Partition local lines: file cards (to interleave) vs transient lines (pinned at bottom).
@@ -1511,7 +1762,28 @@ func (c *chatScreen) rebuildView() {
 		} else if hasHist {
 			m := visibleHistory[hi]
 			withHeader := startGroup(m.Username, m.Kind, c.messageTime(m))
-			push(c.renderedEntry(m, withHeader), reactableMsgId(m))
+			entry := c.renderedEntry(m, withHeader)
+			// The reaction picker is an extra transcript row directly ABOVE
+			// its message's entry (WhatsApp-style anchor), never a drawer row:
+			// it scrolls with the message it targets. refreshViewport turns
+			// reactionLineIdx into the viewport-relative reactionRow the
+			// hit-test reads.
+			if entry != "" && m.MsgId != "" && m.MsgId == c.pendingReactionMsgId {
+				c.reactionLineIdx = len(c.lines)
+				push(c.reactionPickerView(m), "")
+			}
+			push(entry, reactableMsgId(m))
+			// The reactor dropdown hangs directly BELOW its message: a
+			// rounded card (header + divider + reactor rows) whose reveal
+			// frame is c.detailAnim, painted as control lines that never
+			// map to a message hit.
+			if entry != "" && m.MsgId != "" && m.MsgId == c.detailMsgId && c.detailEmoji != "" {
+				c.detailLineIdx = len(c.lines)
+				for _, row := range c.reactionDetailPaint(m, c.detailEmoji, c.detailAnim) {
+					push(row, "")
+				}
+				c.detailN = len(c.lines) - c.detailLineIdx
+			}
 			hi++
 		} else {
 			break
@@ -1547,6 +1819,9 @@ func (c *chatScreen) refreshViewport() {
 		// painted straight into the viewport (never into c.lines) so the
 		// transcript's row model stays message-for-message.
 		c.rowMsg = c.rowMsg[:0]
+		c.reactionRow = -1
+		c.detailRow = -1
+		c.detailRowH = 0
 		c.vp.SetContent(c.emptyStateView(w))
 		if atBottom {
 			c.vp.GotoBottom()
@@ -1574,17 +1849,33 @@ func (c *chatScreen) refreshViewport() {
 	}
 	// Row index: viewport content row -> owning MsgId. Every line is
 	// pre-wrapped to `w`, so a wrapped block occupies exactly its newline
-	// count + 1 screen rows (the viewport never re-wraps).
+	// count + 1 screen rows (the viewport never re-wraps). The anchored
+	// picker line is indexed in the same pass: reactionRow is the content row
+	// its single line paints on, so the hit-test follows any scroll.
 	c.rowMsg = c.rowMsg[:0]
+	c.reactionRow = -1
+	c.detailRow = -1
+	c.detailRowH = 0
+	row := 0
 	for i, wl := range wrapped {
+		if i == c.reactionLineIdx {
+			c.reactionRow = row
+		}
+		if i == c.detailLineIdx {
+			c.detailRow = row
+		}
 		id := ""
 		if i < len(c.lineMsg) {
 			id = c.lineMsg[i]
 		}
 		n := strings.Count(wl, "\n") + 1
+		if c.detailLineIdx >= 0 && i >= c.detailLineIdx && i < c.detailLineIdx+c.detailN {
+			c.detailRowH += n
+		}
 		for j := 0; j < n; j++ {
 			c.rowMsg = append(c.rowMsg, id)
 		}
+		row += n
 	}
 	c.vp.SetContent(strings.Join(wrapped, "\n"))
 	if atBottom {
@@ -2256,9 +2547,11 @@ func (c *chatScreen) peerInCall(peer string) bool {
 // deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
-	c.palette.close()           // stale "/" query must not survive a mode switch
-	c.pendingReactionMsgId = "" // the reacted row is not in the new thread
-	delete(c.unread, user)      // opening the thread clears its badge
+	c.palette.close() // stale "/" query must not survive a mode switch
+	// The anchored aux rows do not belong to the new thread.
+	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = "", ""
+	delete(c.unread, user) // opening the thread clears its badge
 	c.rebuildView()
 	return nil
 }
@@ -2271,6 +2564,7 @@ func (c *chatScreen) exitPrivate() {
 	c.targetUser = ""
 	c.palette.close()
 	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = "", ""
 	c.roomUnread = 0 // back in the room: everything is visible again
 	c.rebuildView()
 }
@@ -2635,6 +2929,21 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case reactionDetailAnimMsg:
+		// One reveal tick: advance the open dropdown a frame and re-arm.
+		// Ticks from a superseded generation (dismissed, reopened, another
+		// chip) are ignored, so a stale timer can never resurrect the card.
+		if msg.gen != c.detailAnimGen || c.detailMsgId == "" {
+			break
+		}
+		if next := min(msg.frame, reactionDetailAnimFrames-1); next > c.detailAnim {
+			c.detailAnim = next
+			c.rebuildView()
+			if c.detailAnim < reactionDetailAnimFrames-1 {
+				cmds = append(cmds, scheduleReactionDetailAnim(msg.gen, c.detailAnim+1))
+			}
+		}
+
 	case mediaInfoMsg:
 		// Media chatter never reaches the transcript: the latest event
 		// parks on the status line, conversation stays clean.
@@ -2748,8 +3057,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.SetValue("/")
 			c.palette.sync("/")
 			c.input.Focus()
-			c.focus = focusComposer     // the drawer rides on the composer
-			c.pendingReactionMsgId = "" // one drawer slot: commands replace the bar
+			c.focus = focusComposer // the drawer rides on the composer
+			c.closeReactionAux()    // one drawer slot: commands replace the aux rows
 			break
 		}
 		// Ctrl+L clears the composer line and repaints the screen.
@@ -2759,10 +3068,11 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return c, tea.ClearScreen
 		}
 		if msg.Type == tea.KeyEsc {
-			// Esc dismisses transient state — the reaction bar first, then
-			// the rail's filter, then the private view. NEVER quits the app.
-			if c.pendingReactionMsgId != "" {
-				c.pendingReactionMsgId = ""
+			// Esc dismisses transient state — the anchored reaction picker
+			// or the reactor detail bar first, then the rail's filter, then
+			// the private view. NEVER quits the app.
+			if c.pendingReactionMsgId != "" || c.detailMsgId != "" {
+				c.closeReactionAux()
 				break
 			}
 			if c.sideFilter != "" {
@@ -2788,11 +3098,13 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Home / End jump the transcript to the top or bottom (the viewport
 		// does not bind them in bubbles v1).
 		if msg.Type == tea.KeyHome || msg.Type == tea.KeyEnd {
+			before := c.vp.YOffset
 			if msg.Type == tea.KeyHome {
 				c.vp.GotoTop()
 			} else {
 				c.vp.GotoBottom()
 			}
+			c.dismissAuxOnScroll(before)
 			break
 		}
 		// With the conversation rail focused, arrows move its cursor
@@ -2811,18 +3123,25 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.editSideFilter(msg)
 			break
 		}
-		// Keyboard reaction fallback (transcript focus): `r` opens the bar
-		// on the newest message, then 1-6 toggle an emoji on the target.
-		// Consumed before any text handling so the composer never sees them.
+		// Keyboard reaction fallback (transcript focus): `r` opens the picker
+		// anchored above the newest message, then 1-6 toggle an emoji on the
+		// target and close it (one pick). Consumed before any text handling so
+		// the composer never sees them.
 		if c.focus == focusTranscript && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
 			r := msg.Runes[0]
 			consumed := false
 			if r == 'r' || r == 'R' {
 				consumed = true
+				next := ""
 				if c.pendingReactionMsgId == "" {
-					c.pendingReactionMsgId = c.newestReactableMsgId()
-				} else {
-					c.pendingReactionMsgId = ""
+					next = c.newestReactableMsgId()
+				}
+				if next != c.pendingReactionMsgId {
+					c.pendingReactionMsgId = next
+					c.detailMsgId, c.detailEmoji = "", "" // one aux row at a time
+					c.rebuildView()                       // open/close repaints the anchored row
+				} else if next == "" && c.detailMsgId != "" {
+					c.closeReactionDetail() // nothing to pick still dismisses the detail
 				}
 			} else if r >= '1' && r <= '6' && c.pendingReactionMsgId != "" {
 				consumed = true
@@ -2834,10 +3153,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		// Typing dismisses the transient reaction bar (the drawer slot is
-		// modal: text and reactions never compete for the same keys).
-		if textEditKey(msg) && c.pendingReactionMsgId != "" {
+		// Typing dismisses the anchored reaction aux rows (transient state:
+		// text and reactions never compete for the same keys).
+		if textEditKey(msg) && (c.pendingReactionMsgId != "" || c.detailMsgId != "") {
 			c.pendingReactionMsgId = ""
+			c.detailMsgId, c.detailEmoji = "", ""
+			c.rebuildView()
 		}
 		// Any other key that edits the composer also focuses it, so the
 		// indicator always sits where the text is about to appear.
@@ -2885,8 +3206,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if forward {
+		before := c.vp.YOffset
 		var vpc tea.Cmd
 		c.vp, vpc = c.vp.Update(msg)
+		c.dismissAuxOnScroll(before)
 		cmds = append(cmds, vpc)
 	}
 
@@ -3005,7 +3328,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 // not on screen (the rail collapses on narrow terminals) is skipped, so
 // focus can never point at something with no indicator to paint.
 func (c *chatScreen) cycleFocus(reverse bool) {
-	c.pendingReactionMsgId = "" // focus moves: the transient bar dismisses
+	c.closeReactionAux() // focus moves: the reaction aux rows dismiss
 	for i := 0; i < 3; i++ {
 		if reverse {
 			c.focus = c.focus.prev()
@@ -3216,7 +3539,7 @@ func (c chatScreen) atSearchBox(y int, l layout) bool {
 
 // transcriptTopRow is the terminal row of the transcript's first painted
 // line (frame + banner + chat header). Shared by focus hit-testing and the
-// reaction drawer geometry so they can never disagree.
+// anchored reaction picker geometry so they can never disagree.
 func transcriptTopRow(l layout) int {
 	frameOff, headOff := 0, 0
 	if l.frameOn {
@@ -3228,15 +3551,89 @@ func transcriptTopRow(l layout) int {
 	return frameOff + headOff + l.headRows
 }
 
-// reactionBarRow is the terminal row the reaction drawer bar paints on:
-// right below the transcript, after the drawer's one-row lift spacer.
-func reactionBarRow(l layout) int {
-	return transcriptTopRow(l) + maxInt(l.vpHeight, 0) + 1
+// reactionPickerY maps the anchored reaction picker onto the terminal: the
+// picker is a transcript row, so its screen row is the transcript top plus its
+// content row minus the scroll offset. Returns -1 when the picker is closed,
+// not painted, or scrolled out of view.
+func (c chatScreen) reactionPickerY(l layout) int {
+	if c.pendingReactionMsgId == "" || c.reactionRow < 0 || l.vpHeight <= 0 {
+		return -1
+	}
+	top := transcriptTopRow(l)
+	y := top + c.reactionRow - c.vp.YOffset
+	if y < top || y >= top+l.vpHeight {
+		return -1
+	}
+	return y
+}
+
+// reactionPickerX0 is the content-column offset where the picker's bracketed
+// row begins: right-aligned for own messages, flush left for peers, exactly
+// mirroring the bubble it floats above. Hit-testing adds it to the content
+// origin before mapping a cell through reactionCellAt.
+func (c chatScreen) reactionPickerX0() int {
+	m, ok := c.reactionTarget()
+	if !ok || m.Username != c.me {
+		return 0
+	}
+	if pad := c.transcriptW() - lipgloss.Width(c.reactionPickerRow(m)); pad > 0 {
+		return pad
+	}
+	return 0
+}
+
+// msgById resolves one history message by MsgId (reaction anchors work in
+// both the room and DM threads; ids are globally unique).
+func (c chatScreen) msgById(msgId string) (chatMessage, bool) {
+	if msgId == "" {
+		return chatMessage{}, false
+	}
+	for _, m := range c.history {
+		if m.MsgId == msgId {
+			return m, true
+		}
+	}
+	return chatMessage{}, false
+}
+
+// reactionTarget resolves the message the open picker is anchored to.
+func (c chatScreen) reactionTarget() (chatMessage, bool) {
+	return c.msgById(c.pendingReactionMsgId)
+}
+
+// reactionDetailY maps the open detail bar's first row onto the terminal:
+// anchored directly below its message, so it follows the viewport like the
+// picker. Returns -1 when closed, not painted, or scrolled out of view.
+func (c chatScreen) reactionDetailY(l layout) int {
+	if c.detailMsgId == "" || c.detailRow < 0 || l.vpHeight <= 0 {
+		return -1
+	}
+	top := transcriptTopRow(l)
+	y := top + c.detailRow - c.vp.YOffset
+	if y < top || y >= top+l.vpHeight {
+		return -1
+	}
+	return y
+}
+
+// reactionDetailAtY reports whether a terminal row paints inside the open
+// detail block (its own rows are controls: clicks there never dismiss it).
+func (c chatScreen) reactionDetailAtY(y int, l layout) bool {
+	if c.detailMsgId == "" || c.detailRow < 0 || c.detailRowH <= 0 {
+		return false
+	}
+	top := transcriptTopRow(l)
+	if l.vpHeight <= 0 || y < top || y >= top+l.vpHeight {
+		return false
+	}
+	row := y - top + c.vp.YOffset
+	return row >= c.detailRow && row < c.detailRow+c.detailRowH
 }
 
 // msgAtY maps a transcript click row onto the MsgId painted there ("" for
-// padding, local rows, or outside the transcript). rowMsg is the wrapped-row
-// index refreshViewport builds, offset by the viewport's scroll position.
+// padding, the anchored picker row, the detail block, local rows, or outside
+// the transcript). rowMsg is the wrapped-row index refreshViewport builds,
+// offset by the viewport's scroll position.
 func (c chatScreen) msgAtY(y int, l layout) string {
 	top := transcriptTopRow(l)
 	if l.vpHeight <= 0 || y < top || y >= top+l.vpHeight {
@@ -3245,6 +3642,9 @@ func (c chatScreen) msgAtY(y int, l layout) string {
 	row := y - top + c.vp.YOffset
 	if row < 0 || row >= len(c.rowMsg) {
 		return ""
+	}
+	if c.pendingReactionMsgId != "" && row == c.reactionRow {
+		return "" // the picker row is a control, never a message hit
 	}
 	return c.rowMsg[row]
 }
@@ -3433,7 +3833,7 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				if msg.X == l.rosterX+l.sidebarWidth-2 {
 					c.input.SetValue("/")
 					c.palette.sync("/")
-					c.pendingReactionMsgId = "" // one drawer slot
+					c.closeReactionAux() // one drawer slot
 					c.focus = focusComposer
 				} else {
 					c.focus = focusSidebar
@@ -3457,27 +3857,41 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			c.enterPrivate(u)
 			return nil
 		}
-		// Main column. An open reaction bar owns its row: a hit on one of
-		// its choices toggles it; anywhere else on the row keeps the bar
-		// open. Otherwise a click on a message bubble opens its reaction
-		// bar (a second click on the same message closes it), and any other
-		// row simply takes focus.
-		if c.pendingReactionMsgId != "" && msg.Y == reactionBarRow(l) {
-			if choice, ok := reactionCellAt(msg.X - transcriptX0(l)); ok && choice != "+" {
-				if cmd := c.toggleReaction(c.pendingReactionMsgId, choice); cmd != nil {
-					return cmd
-				}
+		// Main column. An open picker owns its anchored row: a hit on one of
+		// its choices toggles it and closes the picker — a pick never opens
+		// the reactor detail by itself; anywhere else on the row keeps the
+		// picker open. The detail bar opens only from an explicit badge-chip
+		// click for that msgId+emoji (reselecting the same chip closes it).
+		// Otherwise a click on a message opens its picker directly above it —
+		// a second click dismisses — and every other click drops the detail
+		// bar.
+		if y := c.reactionPickerY(l); y >= 0 && msg.Y == y {
+			off := msg.X - (transcriptX0(l) + 1) - c.reactionPickerX0()
+			if choice, ok := reactionCellAt(off); ok && choice != "+" {
+				// Toggle only: one pick closes the picker and leaves no
+				// detail behind (inspection is an explicit badge-chip click).
+				return c.toggleReaction(c.pendingReactionMsgId, choice)
 			}
 			return nil
 		}
 		if id := c.msgAtY(msg.Y, l); id != "" && !c.drawerOpen() {
 			c.focus = focusTranscript
+			if emoji, ok := c.reactionBadgeEmojiAt(id, msg.X, msg.Y, l); ok {
+				return c.toggleReactionDetail(id, emoji)
+			}
+			c.detailMsgId, c.detailEmoji = "", "" // any entry click drops the detail
 			if c.pendingReactionMsgId == id {
 				c.pendingReactionMsgId = "" // second click dismisses
 			} else {
 				c.pendingReactionMsgId = id
 			}
+			c.rebuildView() // anchor/clear paints as a transcript row
 			return nil
+		}
+		// Pick-away: any other main-column click dismisses the detail bar,
+		// unless it lands on the bar's own control rows.
+		if c.detailMsgId != "" && !c.reactionDetailAtY(msg.Y, l) {
+			c.closeReactionDetail()
 		}
 		c.focus = c.focusAtRow(msg.Y, l)
 		return nil
@@ -3533,11 +3947,13 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		step := wheelStepFor(c.vp.Height)
+		before := c.vp.YOffset
 		if up {
 			c.vp.LineUp(step)
 		} else {
 			c.vp.LineDown(step)
 		}
+		c.dismissAuxOnScroll(before)
 		return nil
 	}
 	return nil
@@ -3573,7 +3989,11 @@ func (c *chatScreen) dragTo(sec scrollSection, y int, g barGeom, l layout) {
 	if maxOff <= 0 {
 		return
 	}
+	before := vp.YOffset
 	vp.SetYOffset(int(float64(maxOff) * frac))
+	if sec == secChat {
+		c.dismissAuxOnScroll(before)
+	}
 }
 
 func (c chatScreen) View() string {
