@@ -377,3 +377,53 @@ func (c *signalClient) inboxAck(ids []string) (int, error) {
 	}
 	return r.Removed, nil
 }
+
+// reactionSummary is one message's aggregated reactions: counts per allowlisted
+// emoji plus the requesting user's own picks (at most one by server rule).
+type reactionSummary struct {
+	MsgId  string         `json:"msgId"`
+	Counts map[string]int `json:"counts"`
+	Mine   []string       `json:"mine"`
+}
+
+// react toggles one reaction on the server (authoritative): the same emoji
+// removes the caller's reaction, a different one replaces it. The server
+// returns the resulting state; callers rely on the next poll for truth.
+func (c *signalClient) react(msgId, emoji string) error {
+	code, body, err := postJSON(c.endpoint("/reactions"),
+		map[string]any{"msgId": msgId, "emoji": emoji}, c.headers())
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return apiErr(code, body)
+	}
+	return nil
+}
+
+// reactions fetches aggregated counts. msgIds narrows the hash scan to the
+// messages a caller actually renders (server caps the list at 50); nil asks
+// for the whole-room aggregate.
+func (c *signalClient) reactions(msgIds []string) ([]reactionSummary, error) {
+	path := "/reactions"
+	if len(msgIds) > 0 {
+		path += "?msgIds=" + url.QueryEscape(strings.Join(msgIds, ","))
+	}
+	code, body, err := getJSON(c.endpoint(path), c.headers())
+	if err != nil {
+		return nil, err
+	}
+	if code != 200 {
+		return nil, apiErr(code, body)
+	}
+	var r struct {
+		Reactions []reactionSummary `json:"reactions"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return nil, err
+	}
+	if r.Reactions == nil {
+		r.Reactions = []reactionSummary{}
+	}
+	return r.Reactions, nil
+}

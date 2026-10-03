@@ -395,6 +395,28 @@ const receiptExpiry = 5 * time.Minute
 // netDeliveredMsg arrives when the peer acked one of our messages.
 type netDeliveredMsg struct{ msgId string }
 
+// netReactionMsg carries one inbound reaction nudge. It never mutates local
+// counts directly: the nudge schedules an immediate GET /reactions, keeping
+// the server the single source of truth (and correctly handling replace and
+// remove, which a delta-only frame cannot express without per-sender state).
+type netReactionMsg struct{ reaction engineReaction }
+
+// reactionsFetchedMsg carries one GET /reactions result: the ids that were
+// asked for plus the server's summaries. The requested scope is replaced
+// wholesale, so messages whose reactions vanished are cleared too.
+type reactionsFetchedMsg struct {
+	ids       []string
+	summaries []reactionSummary
+	err       error
+}
+
+// reactionDoneMsg resolves one POST /reactions. On failure the optimistic
+// toggle is rolled back to its captured prior state.
+type reactionDoneMsg struct {
+	msgId, emoji, prev string
+	err                error
+}
+
 // Media UI messages: publish status lines + VU level.
 type mediaInfoMsg struct{ info string }
 type callLevelMsg struct{ level float64 }
@@ -459,6 +481,21 @@ type chatScreen struct {
 	// entries older than unconfirmedAfter raise the status warning below.
 	// The engine owns retry/expiry — this map is display state only.
 	unackedUI map[string]time.Time
+	// Message reactions (cosmetic, server-truth). reactionCounts holds
+	// per-message emoji tallies, myReactions the one emoji I picked per
+	// message ("" = none). Both are keyed by MsgId alone — ids are globally
+	// unique, so general and DM spaces can never collide — and are replaced
+	// wholesale from GET /reactions every 2s; local toggles are optimistic
+	// until the next fetch. pendingReactionMsgId is the message whose
+	// reaction drawer bar is open ("" = closed).
+	reactionCounts       map[string]map[string]int
+	myReactions          map[string]string
+	pendingReactionMsgId string
+	// lineMsg is parallel to lines: the MsgId each transcript entry belongs
+	// to ("" for cards/system/pinned rows). refreshViewport expands it into
+	// rowMsg (viewport content row -> MsgId) so a click maps to a message.
+	lineMsg []string
+	rowMsg  []string
 	// roomUnread counts room broadcasts that arrived while a DM thread is
 	// in view (broadcasts otherwise paint nowhere and badge nothing — a
 	// message can sit in history looking "missing"). Cleared on return to
@@ -696,28 +733,31 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		onPeerLost:   func(user string) { push(netLostMsg{user: user}) },
 		onRoster:     func() { push(netRosterMsg{}) },
 		onDelivered:  func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
+		onReaction:   func(r engineReaction) { push(netReactionMsg{reaction: r}) },
 		onError:      func(err error) { push(netErrMsg{err: err}) },
 		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
 	callMgr.SetRoster(func() map[string][]byte { return rosterMap(eng.peers()) })
 	return chatScreen{
-		sig:         sig,
-		eng:         eng,
-		call:        callMgr,
-		key:         key,
-		me:          me,
-		vp:          vp,
-		input:       ti,
-		netCh:       netCh,
-		leftSent:    &atomic.Bool{},
-		rendered:    map[int]bool{},
-		renderCache: map[int]string{},
-		tsCache:     map[int]time.Time{},
-		wrapCache:   map[string]string{},
-		unread:      map[string]int{},
-		lastDMAt:    map[string]time.Time{},
-		outbox:      nil,
+		sig:            sig,
+		eng:            eng,
+		call:           callMgr,
+		key:            key,
+		me:             me,
+		vp:             vp,
+		input:          ti,
+		netCh:          netCh,
+		leftSent:       &atomic.Bool{},
+		rendered:       map[int]bool{},
+		renderCache:    map[int]string{},
+		tsCache:        map[int]time.Time{},
+		wrapCache:      map[string]string{},
+		unread:         map[string]int{},
+		lastDMAt:       map[string]time.Time{},
+		outbox:         nil,
+		reactionCounts: map[string]map[string]int{},
+		myReactions:    map[string]string{},
 	}
 }
 
@@ -776,6 +816,15 @@ func (c *chatScreen) shouldRender(m chatMessage) bool {
 		m.ConvID = generalConv
 	}
 	return m.ConvID == c.activeConv()
+}
+
+// reactableMsgId is the MsgId a transcript row exposes for reactions:
+// system events have no identity, everything else keeps its E2E id.
+func reactableMsgId(m chatMessage) string {
+	if m.Kind == "system" {
+		return ""
+	}
+	return m.MsgId
 }
 
 // chatTimeLabel formats a message timestamp for the transcript ("" when the
@@ -882,7 +931,39 @@ func (c *chatScreen) renderBody(m chatMessage) string {
 	if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
 		dim = true
 	}
-	return chatBubble(m.Text, m.Username == c.me, dim, availWidth)
+	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth)
+	if badge := c.reactionBadge(m); badge != "" {
+		body += "\n" + badge
+	}
+	return body
+}
+
+// reactionBadge renders the chips under a bubble (`👍2 ❤️1`), in allowlist
+// order, aligned to the same side as the bubble. Counts live in the map, so
+// evictRenderCache must run whenever they move.
+func (c *chatScreen) reactionBadge(m chatMessage) string {
+	if m.MsgId == "" {
+		return ""
+	}
+	counts := c.reactionCounts[m.MsgId]
+	if len(counts) == 0 {
+		return ""
+	}
+	var chips []string
+	for _, e := range reactionEmojis {
+		if n := counts[e]; n > 0 {
+			chips = append(chips, tuiUnreadStyle.Render(fmt.Sprintf(" %s%d ", e, n)))
+		}
+	}
+	if len(chips) == 0 {
+		return ""
+	}
+	line := strings.Join(chips, " ")
+	w := c.transcriptW()
+	if m.Username == c.me {
+		return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(line)
+	}
+	return truncateByWidth(line, w)
 }
 
 // renderEntry composes one transcript entry: the group header (when the
@@ -942,6 +1023,8 @@ func (c *chatScreen) addMessage(m chatMessage) {
 			delete(c.rendered, dropped.Seq)
 			delete(c.renderCache, dropped.Seq)
 			delete(c.tsCache, dropped.Seq)
+			delete(c.reactionCounts, dropped.MsgId)
+			delete(c.myReactions, dropped.MsgId)
 		}
 		c.history = append([]chatMessage(nil), c.history[len(c.history)-maxHistory:]...)
 	}
@@ -1056,6 +1139,211 @@ func (c *chatScreen) evictRenderCache(msgId string) {
 	}
 }
 
+// ---- reactions ---------------------------------------------------------------
+
+// maxReactionPollIDs caps one GET /reactions narrowing list (the server caps
+// it at the same number). Newest messages win: they are the ones on screen.
+const maxReactionPollIDs = 50
+
+// activeReactionMsgIds lists the active conversation's renderable MsgIds,
+// newest first, bounded for the poll query. Reactions are room-scoped on the
+// server, but a client only ever asks about what it currently shows.
+func (c chatScreen) activeReactionMsgIds() []string {
+	var ids []string
+	for i := len(c.history) - 1; i >= 0 && len(ids) < maxReactionPollIDs; i-- {
+		m := c.history[i]
+		if reactableMsgId(m) == "" || !c.shouldRender(m) {
+			continue
+		}
+		ids = append(ids, m.MsgId)
+	}
+	return ids
+}
+
+// applyLocalReaction mirrors the server's toggle semantics optimistically:
+// the same emoji removes my reaction, a different one replaces it.
+func (c *chatScreen) applyLocalReaction(msgId, emoji string) {
+	if c.myReactions == nil {
+		c.myReactions = map[string]string{}
+	}
+	if c.reactionCounts == nil {
+		c.reactionCounts = map[string]map[string]int{}
+	}
+	counts := c.reactionCounts[msgId]
+	cur := c.myReactions[msgId]
+	if cur == emoji { // same emoji toggles off
+		delete(c.myReactions, msgId)
+		if counts != nil {
+			c.decReaction(counts, emoji)
+			if len(counts) == 0 {
+				delete(c.reactionCounts, msgId)
+			}
+		}
+		return
+	}
+	if counts == nil {
+		counts = map[string]int{}
+		c.reactionCounts[msgId] = counts
+	}
+	if cur != "" {
+		c.decReaction(counts, cur)
+	}
+	counts[emoji]++
+	c.myReactions[msgId] = emoji
+}
+
+// decReaction decrements one emoji tally, dropping the key at zero.
+func (c *chatScreen) decReaction(counts map[string]int, emoji string) {
+	if counts[emoji] <= 1 {
+		delete(counts, emoji)
+		return
+	}
+	counts[emoji]--
+}
+
+// undoReaction rolls back one optimistic toggle after a failed POST,
+// provided the user has not moved the reaction elsewhere meanwhile.
+func (c *chatScreen) undoReaction(msgId, emoji, prev string) {
+	if c.myReactions[msgId] != emoji {
+		return
+	}
+	c.applyLocalReaction(msgId, emoji) // same emoji removes the optimistic pick
+	if prev != "" && reactionEmojiAllowed(prev) {
+		c.applyLocalReaction(msgId, prev)
+	}
+}
+
+// reactionCountsEqual compares two emoji tallies.
+func reactionCountsEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// applyFetchedReactions replaces the requested scope with the server's
+// aggregate (the truth): ids absent from the response clear to zero.
+// Returns true when anything changed, so unchanged polls never repaint.
+func (c *chatScreen) applyFetchedReactions(ids []string, summaries []reactionSummary) bool {
+	byID := make(map[string]reactionSummary, len(summaries))
+	for _, s := range summaries {
+		byID[s.MsgId] = s
+	}
+	var changed []string
+	for _, id := range ids {
+		s := byID[id]
+		var newCounts map[string]int
+		if len(s.Counts) > 0 {
+			newCounts = s.Counts
+		}
+		newMine := ""
+		if len(s.Mine) > 0 {
+			newMine = s.Mine[0] // server keeps one reaction per user
+		}
+		if c.myReactions[id] == newMine && reactionCountsEqual(c.reactionCounts[id], newCounts) {
+			continue
+		}
+		if newCounts == nil {
+			delete(c.reactionCounts, id)
+		} else {
+			if c.reactionCounts == nil {
+				c.reactionCounts = map[string]map[string]int{}
+			}
+			c.reactionCounts[id] = newCounts
+		}
+		if newMine == "" {
+			delete(c.myReactions, id) // nil map delete is a no-op
+		} else {
+			if c.myReactions == nil {
+				c.myReactions = map[string]string{}
+			}
+			c.myReactions[id] = newMine
+		}
+		changed = append(changed, id)
+	}
+	for _, id := range changed {
+		c.evictRenderCache(id)
+	}
+	return len(changed) > 0
+}
+
+// toggleReaction applies the optimistic toggle, evicts the stale bubble and
+// returns the command that persists it (server POST + best-effort peer nudge).
+func (c *chatScreen) toggleReaction(msgId, emoji string) tea.Cmd {
+	if msgId == "" || !reactionEmojiAllowed(emoji) {
+		return nil
+	}
+	prev := c.myReactions[msgId]
+	c.applyLocalReaction(msgId, emoji)
+	c.evictRenderCache(msgId)
+	c.rebuildView()
+	return c.doReact(msgId, emoji, prev, c.toForMsgId(msgId))
+}
+
+// doReact persists one reaction: POST /reactions is authoritative, the P2P
+// frame only nudges peers to fetch earlier than their next 2s poll.
+func (c chatScreen) doReact(msgId, emoji, prev, to string) tea.Cmd {
+	if c.sig == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		if err := c.sig.react(msgId, emoji); err != nil {
+			return reactionDoneMsg{msgId: msgId, emoji: emoji, prev: prev, err: err}
+		}
+		if c.eng != nil {
+			_ = c.eng.sendReaction(to, msgId, emoji)
+		}
+		return reactionDoneMsg{msgId: msgId, emoji: emoji, prev: prev}
+	}
+}
+
+// fetchReactionsCmd builds the GET /reactions poll for the active
+// conversation's newest messages (nil when there is nothing to ask about).
+func (c chatScreen) fetchReactionsCmd() tea.Cmd {
+	if c.sig == nil {
+		return nil
+	}
+	ids := c.activeReactionMsgIds()
+	if len(ids) == 0 {
+		return nil
+	}
+	return func() tea.Msg {
+		summaries, err := c.sig.reactions(ids)
+		return reactionsFetchedMsg{ids: ids, summaries: summaries, err: err}
+	}
+}
+
+// toForMsgId resolves the P2P destination for a reaction nudge: the DM peer
+// for a thread message, "" (broadcast) for the room.
+func (c chatScreen) toForMsgId(msgId string) string {
+	for _, m := range c.history {
+		if m.MsgId != msgId {
+			continue
+		}
+		if m.ConvID == "" || m.ConvID == generalConv {
+			return ""
+		}
+		return peerOf(c.me, m.ConvID)
+	}
+	return ""
+}
+
+// newestReactableMsgId is the keyboard fallback target: the newest message
+// with an identity in the active conversation.
+func (c chatScreen) newestReactableMsgId() string {
+	for i := len(c.history) - 1; i >= 0; i-- {
+		if id := reactableMsgId(c.history[i]); id != "" && c.shouldRender(c.history[i]) {
+			return id
+		}
+	}
+	return ""
+}
+
 // renderedBody returns the cached message block for a history message,
 // rendering and memoizing on miss.
 func (c *chatScreen) renderedBody(m chatMessage) string {
@@ -1120,6 +1408,7 @@ func (c *chatScreen) messageTime(m chatMessage) time.Time {
 
 func (c *chatScreen) rebuildView() {
 	c.lines = c.lines[:0]
+	c.lineMsg = c.lineMsg[:0]
 	c.cacheForWidth(c.vp.Width)
 
 	// Partition local lines: file cards (to interleave) vs transient lines (pinned at bottom).
@@ -1185,11 +1474,12 @@ func (c *chatScreen) rebuildView() {
 		}
 		return newRun
 	}
-	push := func(entry string) {
+	push := func(entry, msgId string) {
 		if entry == "" {
 			return // suppressed (own presence line): leave no blank row
 		}
 		c.lines = append(c.lines, entry)
+		c.lineMsg = append(c.lineMsg, msgId)
 	}
 
 	hi, ci := 0, 0
@@ -1216,12 +1506,12 @@ func (c *chatScreen) rebuildView() {
 			if fd.username == c.me {
 				card = lipgloss.NewStyle().Width(maxInt(c.transcriptW(), 1)).Align(lipgloss.Right).Render(card)
 			}
-			push(header + card)
+			push(header+card, "")
 			ci++
 		} else if hasHist {
 			m := visibleHistory[hi]
 			withHeader := startGroup(m.Username, m.Kind, c.messageTime(m))
-			push(c.renderedEntry(m, withHeader))
+			push(c.renderedEntry(m, withHeader), reactableMsgId(m))
 			hi++
 		} else {
 			break
@@ -1229,7 +1519,7 @@ func (c *chatScreen) rebuildView() {
 	}
 	// Append transient pinned lines (pending echo, progress bars, errors) at bottom.
 	for _, ll := range pinned {
-		push(ll.text)
+		push(ll.text, "")
 	}
 	c.syncRosterVp() // users list content lives with the screen, not the copy
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
@@ -1256,6 +1546,7 @@ func (c *chatScreen) refreshViewport() {
 		// Empty state: a centred, helpful hint — never a blank pane. It is
 		// painted straight into the viewport (never into c.lines) so the
 		// transcript's row model stays message-for-message.
+		c.rowMsg = c.rowMsg[:0]
 		c.vp.SetContent(c.emptyStateView(w))
 		if atBottom {
 			c.vp.GotoBottom()
@@ -1280,6 +1571,20 @@ func (c *chatScreen) refreshViewport() {
 		}
 		c.wrapCache[ln] = r
 		wrapped[i] = r
+	}
+	// Row index: viewport content row -> owning MsgId. Every line is
+	// pre-wrapped to `w`, so a wrapped block occupies exactly its newline
+	// count + 1 screen rows (the viewport never re-wraps).
+	c.rowMsg = c.rowMsg[:0]
+	for i, wl := range wrapped {
+		id := ""
+		if i < len(c.lineMsg) {
+			id = c.lineMsg[i]
+		}
+		n := strings.Count(wl, "\n") + 1
+		for j := 0; j < n; j++ {
+			c.rowMsg = append(c.rowMsg, id)
+		}
 	}
 	c.vp.SetContent(strings.Join(wrapped, "\n"))
 	if atBottom {
@@ -1951,8 +2256,9 @@ func (c *chatScreen) peerInCall(peer string) bool {
 // deep-fetch (live messages only) — switching is instant.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
-	c.palette.close()      // stale "/" query must not survive a mode switch
-	delete(c.unread, user) // opening the thread clears its badge
+	c.palette.close()           // stale "/" query must not survive a mode switch
+	c.pendingReactionMsgId = "" // the reacted row is not in the new thread
+	delete(c.unread, user)      // opening the thread clears its badge
 	c.rebuildView()
 	return nil
 }
@@ -1964,6 +2270,7 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.palette.close()
+	c.pendingReactionMsgId = ""
 	c.roomUnread = 0 // back in the room: everything is visible again
 	c.rebuildView()
 }
@@ -2155,6 +2462,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if strings.HasPrefix(c.status, "* ") && strings.Contains(c.status, "unconfirmed") {
 			c.status = ""
 		}
+		// Reaction truth rides the same 2s cadence: one narrowed GET for
+		// the active conversation's newest messages. This is what makes
+		// peer reactions (and lost P2P nudges) eventually consistent.
+		if cmd := c.fetchReactionsCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		cmds = append(cmds, scheduleRoster())
 
 	case netRosterMsg:
@@ -2291,6 +2604,37 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		c.rebuildView()
 		cmds = append(cmds, c.drainNetCmd())
 
+	case netReactionMsg:
+		// A live reaction nudge: ask the server now instead of waiting for
+		// the next 2s tick. Counts are never derived from the frame itself
+		// (replace/remove cannot be expressed as a delta without tracking
+		// every sender's prior pick) — the fetch is the truth.
+		if msg.reaction.From != c.me {
+			if cmd := c.fetchReactionsCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
+	case reactionsFetchedMsg:
+		if msg.err == nil && c.applyFetchedReactions(msg.ids, msg.summaries) {
+			c.rebuildView()
+		}
+
+	case reactionDoneMsg:
+		if msg.err != nil {
+			// POST failed: roll the optimistic toggle back so the badge
+			// never claims a reaction the server did not record.
+			c.undoReaction(msg.msgId, msg.emoji, msg.prev)
+			c.evictRenderCache(msg.msgId)
+			c.rebuildView()
+			if isServerDown(msg.err) {
+				c.status = serverDownMsg
+			} else {
+				c.status = "reaction failed: " + msg.err.Error()
+			}
+		}
+
 	case mediaInfoMsg:
 		// Media chatter never reaches the transcript: the latest event
 		// parks on the status line, conversation stays clean.
@@ -2404,7 +2748,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.SetValue("/")
 			c.palette.sync("/")
 			c.input.Focus()
-			c.focus = focusComposer // the drawer rides on the composer
+			c.focus = focusComposer     // the drawer rides on the composer
+			c.pendingReactionMsgId = "" // one drawer slot: commands replace the bar
 			break
 		}
 		// Ctrl+L clears the composer line and repaints the screen.
@@ -2414,8 +2759,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return c, tea.ClearScreen
 		}
 		if msg.Type == tea.KeyEsc {
-			// Esc dismisses transient state — the rail's filter, then the
-			// private view. It must NEVER quit the app.
+			// Esc dismisses transient state — the reaction bar first, then
+			// the rail's filter, then the private view. NEVER quits the app.
+			if c.pendingReactionMsgId != "" {
+				c.pendingReactionMsgId = ""
+				break
+			}
 			if c.sideFilter != "" {
 				c.clearSideFilter()
 			}
@@ -2461,6 +2810,34 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if c.focus == focusSidebar && textEditKey(msg) {
 			c.editSideFilter(msg)
 			break
+		}
+		// Keyboard reaction fallback (transcript focus): `r` opens the bar
+		// on the newest message, then 1-6 toggle an emoji on the target.
+		// Consumed before any text handling so the composer never sees them.
+		if c.focus == focusTranscript && msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
+			r := msg.Runes[0]
+			consumed := false
+			if r == 'r' || r == 'R' {
+				consumed = true
+				if c.pendingReactionMsgId == "" {
+					c.pendingReactionMsgId = c.newestReactableMsgId()
+				} else {
+					c.pendingReactionMsgId = ""
+				}
+			} else if r >= '1' && r <= '6' && c.pendingReactionMsgId != "" {
+				consumed = true
+				if cmd := c.toggleReaction(c.pendingReactionMsgId, reactionEmojis[int(r-'1')]); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+			if consumed {
+				break
+			}
+		}
+		// Typing dismisses the transient reaction bar (the drawer slot is
+		// modal: text and reactions never compete for the same keys).
+		if textEditKey(msg) && c.pendingReactionMsgId != "" {
+			c.pendingReactionMsgId = ""
 		}
 		// Any other key that edits the composer also focuses it, so the
 		// indicator always sits where the text is about to appear.
@@ -2628,6 +3005,7 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 // not on screen (the rail collapses on narrow terminals) is skipped, so
 // focus can never point at something with no indicator to paint.
 func (c *chatScreen) cycleFocus(reverse bool) {
+	c.pendingReactionMsgId = "" // focus moves: the transient bar dismisses
 	for i := 0; i < 3; i++ {
 		if reverse {
 			c.focus = c.focus.prev()
@@ -2836,11 +3214,10 @@ func (c chatScreen) atSearchBox(y int, l layout) bool {
 	return y >= l.rosterY0-sh && y < l.rosterY0
 }
 
-// focusAtRow maps a click in the main column onto the pane it hit: the
-// composer box, the transcript, or whatever was focused before (banner and
-// drawer rows change nothing). Exactly one pane is ever focused, so exactly
-// one indicator is ever painted.
-func (c chatScreen) focusAtRow(y int, l layout) focusPane {
+// transcriptTopRow is the terminal row of the transcript's first painted
+// line (frame + banner + chat header). Shared by focus hit-testing and the
+// reaction drawer geometry so they can never disagree.
+func transcriptTopRow(l layout) int {
 	frameOff, headOff := 0, 0
 	if l.frameOn {
 		frameOff = 1
@@ -2848,8 +3225,36 @@ func (c chatScreen) focusAtRow(y int, l layout) focusPane {
 	if l.showHeader {
 		headOff = 1
 	}
-	top := frameOff + headOff
-	transcriptTop := top + l.headRows
+	return frameOff + headOff + l.headRows
+}
+
+// reactionBarRow is the terminal row the reaction drawer bar paints on:
+// right below the transcript, after the drawer's one-row lift spacer.
+func reactionBarRow(l layout) int {
+	return transcriptTopRow(l) + maxInt(l.vpHeight, 0) + 1
+}
+
+// msgAtY maps a transcript click row onto the MsgId painted there ("" for
+// padding, local rows, or outside the transcript). rowMsg is the wrapped-row
+// index refreshViewport builds, offset by the viewport's scroll position.
+func (c chatScreen) msgAtY(y int, l layout) string {
+	top := transcriptTopRow(l)
+	if l.vpHeight <= 0 || y < top || y >= top+l.vpHeight {
+		return ""
+	}
+	row := y - top + c.vp.YOffset
+	if row < 0 || row >= len(c.rowMsg) {
+		return ""
+	}
+	return c.rowMsg[row]
+}
+
+// focusAtRow maps a click in the main column onto the pane it hit: the
+// composer box, the transcript, or whatever was focused before (banner and
+// drawer rows change nothing). Exactly one pane is ever focused, so exactly
+// one indicator is ever painted.
+func (c chatScreen) focusAtRow(y int, l layout) focusPane {
+	transcriptTop := transcriptTopRow(l)
 	if y >= transcriptTop && y < transcriptTop+maxInt(l.vpHeight, 0) {
 		return focusTranscript
 	}
@@ -3028,6 +3433,7 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				if msg.X == l.rosterX+l.sidebarWidth-2 {
 					c.input.SetValue("/")
 					c.palette.sync("/")
+					c.pendingReactionMsgId = "" // one drawer slot
 					c.focus = focusComposer
 				} else {
 					c.focus = focusSidebar
@@ -3051,8 +3457,28 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			c.enterPrivate(u)
 			return nil
 		}
-		// Main column: clicking focuses what it hit — the composer box or
-		// the transcript.
+		// Main column. An open reaction bar owns its row: a hit on one of
+		// its choices toggles it; anywhere else on the row keeps the bar
+		// open. Otherwise a click on a message bubble opens its reaction
+		// bar (a second click on the same message closes it), and any other
+		// row simply takes focus.
+		if c.pendingReactionMsgId != "" && msg.Y == reactionBarRow(l) {
+			if choice, ok := reactionCellAt(msg.X - transcriptX0(l)); ok && choice != "+" {
+				if cmd := c.toggleReaction(c.pendingReactionMsgId, choice); cmd != nil {
+					return cmd
+				}
+			}
+			return nil
+		}
+		if id := c.msgAtY(msg.Y, l); id != "" && !c.drawerOpen() {
+			c.focus = focusTranscript
+			if c.pendingReactionMsgId == id {
+				c.pendingReactionMsgId = "" // second click dismisses
+			} else {
+				c.pendingReactionMsgId = id
+			}
+			return nil
+		}
 		c.focus = c.focusAtRow(msg.Y, l)
 		return nil
 

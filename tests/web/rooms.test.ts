@@ -16,6 +16,8 @@ import {
   ackBoxes,
   sweepRooms,
   roomExists,
+  toggleReaction,
+  fetchReactions,
 } from "../../src/lib/rooms";
 
 const PUBKEY = Buffer.alloc(32, 7).toString("base64");
@@ -317,5 +319,131 @@ describe("delivery hardening", () => {
     const res = await ackBoxes(sessionId, peer, ["a-1", 42, ""]);
     expect(res.removed).toBe(1);
     expect(res.skipped).toBe(2);
+  });
+});
+
+describe("message reactions", () => {
+  it("toggle adds, replaces own prior, and removes on repeated emoji", async () => {
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+
+    const on = await toggleReaction(sessionId, username, "m1", "👍");
+    expect(on).toEqual({ msgId: "m1", emoji: "👍", reacted: true });
+    let { reactions } = await fetchReactions(sessionId, username);
+    expect(reactions).toEqual([{ msgId: "m1", counts: { "👍": 1 }, mine: ["👍"] }]);
+
+    // Different emoji replaces the caller's prior one — it never stacks.
+    const swapped = await toggleReaction(sessionId, username, "m1", "❤️");
+    expect(swapped.reacted).toBe(true);
+    ({ reactions } = await fetchReactions(sessionId, username));
+    expect(reactions).toEqual([{ msgId: "m1", counts: { "❤️": 1 }, mine: ["❤️"] }]);
+
+    // Same emoji again toggles the caller's reaction off.
+    const off = await toggleReaction(sessionId, username, "m1", "❤️");
+    expect(off.reacted).toBe(false);
+    ({ reactions } = await fetchReactions(sessionId, username));
+    expect(reactions).toEqual([]);
+  });
+
+  it("stacks counts across users and reports mine per caller", async () => {
+    const { sessionId, username: alice } = await makeRoom();
+    const bob = `b_${Math.random().toString(36).slice(2, 10)}`;
+    const carol = `c_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, bob, PUBKEY);
+    await joinRoom(sessionId, carol, PUBKEY);
+
+    await toggleReaction(sessionId, alice, "m1", "👍");
+    await toggleReaction(sessionId, bob, "m1", "👍");
+    await toggleReaction(sessionId, carol, "m1", "🙏");
+
+    const fromAlice = await fetchReactions(sessionId, alice);
+    expect(fromAlice.reactions).toEqual([
+      { msgId: "m1", counts: { "👍": 2, "🙏": 1 }, mine: ["👍"] },
+    ]);
+    const fromBob = await fetchReactions(sessionId, bob);
+    expect(fromBob.reactions[0].counts).toEqual({ "👍": 2, "🙏": 1 });
+    expect(fromBob.reactions[0].mine).toEqual(["👍"]);
+    const fromCarol = await fetchReactions(sessionId, carol);
+    expect(fromCarol.reactions[0].mine).toEqual(["🙏"]);
+  });
+
+  it("keys counts by msgId across broadcast and DM id spaces", async () => {
+    const { sessionId, username: alice } = await makeRoom();
+    const bob = `b_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, bob, PUBKEY);
+
+    // Same room, same id space: a broadcast id and a DM id never share counts.
+    await toggleReaction(sessionId, alice, "broadcast-1", "👍");
+    await toggleReaction(sessionId, bob, "dm-alice-bob-1", "👍");
+    await toggleReaction(sessionId, bob, "broadcast-1", "😂");
+
+    const { reactions } = await fetchReactions(sessionId, alice);
+    expect(reactions).toEqual([
+      { msgId: "broadcast-1", counts: { "👍": 1, "😂": 1 }, mine: ["👍"] },
+      { msgId: "dm-alice-bob-1", counts: { "👍": 1 }, mine: [] },
+    ]);
+  });
+
+  it("rejects bad emoji/msgId and non-members", async () => {
+    const { sessionId, username } = await makeRoom();
+
+    await expect(toggleReaction(sessionId, username, "m1", "👌")).rejects.toMatchObject({ status: 400 });
+    await expect(toggleReaction(sessionId, username, "m1", "like")).rejects.toMatchObject({ status: 400 });
+    await expect(toggleReaction(sessionId, username, "", "👍")).rejects.toMatchObject({ status: 400 });
+    await expect(toggleReaction(sessionId, username, "x".repeat(129), "👍")).rejects.toMatchObject({ status: 400 });
+    await expect(toggleReaction(sessionId, "stranger", "m1", "👍")).rejects.toMatchObject({ status: 403 });
+    await expect(fetchReactions(sessionId, "stranger")).rejects.toMatchObject({ status: 403 });
+    await expect(fetchReactions("999999", username)).rejects.toMatchObject({ status: 404 });
+    await expect(fetchReactions(sessionId, username, [])).rejects.toMatchObject({ status: 400 });
+    await expect(fetchReactions(sessionId, username, ["x".repeat(129)])).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("fetch caps at 50, filters by msgIds, and reaps corrupt fields", async () => {
+    const { sessionId, username } = await makeRoom();
+    for (let i = 0; i < 60; i++) {
+      await toggleReaction(sessionId, username, `c-${i}`, "👍");
+    }
+    const capped = await fetchReactions(sessionId, username);
+    expect(capped.reactions).toHaveLength(50);
+
+    const filtered = await fetchReactions(sessionId, username, ["c-59", "c-0"]);
+    expect(filtered.reactions.map((r) => r.msgId).sort()).toEqual(["c-0", "c-59"]);
+
+    // Corrupt fields (bad shape / bad emoji / bad username) are ignored and reaped.
+    const key = `room:${sessionId}:reactions`;
+    await redis.hset(key, "garbage|||", "1");
+    await redis.hset(key, "m|🔥|alice", "1");
+    await redis.hset(key, "m|👍|no spaces allowed", "1");
+    const after = await fetchReactions(sessionId, username, ["c-0"]);
+    expect(after.reactions).toHaveLength(1);
+    expect(await redis.hget(key, "garbage|||")).toBeNull();
+    expect(await redis.hget(key, "m|🔥|alice")).toBeNull();
+    expect(await redis.hget(key, "m|👍|no spaces allowed")).toBeNull();
+  });
+
+  it("departures clear the member's reactions", async () => {
+    const { sessionId, username: alice } = await makeRoom();
+    const bob = `b_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, bob, PUBKEY);
+    await toggleReaction(sessionId, alice, "m1", "👍");
+    await toggleReaction(sessionId, bob, "m1", "👍");
+    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 2 });
+
+    await leaveRoom(sessionId, bob);
+    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 1 });
+
+    // Kick cleans up too.
+    await joinRoom(sessionId, bob, PUBKEY);
+    await toggleReaction(sessionId, bob, "m1", "😂");
+    await kickMember(sessionId, alice, bob);
+    expect((await fetchReactions(sessionId, alice)).reactions[0].counts).toEqual({ "👍": 1 });
+  });
+
+  it("reaction sends trip the send budget with 429", async () => {
+    const { checkSendLimit } = await import("../../src/lib/rooms");
+    const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 120; i++) await checkSendLimit("reactions", ip);
+    await expect(checkSendLimit("reactions", ip)).rejects.toMatchObject({ status: 429 });
   });
 });

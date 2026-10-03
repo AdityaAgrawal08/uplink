@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { redis } from "./redis";
+import { redis, type PipeOp } from "./redis";
 import { anonymizeIp } from "./crypto";
 
 // ─── Signaling-plane state machine (Vercel-native architecture) ─────────────
@@ -17,6 +17,7 @@ import { anonymizeIp } from "./crypto";
 //   room:{code}:epoch           string  monotonic roster generation (join/leave/prune bumps)
 //   room:{code}:sig:{username}  list  JSON notes {from, type, payload, ts} (5 min TTL)
 //   room:{code}:inbox:{username} hash msgId -> JSON box {msgId, from, kind, payload, ts} (1h TTL)
+//   room:{code}:reactions       hash  {msgId}|{emoji}|{username} -> "1" (room-lifetime TTL)
 //
 // Roles: creator (main admin, rank 2) > admin (rank 1) > member (rank 0).
 // Kick: creator kicks anyone but self; admins kick members only; members
@@ -43,10 +44,17 @@ export const MAX_SIG_PAYLOAD = 16 * 1024; // SDP/ICE notes are small
 export const MAX_BOX_PAYLOAD = 256 * 1024; // fallback relay: text + small files only
 
 export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
-export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox sends per IP per 5 min
+export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction sends per IP per 5 min
 export const SEND_WINDOW_SEC = 5 * 60;
 export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
 export const READ_LIMIT_PER_WINDOW = 1200; // two same-user tabs + ack overhead stay under budget // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
+
+// Reactions are cosmetic metadata on ciphertext messages: one hash per room.
+// Field = `${msgId}|${emoji}|${username}`, value "1" (presence is the datum;
+// counts are a single HGETALL away, which is what the client's 2s poll does).
+export const REACTION_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🙏"] as const;
+export type ReactionEmoji = (typeof REACTION_EMOJI)[number];
+export const MAX_REACTION_MESSAGES = 50; // one fetch never exceeds ~50 messages (mirrors FETCH_BOX_CAP)
 
 export class RoomError extends Error {
   status: number;
@@ -99,6 +107,7 @@ const bannedKey = (code: string) => `room:${code}:banned`;
 const epochKey = (code: string) => `room:${code}:epoch`;
 const sigKey = (code: string, username: string) => `room:${code}:sig:${username}`;
 const inboxKey = (code: string, username: string) => `room:${code}:inbox:${username}`;
+const reactionsKey = (code: string) => `room:${code}:reactions`;
 
 // bumpEpoch advances the roster generation after any membership change
 // (join, leave, stale-prune). Polling clients compare it against their last
@@ -221,15 +230,17 @@ function parseMember(username: string, raw: unknown): MemberInfo | null {
     return info;
 }
 
-// Refresh the sliding TTL safety net on room + roster + epoch + bans
-// (one round trip). Skipping epoch/bans here would let them decay under an
-// active room: the generation would rewind and kicked users could return.
+// Refresh the sliding TTL safety net on room + roster + epoch + bans +
+// reactions (one round trip). Skipping epoch/bans here would let them decay
+// under an active room: the generation would rewind and kicked users could
+// return.
 async function touchRoom(code: string): Promise<void> {
   await redis.pipeline([
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: epochKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: bannedKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: reactionsKey(code), args: [ROOM_TTL_SEC] },
   ]);
 }
 
@@ -270,7 +281,7 @@ export async function checkCreateLimit(ipHash: string): Promise<void> {
   }
 }
 
-export async function checkSendLimit(kind: "sig" | "inbox", ipHash: string): Promise<void> {
+export async function checkSendLimit(kind: "sig" | "inbox" | "reactions", ipHash: string): Promise<void> {
   const key = `rate:${kind}:${ipHash}`;
   const hits = await redis.incr(key);
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
@@ -483,6 +494,7 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
     { cmd: "del", key: sigKey(code, username), args: [] },
     { cmd: "del", key: inboxKey(code, username), args: [] },
   ]).catch(() => [] as unknown[]);
+  await clearUserReactions(code, username).catch(() => 0);
   await redis.hdel(membersKey(code), username);
   const remaining = await redis.hlen(membersKey(code));
   let ended = false;
@@ -543,6 +555,7 @@ export async function kickMember(
     { cmd: "del", key: sigKey(code, target), args: [] },
     { cmd: "del", key: inboxKey(code, target), args: [] },
   ]).catch(() => [] as unknown[]);
+  await clearUserReactions(code, target).catch(() => 0);
   await redis.hdel(membersKey(code), target);
   await redis.pipeline([
     { cmd: "hset", key: bannedKey(code), args: [target, JSON.stringify({ at: Date.now(), by: actor })] },
@@ -600,7 +613,7 @@ export async function setRole(
 
 export async function destroyRoom(code: string): Promise<void> {
   const members = (await hgetall(membersKey(code))) || {};
-  const keys = [roomKey(code), membersKey(code), epochKey(code), bannedKey(code)];
+  const keys = [roomKey(code), membersKey(code), epochKey(code), bannedKey(code), reactionsKey(code)];
   for (const username of Object.keys(members)) {
     keys.push(sigKey(code, username), inboxKey(code, username));
   }
@@ -762,6 +775,184 @@ export async function ackBoxes(code: string, username: string, ids: unknown): Pr
   const removed = await redis.hdel(inboxKey(code, username), ...clean);
   return { removed, skipped: ids.length - clean.length };
 }
+
+// ─── Message reactions (cosmetic, room-scoped) ──────────────────────────────
+//
+// Reactions are the one piece of chat state the server aggregates: they ride
+// on ciphertext message IDs, contain no user content, and live in ONE hash
+// per room (`{msgId}|{emoji}|{username}` -> "1"), so a client's 2s poll reads
+// every count in one HGETALL. Message IDs are sender-assigned and shared
+// across broadcast and DM spaces (DM privacy is payload-level E2E), so counts
+// are keyed by msgId alone. One reaction per user per message: reacting again
+// with a different emoji replaces the prior one; reacting with the same emoji
+// toggles it off. Reactions die with the room (24h sliding TTL, refreshed by
+// every room touch), and departures clean up after themselves.
+
+export interface ReactionSummary {
+  msgId: string;
+  counts: Record<string, number>; // emoji -> count (allowlist order)
+  mine: string[]; // emojis the requesting user reacted with
+}
+
+export interface ToggleReactionResult {
+  msgId: string;
+  emoji: string;
+  reacted: boolean; // false = the toggle removed this emoji
+}
+
+function isAllowedReactionEmoji(emoji: unknown): emoji is ReactionEmoji {
+  return typeof emoji === "string" && (REACTION_EMOJI as readonly string[]).includes(emoji);
+}
+
+export function assertReactionEmoji(emoji: unknown): asserts emoji is ReactionEmoji {
+  if (!isAllowedReactionEmoji(emoji)) {
+    throw new RoomError(400, `emoji must be one of ${REACTION_EMOJI.join(" ")}`);
+  }
+}
+
+function assertReactionMsgId(msgId: unknown): asserts msgId is string {
+  if (typeof msgId !== "string" || msgId.length === 0 || msgId.length > 128) {
+    throw new RoomError(400, "msgId is required (max 128 chars)");
+  }
+}
+
+// parseReactionField splits a stored field right-to-left: usernames and
+// allowlisted emojis cannot contain "|", so the last two separators are
+// unambiguous even when a sender-assigned msgId itself contains pipes.
+function parseReactionField(field: string): { msgId: string; emoji: ReactionEmoji; username: string } | null {
+  const i = field.lastIndexOf("|");
+  if (i <= 0 || i === field.length - 1) return null;
+  const username = field.slice(i + 1);
+  const j = field.lastIndexOf("|", i - 1);
+  if (j <= 0) return null;
+  const emoji = field.slice(j + 1, i);
+  const msgId = field.slice(0, j);
+  if (!isAllowedReactionEmoji(emoji)) return null;
+  if (!USERNAME_RE.test(username)) return null;
+  if (msgId.length === 0 || msgId.length > 128) return null;
+  return { msgId, emoji, username };
+}
+
+// Remove every reaction of a departing member (leave/kick). Rooms are small
+// and the hash is one HGETALL; best-effort because a cleanup failure must
+// never block the departure itself.
+async function clearUserReactions(code: string, username: string): Promise<void> {
+  const all = await hgetall(reactionsKey(code));
+  if (!all) return;
+  const suffix = `|${username}`;
+  const theirs = Object.keys(all).filter((field) => field.endsWith(suffix));
+  if (theirs.length === 0) return;
+  await redis.hdel(reactionsKey(code), ...theirs);
+}
+
+// Toggle one reaction. Reads membership + the whole reactions hash in one
+// round trip, then writes the delta + TTL refreshes in another. Membership is
+// re-checked on every call because reactions are authenticated state, not
+// fire-and-forget signaling.
+export async function toggleReaction(
+  code: string,
+  username: string,
+  msgId: string,
+  emoji: string
+): Promise<ToggleReactionResult> {
+  assertRoomCode(code);
+  assertUsername(username);
+  assertReactionMsgId(msgId);
+  assertReactionEmoji(emoji);
+
+  const [membersRaw, reactionsRaw] = (await redis.pipeline([
+    { cmd: "hgetall", key: membersKey(code), args: [] },
+    { cmd: "hgetall", key: reactionsKey(code), args: [] },
+  ])) as [Record<string, string> | null, Record<string, string> | null];
+  if (isEmptyRecord(membersRaw)) throw new RoomError(404, "Session not found");
+  if (!membersRaw[username]) throw new RoomError(403, "Not in this session");
+
+  const prefix = `${msgId}|`;
+  const suffix = `|${username}`;
+  const own: string[] = [];
+  for (const field of Object.keys(reactionsRaw || {})) {
+    if (!field.startsWith(prefix) || !field.endsWith(suffix)) continue;
+    // Guard against a piped msgId whose tail happens to look like a suffix:
+    // only exact `{msgId}|{emoji}|{username}` fields are ours.
+    const mid = field.slice(prefix.length, field.length - suffix.length);
+    if (isAllowedReactionEmoji(mid)) own.push(field);
+  }
+  // Same emoji twice = toggle off; any other prior emoji = replace it
+  // (single reaction per user per message, like most chat clients).
+  const field = `${msgId}|${emoji}|${username}`;
+  const same = own.length === 1 && own[0] === field;
+  const ops: PipeOp[] = [];
+  if (own.length > 0) ops.push({ cmd: "hdel", key: reactionsKey(code), args: own });
+  if (!same) ops.push({ cmd: "hset", key: reactionsKey(code), args: [field, "1"] });
+  ops.push(
+    { cmd: "expire", key: reactionsKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] }
+  );
+  await redis.pipeline(ops);
+  return { msgId, emoji, reacted: !same };
+}
+
+// Aggregate the room's reaction hash for the requesting member. Optional
+// `msgIds` narrows the hash scan to messages an on-screen UI actually shows;
+// without it the response is capped at MAX_REACTION_MESSAGES (msgId order).
+// Unparseable fields are reaped like fetchBoxes: they would otherwise shadow
+// cap slots forever.
+export async function fetchReactions(
+  code: string,
+  username: string,
+  msgIds?: string[]
+): Promise<{ reactions: ReactionSummary[] }> {
+  assertRoomCode(code);
+  assertUsername(username);
+  await requireMember(code, username);
+
+  let filter: Set<string> | null = null;
+  if (msgIds !== undefined) {
+    if (!Array.isArray(msgIds) || msgIds.length === 0 || msgIds.length > MAX_REACTION_MESSAGES) {
+      throw new RoomError(400, `msgIds must be an array of 1-${MAX_REACTION_MESSAGES} message IDs`);
+    }
+    const clean = new Set(msgIds.filter((id): id is string => typeof id === "string" && id.length > 0 && id.length <= 128));
+    if (clean.size === 0) throw new RoomError(400, "No valid message IDs");
+    filter = clean;
+  }
+
+  const all = await hgetall(reactionsKey(code));
+  if (!all) return { reactions: [] };
+  const byMsg = new Map<string, { counts: Map<string, number>; mine: Set<string> }>();
+  const corrupt: string[] = [];
+  for (const field of Object.keys(all)) {
+    const parsed = parseReactionField(field);
+    if (!parsed) {
+      corrupt.push(field); // reap: unparseable fields would squat cap slots forever
+      continue;
+    }
+    if (filter && !filter.has(parsed.msgId)) continue;
+    let entry = byMsg.get(parsed.msgId);
+    if (!entry) {
+      entry = { counts: new Map(), mine: new Set() };
+      byMsg.set(parsed.msgId, entry);
+    }
+    entry.counts.set(parsed.emoji, (entry.counts.get(parsed.emoji) || 0) + 1);
+    if (parsed.username === username) entry.mine.add(parsed.emoji);
+  }
+  if (corrupt.length > 0) await redis.hdel(reactionsKey(code), ...corrupt).catch(() => 0);
+
+  const reactions: ReactionSummary[] = [];
+  for (const [msgId, entry] of byMsg) {
+    const counts: Record<string, number> = {};
+    const mine: string[] = [];
+    for (const emoji of REACTION_EMOJI) {
+      const n = entry.counts.get(emoji);
+      if (n) counts[emoji] = n;
+      if (entry.mine.has(emoji)) mine.push(emoji);
+    }
+    reactions.push({ msgId, counts, mine });
+  }
+  reactions.sort((a, b) => (a.msgId < b.msgId ? -1 : a.msgId > b.msgId ? 1 : 0));
+  return { reactions: reactions.slice(0, MAX_REACTION_MESSAGES) };
+}
+
 
 // Sweep: drop members whose heartbeat lapsed, destroy emptied rooms. Runs
 // on cron; per-room isolation so one corrupt room cannot abort the sweep.

@@ -14,19 +14,21 @@ import (
 // plane contract (create/join/leave/heartbeat/signal/inbox/ack). It mirrors
 // the Next.js semantics closely enough to prove the CLI client against.
 type fakeSignalServer struct {
-	mu      sync.Mutex
-	members map[string]map[string]rosterMember // code -> username -> member
-	signals map[string][]signalNote            // code/username -> notes
-	boxes   map[string]map[string]inboxBox     // code/username -> msgId -> box
-	epochs  map[string]int64                   // code -> roster generation (join/leave bumps)
+	mu        sync.Mutex
+	members   map[string]map[string]rosterMember // code -> username -> member
+	signals   map[string][]signalNote            // code/username -> notes
+	boxes     map[string]map[string]inboxBox     // code/username -> msgId -> box
+	epochs    map[string]int64                   // code -> roster generation (join/leave bumps)
+	reactions map[string]map[string]string       // code -> "msgId|emoji|user" -> "1"
 }
 
 func newFakeSignalServer() *fakeSignalServer {
 	return &fakeSignalServer{
-		members: map[string]map[string]rosterMember{},
-		signals: map[string][]signalNote{},
-		boxes:   map[string]map[string]inboxBox{},
-		epochs:  map[string]int64{},
+		members:   map[string]map[string]rosterMember{},
+		signals:   map[string][]signalNote{},
+		boxes:     map[string]map[string]inboxBox{},
+		epochs:    map[string]int64{},
+		reactions: map[string]map[string]string{},
 	}
 }
 
@@ -284,6 +286,93 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		f.write(w, 200, map[string]any{"ok": true, "removed": removed})
+	case "reactions|POST":
+		me := f.me(r)
+		if _, ok := members[me]; !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		var body struct {
+			MsgId string `json:"msgId"`
+			Emoji string `json:"emoji"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if body.MsgId == "" || !reactionEmojiAllowed(body.Emoji) {
+			f.write(w, 400, map[string]string{"error": "bad reaction"})
+			return
+		}
+		if f.reactions[code] == nil {
+			f.reactions[code] = map[string]string{}
+		}
+		prefix := body.MsgId + "|"
+		suffix := "|" + me
+		same := false
+		for field := range f.reactions[code] {
+			if !strings.HasPrefix(field, prefix) || !strings.HasSuffix(field, suffix) {
+				continue
+			}
+			if field == body.MsgId+"|"+body.Emoji+"|"+me {
+				same = true
+			}
+			delete(f.reactions[code], field)
+		}
+		if !same {
+			f.reactions[code][body.MsgId+"|"+body.Emoji+"|"+me] = "1"
+		}
+		f.write(w, 200, map[string]any{"msgId": body.MsgId, "emoji": body.Emoji, "reacted": !same})
+	case "reactions|GET":
+		me := f.me(r)
+		if _, ok := members[me]; !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		filter := map[string]bool{}
+		if raw := r.URL.Query().Get("msgIds"); raw != "" {
+			for _, id := range strings.Split(raw, ",") {
+				if id != "" {
+					filter[id] = true
+				}
+			}
+		}
+		type reactAgg struct {
+			counts map[string]int
+			mine   map[string]bool
+		}
+		byMsg := map[string]*reactAgg{}
+		for field := range f.reactions[code] {
+			i := strings.LastIndex(field, "|")
+			if i <= 0 {
+				continue
+			}
+			j := strings.LastIndex(field[:i], "|")
+			if j <= 0 {
+				continue
+			}
+			mid, emoji, user := field[:j], field[j+1:i], field[i+1:]
+			if len(filter) > 0 && !filter[mid] {
+				continue
+			}
+			a := byMsg[mid]
+			if a == nil {
+				a = &reactAgg{counts: map[string]int{}, mine: map[string]bool{}}
+				byMsg[mid] = a
+			}
+			a.counts[emoji]++
+			if user == me {
+				a.mine[emoji] = true
+			}
+		}
+		out := []map[string]any{}
+		for mid, a := range byMsg {
+			mine := []string{}
+			for _, e := range reactionEmojis {
+				if a.mine[e] {
+					mine = append(mine, e)
+				}
+			}
+			out = append(out, map[string]any{"msgId": mid, "counts": a.counts, "mine": mine})
+		}
+		f.write(w, 200, map[string]any{"reactions": out})
 	default:
 		f.write(w, 404, map[string]string{"error": "unknown"})
 	}

@@ -173,6 +173,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 		home = "."
 	}
 	c.palette.close() // command drawer hands the slot over
+	c.pendingReactionMsgId = ""
 	c.input.SetValue("")
 	c.input.Placeholder = ""
 	// Ensure persistent buffer maps exist.

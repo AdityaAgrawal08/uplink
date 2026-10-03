@@ -54,6 +54,13 @@ type engineFile struct {
 	Size                            int64
 }
 
+// engineReaction is one inbound reaction nudge: Target names the reacted
+// message, Emoji the sender's new pick. Counts are NOT carried — consumers
+// reconcile against GET /reactions (the frame only shortens the poll wait).
+type engineReaction struct {
+	MsgId, From, To, Target, Emoji string
+}
+
 type engineCallbacks struct {
 	onChat      func(engineChat)
 	onDelivered func(msgId string)
@@ -62,6 +69,9 @@ type engineCallbacks struct {
 	onTyping    func(from, to string, active bool)
 	onPeerReady func(username, safetyCode string)
 	onPeerLost  func(username string)
+	// onReaction fires on a live reaction nudge (frameReaction). The payload
+	// is a hint only; counts come from the server poll.
+	onReaction func(r engineReaction)
 	// onRoster fires when a beat learns membership moved (join/leave).
 	// The sidebar refreshes off this (~100ms) instead of waiting for the
 	// next render tick. Nil-tolerant: headless consumers ignore it.
@@ -957,6 +967,15 @@ func (e *engine) dispatch(f frame) {
 		if e.cb.onTyping != nil {
 			e.cb.onTyping(f.From, f.To, f.Active)
 		}
+	case frameReaction:
+		// Cosmetic and idempotent: malformed nudges are dropped, never
+		// acked (there is no ack path) — the server poll is the backstop.
+		if f.Target == "" || !reactionEmojiAllowed(f.Emoji) {
+			return
+		}
+		if e.cb.onReaction != nil {
+			e.cb.onReaction(engineReaction{MsgId: f.MsgId, From: f.From, To: f.To, Target: f.Target, Emoji: f.Emoji})
+		}
 	case frameFileMeta, frameFileChunk, frameFileComplete, frameFile:
 		e.onFileFrame(f)
 	}
@@ -1232,6 +1251,24 @@ func (e *engine) sendChat(to, text string) (string, error) {
 		return "", err
 	}
 	return id, nil
+}
+
+// sendReaction nudges peers that a message's reactions moved. Best-effort by
+// design: the reaction itself is persisted via POST /reactions, and every
+// client's poll reads the server as truth — a dropped nudge only costs up to
+// 2s of latency, so these frames are never ack-tracked or retried.
+func (e *engine) sendReaction(to, target, emoji string) error {
+	if target == "" || !reactionEmojiAllowed(emoji) {
+		return fmt.Errorf("invalid reaction")
+	}
+	id, err := newMsgId()
+	if err != nil {
+		return err
+	}
+	f := newFrame(frameReaction, id, e.me, to)
+	f.Target = target
+	f.Emoji = emoji
+	return e.sendFrame(to, f)
 }
 
 // ensureFreshRoster refreshes the roster synchronously when the snapshot is
