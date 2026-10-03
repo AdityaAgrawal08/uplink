@@ -15,9 +15,21 @@ import {
 // (`{msgId}|{emoji}|{username}` -> "1"), so the client's 2s poll gets every
 // count for every on-screen message in a single GET. POST toggles one
 // reaction: same emoji removes it, a different emoji replaces the caller's
-// prior reaction on that message. Only members may read or write; counts are
-// room-scoped and keyed by sender-assigned msgId (broadcast and DM ids share
-// one space — DM privacy stays payload-level E2E).
+// prior reaction on that message. Only members may read or write.
+//
+// GET response contract (backward compatible — counts/mine untouched):
+//   { "reactions": [
+//       { "msgId": "...",
+//         "counts": { "👍": 2 },             // emoji -> total (allowlist order)
+//         "mine": ["👍"],                    // caller's own emojis
+//         "details": [                       // for the per-message detail bar
+//           { "emoji": "👍", "usernames": ["alice", "bob"] }
+//         ] } ] }
+// `details` is present for every summary (empty array when no reactors):
+// allowlist emoji order, usernames ascending, at most 20 per emoji (counts
+// still carry the full total, so clients can render "+N more"). Like counts,
+// details is room-scoped and keyed by sender-assigned msgId; broadcast and DM
+// ids share one space, so DM privacy stays payload-level E2E (see rooms.ts).
 export const dynamic = "force-dynamic"; // GET aggregates live counts: never cacheable
 
 export async function POST(

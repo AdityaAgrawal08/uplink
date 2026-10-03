@@ -55,6 +55,7 @@ export const READ_LIMIT_PER_WINDOW = 1200; // two same-user tabs + ack overhead 
 export const REACTION_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🙏"] as const;
 export type ReactionEmoji = (typeof REACTION_EMOJI)[number];
 export const MAX_REACTION_MESSAGES = 50; // one fetch never exceeds ~50 messages (mirrors FETCH_BOX_CAP)
+export const MAX_REACTION_REACTORS = 20; // per-emoji usernames in a `details` entry (counts carry the true total)
 
 export class RoomError extends Error {
   status: number;
@@ -787,11 +788,27 @@ export async function ackBoxes(code: string, username: string, ids: unknown): Pr
 // with a different emoji replaces the prior one; reacting with the same emoji
 // toggles it off. Reactions die with the room (24h sliding TTL, refreshed by
 // every room touch), and departures clean up after themselves.
+//
+// `details` backs the per-message detail bar (emoji -> who reacted). It is
+// room-scoped exactly like counts: the server never sees message bodies, so
+// it cannot tell a broadcast msgId from a DM one — the only server-side
+// msgId mapping is the short-lived inbox hash for undelivered boxes, which
+// does not cover P2P-delivered messages. Every member who can see a msgId's
+// counts can therefore also see its reactors; DM msgIds are already exposed
+// room-wide by counts. Closing this gap needs a client-supplied conversation
+// tag on the reaction itself (e.g. a `to` field), which the protocol does not
+// carry today — documented limitation, revisited when reactions gain scope.
+
+export interface ReactionDetail {
+  emoji: string; // allowlisted emoji (allowlist order)
+  usernames: string[]; // reactors, ascending, capped at MAX_REACTION_REACTORS
+}
 
 export interface ReactionSummary {
   msgId: string;
   counts: Record<string, number>; // emoji -> count (allowlist order)
   mine: string[]; // emojis the requesting user reacted with
+  details: ReactionDetail[]; // who reacted with what (allowlist order)
 }
 
 export interface ToggleReactionResult {
@@ -896,8 +913,11 @@ export async function toggleReaction(
 // Aggregate the room's reaction hash for the requesting member. Optional
 // `msgIds` narrows the hash scan to messages an on-screen UI actually shows;
 // without it the response is capped at MAX_REACTION_MESSAGES (msgId order).
-// Unparseable fields are reaped like fetchBoxes: they would otherwise shadow
-// cap slots forever.
+// Each summary carries `details` (emoji -> reactor usernames) for the detail
+// view: allowlist order, usernames ascending, capped at
+// MAX_REACTION_REACTORS per emoji (counts keep the true total). Unparseable
+// fields are reaped like fetchBoxes: they would otherwise shadow cap slots
+// forever.
 export async function fetchReactions(
   code: string,
   username: string,
@@ -919,7 +939,10 @@ export async function fetchReactions(
 
   const all = await hgetall(reactionsKey(code));
   if (!all) return { reactions: [] };
-  const byMsg = new Map<string, { counts: Map<string, number>; mine: Set<string> }>();
+  const byMsg = new Map<
+    string,
+    { counts: Map<string, number>; mine: Set<string>; reactors: Map<string, string[]> }
+  >();
   const corrupt: string[] = [];
   for (const field of Object.keys(all)) {
     const parsed = parseReactionField(field);
@@ -930,11 +953,14 @@ export async function fetchReactions(
     if (filter && !filter.has(parsed.msgId)) continue;
     let entry = byMsg.get(parsed.msgId);
     if (!entry) {
-      entry = { counts: new Map(), mine: new Set() };
+      entry = { counts: new Map(), mine: new Set(), reactors: new Map() };
       byMsg.set(parsed.msgId, entry);
     }
     entry.counts.set(parsed.emoji, (entry.counts.get(parsed.emoji) || 0) + 1);
     if (parsed.username === username) entry.mine.add(parsed.emoji);
+    const reactors = entry.reactors.get(parsed.emoji);
+    if (reactors) reactors.push(parsed.username);
+    else entry.reactors.set(parsed.emoji, [parsed.username]);
   }
   if (corrupt.length > 0) await redis.hdel(reactionsKey(code), ...corrupt).catch(() => 0);
 
@@ -942,12 +968,20 @@ export async function fetchReactions(
   for (const [msgId, entry] of byMsg) {
     const counts: Record<string, number> = {};
     const mine: string[] = [];
+    const details: ReactionDetail[] = [];
     for (const emoji of REACTION_EMOJI) {
       const n = entry.counts.get(emoji);
       if (n) counts[emoji] = n;
       if (entry.mine.has(emoji)) mine.push(emoji);
+      const reactors = entry.reactors.get(emoji);
+      if (reactors && reactors.length > 0) {
+        // One field per (msgId, emoji, username), so the list is already
+        // unique; sort for a stable UI order before capping.
+        reactors.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        details.push({ emoji, usernames: reactors.slice(0, MAX_REACTION_REACTORS) });
+      }
     }
-    reactions.push({ msgId, counts, mine });
+    reactions.push({ msgId, counts, mine, details });
   }
   reactions.sort((a, b) => (a.msgId < b.msgId ? -1 : a.msgId > b.msgId ? 1 : 0));
   return { reactions: reactions.slice(0, MAX_REACTION_MESSAGES) };

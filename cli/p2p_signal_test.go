@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -335,8 +336,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		type reactAgg struct {
-			counts map[string]int
-			mine   map[string]bool
+			counts  map[string]int
+			mine    map[string]bool
+			byEmoji map[string][]string
 		}
 		byMsg := map[string]*reactAgg{}
 		for field := range f.reactions[code] {
@@ -354,10 +356,11 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			a := byMsg[mid]
 			if a == nil {
-				a = &reactAgg{counts: map[string]int{}, mine: map[string]bool{}}
+				a = &reactAgg{counts: map[string]int{}, mine: map[string]bool{}, byEmoji: map[string][]string{}}
 				byMsg[mid] = a
 			}
 			a.counts[emoji]++
+			a.byEmoji[emoji] = append(a.byEmoji[emoji], user)
 			if user == me {
 				a.mine[emoji] = true
 			}
@@ -365,12 +368,17 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out := []map[string]any{}
 		for mid, a := range byMsg {
 			mine := []string{}
+			details := []map[string]any{}
 			for _, e := range reactionEmojis {
 				if a.mine[e] {
 					mine = append(mine, e)
 				}
+				if names := a.byEmoji[e]; len(names) > 0 {
+					sort.Strings(names)
+					details = append(details, map[string]any{"emoji": e, "usernames": names})
+				}
 			}
-			out = append(out, map[string]any{"msgId": mid, "counts": a.counts, "mine": mine})
+			out = append(out, map[string]any{"msgId": mid, "counts": a.counts, "mine": mine, "details": details})
 		}
 		f.write(w, 200, map[string]any{"reactions": out})
 	default:
