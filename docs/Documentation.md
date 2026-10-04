@@ -111,6 +111,14 @@ events, server-down alert) surface on the **status line**, never as
 transcript rows — only peer messages, own echoes, and file cards paint
 the transcript.
 
+@mentions (general room only): typing `@` in the composer opens a
+member-suggestion dropdown — Tab/Enter completes `@name `, Esc dismisses;
+in DMs `@` stays plain text. When a room member's message mentions
+`@yourname`, you get a desktop notification (always, even while the chat is
+focused) and your name paints highlighted in the message bubble. Mentions
+ride as plain text inside ordinary messages: nothing extra is sent or
+stored.
+
 ### Landing
 
 The CREATE/JOIN landing (`uplink` with no arguments) is two-step on the

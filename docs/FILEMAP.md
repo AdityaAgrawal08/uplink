@@ -28,13 +28,15 @@ docs/                Documentatio.md (this project manual) + FILEMAP.md (this fi
 ## 1. CLI root — chat TUI (`cli/chat_*.go`)
 
 - `cli/chat.go` | 139 | Routes chat between fullscreen TUI and plain mode. | `chatMessage, conversationKey, generalConv, runChat, runChatPlain`
-- `cli/chat_commands.go` | 678 | Slash-command registry (7 commands), palette, member picker, settled layout. | `slashCommands, rankSlashCommands, paletteState, paletteView, handlePaletteKeys, runCommand, modTarget, layoutFor, drawerView`
+- `cli/chat_commands.go` | 985 | Slash-command registry (7 commands), palette, member picker, @member dropdown, settled layout. | `slashCommands, rankSlashCommands, paletteState, paletteView, handlePaletteKeys, runCommand, modTarget, layoutFor, drawerView, drawerRowsBudget`
 - `cli/chat_conv_test.go` | 211 | DM isolation from general view and navigation. | `TestDMNeverPaintsInGeneralView, TestThreadViewIsolatedFromRoom, TestMultipleIndependentThreads, TestPendingEchoLivesInItsConversation, TestEnterPrivateSwitchesInstantly`
 - `cli/chat_download.go` | 43 | Downloads dir resolution + unique file paths. | `downloadsDir, uniquePath`
 - `cli/chat_filecard.go` | 247 | File attachment cards, icons, rune-safe truncation. | `fileIcon, fileExtLabel, truncateFilename, fileAttachmentCard, fileKindLabel`
 - `cli/chat_filecard_test.go` | 28 | Rune-safe truncation (emoji/CJK/ASCII). | `TestTruncateFilenameRuneSafe`
 - `cli/chat_hover_test.go` | 116 | Hover highlights exactly one roster row. | `TestHoverPaintsExactlyOneRow, TestMotionUpdatesAndClearsHover`
 - `cli/chat_markdown.go` | 100 | Terminal-escape sanitizer + lightweight markdown. | `sanitizeDisplay, renderMarkdown`
+- `cli/chat_mention.go` | 344 | @mentions in the general room: composer dropdown, receipt parsing, desktop ping, bubble highlight. | `parseMentions, mentionedIn, mentionExcerpt, mentionHighlighted, mentionQuery, mentionCandidates, mentionView, handleMentionKeys, completeMention, isGeneralConv`
+- `cli/chat_mention_test.go` | 598 | Mention parser, dropdown keyboard/painting/budget, notify matrix, highlight. | `TestParseMentions, TestMentionedInCaseSensitiveExact, TestMentionDropdownKeyboard, TestMentionDropdownPaintAndBudget, TestMentionNotifyTriggers, TestMentionNotifyNeverPings, TestMentionHighlight, TestMentionHighlightDMsStayPlain`
 - `cli/chat_picker.go` | 1031 | File-browser drawer for uploads/downloads/buffers. | `pickerEntry, pickerState, openPicker, loadPickerDir, humanSize, pickerView`
 - `cli/chat_picker_test.go` | 564 | Picker browsing, buffering, upload pipeline, drawer. | `TestListDirDirsFirstWithDotfiles, TestParentDirAndBreadcrumb, TestPickerRangeMath, TestPickerBrowseBufferAndQuickUpload`
 - `cli/chat_privacy_test.go` | 186 | Private-view filtering, echoes, targeting. | `TestPrivateViewRetroFiltersHistory, TestPendingEchoSurvivesModeSwitch, TestSendTargetsCurrentPeer, TestCommonRoomSendsBroadcast`
@@ -42,7 +44,7 @@ docs/                Documentatio.md (this project manual) + FILEMAP.md (this fi
 - `cli/chat_sanitize_test.go` | 44 | Escape stripping, markdown attack neutralization. | `TestSanitizeDisplayStripsEscapes, TestRenderMarkdownNeutralizesTerminalAttacks`
 - `cli/chat_theme.go` | 583 | Pure presentation theme: sidebar, header, bubbles, composer, system card. No video/tabs/panel/Send/call-card code remains. | `bubbleRatioFor, avatarColorFor, avatarCell, chatItem, chatItems, topBarView, roomHeaderView, roomHeaderCompact, keyHintsView, renderSystemCard, convPreview`
 - `cli/chat_theme_test.go` | 453 | Density, headers, clean-UI and no-surface contracts. | `TestAudioStateSurvivesLayout, TestNoVideoSurfaces, TestNoCallCard, TestSidebarPreviewSanitized, TestTopBarCollapsesByWidth, TestComposerFullWidthNoSend, TestRoomTabsRemoved, TestSystemCardGreenBar, TestResizeSweepExactFrame`
-- `cli/chat_tui.go` | 2907 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave. | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, orderedUsers, Update, View, runChatTUI, currentScope, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox`
+- `cli/chat_tui.go` | 4226 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave. | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, orderedUsers, Update, View, runChatTUI, currentScope, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox`
 - `cli/chat_tui_test.go` | 1052 | Layout, viewport, sending, outbox, alerts, wire integration. | `newFilterScreen, wireTestEngine, TestComputeLayout, TestFrameNeverExceedsTerminal, TestTryEnqueue, TestSettle410DrainsOutbox, TestOutboxCap, TestLeaveGuardResets, TestRosterTickBareScreen, TestSearchHeightAgreement, TestNotesParkOnStatusLine, TestServerDownAlertAcrossActions, TestMediaInfoStaysOutOfTranscript`
 - `cli/chat_ui_test.go` | 146 | Sidebar density, composer sizing, fullscreen frame. | `TestSidebarWidthDensity, TestComposerRowsDensity, TestFullScreenFrame, TestSidebarSectionsAndNavigation, TestComposerGrowsAndShrinks`
 - `cli/chat_unread_test.go` | 221 | Recency ordering, unread badges, roster pruning. | `TestOrderedUsersRecency, TestUnreadLifecycle, TestSidebarRendersAndClearsBadge, TestBeatPrunesDepartedPeers, TestMouseFollowsRecencyOrder`
@@ -98,7 +100,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `cli/encrypt.go` | 160 | Streaming AES-GCM file encrypt/decrypt in chunks. | `EncryptFileStream, DecryptFileStream`
 - `cli/qr.go` | 55 | Terminal QR rendering (capability-gated). | `ShouldShowQR, PrintQRCode`
 - `cli/clipboard.go` | 11 | Silent system-clipboard copy. | `copyToClipboard`
-- `cli/notify.go` | 15 | Desktop notifications for transfer completion/failure. | `notifyTransferComplete, notifyTransferFailed`
+- `cli/notify.go` | 29 | Desktop notifications: transfer outcomes + @mention pings. | `notifyTransferComplete, notifyTransferFailed, notifyMentioned, mentionNotifier`
 - `cli/version.go` | 462 | Version display, update check, checksum-verified install. | `handleVersion, normVersion, handleUpdate, installBinary, verifyReleaseChecksum`
 - `cli/version_update_test.go` | 198 | Release extraction, versions, auth headers, zip-slip. | `TestExtractReleaseAssetTar, TestExtractReleaseAssetZipSlip, TestCmpVersions`
 - `cli/scrollbars_test.go` | 149 | Scrollbar geometry + independent pane scrolling. | `geomScreen, TestScrollbarDragGeometry, TestIndependentScrollPanes, TestRosterScrollKeepsSelection`
