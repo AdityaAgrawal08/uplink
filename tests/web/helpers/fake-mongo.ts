@@ -60,7 +60,11 @@ export function evalExpr(expr: unknown, doc: FakeDoc): unknown {
         return va === null || va === undefined ? evalExpr(b, doc) : va;
       }
       case "$cond": {
-        const [ifE, thenE, elseE] = arg as unknown[];
+        // Mongo accepts both [$cond: [if, then, else]] and [$cond: { if, then, else }]
+        const condArg = Array.isArray(arg)
+          ? (arg as unknown[])
+          : [(arg as Record<string, unknown>).if, (arg as Record<string, unknown>).then, (arg as Record<string, unknown>).else];
+        const [ifE, thenE, elseE] = condArg;
         return evalExpr(ifE, doc) ? evalExpr(thenE, doc) : evalExpr(elseE, doc);
       }
       default: throw new Error(`fake-mongo: unsupported $expr operator ${op}`);

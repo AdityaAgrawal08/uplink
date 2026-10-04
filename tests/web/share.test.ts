@@ -345,3 +345,73 @@ describe("authorize-download lockout race (finding 9)", () => {
     expect((await authReq("auth-share-00000001", "203.0.113.75", { password: "wrong" })).status).toBe(429);
   });
 });
+
+describe("cleanup route auth (finding 11)", () => {
+  beforeEach(() => {
+    db().reset();
+    delete process.env.ADMIN_API_KEY;
+    delete process.env.CRON_SECRET;
+  });
+  afterEach(() => {
+    delete process.env.ADMIN_API_KEY;
+    delete process.env.CRON_SECRET;
+  });
+
+  function cleanupReq(authHeader?: string) {
+    const headers: Record<string, string> = {};
+    if (authHeader) headers.authorization = authHeader;
+    return import("../../src/app/api/v1/cleanup/route").then(({ POST }) =>
+      POST(new NextRequest("http://localhost/api/v1/cleanup", { method: "POST", headers }))
+    );
+  }
+
+  it("unauthenticated cleanup is refused with 401", async () => {
+    expect((await cleanupReq()).status).toBe(401);
+    expect((await cleanupReq("Bearer wrong-secret")).status).toBe(401);
+    expect((await cleanupReq("Basic abc")).status).toBe(401);
+  });
+
+  it("ADMIN_API_KEY bearer authorizes the run", async () => {
+    process.env.ADMIN_API_KEY = "test-admin-key-123";
+    const res = await cleanupReq("Bearer test-admin-key-123");
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { message: string }).message).toMatch(/cleanup/i);
+  });
+
+  it("CRON_SECRET bearer authorizes the run (Vercel cron style)", async () => {
+    process.env.CRON_SECRET = "cron-secret-456";
+    const res = await cleanupReq("Bearer cron-secret-456");
+    expect(res.status).toBe(200);
+  });
+
+  it("a wrong CRON_SECRET is refused even when one is configured", async () => {
+    process.env.CRON_SECRET = "cron-secret-456";
+    expect((await cleanupReq("Bearer cron-secret-999")).status).toBe(401);
+    expect((await cleanupReq("Bearer cron-secret-456-extra")).status).toBe(401); // length mismatch
+  });
+
+  it("authorized cleanup processes an expired share end to end", async () => {
+    process.env.ADMIN_API_KEY = "test-admin-key-123";
+    db().collection("shares").docs.push({
+      shareId: "cleanup-me-00000001",
+      status: "ACTIVE",
+      expiresAt: new Date(Date.now() - 1000),
+      objectKey: "uploads/2026/10/cleanup/gone.bin",
+      size: 1234,
+    });
+    const res = await cleanupReq("Bearer test-admin-key-123");
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { actions: Array<{ shareId: string; status: string }> };
+    expect(body.actions.find((a) => a.shareId === "cleanup-me-00000001")?.status).toBe("DELETED");
+    const doc = db().collection("shares").docs.find((d) => d.shareId === "cleanup-me-00000001");
+    expect(doc?.status).toBe("DELETED");
+  });
+
+  it("internal performCleanup stays directly callable (after()-hook path)", async () => {
+    // Share routes call performCleanup straight from their after() hooks —
+    // that internal path must keep working without any credential.
+    const { performCleanup } = await import("../../src/app/api/v1/cleanup/route");
+    const res = await performCleanup();
+    expect(res.status).toBe(200);
+  });
+});
