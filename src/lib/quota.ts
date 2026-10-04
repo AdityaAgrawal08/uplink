@@ -280,19 +280,25 @@ export async function releaseUploadQuota(fileSize: number, estimatedClassAOps: n
 
   const db = await getDb();
 
-  // Guard decrements below 0
-  const state = await getQuotaState();
-  const refundSize = Math.min(fileSize, state.reservedBytes);
-  const refundOps = Math.min(estimatedClassAOps, state.classAOps);
-
+  // B53 FIX: atomic pipeline with floor clamps, mirroring commitUploadQuota.
+  // The old read-then-$inc was a TOCTOU: two concurrent releases (e.g. a
+  // racing confirm error path and the cleanup sweep) could both read the
+  // pre-state and both decrement the full amount, driving reservedBytes (and
+  // classAOps) permanently negative and corrupting the quota ledger until the
+  // monthly reset. The pipeline applies the decrement atomically with a $max
+  // floor of 0, so a double release is a harmless no-op for the second refund
+  // — reservedBytes can never go negative, exactly like the commit clamp.
+  const state = await getQuotaState(); // pre-state only feeds the recovery log below, never the decrement
   const res = await db.collection<QuotaDoc>("quotas").findOneAndUpdate(
     { _id: "r2_quota" },
-    {
-      $inc: {
-        reservedBytes: -refundSize,
-        classAOps: -refundOps,
+    [
+      {
+        $set: {
+          reservedBytes: { $max: [0, { $subtract: ["$reservedBytes", fileSize] }] },
+          classAOps: { $max: [0, { $subtract: ["$classAOps", estimatedClassAOps] }] },
+        },
       },
-    },
+    ] as unknown as import("mongodb").UpdateFilter<QuotaDoc>,
     { returnDocument: "after" }
   );
 
