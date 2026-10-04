@@ -636,6 +636,40 @@ async function requireMember(code: string, username: string): Promise<Record<str
   return all;
 }
 
+// ─── Request-signature anchors ──────────────────────────────────────────────
+//
+// Every identity-bearing route verifies a request signature against a
+// pubkey anchor: the roster entry for the claimed username (the immutable
+// hsetnx claim made at join — the trust anchor for the whole plane), the
+// accept body's pubkey, or the per-user invite-scope claim below.
+
+// getMemberPubkey resolves the roster pubkey for a member (null when the
+// member or the room does not exist — the route then answers 401, since no
+// anchor can vouch for the claimed name).
+export async function getMemberPubkey(code: string, username: string): Promise<string | null> {
+  const all = await hgetall(membersKey(code));
+  if (!all || !all[username]) return null;
+  const m = parseMember(username, all[username]);
+  return m ? m.pubkey : null;
+}
+
+// Per-user device-key claim for invite-scoped calls (invites/mine GET,
+// invites/decline): an invitee has no roster entry, so the FIRST signed
+// invite interaction binds the username to a device key (SET NX — first
+// claim wins, immutable, exactly like roster claims). Accept also stamps it,
+// so a user who ever accepts holds a stable claim for later decline/mine.
+const userSigKeyName = (username: string) => `user:${username}:sigkey`;
+
+export async function getUserSigKey(username: string): Promise<string | null> {
+  const v = await redis.get(userSigKeyName(username));
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+export async function claimUserSigKey(username: string, pubkey: string): Promise<boolean> {
+  const claimed = await redis.set(userSigKeyName(username), pubkey, { nx: true });
+  return claimed !== null;
+}
+
 export async function heartbeat(
   code: string,
   username: string,

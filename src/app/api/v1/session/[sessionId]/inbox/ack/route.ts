@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, ackBoxes, checkReadLimit, clientIpHash, assertUsernameHeader } from "@/lib/rooms";
+import { RoomError, ackBoxes, checkReadLimit, clientIpHash, assertUsernameHeader, getMemberPubkey } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // Explicit acknowledgement: deletes exactly the listed boxes. A message is
 // forgotten by the server only after the recipient confirms receipt.
@@ -15,6 +16,11 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
+    // Signature gate: an ack DELETES boxes — the inbox destruction vector
+    // must be provably the recipient's own key.
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
     await checkReadLimit(clientIpHash(req), username); // high-frequency acks share the read budget
 
     const parsed = await parseJsonBody(req);

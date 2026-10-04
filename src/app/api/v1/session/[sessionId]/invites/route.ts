@@ -9,7 +9,9 @@ import {
   assertRoomCode,
   assertUsername,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // POST /api/v1/session/{id}/invites — invite a user to this room.
 // Body: { username: string } (the invitee; must be 3-20
@@ -32,6 +34,11 @@ export async function POST(
     const inviter = req.headers.get("X-Uplink-Username") || "";
     if (!inviter) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(inviter); // validate before budget keying (outer catch maps 400)
+    // Signature gate: invites are name-claims that mint membership paths —
+    // only a rostered key may invite as its owner.
+    const anchorPubkey = await getMemberPubkey(sessionId, inviter);
+    const sigGate = await requireRequestSignature(req, inviter, anchorPubkey);
+    if (sigGate !== true) return sigGate;
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

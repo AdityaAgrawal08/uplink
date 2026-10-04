@@ -8,7 +8,10 @@ import {
   clientIpHash,
   assertRoomCode,
   assertUsernameHeader,
+  getUserSigKey,
+  claimUserSigKey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // POST /api/v1/session/{id}/invites/decline — decline a pending invite
 // without joining. Body: { code: string } — `code` must equal the path
@@ -29,6 +32,14 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
+    // Signature gate with a self-claim anchor (see invites/mine): declining
+    // consumes an invite, so the claimed name must own the signing key.
+    const claimed = await getUserSigKey(username);
+    const headerPubkey = req.headers.get("X-Uplink-Pubkey") ?? "";
+    const anchor = claimed ?? (headerPubkey || null);
+    const sigGate = await requireRequestSignature(req, username, anchor);
+    if (sigGate !== true) return sigGate;
+    if (!claimed && anchor) await claimUserSigKey(username, anchor);
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

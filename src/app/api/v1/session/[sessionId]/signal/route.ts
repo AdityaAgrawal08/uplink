@@ -11,7 +11,9 @@ import {
   checkReadLimit,
   clientIpHash,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // WebRTC rendezvous: members exchange SDP offers/answers and ICE candidates
 // through per-user queues. POST deposits one note (rate-limited per IP);
@@ -27,6 +29,11 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username); // validate before budget keying (outer catch maps 400)
+    // Signature gate: rendezvous notes are identity-bearing (the note is
+    // stamped `from`); the GET below drains the caller's own queue.
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
@@ -51,6 +58,12 @@ export async function GET(
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    assertUsernameHeader(username);
+    // Signature gate on the drain: impersonation here steals/starves a
+    // peer's call-setup notes (presence sabotage).
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
     await checkReadLimit(clientIpHash(req), username); // drains are the hot poll path
 
     const notes = await drainSignals(sessionId, username);

@@ -9,7 +9,9 @@ import {
   checkReadLimit,
   clientIpHash,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // Server-synced message reactions. One hash per room
 // (`{msgId}|{emoji}|{username}` -> "1"), so the client's 2s poll gets every
@@ -42,6 +44,10 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username); // validate before budget keying (outer catch maps 400)
+    // Signature gate: reactions are keyed per-user server-side.
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
@@ -67,6 +73,10 @@ export async function GET(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
+    // Signature gate: the aggregate exposes the caller's own picks ("mine").
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
     await checkReadLimit(clientIpHash(req), username); // rides the same poll budget as inbox/signal
 
     // Optional narrowing: only the messages the caller currently renders.

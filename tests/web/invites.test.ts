@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { generateTestIdentity, signedNextRequest } from "./helpers/reqsig";
 import { redis } from "../../src/lib/redis";
 import {
   RoomError,
@@ -311,14 +312,20 @@ describe("group invites", () => {
     const creator = rand("u");
     const { sessionId } = await createRoom(creator, PUBKEY, await hashPassword("hunter2"));
     const invitee = rand("i");
+    // The route is now signature-gated against the PUBKEY IN THE BODY, so
+    // the invitee carries a real device identity and signs every attempt.
+    const inviteeId = generateTestIdentity();
     await createInvite(sessionId, creator, invitee);
 
     const call = async (password?: string) => {
-      const req = new NextRequest(`http://localhost/api/v1/session/${sessionId}/invites/accept`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Uplink-Username": invitee },
-        body: JSON.stringify({ code: sessionId, pubkey: PUBKEY, ...(password !== undefined ? { password } : {}) }),
-      });
+      const path = `/api/v1/session/${sessionId}/invites/accept`;
+      const req = signedNextRequest(
+        inviteeId,
+        "POST",
+        `http://localhost${path}`,
+        invitee,
+        { code: sessionId, pubkey: inviteeId.pubKeyB64, ...(password !== undefined ? { password } : {}) }
+      ) as NextRequest;
       return acceptInvitePOST(req, { params: Promise.resolve({ sessionId }) });
     };
 

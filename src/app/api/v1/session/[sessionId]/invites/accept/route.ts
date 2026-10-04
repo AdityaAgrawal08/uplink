@@ -11,7 +11,9 @@ import {
   clientIpHash,
   assertRoomCode,
   assertUsernameHeader,
+  claimUserSigKey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // POST /api/v1/session/{id}/invites/accept — accept a pending invite and
 // join the room. Body: { code: string, pubkey: string, password?: string }.
@@ -47,6 +49,17 @@ export async function POST(
     const { code, pubkey, password } = parsed.body as { code?: unknown; pubkey?: unknown; password?: unknown };
     assertRoomCode(code);
     if (code !== sessionId) return apiError("Session code mismatch", 400);
+
+    // Signature gate, anchored to the PUBKEY CARRIED IN THE BODY: the seat
+    // is bound to the device key that proved possession, not to the claimed
+    // name. A valid signature under any OTHER key is refused even though it
+    // cryptographically verifies. The accept also stamps the per-user
+    // invite claim (first claim wins), so later decline/mine calls verify
+    // against this same key.
+    const bodyPubkey = typeof pubkey === "string" && pubkey.length > 0 ? pubkey : null;
+    const sigGate = await requireRequestSignature(req, username, bodyPubkey);
+    if (sigGate !== true) return sigGate;
+    if (bodyPubkey) await claimUserSigKey(username, bodyPubkey);
 
     // Finding 14: accepting IS a join — the per-room join budget applies
     // (before the password gate, so probes burn the room's budget).

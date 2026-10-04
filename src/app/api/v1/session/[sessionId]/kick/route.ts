@@ -9,7 +9,9 @@ import {
   assertRoomCode,
   assertUsername,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // POST /api/v1/session/{id}/kick — remove a user (creator/admin only).
 // The target is banned while the room lives and their transient queues are
@@ -26,6 +28,10 @@ export async function POST(
     const actor = req.headers.get("X-Uplink-Username") || "";
     if (!actor) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(actor);
+    // Signature gate: only a key actually rostered for `actor` can kick.
+    const anchorPubkey = await getMemberPubkey(sessionId, actor);
+    const sigGate = await requireRequestSignature(req, actor, anchorPubkey);
+    if (sigGate !== true) return sigGate;
     await checkJoinLimit(clientIpHash(req)); // membership mutation faucet
 
     const parsed = await parseJsonBody(req);

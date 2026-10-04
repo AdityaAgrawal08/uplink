@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, heartbeat, checkReadLimit, clientIpHash, assertUsernameHeader } from "@/lib/rooms";
+import { RoomError, heartbeat, checkReadLimit, clientIpHash, assertUsernameHeader, getMemberPubkey } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 export async function POST(
   req: NextRequest,
@@ -15,6 +16,13 @@ export async function POST(
       return apiError("X-Uplink-Username header is required", 400);
     }
     assertUsernameHeader(usernameHeader);
+    // Signature gate: prove possession of the device key rostered for this
+    // username BEFORE any presence write (impersonation defense). The signed
+    // payload covers method|path|timestamp|nonce; the anchor is the member's
+    // immutable join-time pubkey claim.
+    const anchorPubkey = await getMemberPubkey(sessionId, usernameHeader);
+    const sigGate = await requireRequestSignature(req, usernameHeader, anchorPubkey);
+    if (sigGate !== true) return sigGate;
     await checkReadLimit(clientIpHash(req), usernameHeader); // high-frequency reads get a generous budget
 
     const parsed = await parseJsonBody(req);
