@@ -118,6 +118,8 @@ type landingModel struct {
 	serverURL  string
 	result     *landingResult
 	shouldQuit bool
+	passModal  bool   // join step 2: password prompt overlay (protected sessions)
+	passErr    string // error shown inside the password modal
 }
 
 func newLandingModel(serverURL string) landingModel {
@@ -170,15 +172,16 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		if msg.Type == tea.MouseLeft {
+			// The password modal is keyboard-driven; ignore clicks while open.
+			if m.passModal {
+				return m, nil
+			}
 			l := m.layout()
 			outerW := l.outerW
 			// header is 3 rows (title, subtitle, blank) above outer
 			headerH := 3
-			// outer height depends on tab (CREATE shorter than JOIN)
+			// CREATE and JOIN share the same two-field form height
 			outerH := 18
-			if m.tab == tabJoin {
-				outerH = 22
-			}
 			if m.errMsg != "" {
 				outerH += 2
 			}
@@ -202,14 +205,13 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				tabW := l.tabW
 				if msg.X >= innerLeft && msg.X < innerLeft+tabW {
 					m.tab = tabCreate
-					if m.focus == focusCode {
-						m.focus = focusUser
-					}
+					m.parkFocusForTab()
 					m.syncFocus()
 					return m, nil
 				}
 				if msg.X >= innerLeft+tabW && msg.X < innerLeft+tabW*2 {
 					m.tab = tabJoin
+					m.parkFocusForTab()
 					m.syncFocus()
 					return m, nil
 				}
@@ -230,6 +232,32 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		// Join step 2: the password modal owns the keyboard while open.
+		if m.passModal && m.tab == tabJoin {
+			switch msg.Type {
+			case tea.KeyEsc:
+				// Back to the form; username+code stay, the password clears.
+				m.passModal = false
+				m.passErr = ""
+				m.passInput.SetValue("")
+				m.submitting = false
+				m.focus = focusSubmit
+				m.syncFocus()
+				return m, nil
+			case tea.KeyEnter:
+				if m.submitting {
+					return m, nil
+				}
+				return m, m.submitPassword()
+			case tea.KeyCtrlC:
+				m.shouldQuit = true
+				return m, tea.Quit
+			default:
+				var cmd tea.Cmd
+				m.passInput, cmd = m.passInput.Update(msg)
+				return m, cmd
+			}
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			// Esc quits landing; CtrlC also quits
@@ -251,17 +279,13 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// switch tabs with arrows
 			if m.tab == tabCreate && msg.Type == tea.KeyRight {
 				m.tab = tabJoin
-				if m.focus == focusCode {
-					m.focus = focusUser
-				}
+				m.parkFocusForTab()
 				m.syncFocus()
 				return m, nil
 			}
 			if m.tab == tabJoin && msg.Type == tea.KeyLeft {
 				m.tab = tabCreate
-				if m.focus == focusCode {
-					m.focus = focusUser
-				}
+				m.parkFocusForTab()
 				m.syncFocus()
 				return m, nil
 			}
@@ -282,11 +306,6 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.focus == focusUser {
 				m.focusNext()
-				m.syncFocus()
-				return m, nil
-			}
-			if m.focus == focusPass && m.tab == tabJoin {
-				m.focus = focusCode
 				m.syncFocus()
 				return m, nil
 			}
@@ -314,8 +333,38 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case landingDoneMsg:
+		if msg.needPass {
+			// Step 1 answered "Password is required for this session": open
+			// the modal. An empty resubmit re-asks and surfaces a hint.
+			m.submitting = false
+			first := !m.passModal
+			m.passModal = true
+			m.passInput.SetValue("")
+			m.passErr = ""
+			if !first {
+				m.passErr = "password required or incorrect"
+			}
+			m.focus = focusPass
+			m.syncFocus()
+			return m, nil
+		}
 		if msg.err != "" {
 			m.submitting = false
+			if msg.modalErr && m.passModal {
+				// Wrong password: stay in the modal, retry in place.
+				m.passErr = msg.err
+				m.focus = focusPass
+				m.syncFocus()
+				return m, nil
+			}
+			// Inline form error (step 1 and anything else); a modal that was
+			// open (e.g. the room vanished mid-flow) closes back to the form.
+			if m.passModal {
+				m.passModal = false
+				m.passInput.SetValue("")
+				m.focus = focusSubmit
+				m.syncFocus()
+			}
 			m.errMsg = msg.err
 			return m, nil
 		}
@@ -334,6 +383,8 @@ func (m landingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case landingJoinOkMsg:
 		m.submitting = false
+		m.passModal = false
+		m.passInput.SetValue("")
 		m.result = &landingResult{Mode: tabJoin, Username: msg.username, Password: msg.password, Code: msg.code, Key: msg.code, ID: msg.id}
 		return m, tea.Quit
 	}
@@ -400,10 +451,9 @@ func (m *landingModel) focusNext() {
 			m.focus = focusUser
 		}
 	} else {
+		// JOIN has two fields: username → code → submit (no password row).
 		switch m.focus {
 		case focusUser:
-			m.focus = focusPass
-		case focusPass:
 			m.focus = focusCode
 		case focusCode:
 			m.focus = focusSubmit
@@ -431,15 +481,25 @@ func (m *landingModel) focusPrev() {
 		switch m.focus {
 		case focusUser:
 			m.focus = focusSubmit
-		case focusPass:
-			m.focus = focusUser
 		case focusCode:
-			m.focus = focusPass
+			m.focus = focusUser
 		case focusSubmit:
 			m.focus = focusCode
 		default:
 			m.focus = focusUser
 		}
+	}
+}
+
+// parkFocusForTab moves focus to username when the focused field does not
+// exist on the newly selected tab (JOIN has no password field, CREATE has no
+// code field).
+func (m *landingModel) parkFocusForTab() {
+	if m.tab == tabCreate && m.focus == focusCode {
+		m.focus = focusUser
+	}
+	if m.tab == tabJoin && m.focus == focusPass {
+		m.focus = focusUser
 	}
 }
 
@@ -472,10 +532,10 @@ func (m *landingModel) hitInputAbsolute(x, y int, l landingLayout, outerLeft, ou
 	if x < innerLeft || x >= innerLeft+innerW {
 		return false
 	}
-	// centers for each input row (each box 3 high)
+	// centers for each input row (each box 3 high); the second row is the
+	// password on CREATE and the code on JOIN
 	userCenter := innerTop + tabH + 1
-	passCenter := userCenter + 4
-	codeCenter := passCenter + 4
+	row2Center := userCenter + 4
 
 	// find closest input by Y distance, with tolerance ±2
 	bestDist := 1000
@@ -485,16 +545,13 @@ func (m *landingModel) hitInputAbsolute(x, y int, l landingLayout, outerLeft, ou
 		bestDist = distUser
 		bestFocus = focusUser
 	}
-	distPass := abs(y - passCenter)
+	distPass := abs(y - row2Center)
 	if distPass < bestDist && distPass <= 2 {
 		bestDist = distPass
-		bestFocus = focusPass
-	}
-	if m.tab == tabJoin {
-		distCode := abs(y - codeCenter)
-		if distCode < bestDist && distCode <= 2 {
-			bestDist = distCode
+		if m.tab == tabJoin {
 			bestFocus = focusCode
+		} else {
+			bestFocus = focusPass
 		}
 	}
 	if bestDist <= 2 {
@@ -519,11 +576,10 @@ func (m *landingModel) hitButtonAbsolute(x, y int, l landingLayout, outerLeft, o
 	tabH := 3
 	userCenter := innerTop + tabH + 1
 	passCenter := userCenter + 4
+	// button row is 3 high below the last input row; both tabs have two
+	// input rows, so the button sits at the same height everywhere
 	buttonTop := passCenter + 4
-	if m.tab == tabJoin {
-		buttonTop += 4
-	}
-	// button row is 3 high, centered horizontally but allow full-width click for forgiveness
+	// allow full-width click for forgiveness
 	if y >= buttonTop && y < buttonTop+3 && x >= innerLeft && x < innerLeft+innerW {
 		return true
 	}
@@ -588,23 +644,24 @@ func (m landingModel) View() string {
 	if m.focus == focusPass {
 		passBox = landInputFocusedStyle.Render(m.passInput.View())
 	}
-	codeBox := ""
-	if m.tab == tabJoin {
-		codeBox = landInputBlurStyle.Render(m.codeInput.View())
-		if m.focus == focusCode {
-			codeBox = landInputFocusedStyle.Render(m.codeInput.View())
-		}
+	codeBox := landInputBlurStyle.Render(m.codeInput.View())
+	if m.focus == focusCode {
+		codeBox = landInputFocusedStyle.Render(m.codeInput.View())
 	}
 
 	// ensure input widths
 	// build rows
 	rowUser := lipgloss.JoinHorizontal(lipgloss.Top, labelUser, " ", userBox)
 	rowPass := lipgloss.JoinHorizontal(lipgloss.Top, labelPass, " ", passBox)
+	rowCode := lipgloss.JoinHorizontal(lipgloss.Top, labelCode, " ", codeBox)
+	// JOIN is two-step: username + code only; the session password is asked
+	// in a modal only when the server reports the session is protected.
 	var rows []string
-	rows = append(rows, rowUser, "", rowPass, "")
+	rows = append(rows, rowUser, "")
 	if m.tab == tabJoin {
-		rowCode := lipgloss.JoinHorizontal(lipgloss.Top, labelCode, " ", codeBox)
 		rows = append(rows, rowCode, "")
+	} else {
+		rows = append(rows, rowPass, "")
 	}
 	// button centered — compact, hugs text
 	btnText := "CREATE"
@@ -653,7 +710,69 @@ func (m landingModel) View() string {
 	content := lipgloss.JoinVertical(lipgloss.Center, header, outer)
 	// center on screen
 	centered := lipgloss.NewStyle().Width(m.w).Height(m.h).Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(content)
+	if m.passModal && m.tab == tabJoin {
+		return overlayCenter(centered, m.modalView(), m.w, m.h)
+	}
 	return centered
+}
+
+// modalView renders the step-2 password prompt. It reuses the masked
+// passInput widget so the •••• echo and caret behaviour match the create
+// form, and it is drawn over the landing by overlayCenter.
+func (m landingModel) modalView() string {
+	innerW := m.w - 8
+	if innerW < 20 {
+		innerW = 20
+	}
+	if innerW > 48 {
+		innerW = 48
+	}
+	m.passInput.Width = innerW - 6
+	passBox := landInputBlurStyle.Render(m.passInput.View())
+	if m.focus == focusPass {
+		passBox = landInputFocusedStyle.Render(m.passInput.View())
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("SESSION PASSWORD")
+	sub := landSubtitleStyle.Render(truncateByWidth("This session is password-protected.", maxInt(innerW-4, 10)))
+	var lines []string
+	lines = append(lines, title, sub, passBox)
+	if m.passErr != "" {
+		lines = append(lines, landErrorStyle.Render(m.passErr))
+	}
+	if m.submitting {
+		lines = append(lines, landLabelStyle.Render("  joining…"))
+	}
+	lines = append(lines, landHintStyle.Render("ENTER submit  ·  ESC back"))
+	inner := strings.Join(lines, "\n")
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colAccent).
+		Background(colPanel).
+		Padding(1, 2).
+		Render(inner)
+}
+
+// overlayCenter draws overlay on top of the full-frame base by replacing the
+// rows the overlay occupies (the modal paints its own opaque panel
+// background), so neither string's ANSI styling is corrupted by splicing.
+func overlayCenter(base, overlay string, w, h int) string {
+	baseLines := strings.Split(base, "\n")
+	ovLines := strings.Split(overlay, "\n")
+	ovW := lipgloss.Width(overlay)
+	startRow := (h - len(ovLines)) / 2
+	if startRow < 0 {
+		startRow = 0
+	}
+	startCol := (w - ovW) / 2
+	if startCol < 0 {
+		startCol = 0
+	}
+	for i := 0; i < len(ovLines) && startRow+i < len(baseLines); i++ {
+		line := strings.Repeat(" ", startCol) + ovLines[i]
+		line += strings.Repeat(" ", maxInt(w-lipgloss.Width(line), 0))
+		baseLines[startRow+i] = line
+	}
+	return strings.Join(baseLines, "\n")
 }
 
 // validation
@@ -682,8 +801,10 @@ func (m *landingModel) validate() string {
 }
 
 type landingDoneMsg struct {
-	result *landingResult
-	err    string
+	result   *landingResult
+	err      string
+	needPass bool // join got 401 "Password is required for this session" -> open modal
+	modalErr bool // 401 on a password-bearing join -> keep the error inside the modal
 }
 type landingCreateOkMsg struct {
 	username, password, key string
@@ -713,7 +834,19 @@ func (m *landingModel) submit() tea.Cmd {
 		return m.doCreate(username, password)
 	}
 	code := strings.TrimSpace(m.codeInput.Value())
-	return m.doJoin(username, password, code)
+	// Two-step join: the form never carries a password; if the session is
+	// protected the server answers 401 and the modal asks for it.
+	return m.doJoin(username, "", code)
+}
+
+// submitPassword runs the modal's join attempt: the code/username already
+// validated at step 1, plus the password typed into the modal.
+func (m *landingModel) submitPassword() tea.Cmd {
+	m.submitting = true
+	m.passErr = ""
+	username := strings.TrimSpace(m.userInput.Value())
+	code := strings.TrimSpace(m.codeInput.Value())
+	return m.doJoin(username, m.passInput.Value(), code)
 }
 
 func (m *landingModel) doCreate(username, password string) tea.Cmd {
@@ -785,9 +918,25 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 			Error string `json:"error"`
 		}
 		_ = jsonDecode(body, &e)
+		if e.Error == "" {
+			e.Error = strings.TrimSpace(string(body))
+		}
 		switch c {
 		case 401:
-			return landingDoneMsg{err: "password required or incorrect"}
+			if password == "" {
+				// Step 1 (no password sent): only the "required" answer opens
+				// the modal; anything else stays an inline form error.
+				if e.Error == "Password is required for this session" {
+					return landingDoneMsg{needPass: true}
+				}
+				return landingDoneMsg{err: "password required or incorrect"}
+			}
+			// Step 2 (password sent): wrong password stays in the modal with
+			// unlimited retries (the server rate-limits per attempt).
+			if e.Error == "Incorrect session password" {
+				return landingDoneMsg{modalErr: true, err: "incorrect password"}
+			}
+			return landingDoneMsg{modalErr: true, err: "password required or incorrect"}
 		case 409:
 			return landingDoneMsg{err: "'" + username + "' already in this session"}
 		case 404:
@@ -795,9 +944,6 @@ func (m *landingModel) doJoin(username, password, code string) tea.Cmd {
 			// room whose last member already left (rooms vanish on empty).
 			return landingDoneMsg{err: "session not found — check the 6-digit code (rooms vanish when emptied)"}
 		default:
-			if e.Error == "" {
-				e.Error = strings.TrimSpace(string(body))
-			}
 			if e.Error == "" {
 				e.Error = fmt.Sprintf("server returned status %d", c)
 			}
