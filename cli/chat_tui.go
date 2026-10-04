@@ -2949,20 +2949,6 @@ func (c *chatScreen) shutdownSessions() {
 	c.eng.stop()
 }
 
-// memberList is the /new-group picker source: every room user (the live
-// roster when an engine is wired, the sidebar snapshot otherwise), self
-// excluded.
-func (c *chatScreen) memberList() []rosterMember {
-	if c.eng != nil {
-		return c.eng.peers()
-	}
-	out := make([]rosterMember, 0, len(c.users))
-	for _, u := range c.users {
-		out = append(out, rosterMember{Username: u, Online: true})
-	}
-	return out
-}
-
 // attachGroup registers a joined group session: builds and starts its
 // engine (tagged traffic keeps the sidebar fresh in the background) and
 // remembers display state. The group password ("" for open groups) enables

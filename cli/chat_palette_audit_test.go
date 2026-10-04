@@ -10,13 +10,13 @@ import (
 
 // ---------------------------------------------------------------------------
 // Command-panel end-to-end audit (BUG 2 regression suite): the whole panel
-// driving through the REAL Update path — open, list all 10 commands,
+// driving through the REAL Update path — open, list all 11 commands,
 // filter-as-you-type, every navigation key, Enter runs, Esc closes, footer
 // hints, empty state, mouse select, and the budget/paint single-plan
 // contract after every interaction.
 // ---------------------------------------------------------------------------
 
-// auditScreen is a creator-role chat screen (sees all 10 commands) with a
+// auditScreen is a creator-role chat screen (sees all 11 commands) with a
 // real layout, driven through Update like the live app.
 func auditScreen(t *testing.T) chatScreen {
 	t.Helper()
@@ -82,7 +82,7 @@ func lipglossHeight(s string) int {
 func TestPaletteEndToEndCreator(t *testing.T) {
 	c := auditScreen(t)
 
-	// Open with "/": all 10 registered commands listed.
+	// Open with "/": all 11 registered commands listed.
 	c, _ = typeKeys(&c, "/")
 	if !c.palette.visible() {
 		t.Fatal("typing / must open the command panel")
@@ -125,8 +125,8 @@ func TestPaletteEndToEndCreator(t *testing.T) {
 	if !strings.Contains(panel, "navigate") || !strings.Contains(panel, "enter") {
 		t.Fatalf("footer must carry the palette hints: %q", panel)
 	}
-	if !strings.Contains(panel, "1/10") {
-		t.Fatalf("footer must carry the 1/10 count: %q", panel)
+	if !strings.Contains(panel, "1/11") {
+		t.Fatalf("footer must carry the 1/11 count: %q", panel)
 	}
 	// The header contract: Bold title left, muted esc right.
 	if !strings.Contains(panel, "Commands") || !strings.Contains(panel, "esc") {
@@ -250,6 +250,73 @@ func TestPaletteMemberStageWheelStepsUsers(t *testing.T) {
 	}
 	if painted != 1 {
 		t.Fatalf("selected user must paint exactly once, got %d", painted)
+	}
+}
+
+// TestPaletteThirdCommandNotFirst is the failing-first regression for the
+// reported "selection stuck on the first item" bug: arrow-down twice (or a
+// filter) must select the THIRD command — Enter must run THAT command, never
+// the first one. Mouse parity: clicking the third painted row and pressing
+// Enter runs the same third command.
+func TestPaletteThirdCommandNotFirst(t *testing.T) {
+	c := auditScreen(t)
+	c, _ = typeKeys(&c, "/")
+	ranked := c.rankedCommands("/")
+	if len(ranked) < 3 {
+		t.Fatalf("need at least 3 commands, got %d", len(ranked))
+	}
+	third := ranked[2].Name
+
+	// Arrow-down twice: selection sits on the third command.
+	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
+	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
+	if c.palette.sel != 2 {
+		t.Fatalf("down twice: sel=%d; want 2 (%s)", c.palette.sel, third)
+	}
+	// Enter runs the third command (the drawer closes; the command's
+	// side effect marks which one ran — /reply opens the reply pick).
+	got, cmd := step(&c, tea.KeyMsg{Type: tea.KeyEnter})
+	if got.palette.visible() {
+		t.Fatal("enter must close the drawer after picking the third command")
+	}
+	if third == "/reply" && got.replyPick == nil {
+		t.Fatalf("enter must run %s (the third command), not the first", third)
+	}
+	_ = cmd
+
+	// Filter variant: "/a" ranks >=3 commands; down twice + Enter must run
+	// the third of THAT filtered list.
+	c2 := auditScreen(t)
+	c2, _ = typeKeys(&c2, "/a")
+	franked := c2.rankedCommands(c2.input.Value())
+	if len(franked) < 3 {
+		t.Fatalf("filtered list too short: %+v", franked)
+	}
+	c2, _ = step(&c2, tea.KeyMsg{Type: tea.KeyDown})
+	c2, _ = step(&c2, tea.KeyMsg{Type: tea.KeyDown})
+	if c2.palette.sel != 2 || c2.rankedCommands(c2.input.Value())[2].Name != franked[2].Name {
+		t.Fatalf("filtered down twice: sel=%d ranked[2]=%s; want %s", c2.palette.sel,
+			c2.rankedCommands(c2.input.Value())[2].Name, franked[2].Name)
+	}
+
+	// Mouse parity: on the FLAT filtered list (/a), click the third visible
+// item row — the hit-test resolves the exact ranked item, never row 0.
+	c3 := auditScreen(t)
+	c3, _ = typeKeys(&c3, "/a")
+	l := c3.layoutFor()
+	y0, _ := c3.drawerYRange(l)
+	x := transcriptX0(l) + 2
+	itemRows := c3.palettePanelRows()
+	var clickY int
+	for i, r := range itemRows {
+		if r.kind == drItem && r.item == 2 { // the third ranked item
+			clickY = y0 + i
+			break
+		}
+	}
+	c3.handleMouse(mouseAt(x, clickY))
+	if c3.palette.sel != 2 {
+		t.Fatalf("click third row: sel=%d; want 2", c3.palette.sel)
 	}
 }
 

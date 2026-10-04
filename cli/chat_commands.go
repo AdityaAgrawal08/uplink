@@ -34,7 +34,8 @@ var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands", Group: "General"},
 	{Name: "/reply", Desc: "reply to a message", Group: "General"},
 	{Name: "/settings", Desc: "invites & notifications", Group: "Settings"},
-	{Name: "/new-group", Desc: "create a group with room members", Group: "Groups"},
+	{Name: "/new-group", Desc: "create a group (add members with /invite)", Group: "Groups"},
+	{Name: "/invite", Desc: "invite room users to this group", Group: "Groups"},
 	{Name: "/upload", Desc: "send file(s) into the room", Group: "Files"},
 	{Name: "/download", Desc: "fetch shared room files", Group: "Files"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room", Group: "Voice"},
@@ -1222,9 +1223,22 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 		c.closeTransientsForWindow()
 		return func() tea.Msg { return openSettingsMsg{} }
 	case "/new-group":
-		// Member pick + creation window; see groups_ui.go.
+		// Creation window (Name/Description/Max opens DIRECTLY — members
+		// are added later through /invite); see groups_ui.go.
 		c.closeTransientsForWindow()
 		return func() tea.Msg { return openNewGroupMsg{} }
+	case "/invite":
+		// Invitation window (groups only): the composer's group view must
+		// be open, otherwise the command answers inline and never opens.
+		if c.activeGroup == "" {
+			c.status = "/invite works inside a group — open the group conversation first"
+			c.rebuildView()
+			return nil
+		}
+		// The group view owns the screen's client/engine: park the message
+		// and let rootModel build the window from the group session.
+		c.closeTransientsForWindow()
+		return func() tea.Msg { return openInviteMsg{} }
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":
@@ -1281,9 +1295,9 @@ func modTarget(arg string) (string, bool) {
 }
 
 // closeTransientsForWindow dismisses every composer-adjacent transient
-// before a full-screen window (/settings, /new-group) opens: the "/" and
-// "@" drawers, the anchored reaction rows, the reply menu/pick and the
-// pinned quote card. One surface at a time.
+// before a full-screen window (/settings, /new-group, /invite) opens: the
+// "/" and "@" drawers, the anchored reaction rows, the reply menu/pick and
+// the pinned quote card. One surface at a time.
 func (c *chatScreen) closeTransientsForWindow() {
 	c.palette.close()
 	c.mention.close()

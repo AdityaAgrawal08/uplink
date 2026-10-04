@@ -2,36 +2,29 @@ package main
 
 import (
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // TestGroupFormTypingRepro drives the REAL /new-group path end to end:
-// member-pick stage → form stage → typing into every field THROUGH the
-// model's Update (not by poking the textinputs directly). Regression for
-// the reported bug: keystrokes never reach the Name/Description/Max-People
-// fields.
+// the window opens DIRECTLY on the creation form (no member-pick stage —
+// members are added later through /invite) and typing into every field
+// works THROUGH the model's Update (not by poking the textinputs directly).
+// Regression for the reported bug: keystrokes never reach the
+// Name/Description/Max-People fields.
 func TestGroupFormTypingRepro(t *testing.T) {
 	srv, _ := newGroupTestServer(t)
 	id, err := generateIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	members := []rosterMember{
-		{Username: "bob", Role: "member"},
-		{Username: "carol", Role: "member"},
-	}
-	m := newGroupModel(srv.URL, "alice", id, "123456", 110, 40, members)
+	m := newGroupModel(srv.URL, "alice", id, "123456", 110, 40)
 
-	// Stage 1: pick a member, Enter to the form.
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeySpace}) // toggle bob (sel 0)
-	if !m.picked["bob"] {
-		t.Fatal("space must pick the highlighted member")
-	}
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.stage != groupStageForm {
-		t.Fatalf("enter must open the form stage, got stage %d", m.stage)
+	// The window opens on the form, Name field focused.
+	if !m.nameInput.Focused() || m.formFocus != 0 {
+		t.Fatalf("window must open on the Name field, focus=%d", m.formFocus)
 	}
 
 	// Name field: type through Update, rune by rune (the real key path).
@@ -81,18 +74,12 @@ func TestGroupFormTypingRepro(t *testing.T) {
 		t.Fatalf("create done = %+v; want a code and the typed name", done)
 	}
 
-	// Esc backs out per stage: from the form it returns to the member
-	// pick (picks kept); from the pick it closes the window.
+	// Esc closes the window outright — there is no earlier stage to return
+	// to (the member multi-select stage is gone).
 	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEsc})
-	if m.stage != groupStagePick {
-		t.Fatal("esc in the form must return to the member pick stage")
-	}
-	if !m.picked["bob"] {
-		t.Fatal("picks must survive esc back to the member pick")
-	}
 	_, cmd = stepGroupC(m, tea.KeyMsg{Type: tea.KeyEsc})
 	if cmd == nil {
-		t.Fatal("esc in the pick stage must produce a close command")
+		t.Fatal("esc must produce a close command")
 	}
 	var closeMsg closeOverlayMsg
 	if got := cmd().(closeOverlayMsg); got != closeMsg {
@@ -100,43 +87,30 @@ func TestGroupFormTypingRepro(t *testing.T) {
 	}
 }
 
-// TestGroupFormEscStageTransitionRepro proves blur/focus sync across the
-// pick→form→pick boundary: after Esc back to the pick stage, Enter must
-// re-enter the form with the name field focused and typing live again.
-func TestGroupFormEscStageTransitionRepro(t *testing.T) {
-	members := []rosterMember{{Username: "bob", Role: "member"}}
-	m := newGroupModel("", "alice", nil, "123456", 110, 40, members)
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter}) // to form
-	for _, r := range []rune("AB") {
+// TestGroupFormBackspaceRepro proves editing keys (backspace) reach the
+// focused field through Update too, not just runes.
+func TestGroupFormBackspaceRepro(t *testing.T) {
+	m := newGroupModel("", "alice", nil, "123456", 110, 40)
+	for _, r := range []rune("abc") {
 		m = stepGroup(m, teaRune(r))
 	}
-	if got := m.nameInput.Value(); got != "AB" {
-		t.Fatalf("name before esc = %q; want AB", got)
+	if got := m.nameInput.Value(); got != "abc" {
+		t.Fatalf("typed = %q; want abc", got)
 	}
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEsc}) // back to pick
-	if m.stage != groupStagePick {
-		t.Fatal("esc must return to pick stage")
+	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyBackspace})
+	if got := m.nameInput.Value(); got != "ab" {
+		t.Fatalf("after backspace = %q; want ab", got)
 	}
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter}) // re-enter form
-	if m.stage != groupStageForm || m.formFocus != 0 {
-		t.Fatalf("re-enter form: stage=%d focus=%d; want form focus 0", m.stage, m.formFocus)
-	}
-	if !m.nameInput.Focused() {
-		t.Fatal("name input must be focused after re-entering the form")
-	}
-	for _, r := range []rune("C") {
-		m = stepGroup(m, teaRune(r))
-	}
-	if got := m.nameInput.Value(); got != "ABC" {
-		t.Fatalf("name after re-enter = %q; want ABC (typing must survive the stage round-trip)", got)
+	if m.formFocus != 0 {
+		t.Fatalf("backspace must stay in the focused field, got %d", m.formFocus)
 	}
 }
 
 // TestNewGroupEndToEndThroughRootModel drives the REAL user path for the
 // /new-group form typing bug: type "/new-group" in the composer, pick it in
-// the palette (Enter), the root model opens the window, pick a member, and
-// type into every form field — all through the program model, exactly like
-// the live app. Regression for keystrokes never reaching the fields.
+// the palette (Enter), the root model opens the window DIRECTLY on the
+// creation form (no member-pick stage), and typing into every field works —
+// all through the program model, exactly like the live app.
 func TestNewGroupEndToEndThroughRootModel(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	t.Cleanup(srv.Close)
@@ -170,24 +144,13 @@ func TestNewGroupEndToEndThroughRootModel(t *testing.T) {
 	if !ok {
 		t.Fatalf("overlay = %T; want groupModel (the /new-group window)", r.overlay)
 	}
-	if gm.stage != groupStagePick {
-		t.Fatalf("window must open on the member pick, stage=%d", gm.stage)
+	// The window opens DIRECTLY on the creation form: Name focused, no
+	// member multi-select stage in between.
+	if gm.formFocus != 0 || !gm.nameInput.Focused() {
+		t.Fatalf("window must open on the Name field, focus=%d", gm.formFocus)
 	}
-	if len(gm.members) == 0 {
-		t.Fatal("window must list room members to invite")
-	}
-
-	// Pick bob with Space, Enter to the form — keys still go through the
-	// root model.
-	rn, _ = r.Update(tea.KeyMsg{Type: tea.KeySpace})
-	r = rn.(rootModel)
-	if !r.overlay.(groupModel).picked["bob"] {
-		t.Fatal("space must pick the highlighted member")
-	}
-	rn, _ = r.Update(tea.KeyMsg{Type: tea.KeyEnter})
-	r = rn.(rootModel)
-	if r.overlay.(groupModel).stage != groupStageForm {
-		t.Fatal("enter must move the window to the form stage")
+	if !strings.Contains(gm.View(), "NEW GROUP") {
+		t.Fatal("window must paint the creation form immediately")
 	}
 
 	// Type into Name: every keystroke must reach the field through the
@@ -240,25 +203,4 @@ func TestNewGroupEndToEndThroughRootModel(t *testing.T) {
 func stepRoot(r rootModel, msg tea.Msg) rootModel {
 	nxt, _ := r.Update(msg)
 	return nxt.(rootModel)
-}
-
-// TestGroupFormBackspaceRepro proves editing keys (backspace) reach the
-// focused field through Update too, not just runes.
-func TestGroupFormBackspaceRepro(t *testing.T) {
-	members := []rosterMember{{Username: "bob", Role: "member"}}
-	m := newGroupModel("", "alice", nil, "123456", 110, 40, members)
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter}) // to form
-	for _, r := range []rune("abc") {
-		m = stepGroup(m, teaRune(r))
-	}
-	if got := m.nameInput.Value(); got != "abc" {
-		t.Fatalf("typed = %q; want abc", got)
-	}
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyBackspace})
-	if got := m.nameInput.Value(); got != "ab" {
-		t.Fatalf("after backspace = %q; want ab", got)
-	}
-	if m.formFocus != 0 {
-		t.Fatalf("backspace must stay in the focused field, got %d", m.formFocus)
-	}
 }

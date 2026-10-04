@@ -144,44 +144,26 @@ func TestGroupCreateValidation(t *testing.T) {
 	}
 }
 
-// TestGroupCreateWindowInlineErrors drives the /new-group window: invalid
-// forms never reach the server (inline errors), the valid path creates the
-// group, crowns the creator, and invites every pick (the 409 already-in-
-// session note rides along without stopping the rest).
+// TestGroupCreateWindowInlineErrors drives the /new-group window: it opens
+// DIRECTLY on the creation form (no member multi-select stage — members are
+// added later through /invite), invalid forms never reach the server
+// (inline errors), and the valid path creates the group and crowns the
+// creator server-side.
 func TestGroupCreateWindow(t *testing.T) {
 	srv, fake := newGroupTestServer(t)
 	id, err := generateIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	// bob's invite hits the server's 409 already-in-session path (he
-	// joined the group by code between the create and the invite — the
-	// fake's race hook stands in for that window).
-	fake.inviteConflict["bob"] = true
 
-	members := []rosterMember{
-		{Username: "bob", Role: "member"},
-		{Username: "carol", Role: "member"},
-	}
-	m := newGroupModel(srv.URL, "alice", id, "123456", 110, 40, members)
+	m := newGroupModel(srv.URL, "alice", id, "123456", 110, 40)
 
-	// Stage 1: pick bob (sel 0), then carol.
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeySpace})
-	if !m.picked["bob"] {
-		t.Fatal("space must toggle the highlighted member")
+	// The window opens straight on the form: Name focused, no pick stage.
+	if !m.nameInput.Focused() || m.formFocus != 0 {
+		t.Fatalf("window must open on the Name field, focus=%d focused=%v", m.formFocus, m.nameInput.Focused())
 	}
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyDown})
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeySpace})
-	if !m.picked["carol"] {
-		t.Fatal("down+space must toggle the second member")
-	}
-	// Moving to the form keeps both picks.
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.stage != groupStageForm {
-		t.Fatal("enter must move to the creation form")
-	}
-	if len(m.selectedUsers()) != 2 {
-		t.Fatalf("picks must survive into the form: %v", m.selectedUsers())
+	if !strings.Contains(m.View(), "NEW GROUP") {
+		t.Error("window must paint the creation form immediately")
 	}
 
 	// Empty name: inline error, no HTTP.
@@ -229,6 +211,9 @@ func TestGroupCreateWindow(t *testing.T) {
 	if done.code == "" {
 		t.Fatal("group create must return a session code")
 	}
+	if len(done.notes) != 0 {
+		t.Fatalf("create must not invite anyone (members join via /invite): notes=%v", done.notes)
+	}
 	// Creator crowned automatically + group meta recorded server-side.
 	meta, ok := fake.fakeGroup(done.code)
 	if !ok {
@@ -242,20 +227,6 @@ func TestGroupCreateWindow(t *testing.T) {
 	fake.mu.Unlock()
 	if creator.Role != "creator" {
 		t.Errorf("creator role = %q; want creator (server-crowned)", creator.Role)
-	}
-	// Invites: bob was already in the session (409 note), carol got a real
-	// invite; the rest continued.
-	if len(done.notes) != 2 {
-		t.Fatalf("notes = %v; want one per invitee", done.notes)
-	}
-	if !strings.Contains(done.notes[0], "already in this session") {
-		t.Errorf("note[0] = %q; want the 409 already-in-session note first", done.notes[0])
-	}
-	if !strings.Contains(done.notes[1], "invited carol") {
-		t.Errorf("note[1] = %q; want invited carol", done.notes[1])
-	}
-	if fake.fakeInviteCount("carol") != 1 {
-		t.Errorf("carol must hold one invite; got %d", fake.fakeInviteCount("carol"))
 	}
 }
 
@@ -671,6 +642,10 @@ func TestInvitePollCmdRidesRosterTick(t *testing.T) {
 // Sidebar listing + conversation routing
 // ---------------------------------------------------------------------------
 
+// TestGroupSidebarListing pins the sidebar contract the reports asked for:
+// joined groups list AFTER the General room and every user row
+// ("General, user1, user2, ..., groupName") with a DM-style unread badge,
+// and the row peer carries the group: namespace.
 func TestGroupSidebarListing(t *testing.T) {
 	c := groupTestScreen("alice")
 	c.users = []string{"alice", "bob"}
@@ -700,6 +675,83 @@ func TestGroupSidebarListing(t *testing.T) {
 	}
 	if groupItems[1].peer != "group:740001" {
 		t.Errorf("group peer = %q; want the group: prefix namespace", groupItems[1].peer)
+	}
+	// Full display order: General first, then users, then groups — a group
+	// row can never appear above a user row.
+	if len(items) < 4 || items[0].name != "General" {
+		t.Fatalf("first row must be General, got %+v", items[0])
+	}
+	seenGroup := false
+	for _, it := range items[1:] {
+		if it.isGroup {
+			seenGroup = true
+			continue
+		}
+		if seenGroup {
+			t.Fatalf("user row %q listed after a group row; order must be General, users..., groups", it.name)
+		}
+	}
+	// Unread paints on the group row exactly like a DM row.
+	rows := c.chatItemRows(items, 20, "")
+	joined := strings.Join(rows, "\n")
+	if !strings.Contains(joined, circledNum(2)) {
+		t.Errorf("group unread badge missing from the painted rows: %q", joined)
+	}
+}
+
+// TestGroupSidebarSwitching drives the open-group switching the reports
+// asked for: the keyboard cursor (hover Enter) AND the mouse row click both
+// switch into the group conversation, unread clears, and the row is then
+// active in the sidebar.
+func TestGroupSidebarSwitching(t *testing.T) {
+	c := groupTestScreen("alice")
+	c.users = []string{"alice", "bob"}
+	c.groups["740001"] = &groupSession{code: "740001", name: "Design", unread: 3}
+	c.groups["740002"] = &groupSession{code: "740002", name: "Chess"}
+	c.width, c.height = 120, 40
+	l := c.layoutFor()
+
+	// Keyboard: rail cursor walks General -> bob -> Chess -> Design, Enter
+	// on the empty composer opens the highlighted group (Design, unread 3).
+	c.moveRosterCursor(1)
+	c.moveRosterCursor(1)
+	c.moveRosterCursor(1)
+	c = stepChat(c, tea.KeyMsg{Type: tea.KeyEnter})
+	if c.activeGroup != "740001" {
+		t.Fatalf("keyboard Enter must open the group under the cursor, active=%q", c.activeGroup)
+	}
+	if c.groups["740001"].unread != 0 {
+		t.Fatal("opening the group must clear its unread")
+	}
+	opened := false
+	for _, it := range c.chatItems() {
+		if it.isGroup && it.name == "Design" && it.active {
+			opened = true
+		}
+	}
+	if !opened {
+		t.Fatal("the opened group must paint as the active sidebar row")
+	}
+
+	// Mouse: click the Chess row (below Design) switches over.
+	c = stepChat(c, tea.KeyMsg{Type: tea.KeyEsc}) // back to the room view
+	items := c.chatItems()
+	chessIdx := -1
+	for i, it := range items {
+		if it.isGroup && it.name == "Chess" {
+			chessIdx = i
+		}
+	}
+	if chessIdx < 0 {
+		t.Fatalf("Chess row missing: %+v", items)
+	}
+	rowY := l.rosterY0 + chessIdx*c.chatItemHeight() + 1 // second row of the entry
+	c = stepChat(c, mouseAt(l.rosterX+5, rowY))
+	if c.activeGroup != "740002" {
+		t.Fatalf("mouse click must open the Chess group, active=%q", c.activeGroup)
+	}
+	if c.groups["740002"].unread != 0 {
+		t.Fatal("mouse-open must clear the group unread")
 	}
 }
 

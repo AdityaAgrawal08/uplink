@@ -11,9 +11,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// ─── full-screen windows: /settings and /new-group ───────────────────────────
+// ─── full-screen windows: /settings, /new-group and /invite ─────────────────
 //
-// Both open as a full-screen model over the chat, hosted by rootModel (the
+// All open as a full-screen model over the chat, hosted by rootModel (the
 // program model runChatTUI now starts). Windows own the whole terminal like
 // the landing: keyboard-first with mouse support where rows carry actions.
 // Esc / Ctrl+C close them back to the chat (chat's own Ctrl+C stays the
@@ -562,27 +562,17 @@ func (m settingsModel) passwordModalView() string {
 
 // ─── /new-group window ───────────────────────────────────────────────────────
 
-const (
-	groupStagePick = iota
-	groupStageForm
-)
-
-// newGroupModel is the creation window: stage 1 picks room members to
-// invite (multi-select dropdown mirroring the "/" palette), stage 2 is the
-// creation form (Name, Description, Max-People) with inline validation.
-// Submitting creates the group (creator crowned server-side) and invites
-// every pick; 409 "already in this session" notes ride along.
+// newGroupModel is the creation window: the form (Name, Description,
+// Max-People) with inline validation, opening DIRECTLY — members are added
+// later through /invite (the invitation window owns the member multi-select).
+// Submitting creates the group (creator crowned server-side) with no
+// invites; the status line announces the fresh session.
 type groupModel struct {
 	w, h       int
 	me         string
 	serverURL  string
 	id         *identityKey
 	parentCode string
-	members    []rosterMember
-	filter     string
-	sel        int
-	picked     map[string]bool
-	stage      int
 	nameInput  textinput.Model
 	descInput  textinput.Model
 	maxInput   textinput.Model
@@ -595,7 +585,7 @@ type groupModel struct {
 // createGroupErrMsg resolves a failed creation attempt (stays in the form).
 type createGroupErrMsg struct{ err error }
 
-func newGroupModel(serverURL, me string, id *identityKey, parentCode string, w, h int, members []rosterMember) groupModel {
+func newGroupModel(serverURL, me string, id *identityKey, parentCode string, w, h int) groupModel {
 	ni := textinput.New()
 	ni.Placeholder = "Design Team"
 	ni.CharLimit = 64
@@ -621,20 +611,11 @@ func newGroupModel(serverURL, me string, id *identityKey, parentCode string, w, 
 	mi.TextStyle = lipgloss.NewStyle().Foreground(colText)
 	mi.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
 
-	out := make([]rosterMember, 0, len(members))
-	for _, mm := range members {
-		if mm.Username != "" && mm.Username != me {
-			out = append(out, mm)
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Username < out[j].Username })
 	return groupModel{
 		me:         me,
 		serverURL:  serverURL,
 		id:         id,
 		parentCode: parentCode,
-		members:    out,
-		picked:     map[string]bool{},
 		w:          w,
 		h:          h,
 		nameInput:  ni,
@@ -645,12 +626,6 @@ func newGroupModel(serverURL, me string, id *identityKey, parentCode string, w, 
 
 func (m groupModel) Init() tea.Cmd { return textinput.Blink }
 
-// candidates ranks room members for the current filter (prefix-first, the
-// palette's ordering contract).
-func (m groupModel) candidates() []rosterMember {
-	return rankUsers(m.members, m.filter)
-}
-
 func (m groupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -660,9 +635,6 @@ func (m groupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyCtrlC {
 			return m, func() tea.Msg { return closeOverlayMsg{} }
-		}
-		if m.stage == groupStagePick {
-			return m.updatePick(msg)
 		}
 		return m.updateForm(msg)
 
@@ -680,70 +652,12 @@ func (m groupModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// updatePick handles the member multi-select stage: typing narrows the
-// list, Space toggles the highlighted member, Enter moves to the form.
-func (m groupModel) updatePick(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyEsc:
-		return m, func() tea.Msg { return closeOverlayMsg{} }
-	case tea.KeyUp:
-		if n := len(m.candidates()); n > 0 {
-			m.sel = ((m.sel-1)%n + n) % n
-		}
-		return m, nil
-	case tea.KeyDown:
-		if n := len(m.candidates()); n > 0 {
-			m.sel = (m.sel + 1) % n
-		}
-		return m, nil
-	case tea.KeySpace:
-		users := m.candidates()
-		if m.sel >= 0 && m.sel < len(users) {
-			u := users[m.sel].Username
-			if m.picked[u] {
-				delete(m.picked, u)
-			} else {
-				m.picked[u] = true
-			}
-		}
-		return m, nil
-	case tea.KeyEnter:
-		// Commit the current picks (possibly empty) and open the form.
-		m.stage = groupStageForm
-		m.nameInput.Focus()
-		m.formFocus = 0
-		return m, nil
-	case tea.KeyBackspace, tea.KeyCtrlH, tea.KeyDelete:
-		if m.filter != "" {
-			r := []rune(m.filter)
-			m.filter = string(r[:len(r)-1])
-			m.sel = 0
-		}
-		return m, nil
-	default:
-		if msg.Type == tea.KeyRunes && len(msg.Runes) > 0 {
-			m.filter += strings.Map(func(r rune) rune {
-				if r < 0x20 || r == 0x7f {
-					return -1
-				}
-				return r
-			}, string(msg.Runes))
-			if len([]rune(m.filter)) > 40 {
-				m.filter = string([]rune(m.filter)[:40])
-			}
-			m.sel = 0
-		}
-		return m, nil
-	}
-}
-
 // updateForm handles the creation form: Tab/Enter walk the fields, the
 // Create button submits with inline validation.
 func (m groupModel) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
-		m.stage = groupStagePick // back to the member pick, picks kept
-		return m, nil
+		return m, func() tea.Msg { return closeOverlayMsg{} }
 	case tea.KeyTab:
 		if msg.String() == "shift+tab" {
 			m.formFocus = (m.formFocus + 3) % 4
@@ -801,20 +715,9 @@ func (m *groupModel) syncFormFocus() {
 	}
 }
 
-// selectedUsers returns the picked usernames in member order (stable).
-func (m groupModel) selectedUsers() []string {
-	var out []string
-	for _, mm := range m.members {
-		if m.picked[mm.Username] {
-			out = append(out, mm.Username)
-		}
-	}
-	return out
-}
-
-// submit validates the form, creates the group and invites every pick.
-// The server crowns the creator automatically; invite errors (notably 409
-// "already in this session") become notes and the rest continue.
+// submit validates the form and creates the group. The server crowns the
+// creator automatically; invites are NOT sent here (the /invite window owns
+// member management), so creation cannot half-fail on an invitee.
 func (m *groupModel) submit() tea.Cmd {
 	m.errMsg = ""
 	name := strings.TrimSpace(m.nameInput.Value())
@@ -833,7 +736,6 @@ func (m *groupModel) submit() tea.Cmd {
 		return nil
 	}
 	m.busy = true
-	users := m.selectedUsers()
 	serverURL := m.serverURL
 	me := m.me
 	id := m.id
@@ -848,20 +750,7 @@ func (m *groupModel) submit() tea.Cmd {
 		if err != nil {
 			return createGroupErrMsg{err: err}
 		}
-		var notes []string
-		for _, u := range users {
-			if err := sig.sendInvite(u); err != nil {
-				switch apiStatusCode(err) {
-				case 409:
-					notes = append(notes, u+" is already in this session")
-				default:
-					notes = append(notes, u+": "+err.Error())
-				}
-			} else {
-				notes = append(notes, "invited "+u)
-			}
-		}
-		return createGroupDoneMsg{code: code, name: name, notes: notes}
+		return createGroupDoneMsg{code: code, name: name}
 	}
 }
 
@@ -869,70 +758,7 @@ func (m groupModel) View() string {
 	if m.w == 0 || m.h == 0 {
 		return "loading…"
 	}
-	if m.stage == groupStagePick {
-		return m.pickView()
-	}
 	return m.formView()
-}
-
-func (m groupModel) pickView() string {
-	outerW := m.w - 4
-	if outerW < 60 {
-		outerW = 60
-	}
-	if outerW > 78 {
-		outerW = 78
-	}
-	inner := outerW - 4
-	users := m.candidates()
-	m.sel = clampInt(m.sel, 0, maxInt(len(users)-1, 0))
-
-	fit := func(s string) string { return fitRow(s, inner) }
-	rows := make([]string, 0, len(users)+8)
-	rows = append(rows, fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ NEW GROUP")))
-	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(
-		"pick members to invite — everyone here can join by invite.")))
-	rows = append(rows, " ")
-
-	// Multi-select dropdown: the palette's row discipline with a leading
-	// pick mark. Empty filter paints every member.
-	q := strings.ToLower(m.filter)
-	for i, u := range users {
-		if q != "" && !strings.HasPrefix(strings.ToLower(u.Username), q) {
-			continue
-		}
-		mark := " "
-		if m.picked[u.Username] {
-			mark = tuiPaletteSelStyle.Render("✓")
-		}
-		line := fit(fmt.Sprintf(" %s  %s%s", mark, u.Username, roleSuffixTag(u.Role)))
-		if i == m.sel {
-			line = fit(tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle)))
-		}
-		rows = append(rows, line)
-	}
-	if len(users) == 0 {
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render("  no members to invite.")))
-	}
-	rows = append(rows, " ")
-	if m.filter != "" {
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render("  filter: "+sanitizeDisplay(m.filter))))
-	}
-	if m.notice != "" {
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colRed).Render(m.notice)))
-	}
-	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
-		"type to filter · space toggle · enter create · esc close")))
-
-	card := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colEdge).
-		Background(colPanel).
-		Width(inner).
-		Padding(0, 1).
-		Render(strings.Join(rows, "\n"))
-	return lipgloss.NewStyle().Width(m.w).Height(m.h).
-		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
 }
 
 func (m groupModel) formView() string {
@@ -967,7 +793,7 @@ func (m groupModel) formView() string {
 	rows := []string{
 		fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ NEW GROUP")),
 		fit(lipgloss.NewStyle().Foreground(colDim).Render(
-			fmt.Sprintf("creating inside session %s · %d invited", sanitizeDisplay(m.parentCode), len(m.selectedUsers())))),
+			fmt.Sprintf("creating inside session %s · add members with /invite later", sanitizeDisplay(m.parentCode)))),
 		" ",
 		row(labelOf("Name :", 0), box(m.nameInput, 0)),
 		row(labelOf("Description :", 1), box(m.descInput, 1)),
@@ -992,7 +818,7 @@ func (m groupModel) formView() string {
 		rows = append(rows, lipgloss.NewStyle().Foreground(colDim).Render(m.notice))
 	}
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
-		"tab moves · enter submits · esc back to members")))
+		"tab moves · enter submits · esc close")))
 
 	card := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1017,14 +843,455 @@ func roleSuffixTag(role string) string {
 	return ""
 }
 
-func clampInt(v, lo, hi int) int {
-	if v < lo {
-		return lo
+// ─── /invite window ──────────────────────────────────────────────────────────
+
+// openInviteMsg travels from the "/invite" command handler to rootModel,
+// which hosts the window (the command refuses to open outside a group, so
+// the message only ever arrives with a group conversation active).
+type openInviteMsg struct{}
+
+// inviteSentMsg resolves one batch send: per-user notes (409 already-in-
+// session skips reported inline, the rest continue).
+type inviteSentMsg struct {
+	notes []string
+}
+
+// inviteModel is the full-screen invitation window for a GROUP conversation:
+// it lists the parent room's users minus the group's existing members, with
+// one-by-one AND Shift+Up/Down range multi-select. Enter toggles the
+// highlighted member (the window stays open for more picks), Tab moves to
+// the Send button, Enter there POSTs /invites for EVERY selected user —
+// 409 already-in-session notes are reported inline and the rest continue.
+// Esc closes without sending anything.
+type inviteModel struct {
+	w, h   int
+	code   string
+	name   string
+	sig    *signalClient // group session client: key = the group code
+	cands  []rosterMember
+	sel    int
+	off    int // scroll window offset into cands
+	anchor int // range anchor (Shift+Up/Down); -1 = no active range
+	picked map[string]bool
+	focus  int // 0 = member list, 1 = Send button
+	busy   bool
+	notice string
+	notes  []string
+}
+
+// inviteMaxRows caps the painted candidate list; longer lists scroll with
+// the highlight (same window discipline as the settings window).
+const inviteMaxRows = 10
+
+// newInviteModel builds the window from the live chat screen: candidates
+// are the parent room's roster minus the group's existing members (and
+// self), in stable username order. sig is the GROUP's session client, so
+// every invite POST targets the group session.
+func newInviteModel(c chatScreen, code, name string, sig *signalClient, w, h int) inviteModel {
+	cands := c.inviteCandidates()
+	return inviteModel{
+		code:   code,
+		name:   name,
+		sig:    sig,
+		cands:  cands,
+		anchor: -1,
+		picked: map[string]bool{},
+		w:      w,
+		h:      h,
 	}
-	if v > hi {
-		return hi
+}
+
+// inviteCandidates builds the window's list: the parent room's roster (the
+// home engine's live presence when wired, the sidebar snapshot otherwise)
+// minus the group's existing members and self, stable by username.
+func (c *chatScreen) inviteCandidates() []rosterMember {
+	var room []rosterMember
+	if c.homeEng != nil {
+		room = c.homeEng.peers()
+	} else {
+		for _, u := range c.users {
+			room = append(room, rosterMember{Username: u, Online: true})
+		}
+	}
+	inGroup := map[string]bool{}
+	if g := c.groups[c.activeGroup]; g != nil && g.eng != nil {
+		for _, m := range g.eng.peers() {
+			if m.Username != "" {
+				inGroup[m.Username] = true
+			}
+		}
+	}
+	out := make([]rosterMember, 0, len(room))
+	for _, m := range room {
+		if m.Username == "" || m.Username == c.me || inGroup[m.Username] {
+			continue
+		}
+		out = append(out, m)
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Username < out[j].Username })
+	return out
+}
+
+func (m inviteModel) Init() tea.Cmd { return nil }
+
+// visibleRows is how many candidate rows the card can paint at this height.
+func (m inviteModel) visibleRows() int {
+	v := m.h - 15 // title + subtitle + button + notes + hints + borders
+	if v < 3 {
+		v = 3
+	}
+	if v > inviteMaxRows {
+		v = inviteMaxRows
 	}
 	return v
+}
+
+// clampSel keeps the highlight + scroll window inside the live list.
+func (m *inviteModel) clampSel() {
+	n := len(m.cands)
+	if n <= 0 {
+		m.sel, m.off = 0, 0
+		return
+	}
+	if m.sel >= n {
+		m.sel = n - 1
+	}
+	if m.sel < 0 {
+		m.sel = 0
+	}
+	visible := m.visibleRows()
+	maxOff := maxInt(n-visible, 0)
+	if m.off > maxOff {
+		m.off = maxOff
+	}
+	if m.sel < m.off {
+		m.off = m.sel
+	}
+	if m.sel >= m.off+visible {
+		m.off = m.sel - visible + 1
+	}
+}
+
+// selectedUsers returns the picked usernames in candidate order (stable).
+func (m inviteModel) selectedUsers() []string {
+	var out []string
+	for _, c := range m.cands {
+		if m.picked[c.Username] {
+			out = append(out, c.Username)
+		}
+	}
+	return out
+}
+
+// sendAll POSTs /invites for every picked user through the group's client:
+// 409 "already in this session" skips are reported inline and the rest
+// continue. The window stays open so the invitee list can be extended.
+func (m *inviteModel) sendAll() tea.Cmd {
+	if m.busy {
+		return nil
+	}
+	users := m.selectedUsers()
+	if len(users) == 0 {
+		m.notice = "no one selected — pick members first"
+		return nil
+	}
+	m.busy = true
+	sig := m.sig
+	return func() tea.Msg {
+		var notes []string
+		for _, u := range users {
+			if err := sig.sendInvite(u); err != nil {
+				switch apiStatusCode(err) {
+				case 409:
+					notes = append(notes, u+" is already in this session")
+				default:
+					notes = append(notes, u+": "+err.Error())
+				}
+			} else {
+				notes = append(notes, "invited "+u)
+			}
+		}
+		return inviteSentMsg{notes: notes}
+	}
+}
+
+func (m inviteModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+		return m, nil
+
+	case tea.MouseMsg:
+		return m.handleMouse(msg)
+
+	case inviteSentMsg:
+		m.busy = false
+		m.notice = ""
+		m.notes = msg.notes
+		// Picks are consumed: the window stays open for the next round.
+		m.picked = map[string]bool{}
+		m.anchor = -1
+		m.focus = 0
+		return m, nil
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+	return m, nil
+}
+
+func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyCtrlC {
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	}
+	// Send button: Enter sends, Tab/Shift+Tab return to the list.
+	if m.focus == 1 {
+		switch msg.Type {
+		case tea.KeyEsc:
+			return m, func() tea.Msg { return closeOverlayMsg{} }
+		case tea.KeyEnter:
+			return m, m.sendAll()
+		case tea.KeyTab, tea.KeyShiftTab:
+			m.focus = 0
+			return m, nil
+		}
+		return m, nil
+	}
+	// Member list: arrows move (Shift extends a range), Enter toggles the
+	// highlighted member and STAYS open, Tab walks to the Send button.
+	switch msg.Type {
+	case tea.KeyEsc:
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	case tea.KeyUp, tea.KeyShiftUp:
+		if msg.Type == tea.KeyShiftUp {
+			if m.anchor < 0 {
+				m.anchor = m.sel
+			}
+		} else {
+			m.anchor = -1
+		}
+		if n := len(m.cands); n > 0 {
+			m.sel = ((m.sel-1)%n + n) % n
+		}
+		m.clampSel()
+		return m, nil
+	case tea.KeyDown, tea.KeyShiftDown:
+		if msg.Type == tea.KeyShiftDown {
+			if m.anchor < 0 {
+				m.anchor = m.sel
+			}
+		} else {
+			m.anchor = -1
+		}
+		if n := len(m.cands); n > 0 {
+			m.sel = (m.sel + 1) % n
+		}
+		m.clampSel()
+		return m, nil
+	case tea.KeyEnter:
+		// A Shift+Up/Down range (anchor set) toggles EVERY member in the
+		// range; otherwise just the highlighted one. Either way the window
+		// STAYS open for the next pick.
+		if m.anchor >= 0 {
+			lo, hi := m.anchor, m.sel
+			if lo > hi {
+				lo, hi = hi, lo
+			}
+			for i := lo; i <= hi && i < len(m.cands); i++ {
+				u := m.cands[i].Username
+				if m.picked[u] {
+					delete(m.picked, u)
+				} else {
+					m.picked[u] = true
+				}
+			}
+			m.anchor = -1
+		} else if m.sel >= 0 && m.sel < len(m.cands) {
+			u := m.cands[m.sel].Username
+			if m.picked[u] {
+				delete(m.picked, u)
+			} else {
+				m.picked[u] = true
+			}
+		}
+		m.notice = ""
+		return m, nil
+	case tea.KeyTab, tea.KeyShiftTab:
+		m.focus = 1
+		return m, nil
+	}
+	return m, nil
+}
+
+// inviteGeom is the shared paint/hit-test geometry of the centered card.
+type inviteGeom struct {
+	outerW    int
+	innerW    int
+	top       int
+	left      int
+	rowFirst  int // first candidate row (terminal Y)
+	rowN      int // painted candidate rows
+	btnRow    int // Send button row (terminal Y)
+	btnFirstX int // button's first clickable X
+	btnLastX  int // button's last clickable X
+}
+
+func (m inviteModel) geom() inviteGeom {
+	outerW := m.w - 4
+	if outerW < 60 {
+		outerW = 60
+	}
+	if outerW > 78 {
+		outerW = 78
+	}
+	innerW := outerW - 4 // border + padding leave 2 cells per side
+	n := len(m.cands)
+	v := m.visibleRows()
+	if n > v {
+		n = v
+	}
+	// Card interior rows: title, subtitle, n candidate rows, notes/blank,
+	// button, hint.
+	outerH := 8 + n + 2 // +2 border
+	top := (m.h - outerH) / 2
+	if top < 0 {
+		top = 0
+	}
+	left := (m.w - outerW) / 2
+	if left < 0 {
+		left = 0
+	}
+	return inviteGeom{
+		outerW:    outerW,
+		innerW:    innerW,
+		top:       top,
+		left:      left,
+		rowFirst:  top + 1 + 2,
+		rowN:      n,
+		btnRow:    top + 1 + 2 + n + 2,
+		// The Send button renders centered on the inner width: Width(inner)
+		// with Align(Center) over a 10-cell button — cells
+		// [left+2+(inner-10)/2, +9], i.e. [cx-5, cx+4] with cx=left+2+inner/2.
+		btnFirstX: left + 2 + innerW/2 - 5,
+		btnLastX:  left + 2 + innerW/2 + 4,
+	}
+}
+
+func (m inviteModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Type != tea.MouseLeft || msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	g := m.geom()
+	// Send button click: send to every picked user.
+	if msg.Y == g.btnRow && msg.X >= g.btnFirstX && msg.X <= g.btnLastX {
+		return m, m.sendAll()
+	}
+	// Candidate row click: select AND toggle the member (mouse parity with
+	// keyboard Enter), the window stays open.
+	if msg.Y < g.rowFirst || msg.Y >= g.rowFirst+g.rowN {
+		return m, nil
+	}
+	idx := m.off + (msg.Y - g.rowFirst)
+	if idx < 0 || idx >= len(m.cands) {
+		return m, nil
+	}
+	m.sel = idx
+	m.anchor = -1
+	u := m.cands[idx].Username
+	if m.picked[u] {
+		delete(m.picked, u)
+	} else {
+		m.picked[u] = true
+	}
+	m.notice = ""
+	return m, nil
+}
+
+func (m inviteModel) View() string {
+	if m.w == 0 || m.h == 0 {
+		return "loading…"
+	}
+	g := m.geom()
+	inner := g.innerW
+
+	fit := func(s string) string { return fitRow(s, inner) }
+	rows := make([]string, 0, 8+g.rowN)
+	rows = append(rows, fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ INVITE")))
+	sub := "add members to group " + sanitizeDisplay(m.name)
+	if m.name == "" {
+		sub = "add members to group " + sanitizeDisplay(m.code)
+	}
+	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(sub)))
+
+	if len(m.cands) == 0 {
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render("  no one left to invite.")))
+	} else {
+		for i := 0; i < g.rowN; i++ {
+			idx := m.off + i
+			if idx >= len(m.cands) {
+				break
+			}
+			cand := m.cands[idx]
+			mark := " "
+			if m.picked[cand.Username] {
+				mark = "✓"
+			}
+			ranged := false
+			if m.anchor >= 0 {
+				lo, hi := m.anchor, m.sel
+				if lo > hi {
+					lo, hi = hi, lo
+				}
+				ranged = idx >= lo && idx <= hi
+			}
+			marker := "  "
+			if ranged {
+				marker = "> "
+			}
+			line := fit(marker + mark + "  " + cand.Username + roleSuffixTag(cand.Role))
+			if idx == m.sel {
+				line = fit(tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle)))
+			}
+			rows = append(rows, line)
+		}
+		if len(m.cands) > g.rowN {
+			rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
+				fmt.Sprintf("  … +%d more", len(m.cands)-g.rowN))))
+		}
+	}
+
+	if len(m.notes) > 0 {
+		notes := strings.Join(m.notes, " · ")
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(truncateStringPlain(notes, inner))))
+	} else if m.notice != "" {
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colRed).Render(m.notice)))
+	} else {
+		rows = append(rows, " ")
+	}
+
+	btnText := "SEND"
+	if m.busy {
+		btnText = "sending…"
+	}
+	btnW := lipgloss.Width(btnText) + 4
+	btnStyle := landButtonBlurStyle.Width(btnW).Padding(0, 1)
+	if m.focus == 1 && !m.busy {
+		btnStyle = landButtonSelectedStyle.Width(btnW).Padding(0, 1)
+	}
+	btnRow := lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(btnStyle.Render(btnText))
+	rows = append(rows, fit(btnRow))
+	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
+		"↑↓ move · shift+↑↓ range · enter toggle · tab send · esc close")))
+
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colEdge).
+		Background(colPanel).
+		Width(inner).
+		Padding(0, 1).
+		Render(strings.Join(rows, "\n"))
+	return lipgloss.NewStyle().Width(m.w).Height(m.h).
+		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
 }
 
 // ─── root model: hosts the chat + full-screen windows ───────────────────────
@@ -1052,9 +1319,22 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, nil
 	case openNewGroupMsg:
 		if r.overlay == nil {
-			members := r.chat.memberList()
 			r.overlay = newGroupModel(r.chat.sig.serverURL, r.chat.me, r.chat.id, r.chat.key,
-				r.chat.width, r.chat.height, members)
+				r.chat.width, r.chat.height)
+		}
+		return r, nil
+	case openInviteMsg:
+		if r.overlay == nil {
+			code := r.chat.activeGroup
+			g := r.chat.groups[code]
+			if g == nil || g.sig == nil {
+				return r, nil // a group conversation must be open
+			}
+			name := ""
+			if g.name != "" {
+				name = g.name
+			}
+			r.overlay = newInviteModel(r.chat, code, name, g.sig, r.chat.width, r.chat.height)
 		}
 		return r, nil
 	case closeOverlayMsg:
