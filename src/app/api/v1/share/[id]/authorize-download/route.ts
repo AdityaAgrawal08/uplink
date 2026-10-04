@@ -45,14 +45,36 @@ export async function POST(
     // concurrent legitimate authorizes on a public share tripped the
     // "too many failed attempts" lockout. Failure budget stays tight (5);
     // public throughput gets its own generous window (120 / 5 min).
+    // B57 FIX (finding 9): the failure counter now increments FIRST — before
+    // the argon2 verify — so N parallel wrong guesses can never all pass a
+    // stale pre-check: the 6th concurrent attempt sees the counter already
+    // >5 and is refused without verifying. Bounded: at most 5 in-flight
+    // verifies per IP+share. Del on success keeps legit retries fresh.
     const failKey = `rate:download:fail:${ipHash}:${share.shareId}`;
-    const failStr = await redis.get(failKey);
-    const failures = typeof failStr === "string" ? parseInt(failStr, 10) : 0;
-    if (failures > 5) {
-      return apiError("Too many failed attempts. Locked out for 5 minutes.", 429);
-    }
 
-    if (!share.passwordHash) {
+    if (share.passwordHash) {
+      if (!password) {
+        return NextResponse.json(
+          { error: "Password required for this share", passwordRequired: true },
+          { status: 401 }
+        );
+      }
+      const attempts = await redis.incr(failKey);
+      if (attempts === 1) {
+        await redis.expire(failKey, 300); // 5-minute window
+      }
+      if (attempts > 5) {
+        return apiError("Too many failed attempts. Locked out for 5 minutes.", 429);
+      }
+      const isPasswordValid = await verifyPassword(password, share.passwordHash);
+      if (!isPasswordValid) {
+        return NextResponse.json(
+          { error: "Incorrect password", passwordRequired: true },
+          { status: 401 }
+        );
+      }
+      await redis.del(failKey);
+    } else {
       const pubKey = `rate:download:pub:${ipHash}:${share.shareId}`;
       try {
         const hits = await redis.incr(pubKey);
@@ -80,31 +102,11 @@ export async function POST(
       return apiError(`This share link is not active (${share.status})`, 400);
     }
 
-    // 3. Password Verification (before any quota spend: failed guesses must
-    //    not burn Class B operations — otherwise an attacker can exhaust the
-    //    daily R2 budget with wrong passwords).
-    if (share.passwordHash) {
-      if (!password) {
-        return NextResponse.json(
-          { error: "Password required for this share", passwordRequired: true },
-          { status: 401 }
-        );
-      }
-      const isPasswordValid = await verifyPassword(password, share.passwordHash);
-      if (!isPasswordValid) {
-        const attempts = await redis.incr(failKey);
-        if (attempts === 1) {
-          await redis.expire(failKey, 300); // 5-minute window
-        }
-        return NextResponse.json(
-          { error: "Incorrect password", passwordRequired: true },
-          { status: 401 }
-        );
-      }
-      await redis.del(failKey);
-    }
+    // (Password verification now lives in step 1 — incr-first so parallel
+    // guesses cannot race the lockout check, before any quota spend so
+    // failed guesses never burn Class B operations.)
 
-    // 4. Atomic Download Counter and Limit Check
+    // 3. Atomic Download Counter and Limit Check
     // Inline preview requests (preview=true for safe types) must NOT burn a
     // download credit — otherwise merely opening the web page kills shares.
     const isSafePreview = SAFE_PREVIEW_TYPES.includes(share.mimeType);

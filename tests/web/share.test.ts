@@ -25,7 +25,9 @@ vi.mock("next/server", async (importOriginal) => {
 
 import { POST as initPOST } from "../../src/app/api/v1/share/init/route";
 import { POST as previewPOST } from "../../src/app/api/v1/share/[id]/preview-text/route";
+import { POST as authorizePOST } from "../../src/app/api/v1/share/[id]/authorize-download/route";
 import { getObjectText, PREVIEW_TEXT_MAX_BYTES } from "../../src/lib/r2";
+import * as cryptoMod from "../../src/lib/crypto";
 import { hashPassword } from "../../src/lib/crypto";
 
 function db(): FakeDb {
@@ -227,5 +229,119 @@ describe("getObjectText memory cap (finding 7)", () => {
 
   it("returns empty for missing objects", async () => {
     expect(await getObjectText(`uploads/2026/10/preview/nope-${Math.random().toString(36).slice(2)}.txt`)).toBe("");
+  });
+});
+
+describe("authorize-download lockout race (finding 9)", () => {
+  let passwordHash: string;
+
+  beforeEach(async () => {
+    db().reset();
+    process.env.TRUST_PROXY = "true";
+    passwordHash = await hashPassword("hunter2");
+  });
+  afterEach(() => {
+    delete process.env.TRUST_PROXY;
+    vi.restoreAllMocks();
+  });
+
+  function seedShare(overrides: Partial<FakeDoc> = {}) {
+    db().collection("shares").docs.push({
+      shareId: "auth-share-00000001",
+      status: "ACTIVE",
+      expiresAt: new Date(Date.now() + 3600_000),
+      passwordHash: null,
+      objectKey: "uploads/2026/10/auth/auth.bin",
+      storageFilename: "auth.bin",
+      mimeType: "application/octet-stream",
+      downloadsCount: 0,
+      downloadLimit: 100,
+      ...overrides,
+    });
+  }
+
+  function authReq(id: string, ip: string, body: Record<string, unknown>) {
+    return authorizePOST(
+      new NextRequest(`http://localhost/api/v1/share/${id}/authorize-download`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+        body: JSON.stringify(body),
+      }),
+      { params: Promise.resolve({ id }) }
+    );
+  }
+
+  it("parallel wrong passwords verify at most 5 times; the rest 429", async () => {
+    seedShare({ passwordHash });
+    // Slow the verifier down so 10 truly-concurrent requests overlap: the
+    // first 5 increment the counter and enter verify; requests 6-10 see the
+    // counter already >5 and are refused WITHOUT verifying.
+    const verifySpy = vi.spyOn(cryptoMod, "verifyPassword").mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 25));
+      return false;
+    });
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => authReq("auth-share-00000001", "203.0.113.70", { password: "wrong" }))
+    );
+    const statuses = Object.groupBy(results, (r) => r.status);
+    expect(statuses[401]?.length ?? 0).toBe(5);
+    expect(statuses[429]?.length ?? 0).toBe(5);
+    expect(verifySpy).toHaveBeenCalledTimes(5); // bounded: 5 verifies max
+    // Still locked for this IP+share afterwards.
+    expect((await authReq("auth-share-00000001", "203.0.113.70", { password: "wrong" })).status).toBe(429);
+    expect(verifySpy).toHaveBeenCalledTimes(5);
+  });
+
+  it("sequential wrong passwords: 5 verifies then lockout", async () => {
+    seedShare({ passwordHash });
+    for (let i = 0; i < 5; i++) {
+      expect((await authReq("auth-share-00000001", "203.0.113.71", { password: "wrong" })).status).toBe(401);
+    }
+    expect((await authReq("auth-share-00000001", "203.0.113.71", { password: "wrong" })).status).toBe(429);
+    // Per-IP isolation: another IP still gets exactly 5 fresh tries.
+    expect((await authReq("auth-share-00000001", "203.0.113.72", { password: "wrong" })).status).toBe(401);
+  });
+
+  it("correct password deletes the failure counter (del on success)", async () => {
+    seedShare({ passwordHash });
+    for (let i = 0; i < 3; i++) {
+      await authReq("auth-share-00000001", "203.0.113.73", { password: "wrong" });
+    }
+    const ok = await authReq("auth-share-00000001", "203.0.113.73", { password: "hunter2" });
+    expect(ok.status).toBe(200);
+    // Counter gone: the next wrong guess starts fresh (401, not 429).
+    expect((await authReq("auth-share-00000001", "203.0.113.73", { password: "wrong" })).status).toBe(401);
+  });
+
+  it("public shares never touch the failure counter (B42 preserved)", async () => {
+    seedShare(); // no passwordHash
+    const verifySpy = vi.spyOn(cryptoMod, "verifyPassword").mockImplementation(async () => true);
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => authReq("auth-share-00000001", "203.0.113.74", {}))
+    );
+    for (const r of results) expect(r.status).toBe(200);
+    expect(verifySpy).not.toHaveBeenCalled();
+  });
+
+  it("preview-text and authorize-download share one lockout budget", async () => {
+    seedShare({ passwordHash });
+    // Burn 3 guesses through the preview endpoint…
+    for (let i = 0; i < 3; i++) {
+      const res = await previewPOST(
+        new NextRequest(`http://localhost/api/v1/share/auth-share-00000001/preview-text`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forwarded-for": "203.0.113.75" },
+          body: JSON.stringify({ password: "wrong" }),
+        }),
+        { params: Promise.resolve({ id: "auth-share-00000001" }) }
+      );
+      expect(res.status).toBe(401);
+    }
+    // …and the 4th guess through authorize-download trips the shared counter
+    // to 4, the 5th to 5, and the 6th is locked out.
+    expect((await authReq("auth-share-00000001", "203.0.113.75", { password: "wrong" })).status).toBe(401);
+    expect((await authReq("auth-share-00000001", "203.0.113.75", { password: "wrong" })).status).toBe(401);
+    expect((await authReq("auth-share-00000001", "203.0.113.75", { password: "wrong" })).status).toBe(429);
   });
 });
