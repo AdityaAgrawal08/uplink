@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { redis } from "../../src/lib/redis";
 import {
@@ -17,8 +17,10 @@ import {
   declineInvite,
   MAX_PENDING_INVITES,
 } from "../../src/lib/rooms";
-import { hashPassword } from "../../src/lib/crypto";
+import { hashPassword, getDummyPasswordHash } from "../../src/lib/crypto";
+import * as cryptoMod from "../../src/lib/crypto";
 import { POST as acceptInvitePOST } from "../../src/app/api/v1/session/[sessionId]/invites/accept/route";
+import { POST as joinPOST } from "../../src/app/api/v1/session/[sessionId]/join/route";
 
 const PUBKEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -350,6 +352,67 @@ describe("group invites", () => {
     expect(await redis.hget(`room:${sessionId}:invites`, invitee)).toBeNull();
     await expect(declineInvite(sessionId, invitee)).rejects.toMatchObject({ status: 404 });
     await expect(declineInvite("999999", invitee)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("timing oracle closed: unprotected rooms verify a dummy hash (finding 15)", async () => {
+    const protectedHash = await hashPassword("hunter2");
+    const open = await makeRoom();
+    const protectedRoom = await createRoom(rand("u"), PUBKEY, protectedHash);
+
+    const joinReq = (code: string, body: Record<string, unknown>) =>
+      joinPOST(
+        new NextRequest(`http://localhost/api/v1/session/${code}/join`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-forwarded-for": "203.0.113.90" },
+          body: JSON.stringify(body),
+        }),
+        { params: Promise.resolve({ sessionId: code }) }
+      );
+
+    // Warm the one-time dummy-hash computation so the measured timings below
+    // reflect the verify, not the hash generation.
+    await getDummyPasswordHash();
+
+    const calls: { pw: string; hash: string; verifyMs: number }[] = [];
+    const originalVerify = cryptoMod.verifyPassword;
+    const verifySpy = vi.spyOn(cryptoMod, "verifyPassword").mockImplementation(async (pw: string, hash: string) => {
+      const t0 = performance.now();
+      const result = await originalVerify(pw, hash);
+      calls.push({ pw, hash, verifyMs: performance.now() - t0 });
+      return result;
+    });
+
+    try {
+      // Unprotected room, no password: succeeds, but the route still runs a
+      // verification against the DUMMY hash (never the real wall-clock ~0ms).
+      const openRes = await joinReq(open.sessionId, { username: rand("o"), pubkey: PUBKEY });
+      expect(openRes.status).toBe(200);
+
+      // Protected room, wrong password: 401 after a verification against the
+      // REAL hash.
+      const protectedRes = await joinReq(protectedRoom.sessionId, {
+        username: rand("p"), pubkey: PUBKEY, password: "wrong",
+      });
+      expect(protectedRes.status).toBe(401);
+
+      // Both paths ran one argon2 verification.
+      expect(calls.length).toBe(2);
+      const [openCall, protectedCall] = calls;
+      expect(openCall.pw).toBe(""); // no password sent to the unprotected room
+      expect(openCall.hash).not.toBe(protectedHash); // dummy hash, not a real one
+      expect(protectedCall.hash).toBe(protectedHash);
+      expect(protectedCall.pw).toBe("wrong");
+
+      // Loose timing bound: the open path's verification must cost REAL argon2
+      // time (measured ~2.8ms here; slower machines measure more), not the
+      // ~0ms of a no-op — that is the side channel the dummy hash closes.
+      // The deterministic guards (one verify per path, dummy hash on the
+      // open room) are the primary regression net; this floor only catches
+      // a verify that silently degenerated into a no-op.
+      expect(openCall.verifyMs).toBeGreaterThan(1); // argon2 floor (no-op ≈ 0ms)
+    } finally {
+      verifySpy.mockRestore();
+    }
   });
 
   it("room destruction cleans the invites hash and per-user index entries", async () => {

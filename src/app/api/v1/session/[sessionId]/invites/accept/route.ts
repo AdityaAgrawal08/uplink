@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifyPassword } from "@/lib/crypto";
+import { verifyPassword, getDummyPasswordHash } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
 import {
@@ -67,6 +67,11 @@ export async function POST(
       if (!(await verifyPassword(password, meta.passwordHash))) {
         return apiError("Incorrect session password", 401);
       }
+    } else {
+      // Finding 15 (timing oracle): same equalization as POST /join — verify
+      // against a dummy hash so unprotected rooms cost the same as a wrong
+      // guess on a protected room. The accept still proceeds.
+      await verifyPassword(typeof password === "string" ? password : "", await getDummyPasswordHash());
     }
 
     const { roster, epoch } = await acceptInvite(sessionId, username, pubkey as string);

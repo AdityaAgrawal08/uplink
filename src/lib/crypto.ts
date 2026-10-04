@@ -24,6 +24,23 @@ export async function verifyPassword(password: string, hash: string): Promise<bo
   }
 }
 
+let dummyPasswordHashPromise: Promise<string> | null = null;
+
+// getDummyPasswordHash returns an argon2 hash of a fixed throwaway password,
+// computed once per process. Routes verify against it when a room has NO
+// password (finding 15): an unprotected room previously answered in ~1ms
+// while a protected room burned 30-80ms on argon2 per wrong guess, so a
+// remote scanner could map protected rooms by response timing without ever
+// committing to a visible join. Verifying the (absent) password against the
+// dummy hash equalizes the expensive work — the join still succeeds, this is
+// a side-channel fix, not a new gate.
+export function getDummyPasswordHash(): Promise<string> {
+  if (!dummyPasswordHashPromise) {
+    dummyPasswordHashPromise = hashPassword("uplink-timing-equalizer-dummy-password");
+  }
+  return dummyPasswordHashPromise;
+}
+
 let ipAnonymizationSecret: string;
 
 function getIpAnonymizationSecret(): string {
