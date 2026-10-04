@@ -21,8 +21,7 @@ src/components/      FilePreview, SyntaxHighlighter (React)
 src/lib/             Backend libraries (auth/rooms/redis/r2/crypto/quota/mongo/env/utils/crc64)
 server/              SHELVED Go WebSocket relay (own module) — not deployed
 tests/               Web/E2E test suites + manual probes (see tests/README.md)
-packaging/           Arch Linux PKGBUILD
-.github/workflows/  ci.yml, release.yml, npm.yml
+.github/workflows/  ci.yml, release.yml
 docs/                Documentatio.md (this project manual) + FILEMAP.md (this file)
 ```
 
@@ -174,9 +173,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `.goreleaser.yaml` | Multi-OS builds, archives, checksums for tags `v*`. |
 - `.github/workflows/ci.yml` | Push/PR: Go vet + `go test -race` + cross-builds; web lint/typecheck/unit/build; e2e matrix; single `pipeline` gate. No per-run artifact uploads. |
 - `.github/workflows/release.yml` | Tag push → GoReleaser publish. |
-- `.github/workflows/npm.yml` | Tag push → tag-gated npm publish (`@aditya/uplink` shim). |
-- `install.sh` / `install.ps1` | Checksum-verified installers (fail closed, sudo fallback). |
-- `packaging/archlinux/PKGBUILD` | Git-snapshot pacman package. |
+- `install.sh` / `install.ps1` | Checksum-verified installers (fail closed, sudo fallback); install from GitHub Releases. |
 - `tests/e2e/` | `e2e_phase0.sh` (transfer matrix), `session_flow_test.sh` (signaling lifecycle), `chat_two_clients.sh` (two-client chat) — need a live server + built CLI; `make e2e`. |
 - `tests/probes/` | `probe_r2.ts`, `test_quota.ts` — manual debug probes (not run by CI; need `.env`/live server). |
 - `tests/README.md` | Layout, runner mapping, exact commands, why Go tests stay colocated. |
