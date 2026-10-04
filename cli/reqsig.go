@@ -6,11 +6,12 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"math/big"
 	"net/url"
+	"os"
 	"strconv"
-
 	"time"
 
 	"filippo.io/edwards25519"
@@ -242,4 +243,43 @@ func (c *signalClient) sigHeadersWithPubkey(method, rawURL string) map[string]st
 		h["X-Uplink-Pubkey"] = pubkeyB64(c.id)
 	}
 	return h
+}
+
+// cmdRequestSig prints curl-ready signature headers for one signaling call
+// using the device identity (same signer as the live client). Built for the
+// repo's shell e2e probes (tests/e2e) and scripted integrations: every line
+// is a literal curl -H value, including X-Uplink-Pubkey (the identity's
+// roster pubkey — use it in create/join bodies so the roster anchor matches
+// the signing key).
+//
+//	uplink request-sig --username alice --method POST \\
+//	  --path /api/v1/session/123456/heartbeat
+func cmdRequestSig(args []string) {
+	fs := flag.NewFlagSet("request-sig", flag.ExitOnError)
+	username := fs.String("username", "", "X-Uplink-Username (the claimed identity)")
+	method := fs.String("method", "POST", "HTTP method (POST/GET)")
+	path := fs.String("path", "", "Request path WITHOUT query string (the signed payload)")
+	if err := fs.Parse(args); err != nil {
+		os.Exit(1)
+	}
+	if *username == "" || *path == "" {
+		fmt.Fprintln(os.Stderr, "request-sig: --username and --path are required")
+		os.Exit(2)
+	}
+	if !usernameRegex.MatchString(*username) {
+		fmt.Fprintf(os.Stderr, "request-sig: invalid username %q\n", *username)
+		os.Exit(2)
+	}
+	id, err := loadOrCreateIdentity()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "request-sig: %v\n", err)
+		os.Exit(1)
+	}
+	c := &signalClient{me: *username, id: id}
+	headers := c.sigHeadersWithPubkey(*method, "http://uplink.invalid"+*path)
+	for _, k := range []string{"X-Uplink-Username", "X-Uplink-Pubkey", "X-Uplink-Timestamp", "X-Uplink-Nonce", "X-Uplink-Sig"} {
+		if v := headers[k]; v != "" {
+			fmt.Printf("%s: %s\n", k, v)
+		}
+	}
 }

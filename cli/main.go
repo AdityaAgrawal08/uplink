@@ -168,6 +168,8 @@ func main() {
 		handleVersion()
 	case "update":
 		handleUpdate()
+	case "request-sig":
+		cmdRequestSig(os.Args[2:])
 	default:
 		if strings.HasPrefix(subcommand, "-") {
 			fmt.Printf("✗ Error: Unknown option \"%s\"\n\n", subcommand)
@@ -200,6 +202,9 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("  version          Show version")
 	fmt.Println("  update           Self-update to latest release")
+	fmt.Println("  request-sig      Print signed signaling headers for scripts/e2e probes")
+	fmt.Println("                   uplink request-sig --username alice --method POST \\")
+	fmt.Println("                     --path /api/v1/session/123456/heartbeat")
 	fmt.Println()
 	fmt.Println("  help        Show available commands")
 	fmt.Println("              uplink --help")

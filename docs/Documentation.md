@@ -278,6 +278,45 @@ versioned tarballs + `checksums.txt`, verified by both installers and
 - Voice: Opus over UDP Noise sessions, jitter buffer, mic-level gate.
 - Share links: `id:KEY` (AES-256 file key, never sent to server in clear).
 
+## 7b. Request signatures (signaling trust plane)
+
+Every identity-bearing signaling call must prove possession of the device
+identity key before the server acts on it. A raw `X-Uplink-Username`
+header alone authorizes nothing.
+
+- **Signed payload:** `METHOD|PATH|TIMESTAMP_MS|NONCE`, signed with the
+  X25519 device identity key (the same keypair whose public half is claimed
+  immutably in the room roster at join — `hsetnx`). Since X25519 cannot
+  sign directly, the CLI signs with the Edwards form of the same private
+  scalar (`a = k mod L`, sign bit forced to 0); the RFC 7748 §4.1
+  birational map (`u = (1+y)/(1−y)`) is a group isomorphism sending the
+  Edwards base point to `u = 9`, so the server derives the verification
+  key from the rostered pubkey alone (`y = (u−1)/(u+1)`, `x` sign bit 0)
+  and runs a stock Ed25519 verify (Node `crypto.verify`, Go
+  `ed25519.Verify`, filippo.io/edwards25519 for the scalar math).
+- **Headers:** `X-Uplink-Timestamp` (unix ms), `X-Uplink-Nonce` (16 random
+  bytes hex), `X-Uplink-Sig` (base64, 64 bytes), `X-Uplink-Username`
+  (unchanged). `X-Uplink-Pubkey` is used ONLY by the invite-scoped calls
+  below on first use.
+- **Replay protection:** timestamp must be within 30s of the server clock;
+  each `(timestamp, nonce)` pair is single-use per username
+  (`SET NX sig:nonce:{user}:{sha256(ts|nonce)} EX 120`).
+- **Failure:** any missing/stale/invalid/replayed signature → `401
+  "Invalid or missing request signature"` (distinct from the 400 for a
+  missing username header). Hard-fail closed; no compat mode.
+- **Anchors per route:** roster pubkey for heartbeat/kick/admin/leave/
+  inbox/ack/signal/reactions/invites-POST; the pubkey **carried in the
+  accept body** for invites/accept (the seat is bound to the key that
+  signed, not just the name); a per-user first-use claim
+  (`SET NX user:{name}:sigkey`) for invites/mine and invites/decline,
+  stamped by accept too.
+- **Crown transfer:** a creator's leave is signature-verified before
+  `transferCreator` runs, so the crown change is authorized by the
+  leaver's own key.
+- **Client:** `signalClient` (cli/p2p_signal.go) signs every call; the
+  engine treats the gate's 401 as "not a member" and rejoins with its
+  identity (the same semantics as the old 403).
+
 ## 8. Implementation conventions (read before changing code)
 
 - **TUI exact-row contract:** every painted frame is exactly `H` rows ×
@@ -299,8 +338,8 @@ versioned tarballs + `checksums.txt`, verified by both installers and
 
 ## 9. Known limitations (audit-backed, not yet fixed)
 
-Member auth is header-only (no join tokens); quota `confirm` trusts
-declared size; LAN discovery is mDNS-trust-on-first-use; WAN receive path
-is non-functional; cloud/LAN/WAN download streams are unbounded; no
-forward secrecy on inbox boxes; no key-continuity store. Fix in priority
-order: signaling auth → quota lifecycle → LAN trust → transfer bounds.
+Quota `confirm` trusts declared size; LAN discovery is
+mDNS-trust-on-first-use; WAN receive path is non-functional; cloud/LAN/WAN
+download streams are unbounded; no forward secrecy on inbox boxes; no
+key-continuity store. Fix in priority order: quota lifecycle → LAN trust →
+transfer bounds.
