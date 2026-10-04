@@ -767,16 +767,20 @@ func (m groupModel) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.submit()
 	default:
-		// Route editing to the focused field.
+		// Route editing to the focused field. The input's Update returns a
+		// NEW model — it must be stored back or the keystroke vanishes.
 		switch m.formFocus {
 		case 0:
-			_, cmd := m.nameInput.Update(msg)
+			var cmd tea.Cmd
+			m.nameInput, cmd = m.nameInput.Update(msg)
 			return m, cmd
 		case 1:
-			_, cmd := m.descInput.Update(msg)
+			var cmd tea.Cmd
+			m.descInput, cmd = m.descInput.Update(msg)
 			return m, cmd
 		case 2:
-			_, cmd := m.maxInput.Update(msg)
+			var cmd tea.Cmd
+			m.maxInput, cmd = m.maxInput.Update(msg)
 			return m, cmd
 		}
 		return m, nil

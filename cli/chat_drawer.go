@@ -624,15 +624,29 @@ func (c *chatScreen) drawerSelectItem(item int, l layout) {
 
 // drawerStep moves the selection by d (wheel parity with the arrow keys:
 // same step, same wrap, no debounce — cursor moves are never deferred).
+// The panel steps the list it actually PAINTS: the member stage of the "/"
+// drawer walks the ranked user rows, the command stage the ranked commands
+// (the "@" dropdown its candidates, the picker its filtered files) — never
+// a cross-list count, which would wrap at the wrong boundary.
 func (c *chatScreen) drawerStep(d int) {
 	switch {
 	case c.picker.isActive():
 		c.picker.moveTo(c.picker.cursor+d, false)
 	case c.palette.visible():
-		if d < 0 {
-			c.palette.moveUp(len(c.rankedCommands(c.input.Value())))
+		if _, users, ok := c.paletteUsers(); ok {
+			n := len(users)
+			if d < 0 {
+				c.palette.moveUp(n)
+			} else {
+				c.palette.moveDown(n)
+			}
 		} else {
-			c.palette.moveDown(len(c.rankedCommands(c.input.Value())))
+			n := len(c.rankedCommands(c.input.Value()))
+			if d < 0 {
+				c.palette.moveUp(n)
+			} else {
+				c.palette.moveDown(n)
+			}
 		}
 	case c.mention.visible():
 		_, users, ok := c.mentionCandidates()
