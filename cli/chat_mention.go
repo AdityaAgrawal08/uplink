@@ -263,10 +263,10 @@ func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action fun
 	}
 	switch msg.Type {
 	case tea.KeyUp:
-		c.mention.moveUp(len(users))
+		c.mention.moveUpOrdered(c.drawerItemSeq())
 		return true, nil
 	case tea.KeyDown:
-		c.mention.moveDown(len(users))
+		c.mention.moveDownOrdered(c.drawerItemSeq())
 		return true, nil
 	case tea.KeyHome:
 		c.mention.moveHome(len(users))

@@ -429,11 +429,22 @@ type roleDoneMsg struct {
 // roster: membership, call publish scope, unread/hover pruning, and an
 // immediate repaint on ANY change. Shared by the 2s render tick and the
 // engine's roster-changed push.
+//
+// The sidebar ALWAYS renders the HOME session's membership — General,
+// every main-room user, then every joined group — in every conversation
+// view. While a group view is open c.eng is the GROUP's engine, whose peer
+// set is a different room's membership: feeding it to the sidebar would
+// hide main-room users (and prune their unread/recency) behind the group
+// view, so the roster derives from c.homeEng whenever one exists.
 func (c *chatScreen) syncRosterFromEngine() {
 	if c.eng == nil {
 		return // bare/test screens carry no engine
 	}
-	roster := c.eng.peers()
+	eng := c.eng
+	if c.homeEng != nil {
+		eng = c.homeEng
+	}
+	roster := eng.peers()
 	users := onlineNames(roster, c.me)
 	changed := len(users) != len(c.users)
 	if !changed {
@@ -469,8 +480,9 @@ func (c *chatScreen) syncRosterFromEngine() {
 		}
 	}
 	// Group hover targets survive roster syncs (groups are not in the
-	// member roster); while a group VIEW is open the roster belongs to
-	// that group, so DM unread/recency must not be pruned against it.
+	// member roster). The live roster above is always the HOME room's
+	// membership, so main-room hover pruning stays correct in every view;
+	// a group view only skips it because group rows are not home members.
 	if c.activeGroup == "" && c.hoverPeer != "" && groupPeerCode(c.hoverPeer) == "" && !live[c.hoverPeer] {
 		c.hoverPeer = ""
 	}

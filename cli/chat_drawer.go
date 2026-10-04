@@ -271,6 +271,21 @@ func (p drawerPlan) hitOf(item int) fuzzyHit {
 	return p.hits[item]
 }
 
+// displayOrder returns the plan's ITEM sequence in painted order (group
+// headers and separators skipped). Flat plans yield the identity sequence;
+// grouped plans yield the ranked indices in displayed group order — the
+// sequence arrow/wheel stepping must follow so the highlight walks the
+// rows the user actually sees.
+func (p drawerPlan) displayOrder() []int {
+	out := make([]int, 0, len(p.pos))
+	for _, r := range p.rows {
+		if r.kind == drItem {
+			out = append(out, r.item)
+		}
+	}
+	return out
+}
+
 // buildDrawerPlan assembles the display rows for a list picker: grouped
 // (bold headers + blank-line separators, NOT rule lines) when grouped is
 // true, flat (a single ranked list) when filtering. Groups appear in
@@ -633,30 +648,16 @@ func (c *chatScreen) drawerStep(d int) {
 	case c.picker.isActive():
 		c.picker.moveTo(c.picker.cursor+d, false)
 	case c.palette.visible():
-		if _, users, ok := c.paletteUsers(); ok {
-			n := len(users)
-			if d < 0 {
-				c.palette.moveUp(n)
-			} else {
-				c.palette.moveDown(n)
-			}
+		if d < 0 {
+			c.palette.moveUpOrdered(c.drawerItemSeq())
 		} else {
-			n := len(c.rankedCommands(c.input.Value()))
-			if d < 0 {
-				c.palette.moveUp(n)
-			} else {
-				c.palette.moveDown(n)
-			}
+			c.palette.moveDownOrdered(c.drawerItemSeq())
 		}
 	case c.mention.visible():
-		_, users, ok := c.mentionCandidates()
-		if !ok {
-			return
-		}
 		if d < 0 {
-			c.mention.moveUp(len(users))
+			c.mention.moveUpOrdered(c.drawerItemSeq())
 		} else {
-			c.mention.moveDown(len(users))
+			c.mention.moveDownOrdered(c.drawerItemSeq())
 		}
 	}
 	c.settleActiveDrawer()

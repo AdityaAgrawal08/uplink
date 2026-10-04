@@ -258,6 +258,12 @@ func TestPaletteMemberStageWheelStepsUsers(t *testing.T) {
 // filter) must select the THIRD command — Enter must run THAT command, never
 // the first one. Mouse parity: clicking the third painted row and pressing
 // Enter runs the same third command.
+//
+// The empty-query drawer paints commands GROUPED under category headers,
+// so "third command" means the third PAINTED row: with the draw now
+// walking the painted order, down twice lands on the third displayed item
+// (the earlier ranked-space assertion encoded the very miss the live report
+// surfaced — arrows jumping across groups).
 func TestPaletteThirdCommandNotFirst(t *testing.T) {
 	c := auditScreen(t)
 	c, _ = typeKeys(&c, "/")
@@ -265,22 +271,41 @@ func TestPaletteThirdCommandNotFirst(t *testing.T) {
 	if len(ranked) < 3 {
 		t.Fatalf("need at least 3 commands, got %d", len(ranked))
 	}
-	third := ranked[2].Name
-
-	// Arrow-down twice: selection sits on the third command.
-	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
-	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
-	if c.palette.sel != 2 {
-		t.Fatalf("down twice: sel=%d; want 2 (%s)", c.palette.sel, third)
+	var disp []int // painted item order (ranked indices in display order)
+	for _, r := range commandsPlan(ranked, len(ranked), true).rows {
+		if r.kind == drItem {
+			disp = append(disp, r.item)
+		}
 	}
-	// Enter runs the third command (the drawer closes; the command's
-	// side effect marks which one ran — /reply opens the reply pick).
+	if len(disp) < 3 {
+		t.Fatalf("grouped plan paints %d items; need >= 3", len(disp))
+	}
+	third := ranked[disp[2]].Name
+	thirdItem := disp[2]
+
+	// Arrow-down twice: selection sits on the third PAINTED command.
+	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
+	c, _ = step(&c, tea.KeyMsg{Type: tea.KeyDown})
+	if c.palette.sel != thirdItem {
+		t.Fatalf("down twice: sel=%d (%s); want %d (%s, the third painted item)",
+			c.palette.sel, ranked[c.palette.sel].Name, thirdItem, third)
+	}
+	// Enter runs the third command: TakesUser commands morph into the
+	// member stage with the command completed (no empty-arg fire); /reply
+	// opens the reply pick. Either way the FIRST command never runs.
 	got, cmd := step(&c, tea.KeyMsg{Type: tea.KeyEnter})
 	if got.palette.visible() {
-		t.Fatal("enter must close the drawer after picking the third command")
-	}
-	if third == "/reply" && got.replyPick == nil {
-		t.Fatalf("enter must run %s (the third command), not the first", third)
+		if third != "/kick" && third != "/admin" && third != "/unadmin" {
+			t.Fatalf("enter must close the drawer after picking the third command (%s)", third)
+		}
+		if got.input.Value() != third+" " {
+			t.Fatalf("enter on %s must complete it into the member picker, input=%q", third, got.input.Value())
+		}
+		if _, _, ok := got.paletteUsers(); !ok {
+			t.Fatalf("enter on %s must open the member-picker stage", third)
+		}
+	} else if third == "/reply" && got.replyPick == nil {
+		t.Fatalf("enter must run %s (the third painted command), not the first", third)
 	}
 	_ = cmd
 

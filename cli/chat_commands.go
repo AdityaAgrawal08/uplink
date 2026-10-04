@@ -404,6 +404,49 @@ func (p *paletteState) moveDown(n int) {
 	p.followSel()
 }
 
+// seqIndexOf locates sel inside a display-order item sequence (-1 when a
+// stale cursor no longer appears — e.g. after a re-rank moved it out).
+func seqIndexOf(seq []int, sel int) int {
+	for i, it := range seq {
+		if it == sel {
+			return i
+		}
+	}
+	return -1
+}
+
+// moveUpOrdered / moveDownOrdered step the highlight through the PAINTED
+// item sequence (drawerPlan.displayOrder), with the same wrap-around as
+// moveUp/moveDown. Grouped modes (empty "/" query under category headers,
+// empty member fragment under role headers) reorder items on screen, so
+// stepping the ranked array would jump across groups and skip rows; the
+// display-order walk keeps every arrow press on the next visible row.
+func (p *paletteState) moveUpOrdered(seq []int) {
+	if n := len(seq); n <= 0 {
+		p.sel, p.off = 0, 0
+		return
+	}
+	at := seqIndexOf(seq, p.sel)
+	if at < 0 {
+		at = 0 // stale cursor: wrap to the far end
+	}
+	p.sel = seq[(at-1+len(seq))%len(seq)]
+	p.followSel()
+}
+
+func (p *paletteState) moveDownOrdered(seq []int) {
+	if n := len(seq); n <= 0 {
+		p.sel, p.off = 0, 0
+		return
+	}
+	at := seqIndexOf(seq, p.sel)
+	if at < 0 {
+		at = len(seq) - 1 // stale cursor: wrap to the top
+	}
+	p.sel = seq[(at+1)%len(seq)]
+	p.followSel()
+}
+
 // moveHome / moveEnd / movePage jump the highlight without wrap: Home to the
 // top, End to the bottom, pages step by ±10 and CLAMP at the ends (only the
 // arrows wrap). The view centres the window on the destination afterwards.
@@ -1037,6 +1080,31 @@ func (c chatScreen) paletteView(maxW int) string {
 	return c.renderPanel(drawerMaxW(c.width, maxW), c.palettePanelRows(), c.palette.sel)
 }
 
+// drawerItemSeq returns the DISPLAY-order item sequence for whichever list
+// picker owns the drawer slot right now: the "/" command stage, its member
+// stage, or the "@" dropdown. Grouped plans reorder items under headers, so
+// arrow/wheel stepping must walk this sequence — never the raw ranked
+// array — or the highlight jumps across groups.
+func (c chatScreen) drawerItemSeq() []int {
+	switch {
+	case c.palette.visible():
+		if _, users, ok := c.paletteUsers(); ok {
+			_, frag, _ := c.userArgTarget(c.input.Value())
+			return usersPlan(users, drawerMaxRows(c.height), frag == "").displayOrder()
+		}
+		ranked := c.rankedCommands(c.input.Value())
+		return commandsPlan(ranked, drawerMaxRows(c.height), palettePayload(c.input.Value()) == "").displayOrder()
+	case c.mention.visible():
+		_, users, ok := c.mentionCandidates()
+		if !ok {
+			return nil
+		}
+		frag, _ := mentionQuery(c.input.Value())
+		return usersPlan(users, drawerMaxRows(c.height), frag == "").displayOrder()
+	}
+	return nil
+}
+
 // ---- palette key handling ----------------------------------------------------
 
 // handlePaletteKeys intercepts keys while the drawer is open. It returns
@@ -1057,10 +1125,10 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	if cmd, users, ok := c.paletteUsers(); ok && len(users) > 0 {
 		switch msg.Type {
 		case tea.KeyUp:
-			c.palette.moveUp(len(users))
+			c.palette.moveUpOrdered(c.drawerItemSeq())
 			return true, nil
 		case tea.KeyDown:
-			c.palette.moveDown(len(users))
+			c.palette.moveDownOrdered(c.drawerItemSeq())
 			return true, nil
 		case tea.KeyHome:
 			c.palette.moveHome(len(users))
@@ -1111,10 +1179,10 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	}
 	switch msg.Type {
 	case tea.KeyUp:
-		c.palette.moveUp(len(c.rankedCommands(c.input.Value())))
+		c.palette.moveUpOrdered(c.drawerItemSeq())
 		return true, nil
 	case tea.KeyDown:
-		c.palette.moveDown(len(c.rankedCommands(c.input.Value())))
+		c.palette.moveDownOrdered(c.drawerItemSeq())
 		return true, nil
 	case tea.KeyHome:
 		c.palette.moveHome(len(c.rankedCommands(c.input.Value())))
