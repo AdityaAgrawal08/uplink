@@ -335,6 +335,18 @@ func settleInviteReveal(m inviteModel) inviteModel {
 	return m
 }
 
+// sgrBefore asserts the SGR sequence seq is the LAST paint BEFORE the
+// glyph at byte index i in raw — i.e. the terminal renders that glyph with
+// seq's ink, and no later override can steal it. (A bare "contains the
+// glyph + contains the sequence somewhere" check passes even when the ink
+// never reaches the glyph; this is the honest ink-order assertion.)
+func sgrBefore(raw string, i int, seq string) bool {
+	if i < 0 || i >= len(raw) || seq == "" {
+		return false
+	}
+	return strings.HasSuffix(raw[:i], seq)
+}
+
 // TestInviteRowPickVisuals pins the three-state row language: the plain
 // row, the focus CURSOR bar, the picked ACCENT bar with the bright ✓ and
 // bold name, the focused+picked overlap (cursor bar wins the fill, the ✓
@@ -378,8 +390,10 @@ func TestInviteRowPickVisuals(t *testing.T) {
 	if !strings.Contains(stripANSI(picked), "✓") {
 		t.Fatalf("picked row must paint the ✓: %q", stripANSI(picked))
 	}
-	if !strings.Contains(picked, matchSelSeq) {
-		t.Fatalf("the ✓ must ride the bright contrast ink: %q", picked)
+	// The ✓ must be painted BY the bright ink sequence (SGR order, not
+	// mere presence): the ink right before the glyph is matchSel's.
+	if i := strings.Index(picked, "✓"); !sgrBefore(picked, i, matchSelSeq) {
+		t.Fatalf("the ✓ must ride the bright contrast ink (SGR directly before the glyph): %q", picked)
 	}
 
 	// Focused AND picked: the cursor bar wins the fill, the ✓ stays bright
@@ -391,8 +405,8 @@ func TestInviteRowPickVisuals(t *testing.T) {
 	if pickSeq != "" && strings.Contains(both, pickSeq) {
 		t.Fatal("the picked bar must never override the cursor bar")
 	}
-	if !strings.Contains(stripANSI(both), "✓") || !strings.Contains(both, matchSelSeq) {
-		t.Fatalf("the ✓ must stay legible on the cursor bar: %q", both)
+	if i := strings.Index(both, "✓"); i < 0 || !sgrBefore(both, i, matchSelSeq) {
+		t.Fatalf("the ✓ must stay bright-ink on the cursor bar (SGR directly before the glyph): %q", both)
 	}
 
 	// Pulse flash: the just-toggled row wears the pulse style, not the bar.
@@ -408,8 +422,8 @@ func TestInviteRowPickVisuals(t *testing.T) {
 	if seq := styleSeq(tuiPalettePulseStyle); seq == "" || !strings.Contains(flash, seq) {
 		t.Fatalf("flash frame must wear the pulse style: %q", flash)
 	}
-	if !strings.Contains(stripANSI(flash), "✓") {
-		t.Fatalf("the flash must keep the ✓: %q", flash)
+	if i := strings.Index(flash, "✓"); i < 0 || !sgrBefore(flash, i, matchSelSeq) {
+		t.Fatalf("the flash must keep the ✓ bright: %q", flash)
 	}
 	// The pulse only touches its own row — a different item paints normal.
 	other := flashing
@@ -705,6 +719,171 @@ func TestInviteWindowRenders(t *testing.T) {
 	em := settleInviteReveal(newInviteModel(c2, code, "Design", &signalClient{serverURL: "x", key: code, me: "alice"}, 110, 40))
 	if !strings.Contains(em.View(), "No users to invite") {
 		t.Errorf("empty window must paint %q", "No users to invite")
+	}
+}
+
+// TestInviteWindowStripCraft pins the window to the command drawer's craft
+// (the reported "invite list still ugly vs the command panel"): the strip
+// is the shared drawer language — the single top border line, the
+// "Invite — <group>" header + esc hint, role-grouped Admins/Members
+// headers with a blank separator, the muted rest rows, the full-row cursor
+// bar, the footer hints + live counter — NOT a boxed card. It renders
+// through the SHARED painter (drawerPanelView), caps at 80 cells wide, and
+// never wraps the terminal.
+func TestInviteWindowStripCraft(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
+	c := groupTestScreen("alice")
+	c.width, c.height = 110, 40
+	m := settleInviteReveal(newInviteModel(c, "700001", "Design",
+		&signalClient{serverURL: "http://x", key: "700001", me: "alice"}, 110, 40))
+	// Mixed roles: the Admins/Members grouping must paint with a blank
+	// separator between the groups (stable candidate order).
+	m.cands = []rosterMember{
+		{Username: "eve", Role: "admin"},
+		{Username: "carol"},
+		{Username: "dave"},
+	}
+	view := m.View()
+	lines := strings.Split(view, "\n")
+
+	// (a) The strip is a small centered band — never a full-screen box:
+	// the empty canvas surrounds a handful of content rows.
+	nonEmpty := 0
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) != "" {
+			nonEmpty++
+		}
+	}
+	if nonEmpty > 12 {
+		t.Fatalf("the invite strip must stay a band, got %d content rows:\n%s", nonEmpty, view)
+	}
+	for _, box := range []string{"╭", "╮", "╰", "╯", "│"} {
+		if strings.Contains(view, box) {
+			t.Fatalf("the strip must not wear a box border (%q found):\n%s", box, view)
+		}
+	}
+
+	// (b) The single top border line runs in accent — the drawer's one
+	// border, above the header.
+	var borderLine string
+	for _, ln := range lines {
+		if strings.Contains(ln, "─") {
+			borderLine = ln
+			break
+		}
+	}
+	if borderLine == "" {
+		t.Fatal("the strip must paint the single top border line")
+	}
+	if run := strings.TrimLeft(stripANSI(borderLine), " "); !strings.HasPrefix(run, "─") {
+		t.Fatalf("the first line must be the border run: %q", borderLine)
+	}
+	if n := strings.Count(strings.TrimSpace(borderLine), "─"); n < 10 || n > 80 {
+		t.Fatalf("border run = %d cells; want the 80-cell cap, well-formed", n)
+	}
+	// (c) The header contract: bold title + the esc hint.
+	if !strings.Contains(view, "Invite — Design") || !strings.Contains(view, "esc") {
+		t.Fatalf("header contract missing:\n%s", view)
+	}
+	// (d) The grouped member headers + the blank separator between groups.
+	hdrIdx, memIdx := -1, -1
+	for i, ln := range lines {
+		if strings.Contains(ln, "Admins") {
+			hdrIdx = i
+		}
+		if strings.Contains(ln, "Members") {
+			memIdx = i
+		}
+	}
+	if hdrIdx < 0 || memIdx < 0 {
+		t.Fatalf("Admins/Members headers missing:\n%s", view)
+	}
+	// Admins header at i: its item at i+1, the blank separator at i+2, the
+	// Members header at i+3 — headers are separated by one blank row.
+	if memIdx-hdrIdx != 3 {
+		t.Fatalf("the groups must be separated by exactly one blank row (Admins at %d, Members at %d):\n%s", hdrIdx, memIdx, view)
+	}
+	// (e) The footer contract: nav hints left, the live counter right.
+	if !strings.Contains(view, "0 selected") || !strings.Contains(view, "enter toggle") {
+		t.Fatalf("footer hints/counter missing:\n%s", view)
+	}
+	// (f) 80-cell cap: no content row (margin stripped) exceeds 80 cells.
+	for _, ln := range lines {
+		if w := lipgloss.Width(strings.TrimSpace(ln)); w > 80 {
+			t.Fatalf("strip row width %d exceeds the 80-cell cap: %q", w, ln)
+		}
+	}
+	// (g) The row plan is the SHARED drawer plan: paint and hit-test walk
+	// the same rows (mouse parity contract).
+	rows := m.invitePanelRows()
+	if rows[0].kind != drBorder || rows[1].kind != drHeader {
+		t.Fatalf("strip must open with border + header, got %v/%v", rows[0].kind, rows[1].kind)
+	}
+	switch rows[len(rows)-1].kind {
+	case drFooter:
+	default:
+		t.Fatalf("strip must close with the footer, got %v", rows[len(rows)-1].kind)
+	}
+}
+
+// TestInvitePickedRowBrightInkInWindow drives the REAL paint path (the
+// window's View through the shared painter): the ✓ on a picked row AND on
+// a picked row under the cursor carries the bright contrast ink — asserted
+// as the SGR sequence painted immediately before the glyph, the actual
+// ink the terminal applies.
+func TestInvitePickedRowBrightInkInWindow(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
+	_, c, code, _ := inviteFixture(t)
+	m := settleInviteReveal(newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height))
+	matchSelSeq := styleSeq(tuiPaletteMatchSelStyle)
+	if matchSelSeq == "" {
+		t.Skip("color profile emits no SGR for the bright ink")
+	}
+
+	// Picked, cursor elsewhere: Enter picks carol (sel 0), then Down.
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter})
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyDown})
+	checkRow := func(label string) {
+		t.Helper()
+		view := m.View()
+		for _, ln := range strings.Split(view, "\n") {
+			if i := strings.Index(ln, "✓"); i >= 0 {
+				if !sgrBefore(ln, i, matchSelSeq) {
+					t.Fatalf("%s: the ✓ must be painted by the bright ink (SGR before the glyph): %q", label, ln)
+				}
+				return
+			}
+		}
+		t.Fatalf("%s: no ✓ row painted in:\n%s", label, m.View())
+	}
+	checkRow("picked, cursor on another row")
+
+	// Picked AND under the cursor: Enter toggles dave, Up back to carol —
+	// the cursor bar sits ON the picked row; the ✓ must stay bright.
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter}) // pick dave (sel 1)
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyUp})    // cursor on carol (picked)
+	checkRow("cursor over the picked row")
+
+	// The pulse flash keeps the bright ✓ too.
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter}) // toggle carol -> flash
+	view := m.View()
+	found := false
+	for _, ln := range strings.Split(view, "\n") {
+		if i := strings.Index(ln, "✓"); i >= 0 {
+			found = true
+			if !sgrBefore(ln, i, matchSelSeq) {
+				t.Fatalf("flash frame: the ✓ must stay bright-ink: %q", ln)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("flash frame must still paint the ✓:\n%s", view)
 	}
 }
 

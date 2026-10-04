@@ -239,16 +239,29 @@ const (
 	drFooter                        // keymap hints left + count right
 	drTray                          // picker selection tray row (text = label)
 	drNotice                        // picker notice row (text = message)
+	drButton                        // centered action button (text = label; n = 1 when focused)
 	drRaw                           // pre-rendered content row (picker detail panel)
 )
 
 type drawerRow struct {
 	kind drawerRowKind
 	item int      // ranked item index (drItem)
-	text string   // drHeader/drTray/drNotice/drEmpty content; drItem title
+	text string   // drHeader/drTray/drNotice/drEmpty content; drItem title; drButton label
 	desc string   // drItem secondary text (description / role tag)
 	hit  fuzzyHit // drItem precomputed match data (once per filter keystroke)
-	n    int      // drOverflow count; drFooter item count
+	n    int      // drOverflow count; drFooter item count; drButton focus flag
+	// Multi-select rows (the /invite window): a drItem can be PICKED (the
+	// accent picked bar + bright ✓), FLASH (the one-tick just-toggled
+	// pulse), and carry a 2-cell LEADING gutter ("  " or the "> " range
+	// marker). Plain single-select pickers leave all three zero-value.
+	picked bool
+	flash  bool
+	lead   string // 2 cells; "" = plain plan (no gutter, no check slot)
+	// drFooter override: a custom right-side counter ("n selected — Enter
+	// to send") replacing the default "sel/n" when count != "". countEmph
+	// paints the counter in accent bold (the send affordance).
+	count     string
+	countEmph bool
 }
 
 // drawerPlan is the full display structure of one list: the items in their
@@ -511,6 +524,24 @@ func drawerFooterRow(inner int, hints string, sel, n int) string {
 	return tuiPaletteHintStyle.Render(padVisible(row, inner))
 }
 
+// drawerFooterRowCount paints the footer contract with a CUSTOM counter
+// ("n selected — Enter to send" for the invite window) instead of the
+// default "sel/n": keymap hints left in the hint tone, the counter right —
+// accent bold when emph (the live send affordance), hint tone before that.
+// The count's inline style survives the pad (its SGR span comes after the
+// hint tone's, so the terminal renders the counter's ink last).
+func drawerFooterRowCount(inner int, hints, count string, emph bool) string {
+	cw := lipgloss.Width(count)
+	countStyled := tuiPaletteHintStyle.Render(count)
+	if emph {
+		countStyled = lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render(count)
+	}
+	left := maxInt(inner-cw-1, 1)
+	row := tuiPaletteHintStyle.Render(truncateByWidth(hints, left))
+	gap := maxInt(inner-lipgloss.Width(row)-cw, 1)
+	return padVisible(row+strings.Repeat(" ", gap)+countStyled, inner)
+}
+
 // overflowRowView is the "… +N more"/"… +N above" marker.
 func overflowRowView(inner, n int, above bool) string {
 	word := "more"
@@ -518,6 +549,119 @@ func overflowRowView(inner, n int, above bool) string {
 		word = "above"
 	}
 	return tuiPaletteHintStyle.Render(padVisible(fmt.Sprintf("… +%d %s", n, word), inner))
+}
+
+// drawerItemRow paints ONE selectable row: the highlighted title in a name
+// column, the muted description after it, full-width padding so the cursor
+// bar spans edge to edge. The cursor-bar style and the plain-row style are
+// the two single styles every picker shares. Multi-select rows (the
+// /invite window) additionally carry the 2-cell leading gutter (range
+// marker + pick check slot) and the three-state row language: the cursor
+// bar wins the fill, a PICKED row wears the accent picked bar with the
+// bright ✓, and a just-toggled row flashes the pulse style for one tick.
+// The ✓ ALWAYS rides the bright contrast ink (tuiPaletteMatchSelStyle), so
+// it stays legible on every bar — including the cursor bar sitting on top
+// of a picked row.
+func drawerItemRow(r drawerRow, nameCol, inner int, selected bool) string {
+	picked := r.picked
+	name := highlightMatches(r.text, r.hit.matches, selected || picked, inner)
+	check := ""
+	if r.lead != "" {
+		if picked {
+			check = tuiPaletteMatchSelStyle.Render("✓ ")
+		} else {
+			check = "  "
+		}
+	}
+	line := r.lead + check + padVisible(name, nameCol) + tuiPaletteDescStyle.Render(r.desc)
+	line = padVisible(line, inner)
+	switch {
+	case r.flash:
+		line = tuiPalettePulseStyle.Render(retint(line, tuiPalettePulseStyle))
+	case selected:
+		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
+	case picked:
+		line = tuiPalettePickStyle.Render(retint(line, tuiPalettePickStyle))
+	default:
+		line = tuiPaletteRowStyle.Render(line)
+	}
+	return line
+}
+
+// drawerPanelView paints a drawer row plan into the panel string: every
+// row is single-line and pinned to the inner width, so the painted height
+// equals the row count exactly and nothing ever wraps. This is THE shared
+// painter — the "/" palette, the "@" dropdown and the /invite window all
+// render through it, so every picker speaks one visual language.
+func drawerPanelView(inner int, rows []drawerRow, sel int) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	// Multi-select plans (r.lead != "") extend the name column by the
+	// 2-cell range marker + 2-cell check slot, so names stay aligned
+	// under the shared gutter.
+	gutter := 0
+	for _, r := range rows {
+		if r.kind == drItem && r.lead != "" {
+			gutter = 4
+			break
+		}
+	}
+	// Dynamic name column over the VISIBLE item rows: longest title + gap.
+	nameCol := 0
+	for _, r := range rows {
+		if r.kind == drItem {
+			if w := lipgloss.Width(r.text); w > nameCol {
+				nameCol = w
+			}
+		}
+	}
+	nameCol += 2
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		var line string
+		switch r.kind {
+		case drBorder:
+			line = drawerBorderRow(inner)
+		case drHeader:
+			line = drawerHeaderRow(inner, r.text)
+		case drBlank:
+			line = padVisible("", inner)
+		case drItem:
+			line = drawerItemRow(r, nameCol+gutter, inner, r.item == sel)
+		case drOverflow:
+			line = overflowRowView(inner, r.n, r.text == "above")
+		case drEmpty:
+			line = tuiPaletteHintStyle.Render(padVisible(r.text, inner))
+		case drNotice:
+			// The text may carry its own tone (dim results / red error);
+			// the hint wrapper only supplies the fallback colour — the
+			// inner SGR span wins for the cells it covers.
+			line = tuiPaletteHintStyle.Render(padVisible(r.text, inner))
+		case drButton:
+			// Centered label; the focused button wears the full-row
+			// cursor bar (accent bg + contrast ink), the resting one the
+			// plain row tone — the drawer's one-button language.
+			st := tuiPaletteRowStyle
+			if r.n == 1 {
+				st = tuiPaletteSelStyle
+			}
+			label := " " + r.text + " "
+			lp := maxInt((inner-lipgloss.Width(label))/2, 0)
+			line = strings.Repeat(" ", lp) + label
+			line = st.Render(retint(padVisible(line, inner), st))
+		case drFooter:
+			if r.count != "" {
+				line = drawerFooterRowCount(inner, r.text, r.count, r.countEmph)
+			} else {
+				line = drawerFooterRow(inner, r.text, sel, r.n)
+			}
+		default:
+			line = ""
+		}
+		out = append(out, fitRow(line, inner))
+	}
+	return strings.Join(out, "\n")
 }
 
 // ---- matched-char highlight -------------------------------------------------

@@ -479,7 +479,16 @@ func (e *engine) beatOnce() {
 				e.lastBeatErr = jerr
 				e.mu.Unlock()
 				if !recentErr {
-					e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
+					if roomGone(jerr) {
+						// The rejoin itself found the room destroyed (24h
+						// TTL, sweep, last-one-out): nothing to rejoin —
+						// say so once, exactly like the direct 404 beat.
+						// Before this classification a destroyed GROUP sat
+						// in the sidebar forever behind "rejoin failed".
+						e.emitEndedOnce()
+					} else {
+						e.emitErr(fmt.Errorf("rejoin failed (%v) — rejoin manually", jerr))
+					}
 				}
 				return
 			}
@@ -497,13 +506,9 @@ func (e *engine) beatOnce() {
 			// Room destroyed under us (last one out ends it): nothing to
 			// rejoin — say so once instead of rotting silently.
 			e.mu.Lock()
-			notified := e.endedNotified
-			e.endedNotified = true
 			e.lastBeatErr = err
 			e.mu.Unlock()
-			if !notified {
-				e.emitErr(fmt.Errorf("session ended — rooms vanish when emptied; create or join a new one"))
-			}
+			e.emitEndedOnce()
 			return
 		} else {
 			e.mu.Lock()
@@ -553,6 +558,31 @@ func isNotMember(err error) bool {
 		return true
 	}
 	return false
+}
+
+// roomGone reports a join/beat failure that means the ROOM itself no
+// longer exists (as opposed to a name collision, a cap, or a transient
+// error): the server answers 404 "Session not found" for ghost rooms.
+func roomGone(err error) bool {
+	if apiStatusCode(err) == 404 {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "session not found")
+}
+
+// emitEndedOnce reports a destroyed session exactly ONCE per engine: the
+// UI drops the session's sidebar row on this error (chat_tui.go netErrMsg),
+// and later beats must not re-ring the bell every 5s for a room that is
+// gone. Idempotent across both discovery paths (a direct 404 beat and a
+// rejoin that finds the room gone).
+func (e *engine) emitEndedOnce() {
+	e.mu.Lock()
+	notified := e.endedNotified
+	e.endedNotified = true
+	e.mu.Unlock()
+	if !notified {
+		e.emitErr(fmt.Errorf("session ended — rooms vanish when emptied; create or join a new one"))
+	}
 }
 
 // stuckHsTTL bounds a handshake with no progress. Past it the attempt is

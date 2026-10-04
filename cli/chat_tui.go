@@ -2965,6 +2965,16 @@ func (c *chatScreen) shutdownSessions() {
 // engine (tagged traffic keeps the sidebar fresh in the background) and
 // remembers display state. The group password ("" for open groups) enables
 // the engine's self-rejoin after a prune.
+//
+// DISCOVERY LIMITATION: the server exposes no "groups I belong to" list
+// (src/ owns the API surface), so the sidebar's group set is derived
+// client-side from creation, invites+accepts, and this local map — the
+// rows appear the moment a group is created or an invite is accepted, and
+// vanish when the engine reports the room destroyed. A client restart
+// starts with an empty group set: memberships are re-established only by
+// accepting a fresh invite or re-joining by code. Group meta (name) also
+// rides the invite/create payloads, so a group loses its label if the
+// client forgets it and never re-attaches.
 func (c *chatScreen) attachGroup(code, name, desc string, sig *signalClient, password string) {
 	if c.groups == nil {
 		c.groups = map[string]*groupSession{}
@@ -4023,11 +4033,19 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case netErrMsg:
 		// Engine errors surface on the status line, never as chat rows.
 		// Server outages hold the down alert; everything else parks once.
-		// A background group that died (last member left) leaves the
-		// sidebar instead of retrying into the void forever.
+		// A background group that died (last member left / 24h TTL /
+		// server sweep) leaves the sidebar instead of retrying into the
+		// void forever — the engine's beat classifies the ghost-room 404
+		// (or a rejoin that finds the room gone) as "session ended".
 		if msg.key != "" && msg.key != c.key {
 			if g := c.groups[msg.key]; g != nil && strings.Contains(strings.ToLower(msg.err.Error()), "session ended") {
-				c.dropGroup(msg.key, "")
+				reason := ""
+				if g.name != "" {
+					reason = "group " + g.name + " ended — rooms vanish when emptied"
+				} else {
+					reason = "group " + msg.key + " ended — rooms vanish when emptied"
+				}
+				c.dropGroup(msg.key, reason)
 			}
 			cmds = append(cmds, c.drainNetCmd())
 			break
@@ -4038,7 +4056,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			strings.Contains(strings.ToLower(msg.err.Error()), "session ended") {
 			// The open group ended (everyone left): leave the view, drop
 			// the dead session.
-			c.dropGroup(msg.key, "")
+			c.dropGroup(msg.key, msg.err.Error())
 		} else {
 			c.status = msg.err.Error()
 		}

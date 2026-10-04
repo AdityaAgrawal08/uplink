@@ -862,10 +862,18 @@ type inviteSentMsg struct {
 // highlighted member (the window stays open for more picks), Tab moves to
 // the Send button, Enter there POSTs /invites for EVERY selected user —
 // 409 already-in-session notes are reported inline and the rest continue.
-// Esc closes without sending anything. The picker paints in the shared
-// OpenCode/fzf drawer language (chat_drawer.go): role-grouped rows under
-// the "Invite — <group>" header, full-row cursor bar, pick checks, footer
-// hints + count, 80x24-safe caps and the 50ms staged open reveal.
+// Esc closes without sending anything.
+//
+// The window paints in EXACTLY the command drawer's craft (chat_drawer.go):
+// the shared single top border line, the "Invite — <group>" header with
+// the esc hint, the full-row accent cursor bar, muted unselected rows,
+// fzf-matched-char highlight, role-grouped Admins/Members headers with
+// blank separators, the overflow marker, a centered Send button row and
+// the footer contract (nav hints left, "n selected — Enter to send"
+// right). All list chrome renders through the SHARED drawerPanelView
+// painter — the invite window maintains no second renderer. The ✓ rides
+// the bright contrast ink on every bar, 80x24 caps apply, mouse parity
+// walks the same windowed plan, and the 50ms staged open reveal applies.
 type inviteModel struct {
 	w, h   int
 	code   string
@@ -944,26 +952,16 @@ const inviteFooterHints = "↑↓ move · shift+↑↓ range · enter toggle · 
 // the LIVE picked counter right. The counter matches the spec verbatim —
 // "n selected — Enter to send" — in accent bold the moment any pick
 // exists, in the plain hint tone ("0 selected") before that, so the send
-// affordance tracks every toggle instantly. The row sizes against the
-// card's PADDED content width (the card wraps at Padding(0,1), so the
-// last word must end two cells short of inner).
+// affordance tracks every toggle instantly. Rendered through the shared
+// drawer footer painter (drawerFooterRowCount), the one the strip paints.
 func inviteFooterRow(inner, picked int) string {
-	content := maxInt(inner-2, 1)
 	count := fmt.Sprintf("%d selected", picked)
+	emph := false
 	if picked > 0 {
 		count += " — Enter to send"
+		emph = true
 	}
-	cw := lipgloss.Width(count)
-	var countStyled string
-	if picked > 0 {
-		countStyled = lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render(count)
-	} else {
-		countStyled = tuiPaletteHintStyle.Render(count)
-	}
-	left := maxInt(content-cw-1, 1)
-	hints := tuiPaletteHintStyle.Render(truncateByWidth(inviteFooterHints, left))
-	gap := maxInt(content-lipgloss.Width(hints)-lipgloss.Width(countStyled), 1)
-	return hints + strings.Repeat(" ", gap) + countStyled
+	return drawerFooterRowCount(inner, inviteFooterHints, count, emph)
 }
 
 // newInviteModel builds the window from the live chat screen: candidates
@@ -1317,7 +1315,105 @@ func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// inviteGeom is the shared paint/hit-test geometry of the centered card.
+// rangeBounds returns the Shift+Up/Down range under the cursor as an
+// inclusive item interval (-1, -1 = no active range). The "> " row marker
+// and the range toggle both walk this one truth.
+func (m inviteModel) rangeBounds() (lo, hi int) {
+	if m.anchor < 0 {
+		return -1, -1
+	}
+	lo, hi = m.anchor, m.sel
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	return lo, hi
+}
+
+// invitePanelRows builds the invite window's full painted row plan — the
+// shared drawer chrome (chat_drawer.go): the single top border line, the
+// "Invite — <group>" header + esc hint, the windowed candidate rows under
+// role-grouped headers, the overflow marker, the post-send notes/notice
+// row, the centered Send button and the footer contract. The staged open
+// reveal clips how many candidate rows the plan carries at each frame
+// (frame 0 = bare chrome, the settled frame = the full window); border,
+// header, button and footer paint from the first frame, exactly like the
+// old card. The plan IS the paint: View renders it through the shared
+// drawerPanelView and the mouse hit-test walks its drItem rows, so the
+// painted list can never drift from the clickable one.
+func (m inviteModel) invitePanelRows() []drawerRow {
+	title := "Invite — " + sanitizeDisplay(m.name)
+	if m.name == "" {
+		title = "Invite — " + sanitizeDisplay(m.code)
+	}
+	panel := make([]drawerRow, 0, 12)
+	panel = append(panel, drawerRow{kind: drBorder}, drawerRow{kind: drHeader, text: title})
+	if len(m.cands) == 0 {
+		panel = append(panel, drawerRow{kind: drEmpty, text: "No users to invite"})
+	} else {
+		wrows, below, above := m.inviteWindowRows()
+		painted := m.paintedRows(len(wrows))
+		for i := 0; i < painted && i < len(wrows); i++ {
+			r := wrows[i]
+			switch r.kind {
+			case drHeader, drBlank:
+				panel = append(panel, r)
+			case drItem:
+				cand := m.cands[r.item]
+				rr := drawerRow{
+					kind: drItem,
+					item: r.item,
+					text: sanitizeDisplay(cand.Username),
+					desc: roleSuffixTag(cand.Role),
+					hit:  m.invitePlan().hitOf(r.item),
+					lead: "  ",
+				}
+				rr.picked = m.picked[cand.Username]
+				rr.flash = rr.picked && m.pulseItem == r.item && m.pulseFrame == 0 && m.pulseGen > 0
+				if lo, hi := m.rangeBounds(); r.item >= lo && r.item <= hi {
+					rr.lead = "> "
+				}
+				panel = append(panel, rr)
+			}
+		}
+		if below > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: below, text: "more"})
+		} else if above > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: above, text: "above"})
+		}
+	}
+	// Post-send results ride a dim notice row; the inline error a red one.
+	if len(m.notes) > 0 {
+		panel = append(panel, drawerRow{kind: drNotice,
+			text: lipgloss.NewStyle().Foreground(colDim).Render(strings.Join(m.notes, " · "))})
+	} else if m.notice != "" {
+		panel = append(panel, drawerRow{kind: drNotice,
+			text: lipgloss.NewStyle().Foreground(colRed).Render(m.notice)})
+	}
+	// The Send button: a full-row accent bar while focused (the drawer's
+	// one-button language), the plain tone otherwise.
+	btn := "SEND"
+	if m.busy {
+		btn = "sending…"
+	}
+	focusN := 0
+	if m.focus == 1 && !m.busy {
+		focusN = 1
+	}
+	panel = append(panel, drawerRow{kind: drButton, text: btn, n: focusN})
+	// The footer contract: nav hints left, the LIVE picked counter right.
+	count := fmt.Sprintf("%d selected", m.pickedCount())
+	emph := false
+	if m.pickedCount() > 0 {
+		count += " — Enter to send"
+		emph = true
+	}
+	panel = append(panel, drawerRow{kind: drFooter, text: inviteFooterHints, count: count, countEmph: emph})
+	return panel
+}
+
+// inviteGeom is the shared paint/hit-test geometry of the centered strip:
+// the window is a full-screen overlay, and the strip (exactly
+// len(invitePanelRows) rows tall, innerW cells wide) centers in it.
 type inviteGeom struct {
 	outerW    int
 	innerW    int
@@ -1332,44 +1428,48 @@ type inviteGeom struct {
 
 func (m inviteModel) geom() inviteGeom {
 	// The drawer standard's width cap: the terminal edge minus two cells,
-	// never past 80 (with the window's own 60-cell floor so the card
-	// chrome still fits a tiny terminal).
-	outerW := m.w - 4
-	if outerW < 60 {
-		outerW = 60
+	// never past 80 (with a 30-cell floor so a tiny terminal still gets
+	// usable chrome).
+	innerW := m.w - 2
+	if innerW > 80 {
+		innerW = 80
 	}
-	if outerW > 80 {
-		outerW = 80
+	if innerW < 30 {
+		innerW = 30
 	}
-	innerW := outerW - 4 // border + padding leave 2 cells per side
-	wrows, _, _ := m.inviteWindowRows()
-	painted := m.paintedRows(len(wrows))
-	// Card interior rows: title, painted candidate rows (headers +
-	// items + overflow), notes/blank, button, footer — plus the card's
-	// own padding and border.
-	outerH := 5 + painted + 2 + 2
-	top := (m.h - outerH) / 2
-	if top < 0 {
-		top = 0
-	}
-	left := (m.w - outerW) / 2
+	left := (m.w - innerW) / 2
 	if left < 0 {
 		left = 0
 	}
-	return inviteGeom{
-		outerW:    outerW,
-		innerW:    innerW,
-		top:       top,
-		left:      left,
-		rowFirst:  top + 1 + 1,
-		rowN:      painted,
-		btnRow:    top + 1 + 1 + painted + 1,
-		// The Send button renders centered on the inner width: Width(inner)
-		// with Align(Center) over a 10-cell button — cells
-		// [left+2+(inner-10)/2, +9], i.e. [cx-5, cx+4] with cx=left+2+inner/2.
-		btnFirstX: left + 2 + innerW/2 - 5,
-		btnLastX:  left + 2 + innerW/2 + 4,
+	rows := m.invitePanelRows()
+	// Vertical centering: the strip occupies exactly its row count.
+	top := (m.h - len(rows)) / 2
+	if top < 0 {
+		top = 0
 	}
+	g := inviteGeom{outerW: innerW, innerW: innerW, top: top, left: left}
+	// The windowed candidate rows (headers + items + separators) paint at
+	// plan indexes [2, 2+painted) — right after the border + header — and
+	// the mouse hit-test maps a click row back into inviteWindowRows, so
+	// rowN must be the painted WINDOWED count, not just the item rows.
+	g.rowFirst = top + 2
+	wrows, _, _ := m.inviteWindowRows()
+	g.rowN = m.paintedRows(len(wrows))
+	for i, r := range rows {
+		if r.kind == drButton {
+			g.btnRow = top + i
+		}
+	}
+	// The button renders centered: " label ", lp spacer cells on each
+	// side — identical math to drawerPanelView's drButton case.
+	label := " " + "SEND" + " "
+	if m.busy {
+		label = " " + "sending…" + " "
+	}
+	lp := maxInt((innerW-lipgloss.Width(label))/2, 0)
+	g.btnFirstX = left + lp
+	g.btnLastX = left + lp + lipgloss.Width(label) - 1
+	return g
 }
 
 func (m inviteModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -1411,128 +1511,50 @@ func (m inviteModel) View() string {
 	g := m.geom()
 	inner := g.innerW
 
-	fit := func(s string) string { return fitRow(s, inner) }
-	rows := make([]string, 0, 4+g.rowN)
+	// The full window is one drawer strip (chat_drawer.go) — the single
+	// top border line, the header, the windowed rows, the button and the
+	// footer — painted by the SHARED painter and centered on the overlay.
+	rows := m.invitePanelRows()
+	body := drawerPanelView(inner, rows, m.sel)
+	bodyLines := strings.Split(body, "\n")
 
-	// The drawer header contract: "Invite — <group>" bold left, esc hint
-	// right (the group name rides the header, exactly like the drawer
-	// standard's title rows).
-	title := "Invite — " + sanitizeDisplay(m.name)
-	if m.name == "" {
-		title = "Invite — " + sanitizeDisplay(m.code)
+	out := make([]string, m.h)
+	for i := range out {
+		out[i] = ""
 	}
-	rows = append(rows, fit(drawerHeaderRow(inner, title)))
-
-	if len(m.cands) == 0 {
-		rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible("No users to invite", inner))))
-	} else {
-		// The windowed, role-grouped row plan (headers + items + overflow)
-		// — the reveal stages how many rows paint on open.
-		wrows, below, above := m.inviteWindowRows()
-		for i := 0; i < g.rowN && i < len(wrows); i++ {
-			r := wrows[i]
-			var line string
-			switch r.kind {
-			case drHeader:
-				line = drawerHeaderRow(inner, r.text)
-			case drBlank:
-				line = padVisible("", inner)
-			case drItem:
-				line = m.inviteItemRowView(r.item, m.invitePlan().hitOf(r.item), inner)
-			}
-			rows = append(rows, fit(line))
-		}
-		if below > 0 {
-			rows = append(rows, fit(overflowRowView(inner, below, false)))
-		} else if above > 0 {
-			rows = append(rows, fit(overflowRowView(inner, above, true)))
+	for i, ln := range bodyLines {
+		y := g.top + i
+		if y >= 0 && y < m.h {
+			out[y] = strings.Repeat(" ", g.left) + ln
 		}
 	}
-
-	if len(m.notes) > 0 {
-		notes := strings.Join(m.notes, " · ")
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(truncateStringPlain(notes, inner))))
-	} else if m.notice != "" {
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colRed).Render(m.notice)))
-	} else {
-		rows = append(rows, " ")
-	}
-
-	btnText := "SEND"
-	if m.busy {
-		btnText = "sending…"
-	}
-	btnW := lipgloss.Width(btnText) + 4
-	btnStyle := landButtonBlurStyle.Width(btnW).Padding(0, 1)
-	if m.focus == 1 && !m.busy {
-		btnStyle = landButtonSelectedStyle.Width(btnW).Padding(0, 1)
-	}
-	btnRow := lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(btnStyle.Render(btnText))
-	rows = append(rows, fit(btnRow))
-	// The drawer footer contract: keymap hints left, the LIVE picked
-	// counter right — "n selected — Enter to send" in accent bold once
-	// anything is picked ("0 selected" in the hint tone before that).
-	rows = append(rows, fit(inviteFooterRow(inner, m.pickedCount())))
-
-	card := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(colEdge).
-		Background(colPanel).
-		Width(inner).
-		Padding(0, 1).
-		Render(strings.Join(rows, "\n"))
-	return lipgloss.NewStyle().Width(m.w).Height(m.h).
-		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
+	return strings.Join(out, "\n")
 }
 
-// inviteItemRowView paints ONE candidate row in the drawer standard —
-// the range marker, the pick check, the username with matched-char
-// highlight and the role tag — with the three-state row language:
-//
-//   - the cursor row wears the standard full-row accent cursor bar
-//     (dark ink on accent);
-//   - a PICKED row wears the accent PICKED bar with the ink run the other
-//     way (bright on accent) + bold name, so picked-vs-focused reads
-//     instantly even when the two states sit on the same row (focused
-//     wins the bar, the ✓ keeps its bright ink);
-//   - a just-toggled row flashes the pulse style for one tick.
-//
-// The ✓ check ALWAYS rides the bright contrast ink, so it stays legible
-// on every bar (the old accent-on-accent check vanished on the cursor bar
-// — that invisibility is the bug this replaces).
+// inviteItemRowView paints ONE candidate row through the SHARED drawer
+// row painter (drawerItemRow) — the invite window has no second renderer.
+// The row carries the range marker + pick check gutter and the three-state
+// row language: the cursor bar, the picked accent bar (the ✓ always on
+// bright contrast ink), and the one-tick toggle pulse.
 func (m inviteModel) inviteItemRowView(item int, hit fuzzyHit, inner int) string {
+	if item < 0 || item >= len(m.cands) {
+		return ""
+	}
 	cand := m.cands[item]
-	focused := item == m.sel
-	picked := m.picked[cand.Username]
-	pulsing := picked && m.pulseItem == item && m.pulseFrame == 0 && m.pulseGen > 0
-	marker := "  "
-	if m.anchor >= 0 {
-		lo, hi := m.anchor, m.sel
-		if lo > hi {
-			lo, hi = hi, lo
-		}
-		if item >= lo && item <= hi {
-			marker = "> "
-		}
+	r := drawerRow{
+		kind: drItem,
+		item: item,
+		text: sanitizeDisplay(cand.Username),
+		desc: roleSuffixTag(cand.Role),
+		hit:  hit,
+		lead: "  ",
 	}
-	check := " "
-	if picked {
-		check = tuiPaletteMatchSelStyle.Render("✓")
+	r.picked = m.picked[cand.Username]
+	r.flash = r.picked && m.pulseItem == item && m.pulseFrame == 0 && m.pulseGen > 0
+	if lo, hi := m.rangeBounds(); item >= lo && item <= hi {
+		r.lead = "> "
 	}
-	name := highlightMatches(sanitizeDisplay(cand.Username), hit.matches, focused || picked, inner)
-	line := marker + " " + check + " " + name + tuiPaletteDescStyle.Render(roleSuffixTag(cand.Role))
-	line = padVisible(truncateByWidth(line, inner), inner)
-	switch {
-	case pulsing:
-		line = tuiPalettePulseStyle.Render(retint(line, tuiPalettePulseStyle))
-	case focused:
-		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-	case picked:
-		line = tuiPalettePickStyle.Render(retint(line, tuiPalettePickStyle))
-	default:
-		line = tuiPaletteRowStyle.Render(line)
-	}
-	return line
+	return drawerItemRow(r, 26, inner, item == m.sel)
 }
 
 // ─── root model: hosts the chat + full-screen windows ───────────────────────

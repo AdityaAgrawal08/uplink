@@ -1028,64 +1028,12 @@ func (c *chatScreen) centerActiveDrawer() {
 
 // ---- rendering ---------------------------------------------------------------
 
-// renderPanel paints a drawer row plan into the panel string: every row is
-// single-line and pinned to the inner width, so the painted height equals
-// the row count exactly (the paletteRows() budget) and nothing ever wraps.
+// renderPanel paints a drawer row plan into the panel string — the shared
+// drawerPanelView painter (chat_drawer.go), whose every row is single-line
+// and pinned to the inner width, so the painted height equals the row count
+// exactly (the paletteRows() budget) and nothing ever wraps.
 func (c chatScreen) renderPanel(maxW int, rows []drawerRow, sel int) string {
-	if len(rows) == 0 {
-		return ""
-	}
-	inner := maxW
-	// Dynamic name column over the VISIBLE item rows: longest title + gap.
-	nameCol := 0
-	for _, r := range rows {
-		if r.kind == drItem {
-			if w := lipgloss.Width(r.text); w > nameCol {
-				nameCol = w
-			}
-		}
-	}
-	nameCol += 2
-	out := make([]string, 0, len(rows))
-	for _, r := range rows {
-		var line string
-		switch r.kind {
-		case drBorder:
-			line = drawerBorderRow(inner)
-		case drHeader:
-			line = drawerHeaderRow(inner, r.text)
-		case drBlank:
-			line = padVisible("", inner)
-		case drItem:
-			line = drawerItemRow(r, nameCol, inner, r.item == sel)
-		case drOverflow:
-			line = overflowRowView(inner, r.n, r.text == "above")
-		case drEmpty:
-			line = tuiPaletteHintStyle.Render(padVisible(r.text, inner))
-		case drFooter:
-			line = drawerFooterRow(inner, r.text, sel, r.n)
-		default:
-			line = ""
-		}
-		out = append(out, fitRow(line, inner))
-	}
-	return strings.Join(out, "\n")
-}
-
-// drawerItemRow paints ONE selectable row: the highlighted title in a name
-// column, the muted description after it, full-width padding so the cursor
-// bar spans edge to edge. The cursor-bar style and the plain-row style are
-// the two single styles every picker shares.
-func drawerItemRow(r drawerRow, nameCol, inner int, selected bool) string {
-	name := highlightMatches(r.text, r.hit.matches, selected, inner)
-	line := padVisible(name, nameCol) + tuiPaletteDescStyle.Render(r.desc)
-	line = padVisible(line, inner)
-	if selected {
-		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-	} else {
-		line = tuiPaletteRowStyle.Render(line)
-	}
-	return line
+	return drawerPanelView(maxW, rows, sel)
 }
 
 // paletteView renders the drawer for the current composer text: the member
