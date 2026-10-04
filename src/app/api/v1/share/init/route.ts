@@ -194,7 +194,18 @@ export async function POST(req: NextRequest) {
     }
 
     // 5. Share ID and Key construction
-    const shareId = (typeof body.shareId === "string" && body.shareId) || generateShareId();
+    // B59 FIX (finding 12): a client-supplied shareId is honored (the CLI's
+    // resume flow re-sends the previous session's server-generated id), but
+    // it must match the server's own id charset or the request is rejected:
+    // the shareId is embedded in the R2 object key, and an arbitrary value
+    // would smuggle path separators / control characters into object-storage
+    // paths. Server-generated ids (22-char base64url) always match.
+    const SHARE_ID_RE = /^[A-Za-z0-9_-]{10,128}$/;
+    const rawShareId = typeof body.shareId === "string" ? body.shareId : "";
+    if (rawShareId !== "" && !SHARE_ID_RE.test(rawShareId)) {
+      return apiError("shareId must be 10-128 characters of A-Za-z0-9_-", 400);
+    }
+    const shareId = rawShareId || generateShareId();
     const storageFilename = sanitizeFilename(filename);
     const date = new Date();
     const year = date.getUTCFullYear();

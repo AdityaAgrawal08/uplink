@@ -99,6 +99,39 @@ describe("share init: per-IP reservation budget (finding 4)", () => {
     expect(share!.initIpHash).toBeTruthy();
     expect(share!.size).toBe(1024);
   });
+
+  it("client-supplied shareId must match ^[A-Za-z0-9_-]{10,128}$ (finding 12)", async () => {
+    // Valid custom ids are accepted (10 and 128 chars are the boundaries).
+    expect((await initShare("203.0.113.41", 1024, { shareId: "abcdefghij" })).status).toBe(201);
+    expect((await initShare("203.0.113.41", 1024, { shareId: "A".repeat(128) })).status).toBe(201);
+
+    // Invalid shapes are rejected with 400 and NOTHING is inserted.
+    const bad = [
+      "short", // < 10 chars
+      "A".repeat(129), // > 128 chars
+      "has spaces 123", // spaces
+      "path/../../etc", // path traversal attempt
+      "dots..dots", // dots
+      "💥".repeat(10), // non-ASCII
+      "colon:colon", // colon (object-key / protocol separator)
+    ];
+    for (const shareId of bad) {
+      const res = await initShare("203.0.113.42", 1024, { shareId });
+      expect(res.status).toBe(400);
+      const err = await res.json();
+      expect(String(err.error)).toMatch(/shareId/);
+    }
+    expect(db().collection("shares").docs.length).toBe(2); // only the two valid ones
+
+    // A non-string shareId is not "client-supplied": it falls back to server
+    // generation exactly like the original behavior.
+    expect((await initShare("203.0.113.44", 1024, { shareId: 42 })).status).toBe(201);
+
+    // Generated ids (the CLI resume path re-sends them) match the charset.
+    expect((await initShare("203.0.113.43", 1024, {})).status).toBe(201);
+    const generated = db().collection("shares").docs[3].shareId as string;
+    expect(generated).toMatch(/^[A-Za-z0-9_-]{10,128}$/);
+  });
 });
 
 describe("preview-text hardening (finding 7)", () => {
