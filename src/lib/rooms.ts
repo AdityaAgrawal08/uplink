@@ -45,9 +45,15 @@ export const INBOX_TTL_SEC = 60 * 60; // key-level sliding TTL: refreshed per de
 export const PRESENCE_TIMEOUT_MS = 20 * 1000; // ~4 missed 5s heartbeats = offline (fast join/leave visibility; beats are cheap pipelined reads)
 
 export const MAX_SIG_QUEUE = 150; // signaling notes queued per user (media sessions fan out: announce + 3-way handshake + healing retries per peer — 50 dropped chat notes under a room video)
-export const MAX_INBOX = 200; // undelivered boxes held per user
+// B54 FIX (finding 5): the inbox is byte-budgeted, not just count-budgeted.
+// Previously 200 boxes × 256KB payloads allowed ~51MB of ciphertext per
+// victim recipient (a flood fills the 1h inbox TTL with full-capacity
+// boxes). Now 50 boxes × 128KB ≈ 6.4MB worst case per recipient — one
+// fetch returns the whole inbox (FETCH_BOX_CAP = 50), and the ACK path
+// stays free so victims can always clear it.
+export const MAX_INBOX = 50; // undelivered boxes held per user
 export const MAX_SIG_PAYLOAD = 16 * 1024; // SDP/ICE notes are small
-export const MAX_BOX_PAYLOAD = 256 * 1024; // fallback relay: text + small files only
+export const MAX_BOX_PAYLOAD = 128 * 1024; // fallback relay: text + small files only
 
 export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
 export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction sends per IP per 5 min

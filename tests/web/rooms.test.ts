@@ -18,6 +18,7 @@ import {
   roomExists,
   toggleReaction,
   fetchReactions,
+  MAX_INBOX,
 } from "../../src/lib/rooms";
 
 const PUBKEY = Buffer.alloc(32, 7).toString("base64");
@@ -225,7 +226,7 @@ describe("delivery hardening", () => {
     const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
     await joinRoom(sessionId, peer, PUBKEY);
     const big = "x".repeat(1024);
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < MAX_INBOX; i++) {
       await depositBox(sessionId, username, peer, `m-${i}`, "p2p", big);
     }
     await expect(depositBox(sessionId, username, peer, "m-new", "p2p", big)).rejects.toMatchObject({ status: 429 });
@@ -235,12 +236,40 @@ describe("delivery hardening", () => {
     await expect(depositBox(sessionId, other, peer, "m-0", "p2p", big)).rejects.toMatchObject({ status: 409 });
   });
 
+  it("inbox is byte-budgeted: MAX_INBOX × MAX_BOX_PAYLOAD ≈ 6.4MB worst case (finding 5)", async () => {
+    const { MAX_BOX_PAYLOAD } = await import("../../src/lib/rooms");
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    // Worst case per recipient is count-cap × payload-cap.
+    expect(MAX_INBOX * MAX_BOX_PAYLOAD).toBeLessThanOrEqual(10 * 1024 * 1024);
+    // Oversized single box: refused outright.
+    await expect(depositBox(sessionId, username, peer, "huge", "p2p", "y".repeat(MAX_BOX_PAYLOAD + 1))).rejects.toMatchObject({ status: 400 });
+    // Flood with max-size boxes fills the inbox…
+    for (let i = 0; i < MAX_INBOX; i++) {
+      await depositBox(sessionId, username, peer, `f-${i}`, "p2p", "y".repeat(MAX_BOX_PAYLOAD));
+    }
+    await expect(depositBox(sessionId, username, peer, "f-over", "p2p", "y".repeat(MAX_BOX_PAYLOAD))).rejects.toMatchObject({ status: 429 });
+    // …but the victim can always ACK (the ACK path is never throttled) and
+    // a legit small message still lands afterwards.
+    await ackBoxes(sessionId, peer, ["f-0", "f-1"]);
+    await depositBox(sessionId, username, peer, "legit-small", "p2p", "hello");
+    const { boxes } = await fetchBoxes(sessionId, peer);
+    expect(boxes.map((b) => b.msgId)).toContain("legit-small");
+  });
+
   it("fetch caps at 50 and reaps corrupt fields", async () => {
     const { sessionId, username } = await makeRoom();
     const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
     await joinRoom(sessionId, peer, PUBKEY);
-    for (let i = 0; i < 60; i++) {
+    // Fill the inbox to its (byte-budgeted) cap of 50 via the API…
+    for (let i = 0; i < MAX_INBOX; i++) {
       await depositBox(sessionId, username, peer, `c-${i}`, "p2p", "e30=");
+    }
+    // …then stuff it past the cap directly (bypassing depositBox, which
+    // refuses): fetch must still return at most 50 boxes.
+    for (let i = MAX_INBOX; i < MAX_INBOX + 10; i++) {
+      await redis.hset(`room:${sessionId}:inbox:${peer}`, `c-${i}`, JSON.stringify({ msgId: `c-${i}`, from: username, kind: "p2p", payload: "e30=", ts: Date.now() }));
     }
     const { boxes } = await fetchBoxes(sessionId, peer);
     expect(boxes.length).toBe(50);
