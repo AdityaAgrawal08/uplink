@@ -862,7 +862,10 @@ type inviteSentMsg struct {
 // highlighted member (the window stays open for more picks), Tab moves to
 // the Send button, Enter there POSTs /invites for EVERY selected user —
 // 409 already-in-session notes are reported inline and the rest continue.
-// Esc closes without sending anything.
+// Esc closes without sending anything. The picker paints in the shared
+// OpenCode/fzf drawer language (chat_drawer.go): role-grouped rows under
+// the "Invite — <group>" header, full-row cursor bar, pick checks, footer
+// hints + count, 80x24-safe caps and the 50ms staged open reveal.
 type inviteModel struct {
 	w, h   int
 	code   string
@@ -870,18 +873,45 @@ type inviteModel struct {
 	sig    *signalClient // group session client: key = the group code
 	cands  []rosterMember
 	sel    int
-	off    int // scroll window offset into cands
+	off    int // scroll window offset into cands (item space)
 	anchor int // range anchor (Shift+Up/Down); -1 = no active range
 	picked map[string]bool
 	focus  int // 0 = member list, 1 = Send button
 	busy   bool
 	notice string
 	notes  []string
+	// reveal is the painted stage of the open window (0 = bare chrome, the
+	// last frame = fully expanded); revealGen fences stale reveal ticks.
+	reveal    int
+	revealGen int
+	// animations mirrors chatScreen.animations (wired from the env at
+	// construction) so tests can pin the staged reveal deterministically.
+	animations bool
 }
 
-// inviteMaxRows caps the painted candidate list; longer lists scroll with
-// the highlight (same window discipline as the settings window).
-const inviteMaxRows = 10
+// inviteRevealFrames is the number of painted stages in the window's open
+// reveal (0 = bare chrome, the last frame = settled); inviteRevealStep
+// spaces the tea.Tick frames 50ms apart — the same staged reveal as the
+// reaction dropdown and the /reply pointer. Plain/CI runs stay static (the
+// window paints fully expanded, no timers).
+const (
+	inviteRevealFrames = 4
+	inviteRevealStep   = 50 * time.Millisecond
+)
+
+// inviteRevealMsg advances the window's open reveal to painted stage frame.
+// gen fences out ticks from a superseded open (close + reopen).
+type inviteRevealMsg struct{ gen, frame int }
+
+func scheduleInviteReveal(gen, frame int) tea.Cmd {
+	return tea.Tick(inviteRevealStep, func(time.Time) tea.Msg {
+		return inviteRevealMsg{gen: gen, frame: frame}
+	})
+}
+
+// inviteFooterHints is the dim keymap legend under the member list (the
+// drawer footer contract: hints left, count right).
+const inviteFooterHints = "↑↓ move · shift+↑↓ range · enter toggle · tab send · esc close"
 
 // newInviteModel builds the window from the live chat screen: candidates
 // are the parent room's roster minus the group's existing members (and
@@ -890,14 +920,15 @@ const inviteMaxRows = 10
 func newInviteModel(c chatScreen, code, name string, sig *signalClient, w, h int) inviteModel {
 	cands := c.inviteCandidates()
 	return inviteModel{
-		code:   code,
-		name:   name,
-		sig:    sig,
-		cands:  cands,
-		anchor: -1,
-		picked: map[string]bool{},
-		w:      w,
-		h:      h,
+		code:       code,
+		name:       name,
+		sig:        sig,
+		cands:      cands,
+		anchor:     -1,
+		picked:     map[string]bool{},
+		w:          w,
+		h:          h,
+		animations: chatAnimationsEnabled(), // newChatScreen wires exactly this
 	}
 }
 
@@ -932,22 +963,49 @@ func (c *chatScreen) inviteCandidates() []rosterMember {
 	return out
 }
 
-func (m inviteModel) Init() tea.Cmd { return nil }
+// Init arms the window's staged open reveal (the chat's pumps are paused
+// while the window is open, so the window drives its own). Plain/CI runs
+// stay static: the candidates paint fully expanded with no timers.
+func (m inviteModel) Init() tea.Cmd {
+	if !m.animations {
+		return nil
+	}
+	return scheduleInviteReveal(m.revealGen, 1)
+}
 
-// visibleRows is how many candidate rows the card can paint at this height.
+// visibleRows is the window size for the candidate list: the shared drawer
+// cap (at most 10 rows, scaled by half the terminal — never the whole
+// screen), with a 3-row floor so a tiny terminal still gets a usable list.
 func (m inviteModel) visibleRows() int {
-	v := m.h - 15 // title + subtitle + button + notes + hints + borders
+	v := drawerMaxRows(m.h)
 	if v < 3 {
 		v = 3
-	}
-	if v > inviteMaxRows {
-		v = inviteMaxRows
 	}
 	return v
 }
 
-// clampSel keeps the highlight + scroll window inside the live list.
-func (m *inviteModel) clampSel() {
+// invitePlan builds the candidate display plan: role-grouped under
+// Admins/Members headers (the same grouped member standard as the "/"
+// palette's member stage), windowed by visibleRows.
+func (m inviteModel) invitePlan() drawerPlan {
+	return buildDrawerPlan(len(m.cands), len(m.cands) > 0,
+		func(i int) string { return userGroupLabel(m.cands[i]) }, m.visibleRows())
+}
+
+// inviteWindowRows returns the windowed display rows for the current
+// selection — the single source paint, geometry and the mouse hit-test all
+// walk, so the painted list can never drift from the hit-tested one.
+func (m inviteModel) inviteWindowRows() (rows []drawerRow, below, above int) {
+	plan := m.invitePlan()
+	rows, below, above = windowDrawerPlan(plan, m.off, m.sel)
+	return rows, below, above
+}
+
+// settleWindow re-anchors the highlight + scroll window inside the live
+// candidate list, plan-aware (group headers shift display rows — the same
+// follow the palette and the picker use).
+func (m *inviteModel) settleWindow() {
+	plan := m.invitePlan()
 	n := len(m.cands)
 	if n <= 0 {
 		m.sel, m.off = 0, 0
@@ -959,17 +1017,54 @@ func (m *inviteModel) clampSel() {
 	if m.sel < 0 {
 		m.sel = 0
 	}
-	visible := m.visibleRows()
-	maxOff := maxInt(n-visible, 0)
-	if m.off > maxOff {
-		m.off = maxOff
+	settleDrawerWindow(&m.sel, &m.off, plan)
+}
+
+// moveBy steps the highlight through the PAINTED order of the grouped plan
+// (headers shift display rows — the walk follows what the user sees, never
+// the raw candidate array), then re-settles the window.
+func (m *inviteModel) moveBy(d int) {
+	if len(m.cands) == 0 {
+		m.sel, m.off = 0, 0
+		return
 	}
-	if m.sel < m.off {
-		m.off = m.sel
+	disp := m.invitePlan().displayOrder()
+	cur := 0
+	for i, it := range disp {
+		if it == m.sel {
+			cur = i
+			break
+		}
 	}
-	if m.sel >= m.off+visible {
-		m.off = m.sel - visible + 1
+	cur = (cur + d + len(disp)) % len(disp)
+	m.sel = disp[cur]
+	m.settleWindow()
+}
+
+// paintedRows is how many of the windowed rows actually paint at the
+// current reveal stage (0 = bare chrome, the settled frame = all of them).
+// Plain/CI runs always paint fully expanded.
+func (m inviteModel) paintedRows(total int) int {
+	frame := m.reveal
+	if !m.animations {
+		frame = inviteRevealFrames - 1
 	}
+	if frame >= inviteRevealFrames-1 {
+		return total
+	}
+	return total * frame / (inviteRevealFrames - 1)
+}
+
+// paintedPos resolves the highlight's position in PAINTED item order (the
+// footer count). 0 when nothing is selectable.
+func (m inviteModel) paintedPos() int {
+	disp := m.invitePlan().displayOrder()
+	for i, it := range disp {
+		if it == m.sel {
+			return i
+		}
+	}
+	return 0
 }
 
 // selectedUsers returns the picked usernames in candidate order (stable).
@@ -1019,6 +1114,17 @@ func (m inviteModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		m.settleWindow()
+		return m, nil
+
+	case inviteRevealMsg:
+		if msg.gen != m.revealGen {
+			return m, nil // stale reveal tick from a superseded open
+		}
+		m.reveal = msg.frame
+		if m.reveal < inviteRevealFrames-1 {
+			return m, scheduleInviteReveal(m.revealGen, m.reveal+1)
+		}
 		return m, nil
 
 	case tea.MouseMsg:
@@ -1070,10 +1176,7 @@ func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.anchor = -1
 		}
-		if n := len(m.cands); n > 0 {
-			m.sel = ((m.sel-1)%n + n) % n
-		}
-		m.clampSel()
+		m.moveBy(-1)
 		return m, nil
 	case tea.KeyDown, tea.KeyShiftDown:
 		if msg.Type == tea.KeyShiftDown {
@@ -1083,10 +1186,7 @@ func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.anchor = -1
 		}
-		if n := len(m.cands); n > 0 {
-			m.sel = (m.sel + 1) % n
-		}
-		m.clampSel()
+		m.moveBy(+1)
 		return m, nil
 	case tea.KeyEnter:
 		// A Shift+Up/Down range (anchor set) toggles EVERY member in the
@@ -1137,22 +1237,23 @@ type inviteGeom struct {
 }
 
 func (m inviteModel) geom() inviteGeom {
+	// The drawer standard's width cap: the terminal edge minus two cells,
+	// never past 80 (with the window's own 60-cell floor so the card
+	// chrome still fits a tiny terminal).
 	outerW := m.w - 4
 	if outerW < 60 {
 		outerW = 60
 	}
-	if outerW > 78 {
-		outerW = 78
+	if outerW > 80 {
+		outerW = 80
 	}
 	innerW := outerW - 4 // border + padding leave 2 cells per side
-	n := len(m.cands)
-	v := m.visibleRows()
-	if n > v {
-		n = v
-	}
-	// Card interior rows: title, subtitle, n candidate rows, notes/blank,
-	// button, hint.
-	outerH := 8 + n + 2 // +2 border
+	wrows, _, _ := m.inviteWindowRows()
+	painted := m.paintedRows(len(wrows))
+	// Card interior rows: title, painted candidate rows (headers +
+	// items + overflow), notes/blank, button, footer — plus the card's
+	// own padding and border.
+	outerH := 5 + painted + 2 + 2
 	top := (m.h - outerH) / 2
 	if top < 0 {
 		top = 0
@@ -1166,9 +1267,9 @@ func (m inviteModel) geom() inviteGeom {
 		innerW:    innerW,
 		top:       top,
 		left:      left,
-		rowFirst:  top + 1 + 2,
-		rowN:      n,
-		btnRow:    top + 1 + 2 + n + 2,
+		rowFirst:  top + 1 + 1,
+		rowN:      painted,
+		btnRow:    top + 1 + 1 + painted + 1,
 		// The Send button renders centered on the inner width: Width(inner)
 		// with Align(Center) over a 10-cell button — cells
 		// [left+2+(inner-10)/2, +9], i.e. [cx-5, cx+4] with cx=left+2+inner/2.
@@ -1187,15 +1288,23 @@ func (m inviteModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, m.sendAll()
 	}
 	// Candidate row click: select AND toggle the member (mouse parity with
-	// keyboard Enter), the window stays open.
+	// keyboard Enter), the window stays open. The hit-test walks the SAME
+	// windowed row plan the painter emits, so a click on a group header or
+	// a separator is chrome and does nothing.
 	if msg.Y < g.rowFirst || msg.Y >= g.rowFirst+g.rowN {
 		return m, nil
 	}
-	idx := m.off + (msg.Y - g.rowFirst)
+	wrows, _, _ := m.inviteWindowRows()
+	row := msg.Y - g.rowFirst
+	if row < 0 || row >= len(wrows) || wrows[row].kind != drItem {
+		return m, nil
+	}
+	idx := wrows[row].item
 	if idx < 0 || idx >= len(m.cands) {
 		return m, nil
 	}
 	m.sel = idx
+	m.settleWindow()
 	m.anchor = -1
 	u := m.cands[idx].Username
 	if m.picked[u] {
@@ -1215,48 +1324,40 @@ func (m inviteModel) View() string {
 	inner := g.innerW
 
 	fit := func(s string) string { return fitRow(s, inner) }
-	rows := make([]string, 0, 8+g.rowN)
-	rows = append(rows, fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ INVITE")))
-	sub := "add members to group " + sanitizeDisplay(m.name)
+	rows := make([]string, 0, 4+g.rowN)
+
+	// The drawer header contract: "Invite — <group>" bold left, esc hint
+	// right (the group name rides the header, exactly like the drawer
+	// standard's title rows).
+	title := "Invite — " + sanitizeDisplay(m.name)
 	if m.name == "" {
-		sub = "add members to group " + sanitizeDisplay(m.code)
+		title = "Invite — " + sanitizeDisplay(m.code)
 	}
-	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(sub)))
+	rows = append(rows, fit(drawerHeaderRow(inner, title)))
 
 	if len(m.cands) == 0 {
-		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render("  no one left to invite.")))
+		rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible("No users to invite", inner))))
 	} else {
-		for i := 0; i < g.rowN; i++ {
-			idx := m.off + i
-			if idx >= len(m.cands) {
-				break
+		// The windowed, role-grouped row plan (headers + items + overflow)
+		// — the reveal stages how many rows paint on open.
+		wrows, below, above := m.inviteWindowRows()
+		for i := 0; i < g.rowN && i < len(wrows); i++ {
+			r := wrows[i]
+			var line string
+			switch r.kind {
+			case drHeader:
+				line = drawerHeaderRow(inner, r.text)
+			case drBlank:
+				line = padVisible("", inner)
+			case drItem:
+				line = m.inviteItemRowView(r.item, m.invitePlan().hitOf(r.item), inner)
 			}
-			cand := m.cands[idx]
-			mark := " "
-			if m.picked[cand.Username] {
-				mark = "✓"
-			}
-			ranged := false
-			if m.anchor >= 0 {
-				lo, hi := m.anchor, m.sel
-				if lo > hi {
-					lo, hi = hi, lo
-				}
-				ranged = idx >= lo && idx <= hi
-			}
-			marker := "  "
-			if ranged {
-				marker = "> "
-			}
-			line := fit(marker + mark + "  " + cand.Username + roleSuffixTag(cand.Role))
-			if idx == m.sel {
-				line = fit(tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle)))
-			}
-			rows = append(rows, line)
+			rows = append(rows, fit(line))
 		}
-		if len(m.cands) > g.rowN {
-			rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
-				fmt.Sprintf("  … +%d more", len(m.cands)-g.rowN))))
+		if below > 0 {
+			rows = append(rows, fit(overflowRowView(inner, below, false)))
+		} else if above > 0 {
+			rows = append(rows, fit(overflowRowView(inner, above, true)))
 		}
 	}
 
@@ -1280,8 +1381,8 @@ func (m inviteModel) View() string {
 	}
 	btnRow := lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(btnStyle.Render(btnText))
 	rows = append(rows, fit(btnRow))
-	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
-		"↑↓ move · shift+↑↓ range · enter toggle · tab send · esc close")))
+	// The drawer footer contract: keymap hints left, "sel/count" right.
+	rows = append(rows, fit(drawerFooterRow(inner, inviteFooterHints, m.paintedPos(), len(m.cands))))
 
 	card := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1292,6 +1393,39 @@ func (m inviteModel) View() string {
 		Render(strings.Join(rows, "\n"))
 	return lipgloss.NewStyle().Width(m.w).Height(m.h).
 		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
+}
+
+// inviteItemRowView paints ONE candidate row in the drawer standard:
+// the range marker, the pick check (accent, bar ink on the cursor row),
+// the username with matched-char highlight, and the role tag — the
+// full-row cursor bar (accent bg + contrast ink + bold) on the selected
+// row, the shared plain row style otherwise.
+func (m inviteModel) inviteItemRowView(item int, hit fuzzyHit, inner int) string {
+	cand := m.cands[item]
+	selected := item == m.sel
+	marker := "  "
+	if m.anchor >= 0 {
+		lo, hi := m.anchor, m.sel
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		if item >= lo && item <= hi {
+			marker = "> "
+		}
+	}
+	check := " "
+	if m.picked[cand.Username] {
+		check = tuiPaletteMatchStyle.Render("✓")
+	}
+	name := highlightMatches(sanitizeDisplay(cand.Username), hit.matches, selected, inner)
+	line := marker + " " + check + " " + name + tuiPaletteDescStyle.Render(roleSuffixTag(cand.Role))
+	line = padVisible(truncateByWidth(line, inner), inner)
+	if selected {
+		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
+	} else {
+		line = tuiPaletteRowStyle.Render(line)
+	}
+	return line
 }
 
 // ─── root model: hosts the chat + full-screen windows ───────────────────────
@@ -1315,12 +1449,17 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openSettingsMsg:
 		if r.overlay == nil {
 			r.overlay = newSettingsModel(r.chat.sig.serverURL, r.chat.me, r.chat.id, r.chat.width, r.chat.height)
+			// Init arms the window's OWN invite fetch chain
+			// (the chat's roster tick is paused while the window is
+			// open — without this the inbox would never poll).
+			return r, r.overlay.Init()
 		}
 		return r, nil
 	case openNewGroupMsg:
 		if r.overlay == nil {
 			r.overlay = newGroupModel(r.chat.sig.serverURL, r.chat.me, r.chat.id, r.chat.key,
 				r.chat.width, r.chat.height)
+			return r, r.overlay.Init()
 		}
 		return r, nil
 	case openInviteMsg:
@@ -1335,6 +1474,7 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				name = g.name
 			}
 			r.overlay = newInviteModel(r.chat, code, name, g.sig, r.chat.width, r.chat.height)
+			return r, r.overlay.Init()
 		}
 		return r, nil
 	case closeOverlayMsg:

@@ -273,24 +273,30 @@ func TestInviteWindowEscClosesWithoutSending(t *testing.T) {
 
 // TestInviteWindowMouseParity: a click on a candidate row selects AND
 // toggles it (window stays open), a click on the Send button sends; clicks
-// on chrome rows do nothing.
+// on chrome rows (the group header, the title) do nothing.
 func TestInviteWindowMouseParity(t *testing.T) {
 	srv, c, code, _ := inviteFixture(t)
 	fake := srv.Config.Handler.(*fakeSignalServer)
-	m := newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height)
+	m := settleInviteReveal(newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height))
 	g := m.geom()
+	// The grouped plan paints a "Members" header above the candidates:
+	// row +0 is chrome, row +1 is carol, row +2 is dave.
+	wrows, _, _ := m.inviteWindowRows()
+	if wrows[1].kind != drItem {
+		t.Fatalf("fixture: row +1 must be an item row, got %v", wrows[1].kind)
+	}
 
-	// Click the second candidate row: selects dave + toggles him.
-	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst+1))
+	// Click the third painted row (dave): selects him AND toggles him.
+	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst+2))
 	if m.sel != 1 || !m.picked["dave"] {
 		t.Fatalf("row click must select+toggle dave: sel=%d picked=%v", m.sel, m.picked)
 	}
 	// Click the same row again: UN-toggles (toggle semantics).
-	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst+1))
+	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst+2))
 	if m.picked["dave"] {
 		t.Fatal("second click must un-toggle dave")
 	}
-	// The highlight stayed on dave (row 1): keyboard Enter re-picks him,
+	// The highlight stayed on dave (row 2): keyboard Enter re-picks him,
 	// then the Send button click sends the pick.
 	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter})
 	if !m.picked["dave"] {
@@ -304,26 +310,174 @@ func TestInviteWindowMouseParity(t *testing.T) {
 	if fake.fakeInviteCount("dave") != 1 {
 		t.Fatalf("button click must send dave, got %d invites", fake.fakeInviteCount("dave"))
 	}
-	// Chrome click (title row): no selection change, no send.
+	// Chrome click (group header row): no selection change, no send.
 	before := m.sel
+	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst))
+	if m.sel != before {
+		t.Fatalf("header click must not move the selection: sel=%d", m.sel)
+	}
+	// Chrome click (title row): no selection change, no send.
 	m = stepInvite(m, mouseAt(g.left+5, g.rowFirst-2))
 	if m.sel != before {
 		t.Fatalf("chrome click must not move the selection: sel=%d", m.sel)
 	}
 }
 
-// TestInviteWindowRenders: the window paints its title, the candidate rows
-// with pick marks, the Send button and the keymap footer.
-func TestInviteWindowRenders(t *testing.T) {
+// settleInviteReveal drives the window's staged open reveal to its settled
+// frame — the paint/mouse tests run the window post-open, exactly like the
+// reaction dropdown tests arm the reveal ticks explicitly.
+func settleInviteReveal(m inviteModel) inviteModel {
+	for frame := 1; frame < inviteRevealFrames; frame++ {
+		m = stepInvite(m, inviteRevealMsg{gen: m.revealGen, frame: frame})
+	}
+	return m
+}
+
+// TestInviteWindowRevealStaged: the open reveal is staged over tea.Tick
+// frames — frame 0 paints bare chrome, each 50ms tick reveals more rows,
+// the last frame is the settled window. Stale generations stay inert, and
+// no-animation (plain/CI) models paint fully expanded with no timers.
+func TestInviteWindowRevealStaged(t *testing.T) {
 	_, c, code, _ := inviteFixture(t)
 	m := newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height)
+	m.animations = true
+
+	// Init arms the first reveal tick; the window starts at frame 0.
+	if cmd := m.Init(); cmd == nil {
+		t.Fatal("animated open must arm the reveal tick")
+	}
+	if m.reveal != 0 {
+		t.Fatalf("open must start at frame 0, got %d", m.reveal)
+	}
+	// Frame 0: bare chrome — no candidate rows yet.
+	if view := m.View(); strings.Contains(view, "carol") {
+		t.Fatalf("frame 0 must not paint candidates yet:\n%s", view)
+	}
+	// Frame 1: the group header + first row appear; the whole list not yet.
+	m, cmd := stepInviteC(m, inviteRevealMsg{gen: m.revealGen, frame: 1})
+	if cmd == nil {
+		t.Fatal("a mid-reveal frame must re-arm the next tick")
+	}
+	if view := m.View(); !strings.Contains(view, "Members") || strings.Contains(view, "carol") {
+		t.Fatalf("frame 1 must reveal the header first, got:\n%s", view)
+	}
+	// Frame 2: carol appears, dave still hidden.
+	m = stepInvite(m, inviteRevealMsg{gen: m.revealGen, frame: 2})
+	if view := m.View(); !strings.Contains(view, "carol") || strings.Contains(view, "dave") {
+		t.Fatalf("frame 2 must reveal the first row, got:\n%s", view)
+	}
+	// Settled: fully expanded window.
+	m = stepInvite(m, inviteRevealMsg{gen: m.revealGen, frame: inviteRevealFrames - 1})
+	view := m.View()
+	for _, want := range []string{"Members", "carol", "dave", "SEND"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("settled invite view missing %q", want)
+		}
+	}
+	// A stale reveal generation stays inert.
+	stale := stepInvite(m, inviteRevealMsg{gen: 99, frame: 0})
+	if stale.reveal != inviteRevealFrames-1 {
+		t.Fatalf("a stale reveal tick must never rewind the window: reveal=%d", stale.reveal)
+	}
+	// No-animation models: fully expanded, Init arms nothing.
+	m2 := newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height)
+	m2.animations = false
+	if cmd := m2.Init(); cmd != nil {
+		t.Fatal("plain runs must not arm reveal ticks")
+	}
+	if view := m2.View(); !strings.Contains(view, "carol") {
+		t.Fatalf("plain runs paint fully expanded:\n%s", view)
+	}
+}
+
+// TestInviteWindowGroupedRoles: mixed-role candidates paint under the
+// Admins/Members headers in the drawer standard (stable item order, headers
+// inserted), the arrow keys walk every painted item row across the group
+// boundary, and the footer carries the sel/count.
+func TestInviteWindowGroupedRoles(t *testing.T) {
+	c := groupTestScreen("alice")
+	c.width, c.height = 110, 40
+	m := settleInviteReveal(newInviteModel(c, "700001", "Design",
+		&signalClient{serverURL: "http://x", key: "700001", me: "alice"}, 110, 40))
+	m.cands = []rosterMember{
+		{Username: "eve", Role: "admin"},
+		{Username: "carol"},
+		{Username: "dave"},
+	}
+
+	plan := m.invitePlan()
+	var kinds []string
+	for _, r := range plan.rows {
+		switch r.kind {
+		case drHeader:
+			kinds = append(kinds, "H:"+r.text)
+		case drBlank:
+			kinds = append(kinds, "B")
+		case drItem:
+			kinds = append(kinds, "I")
+		}
+	}
+	if got := strings.Join(kinds, ","); got != "H:Admins,I,B,H:Members,I,I" {
+		t.Fatalf("grouped plan = %v; want H:Admins,I,B,H:Members,I,I", got)
+	}
+	if got := strings.Join(itos(plan.displayOrder()), ","); got != "0,1,2" {
+		t.Fatalf("painted order = %v; want 0,1,2 (stable)", got)
+	}
+
+	view := m.View()
+	for _, want := range []string{"Admins", "Members", "eve", "carol", "dave", "1/3"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("grouped view missing %q", want)
+		}
+	}
+	// Arrows walk the painted rows across the group boundary.
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.sel != 1 || m.cands[m.sel].Username != "carol" {
+		t.Fatalf("down across the header: sel=%d %q; want carol", m.sel, m.cands[m.sel].Username)
+	}
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyDown})
+	if m.sel != 2 || m.cands[m.sel].Username != "dave" {
+		t.Fatalf("down into Members: sel=%d %q; want dave", m.sel, m.cands[m.sel].Username)
+	}
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyUp})
+	if m.sel != 1 {
+		t.Fatalf("up must walk back to carol, sel=%d", m.sel)
+	}
+}
+
+// TestInviteWindowRenders: the window paints in the drawer standard — the
+// "Invite — Design" header with the esc hint, the role-grouped candidate
+// rows with pick checks, the Send button and the keymap footer with the
+// count.
+func TestInviteWindowRenders(t *testing.T) {
+	_, c, code, _ := inviteFixture(t)
+	m := settleInviteReveal(newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height))
 	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyDown}) // sel 1
 	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter})
 	view := m.View()
-	for _, want := range []string{"◆ INVITE", "add members to group Design", "carol", "dave", "SEND", "enter toggle"} {
+	for _, want := range []string{"Invite — Design", "Members", "carol", "dave", "SEND", "enter toggle"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("invite view missing %q", want)
 		}
+	}
+	if !strings.Contains(view, "esc") {
+		t.Error("invite header must paint the esc hint (drawer header contract)")
+	}
+	if !strings.Contains(view, "2/2") {
+		t.Errorf("invite footer must paint the sel/count (2/2), got:\n%s", view)
+	}
+	// Picked rows carry a legible check; the selected row wears the bar.
+	if !strings.Contains(view, "✓") {
+		t.Error("picked row must paint its ✓ check")
+	}
+
+	// Empty state: "No users to invite".
+	c2 := groupTestScreen("alice")
+	c2.width, c2.height = 110, 40
+	c2.users = []string{"alice"}
+	em := settleInviteReveal(newInviteModel(c2, code, "Design", &signalClient{serverURL: "x", key: code, me: "alice"}, 110, 40))
+	if !strings.Contains(em.View(), "No users to invite") {
+		t.Errorf("empty window must paint %q", "No users to invite")
 	}
 }
 
