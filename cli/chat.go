@@ -97,7 +97,7 @@ func chatAnimationsEnabled() bool {
 // There is no backlog (the server keeps no transcript) and no local history:
 // the room is live from the moment you join.
 func runChatPlain(serverURL, key, me string, id *identityKey, password string) {
-	sig := &signalClient{serverURL: serverURL, key: key, me: me}
+	sig := &signalClient{serverURL: serverURL, key: key, me: me, id: id}
 	// Consumer-side exactly-once (mirrors the TUI): every received copy is
 	// acked so the sender's backstop graduates, but only the first copy
 	// prints. Previously plain mode never acked at all, so senders retried

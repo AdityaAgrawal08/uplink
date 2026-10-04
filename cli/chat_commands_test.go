@@ -466,16 +466,16 @@ func TestKickMatrixFakeServer(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	defer srv.Close()
 
-	alice := newSignalTestClient(srv, "alice") // room creator = main admin
-	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	alice := newSignalTestClient(t, srv, "alice") // room creator = main admin
+	sid, err := alice.createRoom("alice", pubkeyB64(alice.id), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	alice.key = sid
 	mk := func(u string) *signalClient {
-		c := newSignalTestClient(srv, u)
+		c := newSignalTestClient(t, srv, u)
 		c.key = sid
-		if _, _, err := c.joinRoom(u, "pubkey-"+u, ""); err != nil {
+		if _, _, err := c.joinRoom(u, pubkeyB64(c.id), ""); err != nil {
 			t.Fatal(err)
 		}
 		return c
@@ -812,15 +812,15 @@ func TestKickAdminDispatchAndClient(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	defer srv.Close()
 
-	alice := newSignalTestClient(srv, "alice")
-	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	alice := newSignalTestClient(t, srv, "alice")
+	sid, err := alice.createRoom("alice", pubkeyB64(alice.id), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	alice.key = sid
-	bob := newSignalTestClient(srv, "bob")
+	bob := newSignalTestClient(t, srv, "bob")
 	bob.key = sid
-	if _, _, err := bob.joinRoom("bob", "pubkey-bob", ""); err != nil {
+	if _, _, err := bob.joinRoom("bob", pubkeyB64(bob.id), ""); err != nil {
 		t.Fatal(err)
 	}
 

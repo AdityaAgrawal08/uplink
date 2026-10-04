@@ -120,7 +120,7 @@ func newSettingsModel(serverURL, me string, id *identityKey, w, h int) settingsM
 		me:        me,
 		serverURL: serverURL,
 		id:        id,
-		sig:       &signalClient{serverURL: serverURL, me: me},
+		sig:       &signalClient{serverURL: serverURL, me: me, id: id},
 		w:         w,
 		h:         h,
 		passInput: pi,
@@ -507,7 +507,7 @@ func (m settingsModel) View() string {
 	}
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Bold(true).Render("ACCOUNT")))
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colText).Render(
-		"  " + sanitizeDisplay(m.me) + "  ·  " + sanitizeDisplay(m.serverURL))))
+		"  "+sanitizeDisplay(m.me)+"  ·  "+sanitizeDisplay(m.serverURL))))
 	rows = append(rows, " ")
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
 		"↑↓ select · enter ✓ accept · backspace ✕ decline · esc close")))
@@ -573,23 +573,23 @@ const (
 // Submitting creates the group (creator crowned server-side) and invites
 // every pick; 409 "already in this session" notes ride along.
 type groupModel struct {
-	w, h      int
-	me        string
-	serverURL string
-	id        *identityKey
+	w, h       int
+	me         string
+	serverURL  string
+	id         *identityKey
 	parentCode string
-	members   []rosterMember
-	filter    string
-	sel       int
-	picked    map[string]bool
-	stage     int
-	nameInput textinput.Model
-	descInput textinput.Model
-	maxInput  textinput.Model
-	formFocus int // 0..2 = inputs, 3 = Create
-	errMsg    string
-	notice    string
-	busy      bool
+	members    []rosterMember
+	filter     string
+	sel        int
+	picked     map[string]bool
+	stage      int
+	nameInput  textinput.Model
+	descInput  textinput.Model
+	maxInput   textinput.Model
+	formFocus  int // 0..2 = inputs, 3 = Create
+	errMsg     string
+	notice     string
+	busy       bool
 }
 
 // createGroupErrMsg resolves a failed creation attempt (stays in the form).
@@ -835,7 +835,7 @@ func (m *groupModel) submit() tea.Cmd {
 	id := m.id
 	parentCode := m.parentCode
 	return func() tea.Msg {
-		sig := &signalClient{serverURL: serverURL, me: me}
+		sig := &signalClient{serverURL: serverURL, me: me, id: id}
 		pk := ""
 		if id != nil {
 			pk = pubkeyB64(id)
@@ -1061,14 +1061,14 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, nil
 	case acceptGroupDoneMsg:
 		r.overlay = nil
-		sig := &signalClient{serverURL: r.chat.sig.serverURL, key: m.code, me: r.chat.me}
+		sig := &signalClient{serverURL: r.chat.sig.serverURL, key: m.code, me: r.chat.me, id: r.chat.id}
 		r.chat.attachGroup(m.code, m.name, "", sig, m.password)
 		r.chat.openGroup(m.code)
 		r.chat.status = "joined group " + m.name
 		return r, tea.Batch(r.chat.drainNetCmd(), scheduleRoster())
 	case createGroupDoneMsg:
 		r.overlay = nil
-		sig := &signalClient{serverURL: r.chat.sig.serverURL, key: m.code, me: r.chat.me}
+		sig := &signalClient{serverURL: r.chat.sig.serverURL, key: m.code, me: r.chat.me, id: r.chat.id}
 		r.chat.attachGroup(m.code, m.name, "", sig, "")
 		r.chat.openGroup(m.code)
 		if len(m.notes) > 0 {

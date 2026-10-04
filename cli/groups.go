@@ -117,8 +117,8 @@ func (c *signalClient) rawEndpoint(path string) string {
 // from. Returns the fresh session code (also parked in c.key).
 func (c *signalClient) createGroupRoom(username, pubkey, groupName, groupDesc string, maxMembers *int, parentCode string) (string, error) {
 	payload := map[string]any{
-		"username": username,
-		"pubkey":   pubkey,
+		"username":  username,
+		"pubkey":    pubkey,
 		"groupName": groupName,
 	}
 	if groupDesc != "" {
@@ -154,7 +154,7 @@ func (c *signalClient) createGroupRoom(username, pubkey, groupName, groupDesc st
 // somehow pre-dates the invite; callers surface it as an inline note and
 // continue with the rest.
 func (c *signalClient) sendInvite(username string) error {
-	code, body, err := postJSON(c.endpoint("/invites"), map[string]any{"username": username}, c.headers())
+	code, body, err := postJSON(c.endpoint("/invites"), map[string]any{"username": username}, c.sigHeaders("POST", c.endpoint("/invites")))
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func (c *signalClient) sendInvite(username string) error {
 // myInvites lists my pending invites, newest first (server caps at 50).
 // User-scoped, so it rides the raw endpoint outside /session/.
 func (c *signalClient) myInvites() ([]groupInvite, error) {
-	code, body, err := getJSON(c.rawEndpoint("/api/v1/invites/mine"), c.headers())
+	code, body, err := getJSON(c.rawEndpoint("/api/v1/invites/mine"), c.sigHeadersWithPubkey("GET", c.rawEndpoint("/api/v1/invites/mine")))
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +198,8 @@ func (c *signalClient) acceptInvite(code, pubkey, password string) ([]rosterMemb
 	if password != "" {
 		payload["password"] = password
 	}
-	status, body, err := postJSON(c.rawEndpoint("/api/v1/session/"+url.PathEscape(code)+"/invites/accept"), payload, c.headers())
+	status, body, err := postJSON(c.rawEndpoint("/api/v1/session/"+url.PathEscape(code)+"/invites/accept"), payload,
+		c.sigHeaders("POST", c.rawEndpoint("/api/v1/session/"+url.PathEscape(code)+"/invites/accept")))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -224,7 +225,7 @@ func (c *signalClient) acceptInvite(code, pubkey, password string) ([]rosterMemb
 // answers 404 "Invite not found".
 func (c *signalClient) declineInvite(code string) error {
 	status, body, err := postJSON(c.rawEndpoint("/api/v1/session/"+url.PathEscape(code)+"/invites/decline"),
-		map[string]any{"code": code}, c.headers())
+		map[string]any{"code": code}, c.sigHeadersWithPubkey("POST", c.rawEndpoint("/api/v1/session/"+url.PathEscape(code)+"/invites/decline")))
 	if err != nil {
 		return err
 	}

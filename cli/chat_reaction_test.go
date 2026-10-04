@@ -403,7 +403,7 @@ func TestReactionDetailPickerPickTogglesOnlyBadgeOpensDetail(t *testing.T) {
 
 	c := newFilterScreen("me", "")
 	c.vp = *viewportPtr(60, 20)
-	wireTestEngine(t, c, srv, "me", "alice")
+	_, ids := wireTestEngine(t, c, srv, "me", "alice")
 	m, _ := c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	sc := m.(chatScreen)
 	sc.addMessage(chatMessage{Seq: 1, MsgId: "m1", Username: "me", Kind: "chat", Text: "hello", ConvID: generalConv})
@@ -461,7 +461,7 @@ func TestReactionDetailPickerPickTogglesOnlyBadgeOpensDetail(t *testing.T) {
 
 	// Server truth lands: the breakdown replaces the fallback wholesale and
 	// the detail stays open (reconciled, not dismissed).
-	peer := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	peer := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: ids["alice"]}
 	if err := peer.react("m1", "❤️"); err != nil {
 		t.Fatalf("peer react: %v", err)
 	}
@@ -1139,12 +1139,12 @@ func TestReactionPollFetchesServerTruth(t *testing.T) {
 
 	c := newFilterScreen("me", "")
 	c.vp = *viewportPtr(40, 10)
-	wireTestEngine(t, c, srv, "me", "alice")
+	_, ids := wireTestEngine(t, c, srv, "me", "alice")
 	dm := conversationKey("me", "alice")
 	c.addMessage(chatMessage{Seq: 1, MsgId: "g1", Username: "alice", Kind: "chat", Text: "room", ConvID: generalConv})
 	c.addMessage(chatMessage{Seq: 2, MsgId: "d1", Username: "alice", Kind: "chat", Text: "dm", To: "me", ConvID: dm})
 
-	peer := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	peer := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: ids["alice"]}
 	if err := peer.react("g1", "👍"); err != nil {
 		t.Fatalf("peer react: %v", err)
 	}

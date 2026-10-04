@@ -245,8 +245,9 @@ func TestRosterTickSilentSidebar(t *testing.T) {
 	c.vp = *viewportPtr(40, 10)
 	wireTestEngine(t, c, srv, "bob")
 
-	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
-	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+	aliceID := mustTestIdentity(t)
+	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: aliceID}
+	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(aliceID.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
 	c.eng.beatOnce()
@@ -262,7 +263,7 @@ func TestRosterTickSilentSidebar(t *testing.T) {
 		}
 	}
 
-	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: aliceID}
 	if err := leaver.leaveRoom(); err != nil {
 		t.Fatal(err)
 	}
@@ -304,12 +305,12 @@ func TestEnginePeerRestartConverges(t *testing.T) {
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
 
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -384,12 +385,12 @@ func TestAckBackstopRetryAndGraduate(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -515,12 +516,12 @@ func TestSendAckNamesOriginal(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -564,12 +565,12 @@ func TestMeshFailTeardownAndInboxFallback(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -654,12 +655,12 @@ func TestStreamFramesNeverInbox(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -702,7 +703,7 @@ func TestStreamFramesNeverInbox(t *testing.T) {
 func TestInboxFailureArmsBackstop(t *testing.T) {
 	dead, _ := generateIdentity()
 	// Server URL that refuses connections: every HTTP call fails.
-	badSig := &signalClient{serverURL: "http://127.0.0.1:1", me: "alice"}
+	badSig := &signalClient{serverURL: "http://127.0.0.1:1", me: "alice", id: dead}
 	e := newEngine("alice", dead, badSig, engineCallbacks{})
 	defer e.stop()
 	peerId, _ := generateIdentity()
@@ -735,7 +736,7 @@ func TestRosterVisibilityWithoutSends(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +747,7 @@ func TestRosterVisibilityWithoutSends(t *testing.T) {
 
 	// Bob joins a second later; nobody sends anything, ever.
 	time.Sleep(1100 * time.Millisecond)
-	sigB := &signalClient{serverURL: srv.URL, key: sigA.key, me: "bob"}
+	sigB := &signalClient{serverURL: srv.URL, key: sigA.key, me: "bob", id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -790,12 +791,12 @@ func TestMidSessionDesyncRecoversViaBackstop(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1139,11 +1140,11 @@ func TestUnknownHandshakeNoteRefreshesSilently(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1193,11 +1194,11 @@ func TestVerifyReadyUnknownPeerNoAlert(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1273,11 +1274,11 @@ func TestUnknownInboxSenderRefreshesAndDelivers(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1325,11 +1326,11 @@ func TestRosterLearnedAfterOpenStillHandshakes(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -1386,12 +1387,12 @@ func TestTuiRapidConversationCrossDelivery(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}

@@ -311,7 +311,7 @@ type netFileMsg struct {
 	file engineFile
 }
 type netFileErrMsg struct {
-	key            string
+	key                 string
 	msgId, from, reason string
 }
 type netReadyMsg struct {
@@ -495,8 +495,8 @@ const receiptExpiry = 5 * time.Minute
 
 // netDeliveredMsg arrives when the peer acked one of our messages.
 type netDeliveredMsg struct {
-	key    string
-	msgId  string
+	key   string
+	msgId string
 }
 
 // netReactionMsg carries one inbound reaction nudge. It never mutates local
@@ -680,16 +680,16 @@ type chatScreen struct {
 	replyPickCounter int
 	quoteJumpCounter int
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
-	call         *mediaManager
-	callLevel    float64        // mic loudness for the status meter
-	callStart    time.Time      // latched while a call is live (timer source)
-	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
-	vp           viewport.Model
-	drag         barDrag // scrollbar drag state (any of the three panes)
-	input        textinput.Model
-	palette      paletteState    // "/" command drawer above the composer
-	mention      paletteState    // "@" member dropdown (general room only; the palette's mirror)
-	picker       pickerState     // file-browser mode of that drawer (/upload)
+	call      *mediaManager
+	callLevel float64        // mic loudness for the status meter
+	callStart time.Time      // latched while a call is live (timer source)
+	rosterVp  viewport.Model // scrollable users list (wheel + scrollbar)
+	vp        viewport.Model
+	drag      barDrag // scrollbar drag state (any of the three panes)
+	input     textinput.Model
+	palette   paletteState // "/" command drawer above the composer
+	mention   paletteState // "@" member dropdown (general room only; the palette's mirror)
+	picker    pickerState  // file-browser mode of that drawer (/upload)
 	// frec is the picker/palette usage history behind the ranking's
 	// frecency tiebreak (name-keyed; nil = no history yet).
 	frec map[string]frecEntry
@@ -699,13 +699,13 @@ type chatScreen struct {
 	drawerHoverLock int
 	// mouseActive tracks the last input class (true = mouse): hover
 	// follows rows only while the mouse is actually in play.
-	mouseActive bool
+	mouseActive  bool
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
 	received     []receivedFile  // files arrived this session (for /download)
 	status       string
-	targetUser   string       // private-chat peer; "" = general room
+	targetUser   string // private-chat peer; "" = general room
 	// ── groups ────────────────────────────────────────────────────────────
 	// A group is a named session (code) joined via invite or created with
 	// /new-group. Every joined group keeps its own signal client + engine
@@ -724,8 +724,8 @@ type chatScreen struct {
 	id             *identityKey             // device identity (group engines reuse it)
 	pendingInvites int                      // badge: invite rows the server currently holds
 	seenInvites    map[string]bool          // invite codes already beeep'd (one ping per invite)
-	leftSent     *atomic.Bool // per-screen leave guard (pointer: screen is copied by value)
-	drainTimer   *time.Timer  // reused pump timer (no time.After alloc per cycle)
+	leftSent       *atomic.Bool             // per-screen leave guard (pointer: screen is copied by value)
+	drainTimer     *time.Timer              // reused pump timer (no time.After alloc per cycle)
 }
 
 // focusPane names the one component that owns keyboard focus. Exactly one
@@ -899,7 +899,7 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		PageDown: bkeys.NewBinding(bkeys.WithKeys("pgdown")),
 	}
 	netCh := make(chan tea.Msg, 256)
-	sig := &signalClient{serverURL: serverURL, key: key, me: me}
+	sig := &signalClient{serverURL: serverURL, key: key, me: me, id: id}
 	// Engine callbacks only ever push into netCh (never touch the screen:
 	// they run on network goroutines). The drain command below feeds them
 	// into Update on the main loop. Every event is tagged with the session
@@ -938,8 +938,10 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 				_ = eng.sendAck(c.From, c.MsgId)
 			}
 		},
-		onFile:       func(f engineFile) { push(netFileMsg{key: key, file: f}) },
-		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason}) },
+		onFile: func(f engineFile) { push(netFileMsg{key: key, file: f}) },
+		onFileErr: func(msgId, from, reason string) {
+			push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason})
+		},
 		onPeerReady:  func(user, code string) { push(netReadyMsg{key: key, user: user, code: code}) },
 		onPeerLost:   func(user string) { push(netLostMsg{key: key, user: user}) },
 		onRoster:     func() { push(netRosterMsg{}) },
@@ -1010,8 +1012,10 @@ func (c *chatScreen) newSessionEngine(sig *signalClient) *engine {
 				_ = eng.sendAck(ch.From, ch.MsgId)
 			}
 		},
-		onFile:       func(f engineFile) { push(netFileMsg{key: key, file: f}) },
-		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason}) },
+		onFile: func(f engineFile) { push(netFileMsg{key: key, file: f}) },
+		onFileErr: func(msgId, from, reason string) {
+			push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason})
+		},
 		onPeerReady:  func(user, code string) { push(netReadyMsg{key: key, user: user, code: code}) },
 		onPeerLost:   func(user string) { push(netLostMsg{key: key, user: user}) },
 		onRoster:     func() { push(netRosterMsg{}) },
@@ -2774,7 +2778,7 @@ func (c *chatScreen) pollInvitesCmd() tea.Cmd {
 	if c.sig == nil {
 		return nil
 	}
-	sig := &signalClient{serverURL: c.sig.serverURL, me: c.me}
+	sig := &signalClient{serverURL: c.sig.serverURL, me: c.me, id: c.id}
 	return func() tea.Msg {
 		invites, err := sig.myInvites()
 		return invitesPolledMsg{invites: invites, err: err}

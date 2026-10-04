@@ -97,7 +97,7 @@ func groupFixture(t *testing.T, srv *httptest.Server, me, target, name string, m
 	if err != nil {
 		t.Fatal(err)
 	}
-	sig := &signalClient{serverURL: srv.URL, me: me}
+	sig := &signalClient{serverURL: srv.URL, me: me, id: id}
 	code, err := sig.createGroupRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), name, "", max, "123456")
 	if err != nil {
 		t.Fatalf("createGroupRoom: %v", err)
@@ -209,9 +209,9 @@ func TestGroupCreateWindow(t *testing.T) {
 		_ = cmd
 	}
 	m.formFocus = 0
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})   // 0->1
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})   // 1->2
-	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})   // 2->3 (Create button)
+	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})     // 0->1
+	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})     // 1->2
+	m = stepGroup(m, tea.KeyMsg{Type: tea.KeyEnter})     // 2->3 (Create button)
 	m, _ = stepGroupC(m, tea.KeyMsg{Type: tea.KeyEnter}) // Enter on the button submits
 	if m.errMsg == "" || !strings.Contains(m.errMsg, "at least 2") {
 		t.Fatalf("max 1 must fail inline, got %q", m.errMsg)
@@ -286,7 +286,7 @@ func TestGroupInviteSendErrors(t *testing.T) {
 	pk := base64.StdEncoding.EncodeToString(id.publicKey())
 
 	// alice owns the home room; bob joins it; eve is a stranger.
-	alice := &signalClient{serverURL: srv.URL, me: "alice"}
+	alice := &signalClient{serverURL: srv.URL, me: "alice", id: id}
 	if _, err := alice.createRoom("alice", pk, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -304,8 +304,9 @@ func TestGroupInviteSendErrors(t *testing.T) {
 	}
 	eve := &signalClient{serverURL: srv.URL, key: "123456", me: "eve"}
 	err = eve.sendInvite("carol")
-	if err == nil || !strings.Contains(err.Error(), "Not in this session") {
-		t.Errorf("non-member invite err = %v; want 'Not in this session'", err)
+	if err == nil || apiStatusCode(err) != 401 ||
+		!strings.Contains(err.Error(), "Invalid or missing request signature") {
+		t.Errorf("non-member invite err = %v; want 401 signature rejection", err)
 	}
 	err = alice.sendInvite("bob")
 	if err == nil || !strings.Contains(err.Error(), "User is already in this session") {
@@ -313,8 +314,9 @@ func TestGroupInviteSendErrors(t *testing.T) {
 	}
 	ghost := &signalClient{serverURL: srv.URL, key: "999999", me: "alice"}
 	err = ghost.sendInvite("carol")
-	if err == nil || !strings.Contains(err.Error(), "Session not found") {
-		t.Errorf("ghost-session invite err = %v; want 'Session not found'", err)
+	if err == nil || apiStatusCode(err) != 401 ||
+		!strings.Contains(err.Error(), "Invalid or missing request signature") {
+		t.Errorf("ghost-session invite err = %v; want 401 signature rejection", err)
 	}
 	if err := alice.sendInvite("carol"); err != nil {
 		t.Errorf("valid invite failed: %v", err)
@@ -380,7 +382,7 @@ func TestSettingsAcceptProtectedPasswordModal(t *testing.T) {
 	srv, fake := newGroupTestServer(t)
 	id, _ := generateIdentity()
 	creator, _ := generateIdentity()
-	csig := &signalClient{serverURL: srv.URL, me: "bob"}
+	csig := &signalClient{serverURL: srv.URL, me: "bob", id: creator}
 	code, err := csig.createGroupRoom("bob", base64.StdEncoding.EncodeToString(creator.publicKey()), "Vault", "", nil, "123456")
 	if err != nil {
 		t.Fatal(err)
@@ -460,7 +462,7 @@ func TestSettingsAcceptFullConsumesTerminal(t *testing.T) {
 	srv, fake := newGroupTestServer(t)
 	id, _ := generateIdentity()
 	creator, _ := generateIdentity()
-	csig := &signalClient{serverURL: srv.URL, me: "bob"}
+	csig := &signalClient{serverURL: srv.URL, me: "bob", id: creator}
 	// Cap of 2, bob + carol already inside: alice's accept is full.
 	max := 2
 	code, err := csig.createGroupRoom("bob", base64.StdEncoding.EncodeToString(creator.publicKey()), "Full", "", &max, "123456")
@@ -494,7 +496,7 @@ func TestSettingsAcceptFullConsumesTerminal(t *testing.T) {
 	if fake.fakeInviteCount("alice") != 0 {
 		t.Error("server must consume the invite on the full 403")
 	}
-	alice := &signalClient{serverURL: srv.URL, me: "alice"}
+	alice := &signalClient{serverURL: srv.URL, me: "alice", id: id}
 	if _, _, err := alice.acceptInvite(code, pubkeyB64(id), ""); err == nil ||
 		!strings.Contains(err.Error(), "Invite not found") {
 		t.Errorf("re-accept must 404, got %v", err)
@@ -527,7 +529,7 @@ func TestSettingsDecline(t *testing.T) {
 		t.Error("server must drop the invite on decline")
 	}
 	// Terminal: re-decline 404s ("Invite not found") — nothing to do.
-	alice := &signalClient{serverURL: srv.URL, me: "alice"}
+	alice := &signalClient{serverURL: srv.URL, me: "alice", id: id}
 	if err := alice.declineInvite(code); err == nil ||
 		!strings.Contains(err.Error(), "Invite not found") {
 		t.Errorf("re-decline must 404, got %v", err)
@@ -637,7 +639,7 @@ func TestInvitePollCmdRidesRosterTick(t *testing.T) {
 
 	// myInvites surfaces the invite with the group name attached.
 	for i := 0; i < 3; i++ {
-		sig := &signalClient{serverURL: srv.URL, me: "alice"}
+		sig := &signalClient{serverURL: srv.URL, me: "alice", id: id}
 		invites, err := sig.myInvites()
 		if err != nil {
 			t.Fatal(err)

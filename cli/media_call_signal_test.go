@@ -42,12 +42,12 @@ func TestPublishOverSignalPath(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -160,12 +160,12 @@ func TestAudioEndToEndWithTestMic(t *testing.T) {
 
 	ida, _ := generateIdentity()
 	idb, _ := generateIdentity()
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", base64.StdEncoding.EncodeToString(ida.publicKey()), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	if _, _, err := sigB.joinRoom("bob", base64.StdEncoding.EncodeToString(idb.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}

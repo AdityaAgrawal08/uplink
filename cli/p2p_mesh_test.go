@@ -119,20 +119,23 @@ func TestMeshLoopback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	ida, _ := generateIdentity()
+	idb, _ := generateIdentity()
 	pa := newMeshProbe()
 	pb := newMeshProbe()
-	ma := newMesh("alice", &signalClient{serverURL: srv.URL, me: "alice", key: sid}, []string{}, pa.callbacks())
-	mb := newMesh("bob", &signalClient{serverURL: srv.URL, me: "bob", key: sid}, []string{}, pb.callbacks())
+	ma := newMesh("alice", &signalClient{serverURL: srv.URL, me: "alice", key: sid, id: ida}, []string{}, pa.callbacks())
+	mb := newMesh("bob", &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}, []string{}, pb.callbacks())
 	defer ma.close()
 	defer mb.close()
 
-	// register both members (fake server has no pubkey requirement)
-	sa := &signalClient{serverURL: srv.URL, me: "alice", key: sid}
-	sb := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
-	if _, _, err := sa.joinRoom("alice", "pub-a", ""); err != nil {
+	// register both members with real device keys (their polls/sends are
+	// signature-gated against these roster pubkeys)
+	sa := &signalClient{serverURL: srv.URL, me: "alice", key: sid, id: ida}
+	sb := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
+	if _, _, err := sa.joinRoom("alice", pubkeyB64(ida), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := sb.joinRoom("bob", "pub-b", ""); err != nil {
+	if _, _, err := sb.joinRoom("bob", pubkeyB64(idb), ""); err != nil {
 		t.Fatal(err)
 	}
 

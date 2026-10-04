@@ -1,11 +1,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -34,6 +38,12 @@ type fakeSignalServer struct {
 	// race where the target joins the group by code between the creator's
 	// create and invite calls (test-only hook).
 	inviteConflict map[string]bool
+	// Request-signature plane (mirrors the real server): sigkeys is the
+	// immutable per-username device-key claim used by invite-scoped calls
+	// (invites/mine, decline) where the caller has no roster entry yet.
+	// nonces makes each (user, timestamp|nonce) usable exactly once.
+	sigkeys map[string]string
+	nonces  map[string]bool
 }
 
 // fakeGroupMeta is the fake's group metadata (max < 0 = unlimited).
@@ -44,16 +54,86 @@ type fakeGroupMeta struct {
 
 func newFakeSignalServer() *fakeSignalServer {
 	return &fakeSignalServer{
-		members:   map[string]map[string]rosterMember{},
-		signals:   map[string][]signalNote{},
-		boxes:     map[string]map[string]inboxBox{},
-		epochs:    map[string]int64{},
-		reactions: map[string]map[string]string{},
-		groupMeta: map[string]fakeGroupMeta{},
-		invites:   map[string][]groupInvite{},
+		members:        map[string]map[string]rosterMember{},
+		signals:        map[string][]signalNote{},
+		boxes:          map[string]map[string]inboxBox{},
+		epochs:         map[string]int64{},
+		reactions:      map[string]map[string]string{},
+		groupMeta:      map[string]fakeGroupMeta{},
+		invites:        map[string][]groupInvite{},
 		inviteConflict: map[string]bool{},
+		sigkeys:        map[string]string{},
+		nonces:         map[string]bool{},
 	}
 }
+
+// --- request-signature gate (mirrors the real server) ----------------------
+
+// requireSig rejects the request unless its signature verifies against the
+// anchor pubkey (the roster entry for the claimed username, the body pubkey
+// on accept, or the per-user sigkey claim on invite-scoped calls). The
+// signed payload is METHOD|PATH|TIMESTAMP|NONCE (path WITHOUT query), the
+// window is 30s, and each (timestamp, nonce) pair is single-use.
+func (f *fakeSignalServer) requireSig(w http.ResponseWriter, r *http.Request, anchorPubkey string) bool {
+	me := f.me(r)
+	reject := func() bool {
+		f.write(w, 401, map[string]string{"error": "Invalid or missing request signature"})
+		return false
+	}
+	ts := r.Header.Get("X-Uplink-Timestamp")
+	nonce := r.Header.Get("X-Uplink-Nonce")
+	sigB64 := r.Header.Get("X-Uplink-Sig")
+	if anchorPubkey == "" || ts == "" || nonce == "" || sigB64 == "" {
+		return reject()
+	}
+	tsv, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || tsv <= 0 || nowMs()-tsv > requestSigWindowMs || tsv-nowMs() > requestSigWindowMs {
+		return reject()
+	}
+	replayKey := "sig:nonce:" + me + ":" + sha256Hex(ts+"|"+nonce)
+	if f.nonces[replayKey] {
+		return reject()
+	}
+	f.nonces[replayKey] = true
+	u, err := base64.StdEncoding.DecodeString(anchorPubkey)
+	if err != nil || len(u) != 32 {
+		return reject()
+	}
+	sig, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil || len(sig) != 64 {
+		return reject()
+	}
+	msg := signatureMsg(r.Method, r.URL.Path, ts, nonce)
+	if !verifyRequestSigAgainstX25519(u, msg, sig) {
+		return reject()
+	}
+	return true
+}
+
+// sigAnchorForUser resolves the verification anchor for invite-scoped calls:
+// the immutable per-username claim if one exists; otherwise the caller's
+// X-Uplink-Pubkey header (self-claim on FIRST use — the device key binds the
+// username from then on, exactly like a roster claim).
+func (f *fakeSignalServer) sigAnchorForUser(w http.ResponseWriter, r *http.Request, me string) (string, bool) {
+	if anchor := f.sigkeys[me]; anchor != "" {
+		return anchor, f.requireSig(w, r, anchor)
+	}
+	anchor := strings.TrimSpace(r.Header.Get("X-Uplink-Pubkey"))
+	if !f.requireSig(w, r, anchor) {
+		return "", false
+	}
+	f.sigkeys[me] = anchor // first claim wins (immutable)
+	return anchor, true
+}
+
+// sha256Hex is the replay-key digest (imports kept local to this file's
+// existing dependency set; crypto/sha256 is already available).
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func nowMs() int64 { return time.Now().UnixMilli() }
 
 // fakeInviteCount reports pending invites for a user (test accessor).
 func (f *fakeSignalServer) fakeInviteCount(user string) int {
@@ -105,6 +185,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// User-scoped invite inbox (outside the /session/ tree).
 	if p == "/api/v1/invites/mine" && r.Method == "GET" {
 		me := f.me(r)
+		if _, ok := f.sigAnchorForUser(w, r, me); !ok {
+			return
+		}
 		out := f.invites[me]
 		if out == nil {
 			out = []groupInvite{}
@@ -188,8 +271,15 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	members, roomExists := f.members[code]
 	if !roomExists {
-		f.write(w, 404, map[string]string{"error": "Session not found"})
-		return
+		// Join/accept need the room to actually exist (plain 404). Every
+		// other route is signature-gated FIRST, exactly like the real
+		// server: a ghost room yields no roster anchor for the claimed
+		// username, so the gate answers 401 before any room lookup.
+		if sub+"|"+r.Method == "join|POST" || sub+"|"+r.Method == "invites/accept|POST" {
+			f.write(w, 404, map[string]string{"error": "Session not found"})
+			return
+		}
+		members = map[string]rosterMember{}
 	}
 	roster := func() []rosterMember {
 		out := []rosterMember{}
@@ -225,6 +315,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{body.Username}, "roster": roster(), "epoch": f.epochs[code]})
 	case "invites|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -264,6 +357,15 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Password string `json:"password,omitempty"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
+		// Signature FIRST, anchored to the pubkey carried in the body: the
+		// seat is bound to the device key that proved possession, not just
+		// to the claimed name.
+		if !f.requireSig(w, r, body.Pubkey) {
+			return
+		}
+		if f.sigkeys[me] == "" {
+			f.sigkeys[me] = body.Pubkey // first-use claim (immutable)
+		}
 		// Password FIRST: required/incorrect answer 401 before anything
 		// else (the contract's ordering, so the modal opens correctly).
 		if meta, ok := f.groupMeta[code]; ok && meta.pass != "" && body.Password != meta.pass {
@@ -301,6 +403,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{me}, "roster": roster(), "epoch": f.epochs[code]})
 	case "invites/decline|POST":
 		me := f.me(r)
+		if _, ok := f.sigAnchorForUser(w, r, me); !ok {
+			return
+		}
 		var body struct {
 			Code string `json:"code"`
 		}
@@ -313,6 +418,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]bool{"ok": true})
 	case "leave|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; ok {
 			f.epochs[code]++
 		}
@@ -325,6 +433,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"ok": true, "remaining": remaining, "ended": ended})
 	case "heartbeat|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -332,6 +443,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"ok": true, "activeUsers": []string{me}, "roster": roster(), "epoch": f.epochs[code]})
 	case "signal|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -349,6 +463,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 201, map[string]bool{"ok": true})
 	case "signal|GET":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -362,6 +479,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"notes": notes})
 	case "inbox|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -382,6 +502,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 201, map[string]bool{"ok": true})
 	case "inbox|GET":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -394,6 +517,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "kick|POST":
 		me := f.me(r)
 		actor, ok := members[me]
+		if !f.requireSig(w, r, actor.Pubkey) {
+			return
+		}
 		if !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -433,6 +559,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "admin|POST":
 		me := f.me(r)
 		actor, ok := members[me]
+		if !f.requireSig(w, r, actor.Pubkey) {
+			return
+		}
 		if !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -469,6 +598,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"ok": true, "roster": roster(), "epoch": f.epochs[code]})
 	case "inbox/ack|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -487,6 +619,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"ok": true, "removed": removed})
 	case "reactions|POST":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -521,6 +656,9 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.write(w, 200, map[string]any{"msgId": body.MsgId, "emoji": body.Emoji, "reacted": !same})
 	case "reactions|GET":
 		me := f.me(r)
+		if !f.requireSig(w, r, members[me].Pubkey) {
+			return
+		}
 		if _, ok := members[me]; !ok {
 			f.write(w, 403, map[string]string{"error": "Not in this session"})
 			return
@@ -584,16 +722,17 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func newSignalTestClient(ts *httptest.Server, me string) *signalClient {
-	return &signalClient{serverURL: ts.URL, me: me}
+func newSignalTestClient(t *testing.T, ts *httptest.Server, me string) *signalClient {
+	t.Helper()
+	return &signalClient{serverURL: ts.URL, me: me, id: mustTestIdentity(t)}
 }
 
 func TestSignalFullFlow(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	defer srv.Close()
 
-	alice := newSignalTestClient(srv, "alice")
-	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	alice := newSignalTestClient(t, srv, "alice")
+	sid, err := alice.createRoom("alice", pubkeyB64(alice.id), "")
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -601,9 +740,9 @@ func TestSignalFullFlow(t *testing.T) {
 		t.Fatalf("unexpected sid %q", sid)
 	}
 
-	bob := newSignalTestClient(srv, "bob")
+	bob := newSignalTestClient(t, srv, "bob")
 	bob.key = sid
-	roster, epoch, err := bob.joinRoom("bob", "pubkey-bob", "")
+	roster, epoch, err := bob.joinRoom("bob", pubkeyB64(bob.id), "")
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
@@ -674,10 +813,12 @@ func TestSignalFullFlow(t *testing.T) {
 	}
 
 	// guards
-	eve := newSignalTestClient(srv, "eve")
+	eve := newSignalTestClient(t, srv, "eve")
 	eve.key = sid
 	if _, _, err := eve.inboxFetch(); err == nil {
-		t.Fatal("expected 403 for non-member")
+		t.Fatal("expected 401 for non-member (no roster key anchor)")
+	} else if apiStatusCode(err) != 401 {
+		t.Fatalf("non-member inboxFetch status = %d; want 401", apiStatusCode(err))
 	}
 	if err := alice.inboxSend("ghost", "m2", "chat", "x"); err == nil {
 		t.Fatal("expected 404 for unknown recipient")

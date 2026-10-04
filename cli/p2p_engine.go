@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -542,7 +543,16 @@ func (e *engine) beatOnce() {
 
 // isNotMember reports the server's "you are not in this session" rejection.
 func isNotMember(err error) bool {
-	return apiStatusCode(err) == 403
+	if apiStatusCode(err) == 403 {
+		return true
+	}
+	// Since the signature gate fronts every identity-bearing route, a
+	// pruned member's next beat answers 401 (their key is no longer in the
+	// roster to anchor the signature) instead of 403. Same meaning: rejoin.
+	if apiStatusCode(err) == 401 && strings.Contains(err.Error(), "Invalid or missing request signature") {
+		return true
+	}
+	return false
 }
 
 // stuckHsTTL bounds a handshake with no progress. Past it the attempt is
