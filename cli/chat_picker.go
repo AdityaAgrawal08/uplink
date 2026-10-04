@@ -173,6 +173,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 		home = "."
 	}
 	c.palette.close()    // command drawer hands the slot over
+	c.mention.close()    // "@" dropdown hands the slot over too
 	c.closeReactionAux() // the anchored aux rows never survive a mode switch
 	c.input.SetValue("")
 	c.input.Placeholder = ""
@@ -201,6 +202,7 @@ func (c *chatScreen) openPicker() tea.Cmd {
 func (c *chatScreen) openFilesDrawer() tea.Cmd {
 	c.focus = focusComposer
 	c.palette.close()
+	c.mention.close() // "@" dropdown hands the slot over too
 	c.input.SetValue("")
 	c.input.Placeholder = ""
 	files := make([]receivedFile, len(c.received))

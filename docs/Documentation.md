@@ -145,6 +145,14 @@ scrolls it to the top of the viewport, and highlights the entire row
 history, an inline note — `original message no longer in view` — says so
 instead.
 
+@mentions (general room only): typing `@` in the composer opens a
+member-suggestion dropdown — Tab/Enter completes `@name `, Esc dismisses;
+in DMs `@` stays plain text. When a room member's message mentions
+`@yourname`, you get a desktop notification (always, even while the chat is
+focused) and your name paints highlighted in the message bubble. Mentions
+ride as plain text inside ordinary messages: nothing extra is sent or
+stored.
+
 ### Landing
 
 The CREATE/JOIN landing (`uplink` with no arguments) is two-step on the

@@ -332,26 +332,11 @@ func (p *paletteState) close() {
 	p.off = 0
 }
 
-// paletteRows is the exact terminal-row budget the drawer consumes right now:
-// one blank spacer above the panel, the visible command rows, the keymap
-// footer, and the panel's own border. In file-browser mode (/upload) the
-// picker's budget takes over. The reaction picker is NOT budgeted here: it
-// paints as a transcript row anchored above its message, so the drawer slot
-// stays free for commands. Width never affects the budget (rows truncate,
-// they do not wrap), so this number is deterministic BEFORE layout math runs —
-// which is what lets computeLayoutWithPalette reserve it up front.
-func (c chatScreen) paletteRows() int {
-	if c.picker.isActive() {
-		return c.pickerRows()
-	}
-	if !c.palette.visible() {
-		return 0
-	}
-	n := len(c.rankedCommands(c.input.Value()))
-	if _, users, ok := c.paletteUsers(); ok {
-		n = len(users) // member-picker stage budgets member rows, not commands
-	}
-	if n == 0 {
+// drawerRowsBudget converts a candidate count into the drawer slot budget:
+// one blank spacer above the panel, the visible rows (plus the overflow
+// indicator), the keymap footer, and the panel's own border.
+func drawerRowsBudget(n int) int {
+	if n <= 0 {
 		return 0
 	}
 	rows := min(n, paletteMaxVisible)
@@ -366,6 +351,35 @@ func (c chatScreen) paletteRows() int {
 func (c chatScreen) quoteRows() int {
 	if c.composerQuote != nil && c.composerQuote.ReplyTo != "" {
 		return 1
+	}
+	return 0
+}
+
+// paletteRows is the exact terminal-row budget the drawer slot consumes
+// right now: the file browser (/upload), the "/" command drawer, or the "@"
+// member dropdown — one mode owns the slot at a time. In file-browser mode
+// the picker's budget takes over. The reaction picker is NOT budgeted here:
+// it paints as a transcript row anchored above its message, so the drawer
+// slot stays free. Width never affects the budget (rows truncate, they do
+// not wrap), so this number is deterministic BEFORE layout math runs — which
+// is what lets computeLayoutWithPalette reserve it up front.
+func (c chatScreen) paletteRows() int {
+	if c.picker.isActive() {
+		return c.pickerRows()
+	}
+	if c.palette.visible() {
+		n := len(c.rankedCommands(c.input.Value()))
+		if _, users, ok := c.paletteUsers(); ok {
+			n = len(users) // member-picker stage budgets member rows, not commands
+		}
+		return drawerRowsBudget(n)
+	}
+	if c.mention.visible() {
+		_, users, ok := c.mentionCandidates()
+		if !ok {
+			return 0
+		}
+		return drawerRowsBudget(len(users))
 	}
 	return 0
 }
@@ -400,13 +414,20 @@ func (c chatScreen) layoutFor() layout {
 // ---- palette view ------------------------------------------------------------
 
 // drawerView renders whichever mode owns the drawer slot above the composer:
-// the file browser (picker) or the "/" command list. The reaction picker no
+// the file browser (picker) or the "/" command list — or the "@" member
+// dropdown, the palette's mirror for mentions. The reaction picker no
 // longer competes for this slot — it is anchored in the transcript.
 func (c chatScreen) drawerView(maxW int) string {
 	if c.picker.isActive() {
 		return c.pickerView(maxW)
 	}
-	return c.paletteView(maxW)
+	if c.palette.visible() {
+		return c.paletteView(maxW)
+	}
+	if c.mention.visible() {
+		return c.mentionView(maxW)
+	}
+	return ""
 }
 
 // ---- reaction picker ---------------------------------------------------------
@@ -972,10 +993,14 @@ func padVisible(s string, n int) string {
 
 // ensurePaletteOpen re-syncs drawer visibility after any edit that was NOT
 // intercepted by handlePaletteKeys (plain typing, backspace, paste…). Called
-// on every non-intercepted KeyMsg so "/" toggling stays instantaneous.
+// on every non-intercepted KeyMsg so "/" and "@" toggling stay instantaneous.
 func ensurePaletteOpen(c *chatScreen) {
 	c.palette.sync(c.input.Value())
+	c.mention.syncMention(c.input.Value(), c.activeConv() == generalConv)
 	if c.palette.visible() {
+		// One drawer slot: "/" owns it while open — the "@" dropdown and
+		// the reaction aux rows yield.
+		c.mention.close()
 		c.closeReactionAux() // one drawer slot: commands replace the aux rows
 	}
 }
