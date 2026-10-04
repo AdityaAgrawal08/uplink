@@ -44,6 +44,7 @@ type signalClient struct {
 	serverURL string
 	key       string // session code; empty until create/join returns it
 	me        string
+	id        *identityKey // device identity; signs every identity-bearing call
 }
 
 func (c *signalClient) endpoint(path string) string {
