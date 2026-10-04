@@ -66,6 +66,14 @@ export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction/invite sends 
 export const SEND_USER_SHARE_PER_WINDOW = 60; // per-username share of the send budget (fairness sub-bucket)
 export const SEND_WINDOW_SEC = 5 * 60;
 export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
+// B60 FIX (finding 14): join attempts are ALSO budgeted per ROOM (global, not
+// per IP): 6-digit codes are guessable, and the per-IP budget alone lets a
+// botnet shotgun one code from many IPs. A room seeing more than
+// JOIN_LIMIT_PER_ROOM_PER_WINDOW well-formed join attempts in a window is
+// being scanned, whatever the source mix; legit rooms (a class joining over
+// minutes) stay far under it. The 6-digit UX is untouched — normal joins use
+// a handful of attempts per room per window.
+export const JOIN_LIMIT_PER_ROOM_PER_WINDOW = 120;
 export const READ_LIMIT_PER_WINDOW = 1200; // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
 export const READ_USER_SHARE_PER_WINDOW = 600; // per-username share of the read budget (~2/s per user: two same-user tabs + ack overhead)
 
@@ -391,6 +399,23 @@ export async function checkJoinLimit(ipHash: string): Promise<void> {
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
   if (hits > JOIN_LIMIT_PER_WINDOW) {
     throw new RoomError(429, "Too many requests. Slow down and try again.");
+  }
+}
+
+// checkRoomJoinLimit budgets join attempts PER ROOM (finding 14): the
+// anti-brute-force term for 6-digit room codes. The counter is global to the
+// room — a botnet spraying one code from many IPs trips it just like a
+// single shotgunner — and counts every well-formed attempt regardless of
+// where it fails (wrong password, full room, unknown username), because
+// each attempt is a guess the attacker learns from. Other rooms are
+// unaffected (the key is per room).
+export async function checkRoomJoinLimit(code: string): Promise<void> {
+  assertRoomCode(code);
+  const key = `rate:joinroom:${code}`;
+  const hits = await redis.incr(key);
+  if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
+  if (hits > JOIN_LIMIT_PER_ROOM_PER_WINDOW) {
+    throw new RoomError(429, "Too many join attempts for this session. Try again later.");
   }
 }
 

@@ -7,6 +7,7 @@ import {
   acceptInvite,
   getRoomMeta,
   checkJoinLimit,
+  checkRoomJoinLimit,
   clientIpHash,
   assertRoomCode,
   assertUsernameHeader,
@@ -46,6 +47,10 @@ export async function POST(
     const { code, pubkey, password } = parsed.body as { code?: unknown; pubkey?: unknown; password?: unknown };
     assertRoomCode(code);
     if (code !== sessionId) return apiError("Session code mismatch", 400);
+
+    // Finding 14: accepting IS a join — the per-room join budget applies
+    // (before the password gate, so probes burn the room's budget).
+    await checkRoomJoinLimit(sessionId);
 
     // Password gate FIRST (same verifyPassword path as POST /join): 401s
     // surface before any cap or join logic, keeping the CLI's two-step

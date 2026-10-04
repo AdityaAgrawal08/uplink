@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { NextRequest } from "next/server";
 import { redis } from "../../src/lib/redis";
 import {
   RoomError,
@@ -226,6 +227,52 @@ describe("rooms signaling plane", () => {
     // A different IP is unaffected.
     const ip5 = `test-ip-${Math.random().toString(36).slice(2)}`;
     await expect(checkSendLimit("sig", ip5, "alice")).resolves.toBeUndefined();
+  });
+
+  it("per-room join throttle: shotgun on one room 429s while other rooms are unaffected (finding 14)", async () => {
+    const { checkRoomJoinLimit, checkJoinLimit, JOIN_LIMIT_PER_ROOM_PER_WINDOW } = await import("../../src/lib/rooms");
+    const codeA = "111111";
+    const codeB = "222222";
+    for (let i = 0; i < JOIN_LIMIT_PER_ROOM_PER_WINDOW; i++) await checkRoomJoinLimit(codeA);
+    await expect(checkRoomJoinLimit(codeA)).rejects.toMatchObject({ status: 429 });
+    // Other rooms and the per-IP budget are untouched by room A's shotgun.
+    await expect(checkRoomJoinLimit(codeB)).resolves.toBeUndefined();
+    await expect(checkRoomJoinLimit("333333")).resolves.toBeUndefined();
+    await expect(checkJoinLimit(`ip-${Math.random().toString(36).slice(2)}`)).resolves.toBeUndefined();
+  });
+
+  it("route-level: rotating-IP join probes against one room hit the per-room budget (finding 14)", async () => {
+    const { POST: joinPOST } = await import("../../src/app/api/v1/session/[sessionId]/join/route");
+    const { createRoom } = await import("../../src/lib/rooms");
+    const sessionId = (await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, "fake-hash-for-401s")).sessionId;
+    const other = (await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, "fake-hash-for-401s")).sessionId;
+
+    process.env.TRUST_PROXY = "true"; // XFF is the per-IP budget key here
+    try {
+      // Pre-warm the ROOM budget exactly to the cap (this simulates 120
+      // shotgun probes from rotating IPs: per-IP budgets can't trip because
+      // every probe has a fresh IP — only the per-room budget can).
+      for (let i = 0; i < 120; i++) await redis.incr(`rate:joinroom:${sessionId}`);
+      // The 121st well-formed attempt is refused by the per-room budget
+      // BEFORE the password gate (message is distinct from the per-IP 429).
+      const probe = (code: string, ip: string) =>
+        joinPOST(
+          new NextRequest(`http://localhost/api/v1/session/${code}/join`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+            body: JSON.stringify({ username: "probe_user", pubkey: PUBKEY, password: "wrong" }),
+          }),
+          { params: Promise.resolve({ sessionId: code }) }
+        );
+      const throttled = await probe(sessionId, "198.51.100.1");
+      expect(throttled.status).toBe(429);
+      expect(((await throttled.json()) as { error: string }).error).toMatch(/join attempts/i);
+      // A different room still answers normally (per-room isolation).
+      const otherRes = await probe(other, "198.51.100.2");
+      expect(otherRes.status).toBe(401); // wrong password — not throttled
+    } finally {
+      delete process.env.TRUST_PROXY;
+    }
   });
 
   it("XFF trust: TRUST_PROXY=true keys budgets per IP, unset/false shares one bucket (finding 10)", async () => {

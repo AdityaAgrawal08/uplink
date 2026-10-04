@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { verifyPassword } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, clientIpHash, assertRoomCode } from "@/lib/rooms";
+import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, checkRoomJoinLimit, clientIpHash, assertRoomCode } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -16,6 +16,11 @@ export async function POST(
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { username, pubkey, password } = parsed.body;
+
+    // Finding 14: per-ROOM join budget (anti-brute-force for 6-digit codes),
+    // counted per well-formed attempt — before the password gate, so failed
+    // guesses (the attacker's probes) burn the room's budget too.
+    await checkRoomJoinLimit(sessionId);
 
     const meta = await getRoomMeta(sessionId);
     if (!meta) {
