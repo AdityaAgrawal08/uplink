@@ -111,6 +111,15 @@ events, server-down alert) surface on the **status line**, never as
 transcript rows — only peer messages, own echoes, and file cards paint
 the transcript.
 
+### Landing
+
+The CREATE/JOIN landing (`uplink` with no arguments) is two-step on the
+JOIN tab: username + 6-digit session code only. The session password is
+asked afterwards, in a modal overlay, only when the server reports the
+session is password-protected (401 "password required"); Esc dismisses the
+modal back to the form, and an incorrect password can be retried in place.
+CREATE keeps its optional password field for new sessions.
+
 ### Environment variables (CLI)
 
 | Variable | Effect |

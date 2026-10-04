@@ -90,8 +90,9 @@ Video calling is fully removed on this branch. Audio-only.
 - `cli/resume.go` | 112 | Multipart upload resume state + cleanup. | `ResumeState, Save, LoadResumeState, DeleteResumeState, CleanOldResumeStates`
 - `cli/speed.go` | 72 | Bandwidth measure + adaptive multipart chunk sizing. | `AdaptiveChunker, Measure, RecordSpeed, ChunkSize`
 - `cli/session.go` | 219 | Create/join prompts, shared HTTP client, JSON helpers. | `sharedHTTPClient, postJSON, getJSON, cmdCreateSession, cmdJoinChat`
-- `cli/landing.go` | 816 | CREATE/JOIN landing TUI form + validation + API calls. | `landingModel, newLandingModel, Init, Update`
+- `cli/landing.go` | 957 | CREATE/JOIN landing TUI form + validation + API calls; two-step join with password modal for protected sessions. | `landingModel, newLandingModel, Init, Update`
 - `cli/landing_test.go` | 66 | Landing code/username validation. | `TestLandingValidateCodeStrict, TestLandingValidateUsername`
+- `cli/landing_join_test.go` | 374 | Two-step join: no password field on JOIN, protected-session modal, retry, Esc, inline errors. | `joinFixture, newJoinTestModel, TestLandingJoinFormHasNoPasswordField, TestLandingJoinFocusCycleSkipsPassword, TestLandingJoinNoPasswordRoomJoins, TestLandingJoinProtectedOpensModal, TestLandingJoinWrongPasswordThenRetrySucceeds, TestLandingJoinModalEscPreservesInputs, TestLandingJoinInlineErrorsUnchanged, TestLandingJoinModalRetry404ClosesToForm`
 - `cli/config.go` | 97 | Layered config: defaults < file < env. | `Config, defaultConfig, LoadConfig`
 - `cli/config_cmd.go` | 175 | `config get/set/ls` subcommands. | `handleConfig, handleConfigGet, handleConfigSet, handleConfigLs`
 - `cli/encrypt.go` | 160 | Streaming AES-GCM file encrypt/decrypt in chunks. | `EncryptFileStream, DecryptFileStream`
