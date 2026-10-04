@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { getDb } from "@/lib/mongodb";
 import { deleteObject } from "@/lib/r2";
 import { recordDeleteQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
+import { releaseIpReservation } from "@/lib/reservation";
 import { validateAdminAuth } from "@/lib/auth";
 import { apiError } from "@/lib/api-utils";
 
@@ -124,6 +125,11 @@ export async function performCleanup() {
             const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
             const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
             await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+            // Finding 4: refund the initiator's per-IP reservation counter
+            // (initIpHash rides the share doc; no request context here).
+            if (share.initIpHash) {
+              await releaseIpReservation(share.initIpHash, share.size).catch(err => console.error("Failed to release IP reservation in cleanup:", err));
+            }
           } else {
             // If it was committed, decrement active storage bytes and record delete op
             await recordDeleteQuota(share.size);
@@ -154,6 +160,11 @@ export async function performCleanup() {
             const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
             const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
             await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+            // Finding 4: refund the per-IP reservation counter even when the
+            // R2 delete itself failed — the reservation is over either way.
+            if (share.initIpHash) {
+              await releaseIpReservation(share.initIpHash, share.size).catch(err => console.error("Failed to release IP reservation in cleanup (delete failed):", err));
+            }
           }
 
           results.push({ shareId: share.shareId, status: "DELETE_FAILED" });
