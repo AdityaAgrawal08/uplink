@@ -59,10 +59,6 @@ async function initShare(ip: string, size: number, extra: Record<string, unknown
   return res;
 }
 
-async function initPOSTOnly(url: string, ip: string, body: Record<string, unknown>) {
-  return initPOST(req(url, ip, body));
-}
-
 describe("share init: per-IP reservation budget (finding 4)", () => {
   beforeEach(() => {
     db().reset();
