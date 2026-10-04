@@ -1,6 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { FakeDb, FakeDoc } from "./helpers/fake-mongo";
 import { NextRequest } from "next/server";
+import fs from "fs";
+import path from "path";
 
 // All share-route tests run against an in-memory Mongo stand-in
 // (helpers/fake-mongo.ts) plus MockRedis. `after` must be stubbed: Next.js
@@ -22,6 +24,9 @@ vi.mock("next/server", async (importOriginal) => {
 });
 
 import { POST as initPOST } from "../../src/app/api/v1/share/init/route";
+import { POST as previewPOST } from "../../src/app/api/v1/share/[id]/preview-text/route";
+import { getObjectText, PREVIEW_TEXT_MAX_BYTES } from "../../src/lib/r2";
+import { hashPassword } from "../../src/lib/crypto";
 
 function db(): FakeDb {
   return (mongo.handle as { db: FakeDb }).db;
@@ -91,5 +96,136 @@ describe("share init: per-IP reservation budget (finding 4)", () => {
     expect(share).toBeDefined();
     expect(share!.initIpHash).toBeTruthy();
     expect(share!.size).toBe(1024);
+  });
+});
+
+describe("preview-text hardening (finding 7)", () => {
+  let passwordHash: string;
+
+  beforeEach(async () => {
+    db().reset();
+    process.env.TRUST_PROXY = "true";
+    passwordHash = await hashPassword("hunter2");
+  });
+  afterEach(() => {
+    delete process.env.TRUST_PROXY;
+  });
+
+  function seedShare(overrides: Partial<FakeDoc>) {
+    db().collection("shares").docs.push({
+      shareId: "preview-share-0000001",
+      status: "ACTIVE",
+      expiresAt: new Date(Date.now() + 3600_000),
+      passwordHash: null,
+      objectKey: "uploads/2026/10/preview/preview.txt",
+      isEncrypted: false,
+      downloadsCount: 0,
+      downloadLimit: 10,
+      ...overrides,
+    });
+  }
+
+  function previewReq(id: string, ip: string, body: Record<string, unknown>) {
+    return previewPOST(
+      new NextRequest(`http://localhost/api/v1/share/${id}/preview-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+        body: JSON.stringify(body),
+      }),
+      { params: Promise.resolve({ id }) }
+    );
+  }
+
+  it("previews count against downloadsCount/downloadLimit atomically; exhausted → 410", async () => {
+    seedShare({ downloadLimit: 2 });
+    db().collection("shares").docs[0].downloadsCount = 0;
+
+    const key = "uploads/2026/10/preview/preview.txt";
+    const p = path.join(process.cwd(), "uploads_dev", key);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "hello preview");
+
+    for (let i = 0; i < 2; i++) {
+      const res = await previewReq("preview-share-0000001", "203.0.113.50", {});
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { text: string }).text).toBe("hello preview");
+    }
+    // downloadsCount was bumped atomically on each successful preview.
+    expect(db().collection("shares").docs[0].downloadsCount).toBe(2);
+    // Third preview: limit reached — 410, exactly like authorize-download.
+    const exhausted = await previewReq("preview-share-0000001", "203.0.113.50", {});
+    expect(exhausted.status).toBe(410);
+
+    fs.rmSync(p, { force: true });
+  });
+
+  it("wrong passwords trip the shared failKey lockout: 5 verifies, then 429", async () => {
+    seedShare({ passwordHash });
+    for (let i = 0; i < 5; i++) {
+      const res = await previewReq("preview-share-0000001", "203.0.113.60", { password: "wrong" });
+      expect(res.status).toBe(401);
+    }
+    const locked = await previewReq("preview-share-0000001", "203.0.113.60", { password: "wrong" });
+    expect(locked.status).toBe(429);
+    // Correct password also refused while locked out (the counter is checked
+    // before verification — a lockout is a lockout).
+    expect((await previewReq("preview-share-0000001", "203.0.113.60", { password: "hunter2" })).status).toBe(429);
+    // A different IP shares no lockout.
+    expect((await previewReq("preview-share-0000001", "203.0.113.61", { password: "wrong" })).status).toBe(401);
+  });
+
+  it("a successful password resets the lockout (del on success)", async () => {
+    seedShare({ passwordHash });
+    const key = "uploads/2026/10/preview/preview.txt";
+    const p = path.join(process.cwd(), "uploads_dev", key);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, "hello preview");
+    try {
+      for (let i = 0; i < 3; i++) {
+        await previewReq("preview-share-0000001", "203.0.113.62", { password: "wrong" });
+      }
+      const ok = await previewReq("preview-share-0000001", "203.0.113.62", { password: "hunter2" });
+      expect(ok.status).toBe(200);
+      // Lockout counter was deleted on success: wrong guesses start fresh.
+      const again = await previewReq("preview-share-0000001", "203.0.113.62", { password: "wrong" });
+      expect(again.status).toBe(401);
+    } finally {
+      fs.rmSync(p, { force: true });
+    }
+  });
+});
+
+describe("getObjectText memory cap (finding 7)", () => {
+  it("reads at most maxBytes+1 from a large file", async () => {
+    const key = `uploads/2026/10/preview/big-${Math.random().toString(36).slice(2)}.txt`;
+    const p = path.join(process.cwd(), "uploads_dev", key);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const content = "A".repeat(200 * 1024); // 200KB — far above the cap
+    fs.writeFileSync(p, content);
+    try {
+      const text = await getObjectText(key);
+      expect(text.length).toBeLessThanOrEqual(PREVIEW_TEXT_MAX_BYTES + 1);
+      expect(text).toBe(content.slice(0, PREVIEW_TEXT_MAX_BYTES + 1));
+    } finally {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  it("honors a custom maxBytes (memory cap scales)", async () => {
+    const key = `uploads/2026/10/preview/small-${Math.random().toString(36).slice(2)}.txt`;
+    const p = path.join(process.cwd(), "uploads_dev", key);
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const content = "B".repeat(10 * 1024);
+    fs.writeFileSync(p, content);
+    try {
+      const text = await getObjectText(key, 100);
+      expect(text).toBe("B".repeat(101)); // maxBytes + 1 truncation probe
+    } finally {
+      fs.rmSync(p, { force: true });
+    }
+  });
+
+  it("returns empty for missing objects", async () => {
+    expect(await getObjectText(`uploads/2026/10/preview/nope-${Math.random().toString(36).slice(2)}.txt`)).toBe("");
   });
 });
