@@ -4,9 +4,9 @@ import fs from "fs";
 import path from "path";
 import { getDb } from "@/lib/mongodb";
 import { checkObjectExists, completeMultipartUpload, s3Client, calculateS3ObjectHash } from "@/lib/r2";
-import { anonymizeIp } from "@/lib/crypto";
 import { commitUploadQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
 import { releaseIpReservation } from "@/lib/reservation";
+import { clientIpHash } from "@/lib/rooms";
 import { apiError } from "@/lib/api-utils";
 
 interface ShareData {
@@ -296,10 +296,9 @@ export async function POST(
     }
 
     // 5. Structured Diagnostics Logging
-    // B8 FIX: take the leftmost entry of x-forwarded-for (the real client).
-    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
-    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
-    const ipHash = anonymizeIp(clientIp);
+    // B8 FIX: take the leftmost entry of x-forwarded-for (the real client);
+    // clientIpHash honors TRUST_PROXY (finding 10).
+    const ipHash = clientIpHash(req);
     const userAgent = req.headers.get("user-agent") || "Unknown";
 
     const logEvent = {

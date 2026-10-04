@@ -228,6 +228,45 @@ describe("rooms signaling plane", () => {
     await expect(checkSendLimit("sig", ip5, "alice")).resolves.toBeUndefined();
   });
 
+  it("XFF trust: TRUST_PROXY=true keys budgets per IP, unset/false shares one bucket (finding 10)", async () => {
+    const { clientIpHash, trustProxyHeader, checkSendLimit, SEND_LIMIT_PER_WINDOW } = await import("../../src/lib/rooms");
+    const mkReq = (xff: string) => new Request("http://localhost/x", { headers: { "x-forwarded-for": xff } });
+
+    // Default (TRUST_PROXY unset, no VERCEL): XFF is untrusted.
+    delete process.env.TRUST_PROXY;
+    delete process.env.VERCEL;
+    expect(trustProxyHeader()).toBe(false);
+    expect(clientIpHash(mkReq("1.2.3.4"))).toBe(clientIpHash(mkReq("9.9.9.9"))); // one shared bucket
+
+    // Platform mode: VERCEL=1 trusts the platform's XFF even with the env unset.
+    process.env.VERCEL = "1";
+    expect(trustProxyHeader()).toBe(true);
+    expect(clientIpHash(mkReq("1.2.3.4"))).not.toBe(clientIpHash(mkReq("9.9.9.9")));
+    delete process.env.VERCEL;
+
+    // Explicit "true": trusted — distinct XFF values get distinct buckets and
+    // independent budgets.
+    process.env.TRUST_PROXY = "true";
+    expect(trustProxyHeader()).toBe(true);
+    const ipA = clientIpHash(mkReq("1.2.3.4"));
+    const ipB = clientIpHash(mkReq("9.9.9.9"));
+    expect(ipA).not.toBe(ipB);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("sig", ipA);
+    await expect(checkSendLimit("sig", ipA)).rejects.toMatchObject({ status: 429 });
+    await expect(checkSendLimit("sig", ipB)).resolves.toBeUndefined();
+    delete process.env.TRUST_PROXY;
+
+    // Explicit "false" (and any other non-true value): XFF ignored — both
+    // "IPs" land in the same bucket and share the budget.
+    process.env.TRUST_PROXY = "false";
+    expect(trustProxyHeader()).toBe(false);
+    const shared = clientIpHash(mkReq("1.2.3.4"));
+    expect(clientIpHash(mkReq("9.9.9.9"))).toBe(shared);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("sig", shared);
+    await expect(checkSendLimit("sig", shared)).rejects.toMatchObject({ status: 429 });
+    delete process.env.TRUST_PROXY;
+  });
+
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
     const username = `u_${Math.random().toString(36).slice(2, 10)}`;
     const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");

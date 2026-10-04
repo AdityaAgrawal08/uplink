@@ -4,8 +4,9 @@ import { getDb } from "@/lib/mongodb";
 import { performCleanup } from "../../../cleanup/route";
 import { redis } from "@/lib/redis";
 import { getPresignedDownloadUrl } from "@/lib/r2";
-import { verifyPassword, anonymizeIp } from "@/lib/crypto";
+import { verifyPassword } from "@/lib/crypto";
 import { consumeClassBQuota } from "@/lib/quota";
+import { clientIpHash } from "@/lib/rooms";
 import { apiError } from "@/lib/api-utils";
 
 // Safe preview mime-types allowlist
@@ -26,10 +27,11 @@ export async function POST(
     const body = await req.json().catch(() => ({}));
     const { password, preview } = body;
 
-    // B8 FIX: Split x-forwarded-for by comma and take the first entry.
-    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
-    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
-    const ipHash = anonymizeIp(clientIp);
+    // B8 FIX: split x-forwarded-for by comma and take the first entry.
+    // clientIpHash additionally honors TRUST_PROXY (finding 10): when no
+    // trusted proxy is in front, XFF is attacker-controlled and is ignored
+    // for budget keying.
+    const ipHash = clientIpHash(req);
 
     const db = await getDb();
 
