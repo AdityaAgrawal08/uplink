@@ -884,6 +884,13 @@ type inviteModel struct {
 	// last frame = fully expanded); revealGen fences stale reveal ticks.
 	reveal    int
 	revealGen int
+	// pulseItem is the candidate row flashing its toggle (the 1-tick
+	// selection pulse; -1 = none); pulseGen fences stale pulse ticks the
+	// exact way revealGen fences reveal ticks — a second toggle supersedes
+	// the first's flash.
+	pulseItem  int
+	pulseGen   int
+	pulseFrame int
 	// animations mirrors chatScreen.animations (wired from the env at
 	// construction) so tests can pin the staged reveal deterministically.
 	animations bool
@@ -909,9 +916,55 @@ func scheduleInviteReveal(gen, frame int) tea.Cmd {
 	})
 }
 
+// invitePulseFrames is the painted stage count of the toggle pulse: frame 0
+// is the raw flash, the LAST frame settles into the picked bar (one
+// invitePulseStep tick between them). Same generation-fenced staging as the
+// open reveal; plain/CI runs skip the pulse entirely (the pick paints its
+// settled bar directly).
+const (
+	invitePulseFrames = 2
+	invitePulseStep   = 50 * time.Millisecond
+)
+
+// invitePulseMsg advances the toggle pulse to painted stage frame; gen
+// fences out ticks from a superseded toggle.
+type invitePulseMsg struct{ gen, frame int }
+
+func scheduleInvitePulse(gen, frame int) tea.Cmd {
+	return tea.Tick(invitePulseStep, func(time.Time) tea.Msg {
+		return invitePulseMsg{gen: gen, frame: frame}
+	})
+}
+
 // inviteFooterHints is the dim keymap legend under the member list (the
 // drawer footer contract: hints left, count right).
 const inviteFooterHints = "↑↓ move · shift+↑↓ range · enter toggle · tab send · esc close"
+
+// inviteFooterRow paints the invite window footer: the keymap hints left,
+// the LIVE picked counter right. The counter matches the spec verbatim —
+// "n selected — Enter to send" — in accent bold the moment any pick
+// exists, in the plain hint tone ("0 selected") before that, so the send
+// affordance tracks every toggle instantly. The row sizes against the
+// card's PADDED content width (the card wraps at Padding(0,1), so the
+// last word must end two cells short of inner).
+func inviteFooterRow(inner, picked int) string {
+	content := maxInt(inner-2, 1)
+	count := fmt.Sprintf("%d selected", picked)
+	if picked > 0 {
+		count += " — Enter to send"
+	}
+	cw := lipgloss.Width(count)
+	var countStyled string
+	if picked > 0 {
+		countStyled = lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render(count)
+	} else {
+		countStyled = tuiPaletteHintStyle.Render(count)
+	}
+	left := maxInt(content-cw-1, 1)
+	hints := tuiPaletteHintStyle.Render(truncateByWidth(inviteFooterHints, left))
+	gap := maxInt(content-lipgloss.Width(hints)-lipgloss.Width(countStyled), 1)
+	return hints + strings.Repeat(" ", gap) + countStyled
+}
 
 // newInviteModel builds the window from the live chat screen: candidates
 // are the parent room's roster minus the group's existing members (and
@@ -926,6 +979,7 @@ func newInviteModel(c chatScreen, code, name string, sig *signalClient, w, h int
 		cands:      cands,
 		anchor:     -1,
 		picked:     map[string]bool{},
+		pulseItem:  -1,
 		w:          w,
 		h:          h,
 		animations: chatAnimationsEnabled(), // newChatScreen wires exactly this
@@ -1055,18 +1109,6 @@ func (m inviteModel) paintedRows(total int) int {
 	return total * frame / (inviteRevealFrames - 1)
 }
 
-// paintedPos resolves the highlight's position in PAINTED item order (the
-// footer count). 0 when nothing is selectable.
-func (m inviteModel) paintedPos() int {
-	disp := m.invitePlan().displayOrder()
-	for i, it := range disp {
-		if it == m.sel {
-			return i
-		}
-	}
-	return 0
-}
-
 // selectedUsers returns the picked usernames in candidate order (stable).
 func (m inviteModel) selectedUsers() []string {
 	var out []string
@@ -1076,6 +1118,47 @@ func (m inviteModel) selectedUsers() []string {
 		}
 	}
 	return out
+}
+
+// pickedCount is the live footer counter: how many candidates are picked.
+func (m inviteModel) pickedCount() int {
+	n := 0
+	for _, c := range m.cands {
+		if m.picked[c.Username] {
+			n++
+		}
+	}
+	return n
+}
+
+// armPulse starts the 1-tick selection pulse on cands[item] (generation-
+// fenced: a newer toggle supersedes an older flash). Plain/CI runs settle
+// immediately into the picked bar with no timers, exactly like the reveal.
+func (m *inviteModel) armPulse(item int) tea.Cmd {
+	m.pulseGen++
+	m.pulseItem = item
+	if !m.animations {
+		m.pulseFrame = invitePulseFrames - 1
+		return nil
+	}
+	m.pulseFrame = 0
+	return scheduleInvitePulse(m.pulseGen, 1)
+}
+
+// togglePicked flips the pick state of cands[item] and arms the selection
+// pulse — the one code path every toggle (keyboard Enter, range Enter,
+// mouse click) walks, so the flash fires exactly once per toggle.
+func (m *inviteModel) togglePicked(item int) tea.Cmd {
+	if item < 0 || item >= len(m.cands) {
+		return nil
+	}
+	u := m.cands[item].Username
+	if m.picked[u] {
+		delete(m.picked, u)
+	} else {
+		m.picked[u] = true
+	}
+	return m.armPulse(item)
 }
 
 // sendAll POSTs /invites for every picked user through the group's client:
@@ -1127,6 +1210,17 @@ func (m inviteModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case invitePulseMsg:
+		if msg.gen != m.pulseGen {
+			return m, nil // stale pulse tick from a superseded toggle
+		}
+		m.pulseFrame = msg.frame
+		if m.pulseFrame < invitePulseFrames-1 {
+			return m, scheduleInvitePulse(m.pulseGen, m.pulseFrame+1)
+		}
+		m.pulseItem = -1 // settled: the picked bar itself carries the state
+		return m, nil
+
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
 
@@ -1137,6 +1231,7 @@ func (m inviteModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Picks are consumed: the window stays open for the next round.
 		m.picked = map[string]bool{}
 		m.anchor = -1
+		m.pulseItem = -1
 		m.focus = 0
 		return m, nil
 
@@ -1191,7 +1286,8 @@ func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		// A Shift+Up/Down range (anchor set) toggles EVERY member in the
 		// range; otherwise just the highlighted one. Either way the window
-		// STAYS open for the next pick.
+		// STAYS open for the next pick, and the toggled row flashes its
+		// selection pulse.
 		if m.anchor >= 0 {
 			lo, hi := m.anchor, m.sel
 			if lo > hi {
@@ -1206,15 +1302,13 @@ func (m inviteModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.anchor = -1
-		} else if m.sel >= 0 && m.sel < len(m.cands) {
-			u := m.cands[m.sel].Username
-			if m.picked[u] {
-				delete(m.picked, u)
-			} else {
-				m.picked[u] = true
-			}
+			m.notice = ""
+			return m, m.armPulse(m.sel)
 		}
-		m.notice = ""
+		if m.sel >= 0 && m.sel < len(m.cands) {
+			m.notice = ""
+			return m, m.togglePicked(m.sel)
+		}
 		return m, nil
 	case tea.KeyTab, tea.KeyShiftTab:
 		m.focus = 1
@@ -1306,14 +1400,8 @@ func (m inviteModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	m.sel = idx
 	m.settleWindow()
 	m.anchor = -1
-	u := m.cands[idx].Username
-	if m.picked[u] {
-		delete(m.picked, u)
-	} else {
-		m.picked[u] = true
-	}
 	m.notice = ""
-	return m, nil
+	return m, m.togglePicked(idx)
 }
 
 func (m inviteModel) View() string {
@@ -1381,8 +1469,10 @@ func (m inviteModel) View() string {
 	}
 	btnRow := lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(btnStyle.Render(btnText))
 	rows = append(rows, fit(btnRow))
-	// The drawer footer contract: keymap hints left, "sel/count" right.
-	rows = append(rows, fit(drawerFooterRow(inner, inviteFooterHints, m.paintedPos(), len(m.cands))))
+	// The drawer footer contract: keymap hints left, the LIVE picked
+	// counter right — "n selected — Enter to send" in accent bold once
+	// anything is picked ("0 selected" in the hint tone before that).
+	rows = append(rows, fit(inviteFooterRow(inner, m.pickedCount())))
 
 	card := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1395,14 +1485,26 @@ func (m inviteModel) View() string {
 		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
 }
 
-// inviteItemRowView paints ONE candidate row in the drawer standard:
-// the range marker, the pick check (accent, bar ink on the cursor row),
-// the username with matched-char highlight, and the role tag — the
-// full-row cursor bar (accent bg + contrast ink + bold) on the selected
-// row, the shared plain row style otherwise.
+// inviteItemRowView paints ONE candidate row in the drawer standard —
+// the range marker, the pick check, the username with matched-char
+// highlight and the role tag — with the three-state row language:
+//
+//   - the cursor row wears the standard full-row accent cursor bar
+//     (dark ink on accent);
+//   - a PICKED row wears the accent PICKED bar with the ink run the other
+//     way (bright on accent) + bold name, so picked-vs-focused reads
+//     instantly even when the two states sit on the same row (focused
+//     wins the bar, the ✓ keeps its bright ink);
+//   - a just-toggled row flashes the pulse style for one tick.
+//
+// The ✓ check ALWAYS rides the bright contrast ink, so it stays legible
+// on every bar (the old accent-on-accent check vanished on the cursor bar
+// — that invisibility is the bug this replaces).
 func (m inviteModel) inviteItemRowView(item int, hit fuzzyHit, inner int) string {
 	cand := m.cands[item]
-	selected := item == m.sel
+	focused := item == m.sel
+	picked := m.picked[cand.Username]
+	pulsing := picked && m.pulseItem == item && m.pulseFrame == 0 && m.pulseGen > 0
 	marker := "  "
 	if m.anchor >= 0 {
 		lo, hi := m.anchor, m.sel
@@ -1414,15 +1516,20 @@ func (m inviteModel) inviteItemRowView(item int, hit fuzzyHit, inner int) string
 		}
 	}
 	check := " "
-	if m.picked[cand.Username] {
-		check = tuiPaletteMatchStyle.Render("✓")
+	if picked {
+		check = tuiPaletteMatchSelStyle.Render("✓")
 	}
-	name := highlightMatches(sanitizeDisplay(cand.Username), hit.matches, selected, inner)
+	name := highlightMatches(sanitizeDisplay(cand.Username), hit.matches, focused || picked, inner)
 	line := marker + " " + check + " " + name + tuiPaletteDescStyle.Render(roleSuffixTag(cand.Role))
 	line = padVisible(truncateByWidth(line, inner), inner)
-	if selected {
+	switch {
+	case pulsing:
+		line = tuiPalettePulseStyle.Render(retint(line, tuiPalettePulseStyle))
+	case focused:
 		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-	} else {
+	case picked:
+		line = tuiPalettePickStyle.Render(retint(line, tuiPalettePickStyle))
+	default:
 		line = tuiPaletteRowStyle.Render(line)
 	}
 	return line

@@ -283,6 +283,26 @@ var (
 				Bold(true).
 				Foreground(lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#e8f9ff"})
 
+	// Picked bar — the invite window's multi-select rows: the SAME accent
+	// fill as the cursor bar with the ink run the other way (bright on
+	// accent), so a picked row reads as a filled tile instantly distinct
+	// from the hover bar. The two states must never blur: a row can be
+	// picked AND focused at once, and the ✓/matched chips always ride the
+	// bright contrast ink so they stay legible on either bar.
+	tuiPalettePickStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#062a46", Dark: "#e8f9ff"}).
+				Background(colAccent)
+
+	// Pulse flash — the one-tick "just toggled" flash a fresh pick wears:
+	// the harshest flip the theme allows (panel text tone as the fill,
+	// accent as ink), so the toggle registers before the eye lands on the
+	// ✓. Next tick the row settles into the picked bar.
+	tuiPalettePulseStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(colAccent).
+				Background(colText)
+
 	tuiPaletteDescStyle = lipgloss.NewStyle().Foreground(colDim)
 
 	tuiPaletteHintStyle = lipgloss.NewStyle().Foreground(colFaint)

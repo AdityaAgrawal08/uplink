@@ -310,7 +310,7 @@ func TestSettingsAcceptOpenGroup(t *testing.T) {
 
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
-		{Code: code, GroupName: "Design", By: "bob", At: time.Now().Format(time.RFC3339)},
+		{Code: code, GroupName: "Design", By: "bob", At: time.Now().UnixMilli()},
 	}})
 	if len(m.invites) != 1 {
 		t.Fatalf("invites = %d; want 1", len(m.invites))
@@ -364,7 +364,7 @@ func TestSettingsAcceptProtectedPasswordModal(t *testing.T) {
 	meta := fake.groupMeta[code]
 	meta.pass = "s3cret"
 	fake.groupMeta[code] = meta
-	fake.invites["alice"] = []groupInvite{{Code: code, GroupName: "Vault", By: "bob", At: time.Now().Format(time.RFC3339)}}
+	fake.invites["alice"] = []groupInvite{{Code: code, GroupName: "Vault", By: "bob", At: time.Now().UnixMilli()}}
 	fake.mu.Unlock()
 
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
@@ -452,7 +452,7 @@ func TestSettingsAcceptFullConsumesTerminal(t *testing.T) {
 
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
-		{Code: code, GroupName: "Full", By: "bob", At: time.Now().Format(time.RFC3339)},
+		{Code: code, GroupName: "Full", By: "bob", At: time.Now().UnixMilli()},
 	}})
 	m, cmd := stepSettingsC(m, tea.KeyMsg{Type: tea.KeyEnter})
 	next := runCmdStep(t, m, cmd)
@@ -483,7 +483,7 @@ func TestSettingsDecline(t *testing.T) {
 
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
-		{Code: code, GroupName: "Chess", By: "bob", At: time.Now().Format(time.RFC3339)},
+		{Code: code, GroupName: "Chess", By: "bob", At: time.Now().UnixMilli()},
 	}})
 	// Mouse path: click the ✕ cell of the row (widths must match the
 	// handler's lipgloss.Width math — ✕/✓ are multi-byte UTF-8).
@@ -514,7 +514,7 @@ func TestSettingsDeclineErrorsRetainsRow(t *testing.T) {
 	id, _ := generateIdentity()
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
-		{Code: "700999", GroupName: "Ghost", By: "bob", At: time.Now().Format(time.RFC3339)},
+		{Code: "700999", GroupName: "Ghost", By: "bob", At: time.Now().UnixMilli()},
 	}})
 	m = stepSettings(m, declineDoneMsg{code: "700999", err: &apiStatusError{Code: 500, Msg: "boom"}})
 	if len(m.invites) != 1 {
@@ -532,8 +532,8 @@ func TestSettingsRender(t *testing.T) {
 	id, _ := generateIdentity()
 	m := newSettingsModel(srv.URL, "alice", id, 110, 30)
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
-		{Code: "700001", GroupName: "Design", By: "bob", At: time.Now().Format(time.RFC3339)},
-		{Code: "700002", GroupName: "", By: "carol", At: time.Now().Format(time.RFC3339)},
+		{Code: "700001", GroupName: "Design", By: "bob", At: time.Now().UnixMilli()},
+		{Code: "700002", GroupName: "", By: "carol", At: time.Now().UnixMilli()},
 	}})
 	view := m.View()
 	for _, want := range []string{"◆ SETTINGS", "NOTIFICATIONS", "bob invited you to group Design", "carol invited you to group a group", "✕", "✓", "ACCOUNT"} {
@@ -562,7 +562,7 @@ func TestInviteBadgeAndBeeep(t *testing.T) {
 
 	c := groupTestScreen("alice")
 	c.applyInvites([]groupInvite{
-		{Code: "700001", GroupName: "Design", By: "bob", At: "t"},
+		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
 	if c.pendingInvites != 1 {
 		t.Fatalf("badge = %d; want 1", c.pendingInvites)
@@ -572,15 +572,15 @@ func TestInviteBadgeAndBeeep(t *testing.T) {
 	}
 	// Re-poll with the same list: no re-ring, badge unchanged.
 	c.applyInvites([]groupInvite{
-		{Code: "700001", GroupName: "Design", By: "bob", At: "t"},
+		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
 	if len(pings) != 1 {
 		t.Fatalf("re-poll must not re-ring: %v", pings)
 	}
 	// A second invite rings with the unnamed-group fallback.
 	c.applyInvites([]groupInvite{
-		{Code: "700002", GroupName: "", By: "carol", At: "t"},
-		{Code: "700001", GroupName: "Design", By: "bob", At: "t"},
+		{Code: "700002", GroupName: "", By: "carol", At: 1},
+		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
 	if len(pings) != 2 || pings[1] != "carol|a group" {
 		t.Fatalf("pings = %v; want carol|a group second", pings)

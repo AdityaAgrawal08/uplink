@@ -5,7 +5,9 @@ import (
 	"strings"
 	"testing"
 
-	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // ---------------------------------------------------------------------------
@@ -333,6 +335,230 @@ func settleInviteReveal(m inviteModel) inviteModel {
 	return m
 }
 
+// TestInviteRowPickVisuals pins the three-state row language: the plain
+// row, the focus CURSOR bar, the picked ACCENT bar with the bright ✓ and
+// bold name, the focused+picked overlap (cursor bar wins the fill, the ✓
+// keeps its bright ink — the old accent-on-accent invisibility), and the
+// one-tick pulse flash.
+func TestInviteRowPickVisuals(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256) // SGR sequences needed to assert the bars
+	defer lipgloss.SetColorProfile(prev)
+
+	base := inviteModel{
+		cands:  []rosterMember{{Username: "carol", Role: "admin"}},
+		picked: map[string]bool{},
+		sel:    0,
+	}
+	row := func(m inviteModel) string { return m.inviteItemRowView(0, fuzzyHit{}, 60) }
+	pickSeq := styleSeq(tuiPalettePickStyle)
+	selSeq := styleSeq(tuiPaletteSelStyle)
+	matchSelSeq := styleSeq(tuiPaletteMatchSelStyle)
+
+	// Plain, unpicked, unfocused: no check, no bar.
+	plain := row(base)
+	if strings.Contains(stripANSI(plain), "✓") {
+		t.Fatalf("unpicked row must not paint a check: %q", stripANSI(plain))
+	}
+	if pickSeq != "" && strings.Contains(plain, pickSeq) {
+		t.Fatal("plain row must not wear the picked bar")
+	}
+
+	// Focused: the standard full-row cursor bar.
+	focused := row(inviteModel{cands: base.cands, picked: map[string]bool{}, sel: 0})
+	if selSeq == "" || !strings.Contains(focused, selSeq) {
+		t.Fatalf("focused row must wear the cursor bar: %q", focused)
+	}
+
+	// Picked: the accent bar, bright ✓, bold name (the bar style bolds).
+	picked := row(inviteModel{cands: base.cands, picked: map[string]bool{"carol": true}, sel: -1})
+	if pickSeq == "" || !strings.Contains(picked, pickSeq) {
+		t.Fatalf("picked row must wear the accent picked bar: %q", picked)
+	}
+	if !strings.Contains(stripANSI(picked), "✓") {
+		t.Fatalf("picked row must paint the ✓: %q", stripANSI(picked))
+	}
+	if !strings.Contains(picked, matchSelSeq) {
+		t.Fatalf("the ✓ must ride the bright contrast ink: %q", picked)
+	}
+
+	// Focused AND picked: the cursor bar wins the fill, the ✓ stays bright
+	// (this exact spot used to render accent-on-accent and vanish).
+	both := row(inviteModel{cands: base.cands, picked: map[string]bool{"carol": true}, sel: 0})
+	if !strings.Contains(both, selSeq) {
+		t.Fatalf("focused+picked row must keep the cursor bar: %q", both)
+	}
+	if pickSeq != "" && strings.Contains(both, pickSeq) {
+		t.Fatal("the picked bar must never override the cursor bar")
+	}
+	if !strings.Contains(stripANSI(both), "✓") || !strings.Contains(both, matchSelSeq) {
+		t.Fatalf("the ✓ must stay legible on the cursor bar: %q", both)
+	}
+
+	// Pulse flash: the just-toggled row wears the pulse style, not the bar.
+	flashing := inviteModel{
+		cands:      base.cands,
+		picked:     map[string]bool{"carol": true},
+		sel:        -1,
+		pulseItem:  0,
+		pulseGen:   1,
+		pulseFrame: 0,
+	}
+	flash := row(flashing)
+	if seq := styleSeq(tuiPalettePulseStyle); seq == "" || !strings.Contains(flash, seq) {
+		t.Fatalf("flash frame must wear the pulse style: %q", flash)
+	}
+	if !strings.Contains(stripANSI(flash), "✓") {
+		t.Fatalf("the flash must keep the ✓: %q", flash)
+	}
+	// The pulse only touches its own row — a different item paints normal.
+	other := flashing
+	other.pulseItem = 7
+	if strings.Contains(row(other), styleSeq(tuiPalettePulseStyle)) {
+		t.Fatal("the pulse must only flash its row")
+	}
+}
+
+// TestInviteSelectionPulse: every toggle — keyboard Enter, Shift+Down
+// range Enter, mouse click — arms the generation-fenced 1-tick pulse on
+// the toggled row; the last frame settles into the picked bar; stale
+// generations stay inert; plain/CI runs settle immediately with no timers.
+func TestInviteSelectionPulse(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
+	_, c, code, _ := inviteFixture(t)
+	m := newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height)
+	m.animations = true
+	m = settleInviteReveal(m)
+
+	// Keyboard toggle arms the pulse on the toggled row (sel 0 = carol).
+	m, cmd := stepInviteC(m, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("a toggle must arm the selection pulse tick")
+	}
+	if m.pulseItem != 0 || m.pulseFrame != 0 || m.pulseGen != 1 {
+		t.Fatalf("pulse = item %d frame %d gen %d; want 0/0/1", m.pulseItem, m.pulseFrame, m.pulseGen)
+	}
+	// Frame 0 paints the flash; the frame-1 tick settles the state.
+	flash := m.inviteItemRowView(m.pulseItem, m.invitePlan().hitOf(m.pulseItem), 60)
+	if seq := styleSeq(tuiPalettePulseStyle); seq == "" || !strings.Contains(flash, seq) {
+		t.Fatalf("flash frame must paint the pulse style: %q", flash)
+	}
+	m = stepInvite(m, invitePulseMsg{gen: m.pulseGen, frame: 1})
+	if m.pulseItem != -1 || m.pulseFrame != 1 {
+		t.Fatalf("settle frame must clear the pulse: item=%d frame=%d", m.pulseItem, m.pulseFrame)
+	}
+
+	// Range toggle pulses the range's END row (the highlight).
+	m, c1 := stepInviteC(m, tea.KeyMsg{Type: tea.KeyShiftDown}) // anchor 0, sel 1
+	if c1 != nil {
+		t.Fatal("a plain move must not arm a pulse")
+	}
+	m, cmd = stepInviteC(m, tea.KeyMsg{Type: tea.KeyEnter}) // toggles 0..1
+	if cmd == nil {
+		t.Fatal("a range toggle must arm the pulse")
+	}
+	if m.pulseItem != 1 || m.pulseGen != 2 {
+		t.Fatalf("range pulse = item %d gen %d; want 1/2", m.pulseItem, m.pulseGen)
+	}
+	m = stepInvite(m, invitePulseMsg{gen: m.pulseGen, frame: 1})
+
+	// Mouse click toggle pulses the clicked row (dave, now repainted).
+	g := m.geom()
+	wrows, _, _ := m.inviteWindowRows()
+	daveY := -1
+	for i, r := range wrows {
+		if r.kind == drItem && m.cands[r.item].Username == "dave" {
+			daveY = g.rowFirst + i
+			break
+		}
+	}
+	if daveY < 0 {
+		t.Fatal("fixture: dave row must be painted")
+	}
+	m, cmd = stepInviteC(m, mouseAt(g.left+5, daveY))
+	if cmd == nil {
+		t.Fatal("a mouse toggle must arm the pulse")
+	}
+	if m.pulseItem != 1 || m.pulseGen != 3 {
+		t.Fatalf("mouse pulse = item %d gen %d; want 1/3", m.pulseItem, m.pulseGen)
+	}
+	// A stale generation's tick stays inert (never settles the newer pulse).
+	m = stepInvite(m, invitePulseMsg{gen: 1, frame: 1})
+	if m.pulseItem != 1 || m.pulseFrame != 0 {
+		t.Fatalf("a stale pulse tick must never settle a newer pulse: item=%d frame=%d", m.pulseItem, m.pulseFrame)
+	}
+	m = stepInvite(m, invitePulseMsg{gen: m.pulseGen, frame: 1})
+
+	// Plain runs settle immediately, no timers.
+	p := newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height)
+	p.animations = false
+	p2, cmd := stepInviteC(p, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil {
+		t.Fatal("plain runs must not arm pulse ticks")
+	}
+	if p2.pulseItem != 0 || p2.pulseFrame != invitePulseFrames-1 {
+		t.Fatalf("plain settle = item %d frame %d; want 0/%d", p2.pulseItem, p2.pulseFrame, invitePulseFrames-1)
+	}
+}
+
+// TestInviteFooterLiveCounter pins the spec footer verbatim: "n selected —
+// Enter to send" in accent emphasis once ANY pick exists, "0 selected" in
+// the hint tone before that, hints kept left, one row wide.
+func TestInviteFooterLiveCounter(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256)
+	defer lipgloss.SetColorProfile(prev)
+
+	inner := 76
+	f0 := inviteFooterRow(inner, 0)
+	s0 := stripANSI(f0)
+	if !strings.Contains(s0, "0 selected") || strings.Contains(s0, "Enter to send") {
+		t.Fatalf("empty footer = %q; want 0 selected, no send affordance", s0)
+	}
+	if seq := styleSeq(tuiPaletteHintStyle); seq != "" && !strings.Contains(f0, seq) {
+		t.Fatal("the 0 counter rides the hint tone")
+	}
+
+	f2 := inviteFooterRow(inner, 2)
+	s2 := stripANSI(f2)
+	if !strings.Contains(s2, "2 selected — Enter to send") {
+		t.Fatalf("picked footer = %q; want the spec counter", s2)
+	}
+	if seq := styleSeq(lipgloss.NewStyle().Bold(true).Foreground(colAccent)); seq != "" && !strings.Contains(f2, seq) {
+		t.Fatal("the picked counter must ride accent bold")
+	}
+	if !strings.Contains(s2, "enter toggle") {
+		t.Fatalf("the keymap hints must survive the counter at this width: %q", s2)
+	}
+	if w := lipgloss.Width(f2); w > inner {
+		t.Fatalf("footer width %d > %d", w, inner)
+	}
+
+	// Live through the window: the toggle moves the counter 0 → 1 → 2.
+	_, c, code, _ := inviteFixture(t)
+	m := settleInviteReveal(newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height))
+	view := func() string { return stripANSI(m.View()) }
+	if !strings.Contains(view(), "0 selected") {
+		t.Fatalf("window must open with 0 selected:\n%s", view())
+	}
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter}) // pick carol
+	if !strings.Contains(view(), "1 selected — Enter to send") {
+		t.Fatalf("counter must track the first pick:\n%s", view())
+	}
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyDown})
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter}) // pick dave
+	if !strings.Contains(view(), "2 selected — Enter to send") {
+		t.Fatalf("counter must track the second pick:\n%s", view())
+	}
+	m = stepInvite(m, tea.KeyMsg{Type: tea.KeyEnter}) // un-pick dave
+	if !strings.Contains(view(), "1 selected — Enter to send") {
+		t.Fatalf("counter must shrink on an un-toggle:\n%s", view())
+	}
+}
+
 // TestInviteWindowRevealStaged: the open reveal is staged over tea.Tick
 // frames — frame 0 paints bare chrome, each 50ms tick reveals more rows,
 // the last frame is the settled window. Stale generations stay inert, and
@@ -425,7 +651,7 @@ func TestInviteWindowGroupedRoles(t *testing.T) {
 	}
 
 	view := m.View()
-	for _, want := range []string{"Admins", "Members", "eve", "carol", "dave", "1/3"} {
+	for _, want := range []string{"Admins", "Members", "eve", "carol", "dave", "0 selected"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("grouped view missing %q", want)
 		}
@@ -448,7 +674,7 @@ func TestInviteWindowGroupedRoles(t *testing.T) {
 // TestInviteWindowRenders: the window paints in the drawer standard — the
 // "Invite — Design" header with the esc hint, the role-grouped candidate
 // rows with pick checks, the Send button and the keymap footer with the
-// count.
+// LIVE picked counter ("n selected — Enter to send").
 func TestInviteWindowRenders(t *testing.T) {
 	_, c, code, _ := inviteFixture(t)
 	m := settleInviteReveal(newInviteModel(c, code, "Design", c.groups[code].sig, c.width, c.height))
@@ -463,8 +689,9 @@ func TestInviteWindowRenders(t *testing.T) {
 	if !strings.Contains(view, "esc") {
 		t.Error("invite header must paint the esc hint (drawer header contract)")
 	}
-	if !strings.Contains(view, "2/2") {
-		t.Errorf("invite footer must paint the sel/count (2/2), got:\n%s", view)
+	// The footer counts the LIVE picks in the spec string.
+	if !strings.Contains(view, "1 selected — Enter to send") {
+		t.Errorf("invite footer must paint %q, got:\n%s", "1 selected — Enter to send", view)
 	}
 	// Picked rows carry a legible check; the selected row wears the bar.
 	if !strings.Contains(view, "✓") {

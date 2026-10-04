@@ -16,13 +16,16 @@ import (
 // conversations through the existing chat model.
 
 // groupInvite is one pending invite row from GET /invites/mine (newest
-// first, server caps at 50).
+// first, server caps at 50). at is epoch-MILLIS — the server emits a JSON
+// NUMBER, so the Go field is int64 (a string here produced the
+// "cannot unmarshal number into Go struct field groupInvite.at" failure
+// that surfaced as "invites unavailable" in the settings window).
 type groupInvite struct {
 	Code      string `json:"code"`
 	GroupName string `json:"groupName"`
 	GroupDesc string `json:"groupDesc"`
 	By        string `json:"by"`
-	At        string `json:"at"`
+	At        int64  `json:"at"`
 }
 
 // groupConvPrefix namespaces group conversation buckets. Group messages are

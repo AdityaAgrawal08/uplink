@@ -339,7 +339,10 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		meta := f.groupMeta[code]
-		inv := groupInvite{Code: code, GroupName: meta.name, GroupDesc: meta.desc, By: me, At: time.Now().Format(time.RFC3339)}
+		// The REAL server emits at as epoch-MILLIS (a JSON number) — the fake
+		// mirrors the contract so decode stays honest (a string here once hid
+		// the client's number-into-string bug).
+		inv := groupInvite{Code: code, GroupName: meta.name, GroupDesc: meta.desc, By: me, At: time.Now().UnixMilli()}
 		// Replace a stale invite for the same code (re-invite refreshes).
 		kept := f.invites[body.Username][:0]
 		for _, old := range f.invites[body.Username] {
