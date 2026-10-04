@@ -18,6 +18,12 @@ import { anonymizeIp } from "./crypto";
 //   room:{code}:sig:{username}  list  JSON notes {from, type, payload, ts} (5 min TTL)
 //   room:{code}:inbox:{username} hash msgId -> JSON box {msgId, from, kind, payload, ts} (1h TTL)
 //   room:{code}:reactions       hash  {msgId}|{emoji}|{username} -> "1" (room-lifetime TTL)
+//   room:{code}:invites         hash  invitee username -> JSON {by, at, groupName} (pending invites; room-lifetime TTL)
+//   user:{username}:invites     hash  room code -> "1" (per-user pending-invite index; capped, room-lifetime TTL)
+//
+// Meta extension (group rooms): the room hash's JSON doc carries optional
+// groupName (1-64), groupDesc (0-256), maxMembers (int >= 2, or null/absent
+// = unlimited) and parentCode (the main room a group branches from).
 //
 // Roles: creator (main admin, rank 2) > admin (rank 1) > member (rank 0).
 // Kick: creator kicks anyone but self; admins kick members only; members
@@ -56,6 +62,9 @@ export const REACTION_EMOJI = ["👍", "❤️", "😂", "😮", "😢", "🙏"]
 export type ReactionEmoji = (typeof REACTION_EMOJI)[number];
 export const MAX_REACTION_MESSAGES = 50; // one fetch never exceeds ~50 messages (mirrors FETCH_BOX_CAP)
 export const MAX_REACTION_REACTORS = 20; // per-emoji usernames in a `details` entry (counts carry the true total)
+export const MAX_PENDING_INVITES = 50; // per-user pending-invite index cap (GET /invites/mine stays bounded)
+export const GROUP_NAME_MAX = 64; // groupName length cap (1-64 at create)
+export const GROUP_DESC_MAX = 256; // groupDesc length cap (0-256 at create)
 
 export class RoomError extends Error {
   status: number;
@@ -81,6 +90,7 @@ export interface MemberInfo {
   username: string;
   pubkey: string;
   beat: number;
+  joinedAt: number; // join timestamp; immutable (join order breaks creator-successor ties)
   online: boolean;
   role: Role;
   peerId?: string;
@@ -109,6 +119,8 @@ const epochKey = (code: string) => `room:${code}:epoch`;
 const sigKey = (code: string, username: string) => `room:${code}:sig:${username}`;
 const inboxKey = (code: string, username: string) => `room:${code}:inbox:${username}`;
 const reactionsKey = (code: string) => `room:${code}:reactions`;
+const invitesKey = (code: string) => `room:${code}:invites`;
+const userInvitesKey = (username: string) => `user:${username}:invites`;
 
 // bumpEpoch advances the roster generation after any membership change
 // (join, leave, stale-prune). Polling clients compare it against their last
@@ -215,7 +227,7 @@ export function parseStored<T>(raw: unknown): T | null {
 }
 
 function parseMember(username: string, raw: unknown): MemberInfo | null {
-  const m = parseStored<{ pubkey?: unknown; beat?: unknown; peerId?: unknown; addrs?: unknown; role?: unknown }>(raw);
+  const m = parseStored<{ pubkey?: unknown; beat?: unknown; peerId?: unknown; addrs?: unknown; role?: unknown; joinedAt?: unknown }>(raw);
   if (!m) return null;
     if (typeof m.pubkey !== "string") return null;
     const beat = typeof m.beat === "number" ? m.beat : 0;
@@ -225,6 +237,7 @@ function parseMember(username: string, raw: unknown): MemberInfo | null {
       beat,
       online: Date.now() - beat <= PRESENCE_TIMEOUT_MS,
       role: parseRole(m.role),
+      joinedAt: typeof m.joinedAt === "number" ? m.joinedAt : beat, // legacy pre-joinedAt members: stored beat is the only proxy
     };
     if (typeof m.peerId === "string") info.peerId = m.peerId;
     if (Array.isArray(m.addrs)) info.addrs = m.addrs.filter((a): a is string => typeof a === "string");
@@ -232,9 +245,9 @@ function parseMember(username: string, raw: unknown): MemberInfo | null {
 }
 
 // Refresh the sliding TTL safety net on room + roster + epoch + bans +
-// reactions (one round trip). Skipping epoch/bans here would let them decay
-// under an active room: the generation would rewind and kicked users could
-// return.
+// reactions + invites (one round trip). Skipping epoch/bans/invites here
+// would let them decay under an active room: the generation would rewind
+// and kicked users could return; pending invites would silently die.
 async function touchRoom(code: string): Promise<void> {
   await redis.pipeline([
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
@@ -242,6 +255,7 @@ async function touchRoom(code: string): Promise<void> {
     { cmd: "expire", key: epochKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: bannedKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: reactionsKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: invitesKey(code), args: [ROOM_TTL_SEC] },
   ]);
 }
 
@@ -254,23 +268,48 @@ export interface RoomMeta {
   passwordHash: string | null;
   createdAt: string;
   creator: string | null; // room creator (null = pre-roles room: moderation disabled)
+  groupName: string | null; // group display name (1-64 at create; null = plain room)
+  groupDesc: string | null; // group description (0-256 at create; null = none)
+  maxMembers: number | null; // hard member cap (int >= 2; null = unlimited)
+  parentCode: string | null; // main room this group branches from (optional)
 }
 
-export async function getRoomMeta(code: string): Promise<RoomMeta | null> {
-  const meta = await hgetall(roomKey(code));
+// Stored room metadata lives in ONE field ("meta") of the room hash as a
+// JSON doc. parseRoomMeta decodes it from a raw HGETALL, tolerating backend
+// differences via parseStored (real Upstash auto-parses JSON-ish strings
+// into objects; MockRedis returns the stored string verbatim).
+interface StoredRoomMeta {
+  passwordHash?: unknown;
+  createdAt?: unknown;
+  creator?: unknown;
+  groupName?: unknown;
+  groupDesc?: unknown;
+  maxMembers?: unknown;
+  parentCode?: unknown;
+}
+
+function parseRoomMeta(meta: Record<string, string> | null): RoomMeta | null {
   if (!meta) return null;
   // BUGFIX x2: (1) room metadata lives under the single "meta" field, not
   // top-level; (2) real Upstash auto-parses the JSON string into an object,
   // so a typeof-string gate kills it. parseStored tolerates both shapes.
-  const parsed = parseStored<{ passwordHash?: unknown; createdAt?: unknown; creator?: unknown }>(
-    (meta as Record<string, unknown>).meta
-  );
+  const parsed = parseStored<StoredRoomMeta>((meta as Record<string, unknown>).meta);
   if (!parsed) return null;
   return {
     passwordHash: typeof parsed.passwordHash === "string" ? parsed.passwordHash : null,
     createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : "",
     creator: typeof parsed.creator === "string" ? parsed.creator : null,
+    groupName: typeof parsed.groupName === "string" ? parsed.groupName : null,
+    groupDesc: typeof parsed.groupDesc === "string" ? parsed.groupDesc : null,
+    maxMembers: typeof parsed.maxMembers === "number" && Number.isInteger(parsed.maxMembers) && parsed.maxMembers >= 2
+      ? parsed.maxMembers
+      : null,
+    parentCode: typeof parsed.parentCode === "string" ? parsed.parentCode : null,
   };
+}
+
+export async function getRoomMeta(code: string): Promise<RoomMeta | null> {
+  return parseRoomMeta(await hgetall(roomKey(code)));
 }
 
 export async function checkCreateLimit(ipHash: string): Promise<void> {
@@ -282,7 +321,7 @@ export async function checkCreateLimit(ipHash: string): Promise<void> {
   }
 }
 
-export async function checkSendLimit(kind: "sig" | "inbox" | "reactions", ipHash: string): Promise<void> {
+export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invites", ipHash: string): Promise<void> {
   const key = `rate:${kind}:${ipHash}`;
   const hits = await redis.incr(key);
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
@@ -329,27 +368,64 @@ export function scopedBudgetKey(req: Request, username: string): string {
   return clientIpHash(req) + ":" + username;
 }
 
+// Group-room extensions accepted at create. All optional; maxMembers null
+// = unlimited. parentCode links a group to its main room (format-checked
+// only — the parent need not exist for the group to function).
+export interface CreateRoomOptions {
+  groupName?: string;
+  groupDesc?: string;
+  maxMembers?: number | null;
+  parentCode?: string | null;
+}
+
 export async function createRoom(
   username: string,
   pubkey: string,
-  passwordHash: string | null
+  passwordHash: string | null,
+  opts: CreateRoomOptions = {}
 ): Promise<{ sessionId: string }> {
   assertUsername(username);
   assertPubkey(pubkey);
+  // Group meta validation: lengths are enforced here (not in the route) so
+  // every caller — HTTP and tests alike — meets the same contract.
+  if (opts.groupName !== undefined) {
+    if (typeof opts.groupName !== "string" || opts.groupName.length < 1 || opts.groupName.length > GROUP_NAME_MAX) {
+      throw new RoomError(400, `groupName must be a string of 1-${GROUP_NAME_MAX} characters`);
+    }
+  }
+  if (opts.groupDesc !== undefined) {
+    if (typeof opts.groupDesc !== "string" || opts.groupDesc.length > GROUP_DESC_MAX) {
+      throw new RoomError(400, `groupDesc must be a string of at most ${GROUP_DESC_MAX} characters`);
+    }
+  }
+  if (opts.maxMembers !== undefined && opts.maxMembers !== null) {
+    if (typeof opts.maxMembers !== "number" || !Number.isInteger(opts.maxMembers) || opts.maxMembers < 2) {
+      throw new RoomError(400, "maxMembers must be an integer of at least 2, or null for unlimited");
+    }
+  }
+  if (opts.parentCode !== undefined && opts.parentCode !== null) {
+    assertRoomCode(opts.parentCode);
+  }
+  const now = Date.now();
+  const metaDoc: Record<string, unknown> = {
+    passwordHash,
+    createdAt: new Date().toISOString(),
+    creator: username,
+  };
+  if (opts.groupName !== undefined) metaDoc.groupName = opts.groupName;
+  if (opts.groupDesc !== undefined) metaDoc.groupDesc = opts.groupDesc;
+  if (opts.maxMembers !== undefined && opts.maxMembers !== null) metaDoc.maxMembers = opts.maxMembers;
+  if (opts.parentCode !== undefined && opts.parentCode !== null) metaDoc.parentCode = opts.parentCode;
 
   for (let attempt = 0; attempt < 10; attempt++) {
     const code = generateRoomCode();
-    const created = await redis.hsetnx(roomKey(code), "meta", JSON.stringify({
-      passwordHash,
-      createdAt: new Date().toISOString(),
-      creator: username,
-    }));
+    const created = await redis.hsetnx(roomKey(code), "meta", JSON.stringify(metaDoc));
     if (created === 0) continue; // collision — regenerate
     // Claim the creator and arm TTLs in one round trip. The hsetnx result
     // tells us if our own username somehow raced us (rollback + retry).
     // The creator owns the room: member role for moderation rank.
     const [claimed] = (await redis.pipeline([
-      { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now(), role: "creator" })] },
+      { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: now, role: "creator", joinedAt: now })] },
       { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
       { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     ])) as [number, unknown, unknown];
@@ -374,18 +450,43 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   assertUsername(username);
   assertPubkey(pubkey);
 
-  if (!(await roomExists(code))) {
+  // Room meta + ban state + member count in one round trip: the count feeds
+  // the maxMembers gate below and the meta doubles as the existence proof
+  // (no separate roomExists round trip).
+  const [metaRaw, banned, memberCount] = (await redis.pipeline([
+    { cmd: "hgetall", key: roomKey(code), args: [] },
+    { cmd: "hget", key: bannedKey(code), args: [username] },
+    { cmd: "hlen", key: membersKey(code), args: [] },
+  ])) as [Record<string, string> | null, string | null, number];
+  if (isEmptyRecord(metaRaw)) {
     throw new RoomError(404, "Session not found");
   }
   // Kicked users stay out while the room lives.
-  if (await redis.hget(bannedKey(code), username)) {
+  if (banned) {
     throw new RoomError(403, "You were kicked from this session");
   }
+  // Max-capacity gate: count BEFORE insert, so the room never exceeds
+  // maxMembers via this path (null = unlimited). ATOMICITY LIMITATION —
+  // this is check-then-add: the hlen above and the hsetnx below are
+  // separate round trips, so concurrent joiners can both pass the gate and
+  // oversubscribe by a few seats (classic TOCTOU; MockRedis pipelines run
+  // sequentially in-process, so tests see an atomicity the real backend
+  // does not guarantee). Making the claim itself conditional needs a Lua
+  // script or WATCH/MULTI, which neither MockRedis nor the Upstash REST
+  // pipeline supports here; clients poll the roster within 2s and
+  // self-correct, so a rare overshoot by N simultaneous joiners is
+  // acceptable — and the accept-invite path consumes the invite on this
+  // exact 403, so a full room never strands a pending invite.
+  const meta = parseRoomMeta(metaRaw);
+  if (meta?.maxMembers != null && memberCount >= meta.maxMembers) {
+    throw new RoomError(403, "Maximum allowance is reached");
+  }
+  const now = Date.now();
   // Claim + TTLs + fresh roster in one round trip. Joiners start as
   // members; roles are granted explicitly (existing roles survive rejoins
   // via the 409 path below — re-claiming never demotes).
   const [claimed, , , rosterRaw] = (await redis.pipeline([
-    { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: Date.now(), role: "member" })] },
+    { cmd: "hsetnx", key: membersKey(code), args: [username, JSON.stringify({ pubkey, beat: now, role: "member", joinedAt: now })] },
     { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "hgetall", key: membersKey(code), args: [] },
@@ -393,7 +494,7 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   if (claimed === 0) {
     const existing = await redis.hget(membersKey(code), username);
     if (existing && !parseMember(username, existing)) {
-      await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: Date.now(), role: "member" }));
+      await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: now, role: "member", joinedAt: now }));
       return { roster: rosterFrom(await hgetall(membersKey(code))), epoch: await bumpEpochBestEffort(code) };
     }
     throw new RoomError(409, "Username already taken");
@@ -458,6 +559,7 @@ export async function heartbeat(
     pubkey: current?.pubkey ?? "",
     beat: Date.now(),
     role: current?.role ?? "member", // beats never demote: role changes only via setRole
+    joinedAt: current?.joinedAt ?? Date.now(), // join order is immutable: heartbeats never rewrite it
   };
   if (patch.peerId !== undefined) entry.peerId = patch.peerId;
   else if (current?.peerId !== undefined) entry.peerId = current.peerId;
@@ -479,7 +581,10 @@ export async function heartbeat(
 }
 
 // Remove a member. When the room empties, destroy it immediately — rooms
-// live until the last user leaves, never by timeout.
+// live until the last user leaves, never by timeout. When the CREATOR
+// leaves a non-empty room, the crown passes to the oldest surviving admin
+// (by join time); with no admins, to the oldest surviving member (see
+// transferCreator).
 export async function leaveRoom(code: string, username: string): Promise<{ remaining: number; ended: boolean }> {
   assertRoomCode(code);
   assertUsername(username);
@@ -489,6 +594,7 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
     const count = all ? Object.keys(all).length : 0;
     return { remaining: count, ended: count === 0 };
   }
+  const leaverIsCreator = parseMember(username, all[username])?.role === "creator";
   // Best-effort cleanup of this member's transient queues (their failure
   // must never block the leave itself).
   await redis.pipeline([
@@ -504,10 +610,70 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
     await unindexRoom(code);
     ended = true;
   } else {
+    // The creator leaving transfers the crown (best-effort: a failed
+    // transfer degrades to "no creator" — moderation gated off — and must
+    // never block the leave itself).
+    if (leaverIsCreator) {
+      await transferCreator(code, all, username).catch(() => {});
+    }
     await touchRoom(code);
     await bumpEpochBestEffort(code); // survivors must learn the departure ASAP
   }
   return { remaining, ended };
+}
+
+// Crown transfer: the oldest surviving admin (by joinedAt — the immutable
+// join timestamp stamped at create/join and preserved through heartbeats
+// and role changes) inherits the room; if no admin survives, the oldest
+// surviving member does. Both the meta `creator` field and the successor's
+// member role move, so moderation powers (kick/grant) follow the crown —
+// a successor with a stale "admin"/"member" role would hold the title
+// without the privileges.
+async function transferCreator(
+  code: string,
+  all: Record<string, string>,
+  leaver: string
+): Promise<void> {
+  const survivors: MemberInfo[] = [];
+  for (const [name, raw] of Object.entries(all)) {
+    if (name === leaver) continue;
+    const m = parseMember(name, raw);
+    if (m) survivors.push(m);
+  }
+  if (survivors.length === 0) return;
+  const admins = survivors.filter((m) => m.role === "admin");
+  const pool = admins.length > 0 ? admins : survivors;
+  const successor = pool.reduce((a, b) => (b.joinedAt < a.joinedAt ? b : a));
+
+  const entry: Record<string, unknown> = {
+    pubkey: successor.pubkey,
+    beat: Date.now(), // fresh beat: the new creator is present by definition
+    role: "creator",
+    joinedAt: successor.joinedAt,
+  };
+  if (successor.peerId !== undefined) entry.peerId = successor.peerId;
+  if (successor.addrs !== undefined) entry.addrs = successor.addrs;
+  const meta = await getRoomMeta(code);
+  if (!meta) return; // meta vanished mid-flight: nothing to crown
+  await redis.pipeline([
+    { cmd: "hset", key: membersKey(code), args: [successor.username, JSON.stringify(entry)] },
+    {
+      cmd: "hset",
+      key: roomKey(code),
+      args: [
+        "meta",
+        JSON.stringify({
+          passwordHash: meta.passwordHash,
+          createdAt: meta.createdAt,
+          creator: successor.username,
+          groupName: meta.groupName,
+          groupDesc: meta.groupDesc,
+          maxMembers: meta.maxMembers,
+          parentCode: meta.parentCode,
+        }),
+      ],
+    },
+  ]);
 }
 
 // ─── Moderation (creator/admin privileges) ─────────────────────────────────
@@ -603,6 +769,7 @@ export async function setRole(
     pubkey: targetMember.pubkey,
     beat: Date.now(),
     role,
+    joinedAt: targetMember.joinedAt, // role changes never reorder join time
   };
   if (targetMember.peerId !== undefined) entry.peerId = targetMember.peerId;
   if (targetMember.addrs !== undefined) entry.addrs = targetMember.addrs;
@@ -614,12 +781,29 @@ export async function setRole(
 
 export async function destroyRoom(code: string): Promise<void> {
   const members = (await hgetall(membersKey(code))) || {};
-  const keys = [roomKey(code), membersKey(code), epochKey(code), bannedKey(code), reactionsKey(code)];
+  const invites = (await hgetall(invitesKey(code))) || {};
+  const ops: PipeOp[] = [
+    { cmd: "del", key: roomKey(code), args: [] },
+    { cmd: "del", key: membersKey(code), args: [] },
+    { cmd: "del", key: epochKey(code), args: [] },
+    { cmd: "del", key: bannedKey(code), args: [] },
+    { cmd: "del", key: reactionsKey(code), args: [] },
+    { cmd: "del", key: invitesKey(code), args: [] },
+  ];
   for (const username of Object.keys(members)) {
-    keys.push(sigKey(code, username), inboxKey(code, username));
+    ops.push(
+      { cmd: "del", key: sigKey(code, username), args: [] },
+      { cmd: "del", key: inboxKey(code, username), args: [] }
+    );
   }
-  if (keys.length === 0) return;
-  await redis.pipeline(keys.map((key) => ({ cmd: "del" as const, key, args: [] as (string | number)[] }))).catch(() => [] as unknown[]);
+  // Reap this room's fields from each pending invitee's per-user index
+  // (best-effort: a vanished index key costs nothing; other rooms' invites
+  // on the same index survive).
+  for (const invitee of Object.keys(invites)) {
+    ops.push({ cmd: "hdel", key: userInvitesKey(invitee), args: [code] });
+  }
+  if (ops.length === 0) return;
+  await redis.pipeline(ops).catch(() => [] as unknown[]);
 }
 
 // ─── Signaling notes (WebRTC SDP/ICE rendezvous) ────────────────────────────
@@ -985,6 +1169,181 @@ export async function fetchReactions(
   }
   reactions.sort((a, b) => (a.msgId < b.msgId ? -1 : a.msgId > b.msgId ? 1 : 0));
   return { reactions: reactions.slice(0, MAX_REACTION_MESSAGES) };
+}
+
+// ─── Group invites (any member may invite; per-room hash) ───────────────────
+//
+// Invites are room-scoped like reactions: ONE hash per room
+// (`room:{code}:invites`, field = invitee username -> JSON {by, at,
+// groupName}), so a room's pending invites read in one HGETALL and die with
+// the room. groupName is snapshotted into the invite at send time (the
+// "what is this room" line clients show); groupDesc is read from live room
+// meta at listing time (too long to snapshot).
+//
+// A bounded per-user index (`user:{username}:invites`, field = room code ->
+// "1") backs GET /invites/mine: without it, listing pending invites would
+// require scanning the global room index. The index is capped at
+// MAX_PENDING_INVITES per user (new invites past the cap are 429; re-invites
+// of an existing field refresh without growing), refreshed on every
+// invite/accept/decline, and its fields are reaped when rooms die
+// (destroyRoom) and defensively on read when a room has vanished. The index
+// rides the same sliding TTL as the room hashes it points at, so a stale
+// entry never outlives its room by more than the room's own lifetime.
+
+export interface InviteRecord {
+  code: string;
+  groupName: string | null; // snapshot at invite time ("" rooms read as null)
+  groupDesc: string | null; // live from room meta
+  by: string; // inviter username
+  at: number; // epoch ms of the (latest) invite
+}
+
+const MAX_INVITE_INDEX_SCAN = MAX_PENDING_INVITES; // defense in depth: index is capped at write, re-capped here
+
+// createInvite: any member of the room may invite any non-member, non-banned
+// username. Re-inviting an already-pending invitee is idempotent — it
+// refreshes {by, at} in place (and never grows the index past its cap).
+export async function createInvite(code: string, inviter: string, invitee: string): Promise<void> {
+  assertRoomCode(code);
+  assertUsername(inviter);
+  assertUsername(invitee);
+  if (inviter === invitee) throw new RoomError(400, "You cannot invite yourself");
+
+  // Members + meta + ban state + existing invite + index depth in one round
+  // trip: the invitee checks are all read-only gates.
+  const [membersRaw, metaRaw, banned, existingRaw, indexCount] = (await redis.pipeline([
+    { cmd: "hgetall", key: membersKey(code), args: [] },
+    { cmd: "hgetall", key: roomKey(code), args: [] },
+    { cmd: "hget", key: bannedKey(code), args: [invitee] },
+    { cmd: "hget", key: invitesKey(code), args: [invitee] },
+    { cmd: "hlen", key: userInvitesKey(invitee), args: [] },
+  ])) as [Record<string, string> | null, Record<string, string> | null, string | null, string | null, number];
+  if (isEmptyRecord(membersRaw) || isEmptyRecord(metaRaw)) throw new RoomError(404, "Session not found");
+  if (!membersRaw![inviter]) throw new RoomError(403, "Not in this session");
+  if (membersRaw![invitee]) throw new RoomError(409, "User is already in this session");
+  if (banned) throw new RoomError(403, "This user was kicked from this session");
+  // New invites past the per-user cap are refused; re-invites of a pending
+  // field never grow the index, so they pass even at the cap.
+  if (!existingRaw && indexCount >= MAX_PENDING_INVITES) {
+    throw new RoomError(429, "Too many pending invites. Accept or decline some before inviting more.");
+  }
+  const meta = parseRoomMeta(metaRaw);
+  const groupName = meta?.groupName ?? "";
+  await redis.pipeline([
+    { cmd: "hset", key: invitesKey(code), args: [invitee, JSON.stringify({ by: inviter, at: Date.now(), groupName })] },
+    { cmd: "expire", key: invitesKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "hset", key: userInvitesKey(invitee), args: [code, "1"] },
+    { cmd: "expire", key: userInvitesKey(invitee), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
+  ]);
+}
+
+// getInvitesForUser lists every pending invite for the caller across rooms
+// (the per-user index), newest first. Rooms that vanished between index
+// write and read are skipped AND pruned from the index — the same
+// ROOM_INDEX-style pruning the sweep does for rooms themselves, done
+// defensively on read because sweep cannot iterate user indexes.
+export async function getInvitesForUser(username: string): Promise<InviteRecord[]> {
+  assertUsername(username);
+  const index = await hgetall(userInvitesKey(username));
+  if (!index) return [];
+  const codes = Object.keys(index)
+    .filter((c) => ROOM_CODE_RE.test(c))
+    .slice(0, MAX_INVITE_INDEX_SCAN);
+  if (codes.length === 0) return [];
+  // All room metas + invite hashes in one pipelined round trip (2 ops/room).
+  const ops: PipeOp[] = [];
+  for (const c of codes) {
+    ops.push({ cmd: "hgetall", key: roomKey(c), args: [] });
+    ops.push({ cmd: "hgetall", key: invitesKey(c), args: [] });
+  }
+  const results = await redis.pipeline(ops);
+  const out: InviteRecord[] = [];
+  const vanished: string[] = [];
+  for (let i = 0; i < codes.length; i++) {
+    const meta = parseRoomMeta(results[i * 2] as Record<string, string> | null);
+    if (!meta) {
+      vanished.push(codes[i]); // room died without cleanup (TTL) — reap index entry
+      continue;
+    }
+    const raw = (results[i * 2 + 1] as Record<string, string> | null)?.[username];
+    const stored = parseStored<{ by?: unknown; at?: unknown; groupName?: unknown }>(raw);
+    if (!stored || typeof stored.by !== "string" || typeof stored.at !== "number") {
+      vanished.push(codes[i]); // invite consumed/corrupt while the room lives — reap index entry
+      continue;
+    }
+    out.push({
+      code: codes[i],
+      groupName: typeof stored.groupName === "string" && stored.groupName.length > 0 ? stored.groupName : null,
+      groupDesc: meta.groupDesc,
+      by: stored.by,
+      at: stored.at,
+    });
+  }
+  if (vanished.length > 0) {
+    await redis.hdel(userInvitesKey(username), ...vanished).catch(() => 0);
+  }
+  out.sort((a, b) => b.at - a.at);
+  return out;
+}
+
+// consumeInvite removes a pending invite from both the room hash and the
+// invitee's index. Best-effort on purpose: cleanup failure must never fail
+// the accept/decline that triggered it.
+async function consumeInvite(code: string, username: string): Promise<void> {
+  await redis.pipeline([
+    { cmd: "hdel", key: invitesKey(code), args: [username] },
+    { cmd: "hdel", key: userInvitesKey(username), args: [code] },
+    { cmd: "expire", key: userInvitesKey(username), args: [ROOM_TTL_SEC] }, // keep the safety net on remaining entries
+  ]).catch(() => [] as unknown[]);
+}
+
+// acceptInvite joins the caller to the room the invite names. The invite
+// must exist (404 otherwise). A full room rejects with the exact
+// "Maximum allowance is reached" message AND consumes the invite — a
+// full room never strands a pending seat. On success the join happens
+// first, then the invite is consumed (every path consumes: a stale invite
+// is worse than an unnecessary delete, and re-accepting is then a clean
+// 404).
+export async function acceptInvite(
+  code: string,
+  username: string,
+  pubkey: string
+): Promise<{ roster: MemberInfo[]; epoch: number }> {
+  assertRoomCode(code);
+  assertUsername(username);
+  assertPubkey(pubkey);
+
+  const raw = await redis.hget(invitesKey(code), username);
+  if (!raw) throw new RoomError(404, "Invite not found");
+
+  // Full-room rejection consumes the invite (mirrors the joinRoom gate:
+  // count before insert). The password gate lives in the route, exactly
+  // like the plain join path, so the 401 comes first for protected rooms.
+  const meta = await getRoomMeta(code);
+  if (meta?.maxMembers != null) {
+    const count = await redis.hlen(membersKey(code));
+    if (count >= meta.maxMembers) {
+      await consumeInvite(code, username);
+      throw new RoomError(403, "Maximum allowance is reached");
+    }
+  }
+  try {
+    return await joinRoom(code, username, pubkey);
+  } finally {
+    await consumeInvite(code, username);
+  }
+}
+
+// declineInvite consumes the invite without joining. Requires the invite to
+// exist (404 otherwise), same as accept.
+export async function declineInvite(code: string, username: string): Promise<void> {
+  assertRoomCode(code);
+  assertUsername(username);
+  const raw = await redis.hget(invitesKey(code), username);
+  if (!raw) throw new RoomError(404, "Invite not found");
+  await consumeInvite(code, username);
 }
 
 
