@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 // ---------------------------------------------------------------------------
@@ -560,5 +562,226 @@ func TestOpenPickerStartsInDocuments(t *testing.T) {
 	}
 	if c.picker.cwd != docs {
 		t.Fatalf("picker cwd = %q; want Documents %q", c.picker.cwd, docs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy filter ranking (fzf semantics): matches float by score with the
+// shorter-title tiebreak, non-matches vanish into the muted empty state.
+// ---------------------------------------------------------------------------
+
+func TestPickerFilterFuzzyRankingAndEmptyState(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "file1.txt"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(root, "file10.txt"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(root, "zero.txt"), []byte("x"), 0o644)
+	os.MkdirAll(filepath.Join(root, "fold11"), 0o755)
+	c := newPickerScreenAt(t, root)
+
+	// "/" enters filter mode; "1" filters live per keystroke (cursor resets).
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'1'}})
+	if !c.picker.filtering || c.picker.filter != "1" {
+		t.Fatalf("filter state = %q filtering=%v", c.picker.filter, c.picker.filtering)
+	}
+	// Rows: ".." + fol1d11 + file1.txt + file10.txt; zero.txt vanished;
+	// the shorTer-title tiebreak puts file1.txt before file10.txt.
+	if c.picker.rowCount() != 4 {
+		t.Fatalf("rows = %d; want 4 (.. + fold11 + two matching files)", c.picker.rowCount())
+	}
+	fe := c.picker.filteredEntries()
+	if fe[0].name != "fold11" || fe[1].name != "file1.txt" || fe[2].name != "file10.txt" {
+		t.Fatalf("filtered order = %+v; want fold11, file1.txt, file10.txt (dirs first, shorter wins)", fe)
+	}
+	view := c.View()
+	if strings.Contains(view, "zero.txt") {
+		t.Fatal("non-matching files must vanish from the drawer")
+	}
+
+	// No match at all: the parent row stays reachable (navigation), and
+	// only when NOTHING is left (files mode: no parent row) does the muted
+	// "No matching items" row paint.
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'9'}}) // filter "19"
+	if c.picker.rowCount() != 1 {                                      // just the ".." parent row
+		t.Fatalf("rows after 19 = %d; want 1 (parent only)", c.picker.rowCount())
+	}
+	if !strings.Contains(c.View(), "../") {
+		t.Fatal("the parent row must stay reachable while every entry vanished")
+	}
+	filesSc := newFilterScreen("bob", "")
+	filesSc.vp = *viewportPtr(40, 10)
+	m, _ := filesSc.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	fs := m.(chatScreen)
+	fs = newFilesDrawerAt(fs, []receivedFile{
+		{filename: "grab.bin", from: "alice", size: 25, path: "/tmp/grab.bin", at: time.Now()},
+	})
+	fs, _ = step(fs, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	fs, _ = step(fs, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	if fs.picker.rowCount() != 0 {
+		t.Fatalf("files rows after z = %d; want 0", fs.picker.rowCount())
+	}
+	if !strings.Contains(fs.View(), "No matching items") {
+		t.Fatal("a vanishing files filter must paint the muted no-match row")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Debounced filesystem reload: ~150ms, ONLY on the filter commit — the stale
+// listing keeps painting with the header spinner, never a flash of empty,
+// and a navigation mid-wait fences the stale gen.
+// ---------------------------------------------------------------------------
+
+func TestPickerDebouncedReloadKeepsStaleList(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "alpha.txt"), []byte("x"), 0o644)
+	c := newPickerScreenAt(t, root)
+
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'a'}})
+	got, cmd := step(c, tea.KeyMsg{Type: tea.KeyEnter}) // commit → debounce
+	if !got.picker.loading {
+		t.Fatal("committing the filter must arm the debounced filesystem reload")
+	}
+	inner := got.layoutFor().vpWidth + 2
+	panel := got.pickerView(inner)
+	if !strings.Contains(panel, spinnerGlyph(0)) {
+		t.Fatalf("the header must paint the loading spinner: %q", panel)
+	}
+	if !strings.Contains(panel, "alpha.txt") {
+		t.Fatal("the stale listing must keep painting while loading — never a flash of empty")
+	}
+	// A cursor move during the wait neither cancels nor re-schedules.
+	got, _ = step(got, tea.KeyMsg{Type: tea.KeyDown})
+	if !got.picker.loading {
+		t.Fatal("cursor moves must never touch the in-flight reload")
+	}
+	// Fire the armed reload messages (tick advances the spinner, reload
+	// re-reads and clears loading).
+	msgs := drainCmds(cmd)
+	anyTick, anyReload := false, false
+	for _, m := range msgs {
+		switch m.(type) {
+		case pickerTickMsg:
+			anyTick = true
+		case reloadPickerMsg:
+			anyReload = true
+		}
+		got, _ = step(got, m)
+	}
+	if !anyTick || !anyReload {
+		t.Fatalf("reload cmd must yield spinner tick + reload msg, got %d msgs", len(msgs))
+	}
+	if got.picker.loading {
+		t.Fatal("the reload must clear the loading flag")
+	}
+	// A stale gen (a navigation bumped it) is dropped silently.
+	after := got
+	after.picker.reloadGen++
+	prev := after.picker.reloadGen
+	after, _ = step(after, reloadPickerMsg{gen: prev - 1})
+	if after.picker.loading || after.picker.spin != got.picker.spin {
+		t.Fatal("a stale-gen reload must be ignored")
+	}
+	// The header spinner stops once loading clears.
+	after, _ = step(after, pickerTickMsg{})
+	_ = after
+}
+
+// ---------------------------------------------------------------------------
+// The crumb truncates paths in the MIDDLE (the tail name stays visible).
+// ---------------------------------------------------------------------------
+
+func TestPickerCrumbTruncatesMiddle(t *testing.T) {
+	long := "/home/someone/very/deeply/nested/project/docs/reports/quarterly.md"
+	if got := truncateMiddle(long, 60); lipgloss.Width(got) > 60 || !strings.Contains(got, "…") ||
+		!strings.HasSuffix(stripANSI(got), "quarterly.md") {
+		t.Fatalf("middle truncation failed: %q", got)
+	}
+	if got := truncateMiddle(long, lipgloss.Width(long)); got != long {
+		t.Fatalf("fits: must stay untouched, got %q", got)
+	}
+	// The picker header uses the middle-truncated crumb.
+	c := newPickerScreenAt(t, "/")
+	c.picker.cwd = long
+	panel := c.pickerView(80)
+	if !strings.Contains(panel, "…") {
+		t.Fatalf("picker header must elide the long path: %q", panel)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Picker mouse parity: click selects, wheel steps, Ctrl+C dismisses.
+// ---------------------------------------------------------------------------
+
+func TestPickerMouseParity(t *testing.T) {
+	root := t.TempDir()
+	os.WriteFile(filepath.Join(root, "one.txt"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(root, "two.txt"), []byte("x"), 0o644)
+	c := newPickerScreenAt(t, root)
+	l := c.layoutFor()
+	y0, _ := c.drawerYRange(l)
+	x := transcriptX0(l) + 2
+	itemYs := []int{}
+	for i, r := range c.pickerPanelRows(0) {
+		if r.kind == drItem {
+			itemYs = append(itemYs, y0+i)
+		}
+	}
+	if len(itemYs) < 2 {
+		t.Fatalf("expected item rows, got %v", itemYs)
+	}
+	c.handleMouse(mouseAt(x, itemYs[1]))
+	if c.picker.cursor != 1 {
+		t.Fatalf("click must select the row: cursor=%d; want 1", c.picker.cursor)
+	}
+	c.handleMouse(tea.MouseMsg{Type: tea.MouseWheelUp, X: x, Y: itemYs[1]})
+	if c.picker.cursor != 0 {
+		t.Fatalf("wheel up must step the cursor: cursor=%d; want 0", c.picker.cursor)
+	}
+	got, cmd := step(c, tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd != nil || got.picker.isActive() {
+		t.Fatal("ctrl+c must dismiss the browser, not quit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Home/End/page moves in the browser clamp and centre the window.
+// ---------------------------------------------------------------------------
+
+func TestPickerHomeEndPageClamp(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 30; i++ {
+		os.WriteFile(filepath.Join(root, fmt.Sprintf("f%02d.txt", i)), []byte("x"), 0o644)
+	}
+	c := newPickerScreenAt(t, root) // 31 rows: ".." + 30 files
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyEnd})
+	if c.picker.cursor != 30 {
+		t.Fatalf("End: cursor=%d; want 30", c.picker.cursor)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyHome})
+	if c.picker.cursor != 0 {
+		t.Fatalf("Home: cursor=%d; want 0", c.picker.cursor)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgDown}) // +10
+	if c.picker.cursor != 10 {
+		t.Fatalf("PgDown: cursor=%d; want 10", c.picker.cursor)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgDown})
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgDown})
+	if c.picker.cursor != 30 {
+		t.Fatalf("PgDown must clamp at the end: cursor=%d; want 30", c.picker.cursor)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgUp})
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgUp})
+	if c.picker.cursor != 10 {
+		t.Fatalf("PgUp: cursor=%d; want 10", c.picker.cursor)
+	}
+	// The window keeps the cursor visible (the 30-row list scrolls).
+	panel := c.pickerView(c.layoutFor().vpWidth + 2)
+	if !strings.Contains(panel, "f10.txt") {
+		t.Fatalf("cursor row must stay visible: %q", panel)
+	}
+	if strings.Contains(panel, "f00.txt") {
+		t.Fatalf("scrolled window must not show the top row: %q", panel)
 	}
 }

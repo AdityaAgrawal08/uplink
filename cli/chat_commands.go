@@ -19,6 +19,10 @@ import (
 type slashCommand struct {
 	Name string // canonical form including the leading "/"
 	Desc string // one-line hint painted next to the name
+	// Group is the command's category header, shown while the palette query
+	// is empty (OpenCode-style grouped listing). It also feeds the fuzzy
+	// rank at weight 1x (the name carries 2x).
+	Group string
 	// TakesUser marks commands whose argument is a room member (/kick bob):
 	// once "<cmd> " is typed, the drawer morphs into a member picker.
 	TakesUser bool
@@ -27,41 +31,62 @@ type slashCommand struct {
 // slashCommands is the full catalogue. Keep it the ONLY place a command is
 // declared; execution switches on Name below.
 var slashCommands = []slashCommand{
-	{Name: "/help", Desc: "show available commands"},
-	{Name: "/reply", Desc: "reply to a message"},
-	{Name: "/settings", Desc: "invites & notifications"},
-	{Name: "/new-group", Desc: "create a group with room members"},
-	{Name: "/upload", Desc: "send file(s) into the room"},
-	{Name: "/download", Desc: "fetch shared room files"},
-	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
-	{Name: "/kick", Desc: "kick a user (creator/admin only)", TakesUser: true},
-	{Name: "/admin", Desc: "grant admin (room creator only)", TakesUser: true},
-	{Name: "/unadmin", Desc: "revoke admin (room creator only)", TakesUser: true},
+	{Name: "/help", Desc: "show available commands", Group: "General"},
+	{Name: "/reply", Desc: "reply to a message", Group: "General"},
+	{Name: "/settings", Desc: "invites & notifications", Group: "Settings"},
+	{Name: "/new-group", Desc: "create a group with room members", Group: "Groups"},
+	{Name: "/upload", Desc: "send file(s) into the room", Group: "Files"},
+	{Name: "/download", Desc: "fetch shared room files", Group: "Files"},
+	{Name: "/audio", Desc: "toggle mic to your DM peer / the room", Group: "Voice"},
+	{Name: "/kick", Desc: "kick a user (creator/admin only)", Group: "Moderation", TakesUser: true},
+	{Name: "/admin", Desc: "grant admin (room creator only)", Group: "Moderation", TakesUser: true},
+	{Name: "/unadmin", Desc: "revoke admin (room creator only)", Group: "Moderation", TakesUser: true},
 }
 
 // rankSlashCommands orders items for query "query" ("" = no filter).
 //
 // Ranking contract (what the user sees):
-//  1. commands whose name STARTS WITH the query (case-insensitive) — these are
-//     sorted alphabetically among themselves;
-//  2. then every remaining command in plain dictionary order.
+//  1. an empty query keeps plain dictionary order — the drawer then displays
+//     the commands GROUPED under their category headers;
+//  2. a non-empty query runs the weighted fuzzy rank (title 2x + group 1x),
+//     tie-broken by title-prefix, then shorter title, then frecency, then
+//     stable registry order; non-matching commands vanish (fzf semantics).
+//
+// Menu text is matched against the command name without its leading "/"
+// plus its group label, so "/ge" finds "General"-grouped commands too.
 //
 // Pure function => trivially unit-testable and shared by rendering + selection.
 func rankSlashCommands(items []slashCommand, query string) []slashCommand {
-	q := strings.ToLower(strings.TrimSpace(query))
-	out := make([]slashCommand, len(items))
-	copy(out, items)
+	return rankSlashCommandsF(items, query, nil, time.Time{})
+}
 
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := out[i].Name, out[j].Name
-		ap := strings.HasPrefix(a, q)
-		bp := strings.HasPrefix(b, q)
-		if ap != bp {
-			return ap // prefix matches float to the top
+// rankSlashCommandsF is rankSlashCommands with a frecency history (used by
+// the live screen; nil disables the tiebreak).
+func rankSlashCommandsF(items []slashCommand, query string, frec map[string]frecEntry, now time.Time) []slashCommand {
+	q := strings.TrimSpace(query)
+	if q == "" || q == "/" {
+		out := make([]slashCommand, len(items))
+		copy(out, items)
+		sort.SliceStable(out, func(i, j int) bool {
+			return out[i].Name < out[j].Name // dictionary order inside each group
+		})
+		return out
+	}
+	payload := strings.ToLower(strings.TrimPrefix(q, "/"))
+	hitFor := func(i int) fuzzyHit {
+		stripped := strings.TrimPrefix(items[i].Name, "/")
+		h := rankTitleGroup(payload, stripped, items[i].Group)
+		if h.matched && len(h.matches) > 0 {
+			// display offsets shift by the leading "/" we stripped
+			shifted := make([]int, len(h.matches))
+			for mi, off := range h.matches {
+				shifted[mi] = off + 1
+			}
+			h.matches = shifted
 		}
-		return a < b // dictionary order inside each group
-	})
-	return out
+		return h
+	}
+	return rankFuzzyList(items, hitFor, func(i int) float64 { return frecFor(frec, items[i].Name, now) })
 }
 
 // rankedSlashCommands orders the live registry for the current query.
@@ -110,11 +135,12 @@ func (c *chatScreen) myRole() string {
 	return "member"
 }
 
-// rankedCommands orders the commands visible to OUR role for the query.
+// rankedCommands orders the commands visible to OUR role for the query,
+// with the screen's frecency history as the final tiebreak.
 // Every palette path (paint, budget, keys, Tab, Enter) must use this — never
 // the raw registry — or hidden commands leak back in.
 func (c *chatScreen) rankedCommands(query string) []slashCommand {
-	return rankSlashCommands(visibleSlashCommands(c.myRole()), query)
+	return rankSlashCommandsF(visibleSlashCommands(c.myRole()), query, c.frec, time.Now())
 }
 
 // ---- second-stage member picker --------------------------------------------
@@ -168,22 +194,29 @@ func (c *chatScreen) userCandidates() []rosterMember {
 	return out
 }
 
-// rankUsers orders candidates for a fragment: prefix matches first
-// (case-insensitive), alphabetical inside each group — the same contract as
-// rankSlashCommands, so both picker stages feel identical.
+// rankUsers orders candidates for a fragment: an empty fragment keeps the
+// alphabetical order (the drawer then groups members under role headers);
+// a non-empty fragment runs the same weighted fuzzy rank as commands —
+// title (username) 2x, group (role label) 1x, tie-broken by prefix, shorter,
+// frecency — and non-matching members vanish.
 func rankUsers(users []rosterMember, query string) []rosterMember {
-	q := strings.ToLower(strings.TrimSpace(query))
-	out := make([]rosterMember, len(users))
-	copy(out, users)
-	sort.SliceStable(out, func(i, j int) bool {
-		a, b := strings.ToLower(out[i].Username), strings.ToLower(out[j].Username)
-		ap, bp := strings.HasPrefix(a, q), strings.HasPrefix(b, q)
-		if ap != bp {
-			return ap // prefix matches float to the top
-		}
-		return a < b // dictionary order inside each group
-	})
-	return out
+	return rankUsersF(users, query, nil, time.Time{})
+}
+
+// rankUsersF is rankUsers with a frecency history (nil disables it).
+func rankUsersF(users []rosterMember, query string, frec map[string]frecEntry, now time.Time) []rosterMember {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		out := make([]rosterMember, len(users))
+		copy(out, users)
+		sort.SliceStable(out, func(i, j int) bool {
+			return strings.ToLower(out[i].Username) < strings.ToLower(out[j].Username)
+		})
+		return out
+	}
+	return rankFuzzyList(users,
+		func(i int) fuzzyHit { return rankTitleGroup(q, users[i].Username, userGroupLabel(users[i])) },
+		func(i int) float64 { return frecFor(frec, users[i].Username, now) })
 }
 
 // paletteUsers reports the member-picker state: the command being completed
@@ -193,7 +226,7 @@ func (c *chatScreen) paletteUsers() (cmd string, users []rosterMember, ok bool) 
 	if !ok {
 		return "", nil, false
 	}
-	return cmd, rankUsers(c.userCandidates(), query), true
+	return cmd, rankUsersF(c.userCandidates(), query, c.frec, time.Now()), true
 }
 
 // userRoleTag annotates picker rows: staff stand out, members stay clean.
@@ -210,41 +243,76 @@ func userRoleTag(role string) string {
 
 // ---- palette styling ---------------------------------------------------------
 //
-// The drawer borrows the composer's rounded border + accent colour so the
-// panel reads as if it lifted straight out of the input box.
+// The drawer is an INLINE strip above the composer (not a boxed overlay):
+// one accent top border line, a header, the list window and a footer. Every
+// state owns exactly ONE reusable lipgloss style — the cursor bar, the
+// plain row, the matched-char chip — so all four pickers share one visual
+// language and one style identity.
 
 var (
-	// The drawer borrows the composer's accent so the panel reads as if it
-	// lifted straight out of the input box.
+	// The single top border line borrows the composer's accent so the panel
+	// reads as if it lifted straight out of the input box.
 	tuiPaletteBoxStyle = lipgloss.NewStyle().
 				Border(lipgloss.RoundedBorder(), true).
-				BorderForeground(colAccent) // the focused surface wears the accent
+				BorderForeground(colAccent) // the anchored reaction card keeps its rounded box
 
+	// drawerBorderLineStyle is the drawer's single top border line
+	// (the inline strip contract — the drawer itself is never a box).
+	drawerBorderLineStyle = lipgloss.NewStyle().Foreground(colAccent)
+
+	// Cursor bar — the ONE selected-row style, reused by every picker:
+	// accent background, contrasting ink, bold.
 	tuiPaletteSelStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.AdaptiveColor{Light: "15", Dark: "16"}).
-				Background(colAccent) // accent chip: selected row
+				Foreground(lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#062a46"}).
+				Background(colAccent)
 
+	// Plain (unselected) rows — the ONE resting style: normal text tone.
+	tuiPaletteRowStyle = lipgloss.NewStyle().Foreground(colText)
+
+	// Header titles: bold, in the theme family's normal text tone.
+	tuiPaletteTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(colText)
+
+	// Matched-char highlight, fzf-style: accent on unselected rows…
 	tuiPaletteMatchStyle = lipgloss.NewStyle().
 				Bold(true).
-				Foreground(lipgloss.AdaptiveColor{Light: "#9d174d", Dark: "#f0abfc"}) // the typed prefix
+				Foreground(colAccent)
+	// …and the accent-bright ink on the cursor bar.
+	tuiPaletteMatchSelStyle = lipgloss.NewStyle().
+				Bold(true).
+				Foreground(lipgloss.AdaptiveColor{Light: "#ffffff", Dark: "#e8f9ff"})
 
 	tuiPaletteDescStyle = lipgloss.NewStyle().Foreground(colDim)
 
 	tuiPaletteHintStyle = lipgloss.NewStyle().Foreground(colFaint)
 )
 
-// paletteMaxVisible is the scroll-window size: at most this many command
-// rows paint at once. Longer lists scroll one row at a time with the
-// highlight ("… +N more" below, "… +N above" at the tail).
+// paletteMaxVisible is the DEFAULT scroll-window size for a bare paletteState
+// (tests, pre-resize screens). The live app sizes the window from the
+// terminal instead: drawerMaxRows — at most 10 rows, scaled by half the
+// terminal height (see chat_drawer.go).
 const paletteMaxVisible = 6
 
-// paletteFooterHints is the dim keymap legend under the list.
-const paletteFooterHints = "↑↓ select · tab complete · enter run · esc dismiss"
+// paletteFooterHints is the dim keymap legend under the "/" command list,
+// derived from the keys handlePaletteKeys actually binds.
+const paletteFooterHints = "↑↓ navigate · tab complete · enter select · esc dismiss"
 
 // paletteUserHints is the legend when the drawer morphed into the member
 // picker: Esc steps back to the command instead of dismissing.
-const paletteUserHints = "↑↓ select user · tab complete · enter run · esc back"
+const paletteUserHints = "↑↓ navigate · tab complete · enter run · esc back"
+
+// paletteTitleCommands / paletteTitleUsers are the drawer header titles.
+const (
+	paletteTitleCommands = "Commands"
+	paletteTitleUsers    = "Members"
+)
+
+// palettePayload extracts the filter text of a "/" query: everything after
+// the leading slash, trimmed. "" means the query is empty (grouped display,
+// no fuzzy rank).
+func palettePayload(input string) string {
+	return strings.TrimSpace(strings.TrimPrefix(input, "/"))
+}
 
 // ---- palette state -----------------------------------------------------------
 
@@ -252,14 +320,23 @@ const paletteUserHints = "↑↓ select user · tab complete · enter run · esc
 // typing "/" pops it out ABOVE the input box; it dissolves when the query no
 // longer starts with "/", a row is picked, or Esc is pressed.
 type paletteState struct {
-	open bool
-	sel  int // highlighted row into the last-ranked list
-	off  int // first visible row of the 6-row scroll window
+	open  bool
+	sel   int    // highlighted row into the last-ranked list
+	off   int    // first visible row of the scroll window (item space)
+	win   int    // live window size (0 = paletteMaxVisible default)
+	query string // last-seen filter — a change resets the selection
 }
 
-// sync recomputes visibility from the live composer text.
+// sync recomputes visibility from the live composer text. Filter changes
+// (typing/backspace/paste) reset the selection to the top — the live
+// synchronous filter contract; cursor moves never re-rank.
 func (p *paletteState) sync(text string) {
 	p.open = strings.HasPrefix(text, "/")
+	q := palettePayload(text)
+	if q != p.query {
+		p.query = q
+		p.sel, p.off = 0, 0
+	}
 }
 
 // visible reports whether the panel should paint right now.
@@ -279,7 +356,7 @@ func (p *paletteState) clampSel(n int) {
 	if p.sel < 0 {
 		p.sel = 0
 	}
-	maxOff := max(n-paletteMaxVisible, 0)
+	maxOff := max(n-p.effectiveWin(), 0)
 	if p.off > maxOff {
 		p.off = maxOff
 	}
@@ -289,15 +366,23 @@ func (p *paletteState) clampSel(n int) {
 	if p.sel < p.off {
 		p.off = p.sel
 	}
-	if p.sel > p.off+paletteMaxVisible-1 {
-		p.off = p.sel - paletteMaxVisible + 1
+	if p.sel > p.off+p.effectiveWin()-1 {
+		p.off = p.sel - p.effectiveWin() + 1
 	}
 }
 
+// effectiveWin is the scroll-window size this state is using right now.
+func (p *paletteState) effectiveWin() int {
+	if p.win > 0 {
+		return p.win
+	}
+	return paletteMaxVisible
+}
+
 // moveUp / moveDown shift the highlight with wrap-around (OpenCode behaviour).
-// The 6-row window follows: moving past the last visible row scrolls the
-// window down by one (…5 → 2–7 window), moving above the first visible row
-// scrolls it up by one. Wrapping jumps the window to the far end.
+// The window follows: moving past the last visible row scrolls the window
+// down by one, moving above the first visible row scrolls it up by one.
+// Wrapping jumps the window to the far end.
 func (p *paletteState) moveUp(n int) {
 	if n <= 0 {
 		p.sel = 0
@@ -318,12 +403,44 @@ func (p *paletteState) moveDown(n int) {
 	p.followSel()
 }
 
+// moveHome / moveEnd / movePage jump the highlight without wrap: Home to the
+// top, End to the bottom, pages step by ±10 and CLAMP at the ends (only the
+// arrows wrap). The view centres the window on the destination afterwards.
+func (p *paletteState) moveHome(n int) {
+	if n <= 0 {
+		p.sel, p.off = 0, 0
+		return
+	}
+	p.sel = 0
+}
+
+func (p *paletteState) moveEnd(n int) {
+	if n <= 0 {
+		p.sel, p.off = 0, 0
+		return
+	}
+	p.sel = n - 1
+}
+
+func (p *paletteState) movePage(n, d int) {
+	if n <= 0 {
+		p.sel, p.off = 0, 0
+		return
+	}
+	p.sel += d
+	if p.sel < 0 {
+		p.sel = 0
+	} else if p.sel >= n {
+		p.sel = n - 1
+	}
+}
+
 // followSel scrolls the window the minimum needed to keep sel visible.
 func (p *paletteState) followSel() {
 	if p.sel < p.off {
 		p.off = p.sel
-	} else if p.sel > p.off+paletteMaxVisible-1 {
-		p.off = p.sel - paletteMaxVisible + 1
+	} else if p.sel > p.off+p.effectiveWin()-1 {
+		p.off = p.sel - p.effectiveWin() + 1
 	}
 }
 
@@ -332,29 +449,7 @@ func (p *paletteState) close() {
 	p.open = false
 	p.sel = 0
 	p.off = 0
-}
-
-// drawerRowsBudget converts a candidate count into the drawer slot budget:
-// one blank spacer above the panel, the visible rows (plus the overflow
-// indicator), the keymap footer, and the panel's own border.
-func drawerRowsBudget(n int) int {
-	if n <= 0 {
-		return 0
-	}
-	rows := min(n, paletteMaxVisible)
-	if n > rows {
-		rows++ // "… +N more" overflow indicator
-	}
-	return 1 + rows + 1 + 2 // spacer + commands(+overflow) + hints footer + border
-}
-
-// quoteRows is the exact terminal-row budget a pinned reply citation
-// consumes above the composer: one tinted row, or none.
-func (c chatScreen) quoteRows() int {
-	if c.composerQuote != nil && c.composerQuote.ReplyTo != "" {
-		return 1
-	}
-	return 0
+	p.query = ""
 }
 
 // paletteRows is the exact terminal-row budget the drawer slot consumes
@@ -364,24 +459,31 @@ func (c chatScreen) quoteRows() int {
 // it paints as a transcript row anchored above its message, so the drawer
 // slot stays free. Width never affects the budget (rows truncate, they do
 // not wrap), so this number is deterministic BEFORE layout math runs — which
-// is what lets computeLayoutWithPalette reserve it up front.
+// is what lets computeLayoutWithPalette reserve it up front. The budget
+// derives from the SAME panel rows the painter and the mouse hit-test emit
+// (drawerPanelRows), so the reserved height can never drift from the
+// painted height.
 func (c chatScreen) paletteRows() int {
 	if c.picker.isActive() {
 		return c.pickerRows()
 	}
 	if c.palette.visible() {
-		n := len(c.rankedCommands(c.input.Value()))
-		if _, users, ok := c.paletteUsers(); ok {
-			n = len(users) // member-picker stage budgets member rows, not commands
-		}
-		return drawerRowsBudget(n)
+		return 1 + len(c.palettePanelRows())
 	}
 	if c.mention.visible() {
-		_, users, ok := c.mentionCandidates()
-		if !ok {
+		if _, _, ok := c.mentionCandidates(); !ok {
 			return 0
 		}
-		return drawerRowsBudget(len(users))
+		return 1 + len(c.mentionPanelRows())
+	}
+	return 0
+}
+
+// quoteRows is the exact terminal-row budget a pinned reply citation
+// consumes above the composer: one tinted row, or none.
+func (c chatScreen) quoteRows() int {
+	if c.composerQuote != nil && c.composerQuote.ReplyTo != "" {
+		return 1
 	}
 	return 0
 }
@@ -669,145 +771,269 @@ func (c chatScreen) reactionDetailRows(m chatMessage, emoji string) []string {
 	return c.reactionDetailPaint(m, emoji, reactionDetailAnimFrames-1)
 }
 
-// paletteView renders the pop-out panel for the current composer text. maxW
-// is the outer width budget — the composer's full outer width, so the panel
-// reads as one piece with the input box. Every row is padded to the inner
-// width (selected row's chip then spans edge to edge) and the whole panel is
-// ANSI-truncated if it ever outgrows maxW, so the frame can never wrap.
-// Returns "" when the drawer is closed or nothing matches the query.
+// ---- drawer panels ----------------------------------------------------------
+//
+// drawerPanelRows is THE single source of the drawer's painted row plan:
+// budget (paletteRows), paint (paletteView/drawerView) and the mouse
+// hit-test (drawerSelAt) all derive from these rows, so the reserved height
+// can never drift from the painted height and a click always maps to the row
+// that is actually on screen.
+
+// drawerPanelRows returns the exact panel rows the active mode paints
+// (nil = the slot is free).
+func (c chatScreen) drawerPanelRows() []drawerRow {
+	if c.picker.isActive() {
+		return c.pickerPanelRows(0) // count-only: rows never wrap, width is free
+	}
+	if c.palette.visible() {
+		return c.palettePanelRows()
+	}
+	if c.mention.visible() {
+		return c.mentionPanelRows()
+	}
+	return nil
+}
+
+// commandsPlan builds the display plan for the "/" command drawer: grouped
+// under category headers while the query is empty, flat while filtering.
+func commandsPlan(ranked []slashCommand, win int, grouped bool) drawerPlan {
+	return buildDrawerPlan(len(ranked), grouped, func(i int) string { return ranked[i].Group }, win)
+}
+
+// usersPlan builds the display plan for a member list: grouped under
+// role headers (Admins/Members) while the fragment is empty, flat while
+// filtering.
+func usersPlan(users []rosterMember, win int, grouped bool) drawerPlan {
+	return buildDrawerPlan(len(users), grouped, func(i int) string { return userGroupLabel(users[i]) }, win)
+}
+
+// userGroupLabel is the header an empty-query member list groups under.
+func userGroupLabel(u rosterMember) string {
+	if u.Role == "creator" || u.Role == "admin" {
+		return "Admins"
+	}
+	return "Members"
+}
+
+// palettePanelRows builds the painted rows of the "/" drawer (command stage
+// or member-picker stage): border, header, windowed rows, overflow, footer.
+func (c chatScreen) palettePanelRows() []drawerRow {
+	if _, users, ok := c.paletteUsers(); ok {
+		_, frag, _ := c.userArgTarget(c.input.Value())
+		win := drawerMaxRows(c.height)
+		plan := usersPlan(users, win, frag == "")
+		plan.hits = c.userHits(users, frag)
+		return c.listPanelRows(&c.palette, len(users), plan, paletteTitleUsers, paletteUserHints,
+			func(i int) string { return users[i].Username }, func(i int) string { return userRoleTag(users[i].Role) })
+	}
+	ranked := c.rankedCommands(c.input.Value())
+	payload := palettePayload(c.input.Value())
+	grouped := payload == ""
+	win := drawerMaxRows(c.height)
+	plan := commandsPlan(ranked, win, grouped)
+	plan.hits = c.commandHits(ranked, payload)
+	return c.listPanelRows(&c.palette, len(ranked), plan, paletteTitleCommands, paletteFooterHints,
+		func(i int) string { return ranked[i].Name }, func(i int) string { return ranked[i].Desc })
+}
+
+// commandHits precomputes the fuzzy match data (once per filter keystroke)
+// for the ranked command list; display offsets shift by the leading "/"
+// that the rank stripped.
+func (c chatScreen) commandHits(ranked []slashCommand, payload string) []fuzzyHit {
+	hits := make([]fuzzyHit, len(ranked))
+	for i, cmd := range ranked {
+		if payload == "" {
+			hits[i] = fuzzyHit{matched: true}
+			continue
+		}
+		h := rankTitleGroup(payload, strings.TrimPrefix(cmd.Name, "/"), cmd.Group)
+		if h.matched && len(h.matches) > 0 {
+			shifted := make([]int, len(h.matches))
+			for mi, off := range h.matches {
+				shifted[mi] = off + 1
+			}
+			h.matches = shifted
+		}
+		hits[i] = h
+	}
+	return hits
+}
+
+// userHits precomputes the fuzzy match data for a member list (fragment "" =
+// plain rows, no highlight).
+func (c chatScreen) userHits(users []rosterMember, frag string) []fuzzyHit {
+	hits := make([]fuzzyHit, len(users))
+	for i, u := range users {
+		if frag == "" {
+			hits[i] = fuzzyHit{matched: true}
+			continue
+		}
+		hits[i] = rankTitleGroup(frag, u.Username, userGroupLabel(u))
+	}
+	return hits
+}
+
+// listPanelRows assembles the shared list panel around a display plan: the
+// single top border, the header contract row, the windowed rows (grouped
+// headers + blank separators, or the flat ranked list), the overflow marker
+// and the keymap footer. itemSearchOf supplies each item's highlight source
+// (title); the row carries the precomputed hit, so the matched-char
+// highlight runs once per filter keystroke, not once per row.
+func (c chatScreen) listPanelRows(state *paletteState, items int, plan drawerPlan, title, hints string, itemSearchOf, itemDescOf func(i int) string) []drawerRow {
+	rows, below, above := windowDrawerPlan(plan, state.off, state.sel)
+	panel := make([]drawerRow, 0, len(rows)+5)
+	panel = append(panel, drawerRow{kind: drBorder}, drawerRow{kind: drHeader, text: title})
+	if len(rows) == 0 {
+		panel = append(panel, drawerRow{kind: drEmpty, text: drawerNoMatchText})
+	} else {
+		for _, r := range rows {
+			if r.kind == drItem {
+				r.text = itemSearchOf(r.item)
+				r.desc = itemDescOf(r.item)
+				r.hit = plan.hitOf(r.item)
+			}
+			panel = append(panel, r)
+		}
+		if below > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: below, text: "more"})
+		} else if above > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: above, text: "above"})
+		}
+	}
+	panel = append(panel, drawerRow{kind: drFooter, text: hints, n: items})
+	return panel
+}
+
+// drawerNoMatchText is the muted empty-state row for the list pickers.
+const drawerNoMatchText = "No results found"
+
+// ---- window settling ---------------------------------------------------------
+
+// settleActiveDrawer re-anchors the active picker's window (plan-aware:
+// group headers shift display rows, so the item-space follow used by the
+// bare paletteState is not enough here). Called from the key/mouse handlers
+// (pointer receivers) so the settled state is in place before the next
+// paint — budget, paint and hit-test then all agree on the same window.
+func (c *chatScreen) settleActiveDrawer() {
+	win := drawerMaxRows(c.height)
+	switch {
+	case c.picker.isActive():
+		settleDrawerWindow(&c.picker.cursor, &c.picker.offset, c.pickerItemPlan(win))
+	case c.palette.visible():
+		if _, users, ok := c.paletteUsers(); ok {
+			_, frag, _ := c.userArgTarget(c.input.Value())
+			settleDrawerWindow(&c.palette.sel, &c.palette.off, usersPlan(users, win, frag == ""))
+		} else {
+			ranked := c.rankedCommands(c.input.Value())
+			settleDrawerWindow(&c.palette.sel, &c.palette.off,
+				commandsPlan(ranked, win, palettePayload(c.input.Value()) == ""))
+		}
+	case c.mention.visible():
+		_, users, ok := c.mentionCandidates()
+		if ok {
+			frag, _ := mentionQuery(c.input.Value())
+			settleDrawerWindow(&c.mention.sel, &c.mention.off, usersPlan(users, win, frag == ""))
+		}
+	}
+}
+
+// centerActiveDrawer re-anchors the window CENTERED on the current selection
+// — the behaviour for typing resets, Home/End jumps and ±10 page moves.
+func (c *chatScreen) centerActiveDrawer() {
+	win := drawerMaxRows(c.height)
+	switch {
+	case c.picker.isActive():
+		centerDrawerWindow(&c.picker.cursor, &c.picker.offset, c.pickerItemPlan(win))
+	case c.palette.visible():
+		if _, users, ok := c.paletteUsers(); ok {
+			_, frag, _ := c.userArgTarget(c.input.Value())
+			centerDrawerWindow(&c.palette.sel, &c.palette.off, usersPlan(users, win, frag == ""))
+		} else {
+			ranked := c.rankedCommands(c.input.Value())
+			centerDrawerWindow(&c.palette.sel, &c.palette.off,
+				commandsPlan(ranked, win, palettePayload(c.input.Value()) == ""))
+		}
+	case c.mention.visible():
+		_, users, ok := c.mentionCandidates()
+		if ok {
+			frag, _ := mentionQuery(c.input.Value())
+			centerDrawerWindow(&c.mention.sel, &c.mention.off, usersPlan(users, win, frag == ""))
+		}
+	}
+}
+
+// ---- rendering ---------------------------------------------------------------
+
+// renderPanel paints a drawer row plan into the panel string: every row is
+// single-line and pinned to the inner width, so the painted height equals
+// the row count exactly (the paletteRows() budget) and nothing ever wraps.
+func (c chatScreen) renderPanel(maxW int, rows []drawerRow, sel int) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	inner := maxW
+	// Dynamic name column over the VISIBLE item rows: longest title + gap.
+	nameCol := 0
+	for _, r := range rows {
+		if r.kind == drItem {
+			if w := lipgloss.Width(r.text); w > nameCol {
+				nameCol = w
+			}
+		}
+	}
+	nameCol += 2
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		var line string
+		switch r.kind {
+		case drBorder:
+			line = drawerBorderRow(inner)
+		case drHeader:
+			line = drawerHeaderRow(inner, r.text)
+		case drBlank:
+			line = padVisible("", inner)
+		case drItem:
+			line = drawerItemRow(r, nameCol, inner, r.item == sel)
+		case drOverflow:
+			line = overflowRowView(inner, r.n, r.text == "above")
+		case drEmpty:
+			line = tuiPaletteHintStyle.Render(padVisible(r.text, inner))
+		case drFooter:
+			line = drawerFooterRow(inner, r.text, sel, r.n)
+		default:
+			line = ""
+		}
+		out = append(out, fitRow(line, inner))
+	}
+	return strings.Join(out, "\n")
+}
+
+// drawerItemRow paints ONE selectable row: the highlighted title in a name
+// column, the muted description after it, full-width padding so the cursor
+// bar spans edge to edge. The cursor-bar style and the plain-row style are
+// the two single styles every picker shares.
+func drawerItemRow(r drawerRow, nameCol, inner int, selected bool) string {
+	name := highlightMatches(r.text, r.hit.matches, selected, inner)
+	line := padVisible(name, nameCol) + tuiPaletteDescStyle.Render(r.desc)
+	line = padVisible(line, inner)
+	if selected {
+		line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
+	} else {
+		line = tuiPaletteRowStyle.Render(line)
+	}
+	return line
+}
+
+// paletteView renders the drawer for the current composer text: the member
+// picker when "<cmd> <fragment>" is live, the "/" command list otherwise.
+// maxW is the outer width budget; the panel caps itself at
+// min(maxW, termW-2, 80) and never wraps. The empty state (nothing matches)
+// paints its muted row instead of vanishing.
 func (c chatScreen) paletteView(maxW int) string {
 	if !c.palette.visible() || maxW < 6 {
 		return ""
 	}
-	if _, users, ok := c.paletteUsers(); ok {
-		return c.paletteUsersView(maxW, users)
-	}
-	ranked := c.rankedCommands(c.input.Value())
-	if len(ranked) == 0 {
-		return ""
-	}
-	c.palette.clampSel(len(ranked))
-	off := c.palette.off
-	end := min(off+paletteMaxVisible, len(ranked))
-
-	inner := maxW - 2 // room for the box border
-	query := strings.ToLower(strings.TrimSpace(c.input.Value()))
-
-	// fit hard-clamps a styled row to the panel's inner width. Every row
-	// must stay single-line or the painted height would drift from the
-	// paletteRows() budget reserved inside the layout.
-	fit := func(s string) string {
-		if lipgloss.Width(s) > inner {
-			return lipgloss.NewStyle().MaxWidth(inner).Render(s)
-		}
-		return s
-	}
-
-	nameCol := 0 // dynamic name column: longest visible name + gap
-	for _, cmd := range ranked[off:end] {
-		if w := lipgloss.Width(cmd.Name); w > nameCol {
-			nameCol = w
-		}
-	}
-	nameCol += 2
-
-	rows := make([]string, 0, paletteMaxVisible+2)
-	for idx := off; idx < end; idx++ {
-		cmd := ranked[idx]
-		name := cmd.Name
-		// Highlight the typed prefix inside the command name.
-		if len(name) >= len(query) && len(query) > 0 &&
-			strings.EqualFold(name[:len(query)], query) {
-			name = tuiPaletteMatchStyle.Render(name[:len(query)]) + name[len(query):]
-		}
-		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(cmd.Desc))
-		line = padVisible(line, inner) // full-width rows: chip reaches both edges
-		if idx == c.palette.sel {
-			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-		}
-		rows = append(rows, line)
-	}
-	// Overflow indicator: items below the window keep the old "+N more"
-	// wording; at the tail (nothing below, items above) it reads "+N above".
-	// The row exists whenever the list exceeds the window, so the painted
-	// height always matches the paletteRows() budget.
-	if below := len(ranked) - end; below > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", below)), inner)))
-	} else if above := off; above > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d above", above)), inner)))
-	}
-	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(paletteFooterHints, inner))))
-
-	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
-	if lipgloss.Width(panel) > maxW {
-		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
-	}
-	return panel
-}
-
-// paletteUsersView renders the member-picker stage: one row per candidate
-// (username + role tag), same box/chip/overflow geometry as command rows so
-// the height budget in paletteRows() still holds exactly.
-func (c chatScreen) paletteUsersView(maxW int, users []rosterMember) string {
-	if len(users) == 0 {
-		return ""
-	}
-	c.palette.clampSel(len(users))
-	off := c.palette.off
-	end := min(off+paletteMaxVisible, len(users))
-
-	inner := maxW - 2 // room for the box border
-	query := strings.ToLower(strings.TrimSpace(c.input.Value()))
-	if i := strings.Index(query, " "); i >= 0 {
-		query = strings.TrimLeft(query[i+1:], " ") // match the fragment, not "<cmd> "
-	}
-
-	fit := func(s string) string {
-		if lipgloss.Width(s) > inner {
-			return lipgloss.NewStyle().MaxWidth(inner).Render(s)
-		}
-		return s
-	}
-
-	nameCol := 0
-	for _, u := range users[off:end] {
-		if w := lipgloss.Width(u.Username); w > nameCol {
-			nameCol = w
-		}
-	}
-	nameCol += 2
-
-	rows := make([]string, 0, paletteMaxVisible+2)
-	for idx := off; idx < end; idx++ {
-		u := users[idx]
-		name := u.Username
-		if len(name) >= len(query) && len(query) > 0 &&
-			strings.EqualFold(name[:len(query)], query) {
-			name = tuiPaletteMatchStyle.Render(name[:len(query)]) + name[len(query):]
-		}
-		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(userRoleTag(u.Role)))
-		line = padVisible(line, inner)
-		if idx == c.palette.sel {
-			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-		}
-		rows = append(rows, line)
-	}
-	if below := len(users) - end; below > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", below)), inner)))
-	} else if above := off; above > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d above", above)), inner)))
-	}
-	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(paletteUserHints, inner))))
-
-	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
-	if lipgloss.Width(panel) > maxW {
-		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
-	}
-	return panel
+	return c.renderPanel(drawerMaxW(c.width, maxW), c.palettePanelRows(), c.palette.sel)
 }
 
 // ---- palette key handling ----------------------------------------------------
@@ -819,6 +1045,10 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	if !c.palette.visible() {
 		return false, nil
 	}
+	// The live window derives from the terminal (min(10, termH/2-6)), and
+	// every selection move re-settles the window plan-aware afterwards.
+	c.palette.win = drawerMaxRows(c.height)
+	defer c.settleActiveDrawer()
 	// Member-picker stage: the same drawer completes usernames for the
 	// pending moderation command. Empty candidate list falls through to
 	// submitLine so a hand-typed (possibly stale-presence) name still
@@ -831,11 +1061,29 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 		case tea.KeyDown:
 			c.palette.moveDown(len(users))
 			return true, nil
+		case tea.KeyHome:
+			c.palette.moveHome(len(users))
+			c.centerActiveDrawer()
+			return true, nil
+		case tea.KeyEnd:
+			c.palette.moveEnd(len(users))
+			c.centerActiveDrawer()
+			return true, nil
+		case tea.KeyPgUp:
+			c.palette.movePage(len(users), -10)
+			c.centerActiveDrawer()
+			return true, nil
+		case tea.KeyPgDown:
+			c.palette.movePage(len(users), 10)
+			c.centerActiveDrawer()
+			return true, nil
 		case tea.KeyTab:
 			c.palette.clampSel(len(users))
 			if c.palette.sel < len(users) {
-				c.input.SetValue(cmd + " " + users[c.palette.sel].Username + " ")
+				user := users[c.palette.sel].Username
+				c.input.SetValue(cmd + " " + user + " ")
 				c.palette.close()
+				c.bumpFrec(user)
 			}
 			return true, nil
 		case tea.KeyEnter:
@@ -844,12 +1092,18 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 				user := users[c.palette.sel].Username
 				c.input.SetValue("")
 				c.palette.close()
+				c.bumpFrec(user)
 				return true, func() tea.Cmd { return c.runCommand(cmd, user) }
 			}
 			return true, nil
 		case tea.KeyEsc:
 			// Step back to the command stage, drawer stays open.
 			c.input.SetValue(cmd)
+			return true, nil
+		case tea.KeyCtrlC:
+			// OpenCode parity: Ctrl+C dismisses the drawer outright (Esc
+			// steps back to the command stage).
+			c.palette.close()
 			return true, nil
 		}
 		return false, nil
@@ -861,12 +1115,29 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 	case tea.KeyDown:
 		c.palette.moveDown(len(c.rankedCommands(c.input.Value())))
 		return true, nil
+	case tea.KeyHome:
+		c.palette.moveHome(len(c.rankedCommands(c.input.Value())))
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyEnd:
+		c.palette.moveEnd(len(c.rankedCommands(c.input.Value())))
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyPgUp:
+		c.palette.movePage(len(c.rankedCommands(c.input.Value())), -10)
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyPgDown:
+		c.palette.movePage(len(c.rankedCommands(c.input.Value())), 10)
+		c.centerActiveDrawer()
+		return true, nil
 	case tea.KeyTab:
 		ranked := c.rankedCommands(c.input.Value())
 		c.palette.clampSel(len(ranked))
 		if c.palette.sel < len(ranked) {
 			picked := ranked[c.palette.sel]
 			c.input.SetValue(picked.Name + " ") // complete inline
+			c.bumpFrec(picked.Name)
 			if picked.TakesUser {
 				c.palette.sel = 0 // stay open: morph into the member picker
 				c.palette.off = 0
@@ -891,10 +1162,27 @@ func (c *chatScreen) handlePaletteKeys(msg tea.KeyMsg) (handled bool, action fun
 			name := picked.Name
 			c.input.SetValue("")
 			c.palette.close()
+			c.bumpFrec(name)
 			return true, func() tea.Cmd { return c.runCommand(name, "") }
+		}
+		// Nothing matched. A query shaped like "<cmd> <args>" (a space in
+		// the payload) still sends: close the drawer and let the composer
+		// dispatch the line, so "/upload foo"+Enter keeps working. A bare
+		// unmatched query stays open on its "No results found" state.
+		payload := palettePayload(c.input.Value())
+		if strings.Contains(payload, " ") {
+			line := c.input.Value()
+			c.input.SetValue("")
+			c.palette.close()
+			return true, func() tea.Cmd { return c.submitLine(line) }
 		}
 		return true, nil
 	case tea.KeyEsc:
+		c.palette.close()
+		return true, nil
+	case tea.KeyCtrlC:
+		// OpenCode parity: Ctrl+C dismisses the drawer (the app itself
+		// keeps running — Ctrl+C only quits with no drawer open).
 		c.palette.close()
 		return true, nil
 	}
@@ -1021,9 +1309,13 @@ func padVisible(s string, n int) string {
 // ensurePaletteOpen re-syncs drawer visibility after any edit that was NOT
 // intercepted by handlePaletteKeys (plain typing, backspace, paste…). Called
 // on every non-intercepted KeyMsg so "/" and "@" toggling stay instantaneous.
+// Any such edit is a FILTER change, so the mouse hover is put on hold for
+// one tick (the parity lock: the next motion event is ignored) — the list
+// just re-ranked under the cursor and a stale hover must not fight it.
 func ensurePaletteOpen(c *chatScreen) {
 	c.palette.sync(c.input.Value())
 	c.mention.syncMention(c.input.Value(), c.activeConv() == generalConv)
+	c.drawerHoverLock = 1
 	if c.palette.visible() {
 		// One drawer slot: "/" owns it while open — the "@" dropdown and
 		// the reaction aux rows yield.

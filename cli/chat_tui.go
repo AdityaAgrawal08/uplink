@@ -690,6 +690,16 @@ type chatScreen struct {
 	palette      paletteState    // "/" command drawer above the composer
 	mention      paletteState    // "@" member dropdown (general room only; the palette's mirror)
 	picker       pickerState     // file-browser mode of that drawer (/upload)
+	// frec is the picker/palette usage history behind the ranking's
+	// frecency tiebreak (name-keyed; nil = no history yet).
+	frec map[string]frecEntry
+	// drawerHoverLock is the mouse-parity hold after a filter change: the
+	// next motion event is ignored so a stale hover cannot fight the fresh
+	// ranking (inputMode tracking lives in mouseActive).
+	drawerHoverLock int
+	// mouseActive tracks the last input class (true = mouse): hover
+	// follows rows only while the mouse is actually in play.
+	mouseActive bool
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
@@ -3647,6 +3657,25 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, scheduleCallTick())
 		}
 
+	case reloadPickerMsg:
+		// Debounced filesystem re-read: fires ~150ms after the picker's
+		// filter committed. The stale listing painted with the spinner the
+		// whole time — never a flash of empty. A navigation mid-wait bumps
+		// reloadGen, so a stale gen is dropped silently.
+		if c.picker.isActive() && msg.gen == c.picker.reloadGen {
+			c.picker.loading = false
+			c.loadPickerDir()
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
+	case pickerTickMsg:
+		// Spinner frames while a debounced reload is in flight.
+		if c.picker.isActive() && c.picker.loading {
+			c.picker.spin++
+			cmds = append(cmds, tea.Tick(pickerTickStep, func(time.Time) tea.Msg { return pickerTickMsg{} }))
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
 		// owns the 5s beat; this only renders, every 2s). Membership lives
@@ -4049,6 +4078,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		// Drawer parity: while a picker owns the drawer slot, Ctrl+C
+		// DISMISSES the drawer (OpenCode behaviour) — the app itself never
+		// quits mid-pick. With no drawer open, Ctrl+C keeps its existing
+		// meaning: leave the open group, or leave the session.
+		if msg.Type == tea.KeyCtrlC && c.drawerOpen() {
+			c.closeDrawers()
+			return c, tea.Batch(cmds...)
+		}
 		if msg.Type == tea.KeyCtrlC {
 			// In a group, Ctrl+C LEAVES it (server-side, standard leave
 			// POST) and returns to the common room — the app keeps
@@ -4516,6 +4553,16 @@ const maxSideFilter = 40
 // same time.
 func (c chatScreen) drawerOpen() bool {
 	return c.picker.isActive() || c.palette.visible() || c.mention.visible()
+}
+
+// closeDrawers dismisses whatever owns the drawer slot (Ctrl+C parity:
+// Esc has its staged per-mode behaviour, Ctrl+C is the hard dismiss).
+func (c *chatScreen) closeDrawers() {
+	if c.picker.isActive() {
+		c.closePicker(composerPlaceholder)
+	}
+	c.palette.close()
+	c.mention.close()
 }
 
 // textEditKey reports whether a key is text input: printable characters and
@@ -5042,6 +5089,7 @@ func thumbGeom(total, visible, offset, h int) (thumbTop, thumbH, trackH int, has
 // handleMouse routes wheel scrolling per pane, scrollbar drags, hover and
 // row selection. Wheel/drag on one section never moves the others.
 func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	c.mouseActive = true // inputMode tracking: the mouse is in play now
 	l := c.layoutFor()
 	// Legacy-typed motion messages (tests, X10 paths) carry Action=0.
 	action := msg.Action
@@ -5134,6 +5182,22 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			if msg.X == g.b.x && msg.Y >= g.b.trackY0 && msg.Y < g.b.trackY0+g.b.trackH {
 				c.drag = barDrag{active: true, sec: g.sec, grabOff: msg.Y - (g.b.trackY0 + g.b.thumbTop)}
 				c.dragTo(g.sec, msg.Y, g.b, l)
+				return nil
+			}
+		}
+		// Mouse+keyboard parity: a click inside the drawer selects the row
+		// under the cursor (Enter/Tab still activate — every action stays
+		// keyboard-reachable). Clicks on the drawer's chrome (border,
+		// header, footer, empty state) are consumed: the panel owns its
+		// rows and nothing beneath may react to the same click.
+		if c.drawerOpen() {
+			y0, y1 := c.drawerYRange(l)
+			x0 := transcriptX0(l)
+			x1 := x0 + drawerMaxW(c.width, l.vpWidth+transcriptBorder)
+			if msg.Y >= y0 && msg.Y < y1 && msg.X >= x0 && msg.X < x1 {
+				if item, ok := c.drawerSelAt(msg.Y, l); ok {
+					c.drawerSelectItem(item, l)
+				}
 				return nil
 			}
 		}
@@ -5251,6 +5315,25 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			}
 			return nil
 		}
+		// Drawer hover parity: moving over a row selects it (hover-follow,
+		// fzf-style). One motion event is ignored right after a filter
+		// change (drawerHoverLock) so a stale hover cannot fight the fresh
+		// ranking; hover never fires while the mouse is not the input mode.
+		if c.drawerOpen() {
+			if c.drawerHoverLock > 0 {
+				c.drawerHoverLock--
+			} else {
+				y0, y1 := c.drawerYRange(l)
+				x0 := transcriptX0(l)
+				x1 := x0 + drawerMaxW(c.width, l.vpWidth+transcriptBorder)
+				if msg.Y >= y0 && msg.Y < y1 && msg.X >= x0 && msg.X < x1 {
+					if item, ok := c.drawerSelAt(msg.Y, l); ok {
+						c.drawerSelectItem(item, l)
+						return nil
+					}
+				}
+			}
+		}
 		c.hoverPeer = "" // default: outside every row
 		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
 			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
@@ -5277,6 +5360,20 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		up := msg.Type == tea.MouseWheelUp
+		// Drawer wheel parity: over the panel the wheel steps the
+		// selection exactly like the arrow keys (same wrap, same window
+		// settle) — never the transcript underneath.
+		if c.drawerOpen() {
+			y0, y1 := c.drawerYRange(l)
+			if msg.Y >= y0 && msg.Y < y1 {
+				d := 1
+				if up {
+					d = -1
+				}
+				c.drawerStep(d)
+				return nil
+			}
+		}
 		// Route by pane: conversation rail vs transcript — each scrolls only
 		// itself, with steps proportional to its own height.
 		sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
