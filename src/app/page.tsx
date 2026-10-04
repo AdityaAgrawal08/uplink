@@ -5,7 +5,7 @@ export default function Home() {
       <p>This is a CLI-only file-sharing service. Browser-based uploads are not supported.</p>
       <h2>Installation</h2>
       <pre className="code-block">
-        curl -sSf https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/install.sh | sh
+        curl -sSf https://raw.githubusercontent.com/AdityaAgrawal08/uplink/main/install.sh | sh
       </pre>
       <h2>Usage</h2>
       <p>To share a file or directory:</p>

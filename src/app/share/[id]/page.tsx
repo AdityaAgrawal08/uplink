@@ -51,7 +51,7 @@ export default async function SharePage(props: { params: Promise<{ id: string }>
 
       <h2>First Time? Install the CLI</h2>
       <pre className="code-block">
-        curl -sSf https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/install.sh | sh
+        curl -sSf https://raw.githubusercontent.com/AdityaAgrawal08/uplink/main/install.sh | sh
       </pre>
 
       <FilePreview share={shareMeta} />

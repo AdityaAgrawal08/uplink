@@ -2,7 +2,7 @@
 set -e
 
 # Repository configuration
-REPO="AdityaAgrawal08/uplink-delta"
+REPO="AdityaAgrawal08/uplink"
 BINARY_NAME="uplink"
 
 # Detect OS

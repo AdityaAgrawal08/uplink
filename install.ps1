@@ -1,8 +1,8 @@
 # Uplink installer for Windows (PowerShell 5.1+).
-# Usage: irm https://raw.githubusercontent.com/AdityaAgrawal08/uplink-delta/main/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/AdityaAgrawal08/uplink/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$REPO = "AdityaAgrawal08/uplink-delta"
+$REPO = "AdityaAgrawal08/uplink"
 $BINARY_NAME = "uplink"
 
 # Detect architecture

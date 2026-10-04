@@ -114,7 +114,7 @@ func updateFailureHintWith(visible bool) string {
 // reads as not-visible, which yields the private-repo hint.
 func repoVisibleAnonymously() bool {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get("https://api.github.com/repos/AdityaAgrawal08/uplink-delta")
+	resp, err := client.Get("https://api.github.com/repos/AdityaAgrawal08/uplink")
 	if err != nil {
 		return false
 	}
@@ -197,7 +197,7 @@ func verifyReleaseChecksum(client *http.Client, ghToken string, release githubRe
 func handleUpdate() {
 	fmt.Println("Checking for latest release...")
 	ghToken := os.Getenv("GITHUB_TOKEN")
-	url := "https://api.github.com/repos/AdityaAgrawal08/uplink-delta/releases/latest"
+	url := "https://api.github.com/repos/AdityaAgrawal08/uplink/releases/latest"
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		fmt.Printf("✗ Failed to build request: %v\n", err)
@@ -261,7 +261,7 @@ func handleUpdate() {
 
 	if downloadURL == "" {
 		fmt.Println("✗ No compatible binary found for your platform")
-		fmt.Printf("  Download manually: https://github.com/AdityaAgrawal08/uplink-delta/releases/tag/%s\n", release.TagName)
+		fmt.Printf("  Download manually: https://github.com/AdityaAgrawal08/uplink/releases/tag/%s\n", release.TagName)
 		os.Exit(1)
 	}
 
