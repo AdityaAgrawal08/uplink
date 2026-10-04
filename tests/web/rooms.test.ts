@@ -197,6 +197,37 @@ describe("rooms signaling plane", () => {
     await expect(checkSendLimit("sig", ip3)).rejects.toMatchObject({ status: 429 });
   });
 
+  it("rotatable budgets: fresh-username rotation from one IP still throttles (finding 6)", async () => {
+    const { checkSendLimit, checkReadLimit, SEND_USER_SHARE_PER_WINDOW, READ_USER_SHARE_PER_WINDOW } = await import("../../src/lib/rooms");
+    const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
+
+    // Per-username fairness share: a single user trips at 60 sends, far below
+    // the 120 IP total.
+    for (let i = 0; i < SEND_USER_SHARE_PER_WINDOW; i++) await checkSendLimit("sig", ip, "alice");
+    await expect(checkSendLimit("sig", ip, "alice")).rejects.toMatchObject({ status: 429 });
+
+    // Per-IP anti-Sybil total: rotating to FRESH usernames mints new user
+    // buckets but the IP total is shared — the 121st send from this IP is
+    // refused no matter which fresh name it rides.
+    const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 120; i++) {
+      await checkSendLimit("sig", ip2, `rotating_user_${i}`);
+    }
+    await expect(checkSendLimit("sig", ip2, "brand_new_user")).rejects.toMatchObject({ status: 429 });
+
+    // Reads: same two-bucket structure.
+    const ip3 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < READ_USER_SHARE_PER_WINDOW; i++) await checkReadLimit(ip3, "bob");
+    await expect(checkReadLimit(ip3, "bob")).rejects.toMatchObject({ status: 429 });
+    const ip4 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 1200; i++) await checkReadLimit(ip4, `reader_${i}`);
+    await expect(checkReadLimit(ip4, "fresh_reader")).rejects.toMatchObject({ status: 429 });
+
+    // A different IP is unaffected.
+    const ip5 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    await expect(checkSendLimit("sig", ip5, "alice")).resolves.toBeUndefined();
+  });
+
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
     const username = `u_${Math.random().toString(36).slice(2, 10)}`;
     const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");

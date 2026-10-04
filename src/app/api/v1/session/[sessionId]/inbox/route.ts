@@ -7,7 +7,7 @@ import {
   fetchBoxes,
   checkSendLimit,
   checkReadLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertUsernameHeader,
 } from "@/lib/rooms";
 
@@ -38,7 +38,7 @@ export async function POST(
       to?: unknown; msgId?: unknown; kind?: unknown; payload?: unknown;
     };
 
-    await checkSendLimit("inbox", scopedBudgetKey(req, username));
+    await checkSendLimit("inbox", clientIpHash(req), username);
     await depositBox(sessionId, username, to as string, msgId as string, kind as string, payload as string);
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (error) {
@@ -58,7 +58,7 @@ export async function GET(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
-    await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
+    await checkReadLimit(clientIpHash(req), username); // drains are the hot poll path
 
     const { boxes, epoch } = await fetchBoxes(sessionId, username);
     return NextResponse.json({ boxes, epoch });

@@ -7,7 +7,7 @@ import {
   fetchReactions,
   checkSendLimit,
   checkReadLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertUsernameHeader,
 } from "@/lib/rooms";
 
@@ -47,7 +47,7 @@ export async function POST(
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { msgId, emoji } = parsed.body as { msgId?: unknown; emoji?: unknown };
 
-    await checkSendLimit("reactions", scopedBudgetKey(req, username));
+    await checkSendLimit("reactions", clientIpHash(req), username);
     const result = await toggleReaction(sessionId, username, msgId as string, emoji as string);
     return NextResponse.json(result);
   } catch (error) {
@@ -67,7 +67,7 @@ export async function GET(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
-    await checkReadLimit(scopedBudgetKey(req, username)); // rides the same poll budget as inbox/signal
+    await checkReadLimit(clientIpHash(req), username); // rides the same poll budget as inbox/signal
 
     // Optional narrowing: only the messages the caller currently renders.
     // `?msgIds=a,b,c` (max 50); absent = whole-room aggregate, capped in lib.

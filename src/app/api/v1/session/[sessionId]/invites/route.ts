@@ -5,7 +5,7 @@ import {
   RoomError,
   createInvite,
   checkSendLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertRoomCode,
   assertUsername,
   assertUsernameHeader,
@@ -38,7 +38,7 @@ export async function POST(
     const { username } = parsed.body as { username?: unknown };
     assertUsername(username); // invitee format gate (400 on bad usernames)
 
-    await checkSendLimit("invites", scopedBudgetKey(req, inviter));
+    await checkSendLimit("invites", clientIpHash(req), inviter);
     await createInvite(sessionId, inviter, username as string);
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (error) {

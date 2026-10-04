@@ -56,10 +56,18 @@ export const MAX_SIG_PAYLOAD = 16 * 1024; // SDP/ICE notes are small
 export const MAX_BOX_PAYLOAD = 128 * 1024; // fallback relay: text + small files only
 
 export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
-export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction sends per IP per 5 min
+// B55 FIX (finding 6): send/read budgets now enforce BOTH a per-IP total
+// (the anti-Sybil term — rotating usernames cannot mint fresh buckets) AND a
+// per-username share (a fairness sub-bucket so several members behind one
+// NAT don't starve each other). Membership mutations (join/leave/create/
+// kick/grant) stay purely IP-scoped: budgets that gate Sybil-able actions
+// must not be dodgeable by minting names.
+export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction/invite sends per IP per 5 min
+export const SEND_USER_SHARE_PER_WINDOW = 60; // per-username share of the send budget (fairness sub-bucket)
 export const SEND_WINDOW_SEC = 5 * 60;
 export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
-export const READ_LIMIT_PER_WINDOW = 1200; // two same-user tabs + ack overhead stay under budget // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
+export const READ_LIMIT_PER_WINDOW = 1200; // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
+export const READ_USER_SHARE_PER_WINDOW = 600; // per-username share of the read budget (~2/s per user: two same-user tabs + ack overhead)
 
 // Reactions are cosmetic metadata on ciphertext messages: one hash per room.
 // Field = `${msgId}|${emoji}|${username}`, value "1" (presence is the datum;
@@ -327,8 +335,21 @@ export async function checkCreateLimit(ipHash: string): Promise<void> {
   }
 }
 
-export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invites", ipHash: string): Promise<void> {
-  const key = `rate:${kind}:${ipHash}`;
+// B55 FIX (finding 6): checkSendLimit enforces TWO buckets — a per-IP total
+// (the anti-Sybil term: fresh usernames cannot dodge it) and a per-username
+// share (fairness among members behind one NAT). Usernames are validated
+// upstream (assertUsernameHeader) before they ever key a bucket, and the IP
+// component comes from clientIpHash (TRUST_PROXY-aware — see finding 10).
+export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invites", ipHash: string, username?: string): Promise<void> {
+  if (username) {
+    const userKey = `rate:${kind}:user:${ipHash}:${username}`;
+    const userHits = await redis.incr(userKey);
+    if (userHits === 1) await redis.expire(userKey, SEND_WINDOW_SEC);
+    if (userHits > SEND_USER_SHARE_PER_WINDOW) {
+      throw new RoomError(429, "Too many requests. Slow down and try again.");
+    }
+  }
+  const key = `rate:${kind}:ip:${ipHash}`;
   const hits = await redis.incr(key);
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
   if (hits > SEND_LIMIT_PER_WINDOW) {
@@ -337,10 +358,18 @@ export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invi
 }
 
 // checkReadLimit budgets the high-frequency read path (heartbeats, signal
-// drains, inbox fetches/acks). Members hit these constantly, so the budget
-// is generous — it exists to stop floods, not normal use.
-export async function checkReadLimit(ipHash: string): Promise<void> {
-  const key = `rate:read:${ipHash}`;
+// drains, inbox fetches/acks) with the same two-bucket structure as
+// checkSendLimit: per-IP total + per-username fairness share.
+export async function checkReadLimit(ipHash: string, username?: string): Promise<void> {
+  if (username) {
+    const userKey = `rate:read:user:${ipHash}:${username}`;
+    const userHits = await redis.incr(userKey);
+    if (userHits === 1) await redis.expire(userKey, SEND_WINDOW_SEC);
+    if (userHits > READ_USER_SHARE_PER_WINDOW) {
+      throw new RoomError(429, "Too many requests. Slow down and try again.");
+    }
+  }
+  const key = `rate:read:ip:${ipHash}`;
   const hits = await redis.incr(key);
   if (hits === 1) await redis.expire(key, SEND_WINDOW_SEC);
   if (hits > READ_LIMIT_PER_WINDOW) {
@@ -359,19 +388,35 @@ export async function checkJoinLimit(ipHash: string): Promise<void> {
   }
 }
 
-export function clientIpHash(req: Request): string {
-  const raw = req.headers.get("x-forwarded-for") || "127.0.0.1";
-  const ip = raw.split(",")[0].trim() || "127.0.0.1";
-  return anonymizeIp(ip);
+// trustProxyHeader decides whether x-forwarded-for is a trusted source for
+// the client's real IP (finding 10). Default: trust the platform only —
+// Vercel's proxy overwrites XFF, so the header is platform-controlled there.
+// TRUST_PROXY overrides the default: "true"/"1" trusts a self-hosted reverse
+// proxy (nginx/Caddy); any other explicit value (e.g. "false") never trusts
+// the header.
+export function trustProxyHeader(): boolean {
+  const mode = process.env.TRUST_PROXY;
+  if (mode !== undefined && mode !== "") {
+    return mode === "true" || mode === "1";
+  }
+  return process.env.VERCEL === "1";
 }
 
-// scopedBudgetKey extends a budget key with the caller's username so members
-// behind one NAT (office, dorm) don't share a single throttle bucket.
-// Usernames can't contain ":" (validated charset), so the composition is
-// unambiguous. Join/leave/create deliberately stay IP-scoped: budgets that
-// gate Sybil-able actions must not be dodgeable by minting names.
-export function scopedBudgetKey(req: Request, username: string): string {
-  return clientIpHash(req) + ":" + username;
+// clientIpHash derives the budget key's IP component (finding 10): when a
+// trusted proxy is in front, the leftmost x-forwarded-for entry is the
+// client's real IP ("client, proxy1, proxy2"); otherwise XFF is
+// attacker-controlled — spoofable per request, which would mint unlimited
+// fresh budget buckets — so it is ignored entirely and every client shares
+// ONE bucket ("unknown"). Budgets stay functional (anti-abuse) at the cost
+// of per-IP granularity; operators behind their own proxy must set
+// TRUST_PROXY=true so their (trusted) proxy's XFF is honored again.
+export function clientIpHash(req: Request): string {
+  if (trustProxyHeader()) {
+    const raw = req.headers.get("x-forwarded-for") || "127.0.0.1";
+    const ip = raw.split(",")[0].trim() || "127.0.0.1";
+    return anonymizeIp(ip);
+  }
+  return anonymizeIp("unknown");
 }
 
 // Group-room extensions accepted at create. All optional; maxMembers null

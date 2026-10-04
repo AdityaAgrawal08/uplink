@@ -5,7 +5,7 @@ import {
   RoomError,
   getInvitesForUser,
   checkReadLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertUsernameHeader,
 } from "@/lib/rooms";
 
@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username); // validate before budget keying
-    await checkReadLimit(scopedBudgetKey(req, username));
+    await checkReadLimit(clientIpHash(req), username);
 
     const invites = await getInvitesForUser(username);
     return NextResponse.json({ invites });

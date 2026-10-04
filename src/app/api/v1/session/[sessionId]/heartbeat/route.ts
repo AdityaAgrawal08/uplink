@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, heartbeat, checkReadLimit, scopedBudgetKey, assertUsernameHeader } from "@/lib/rooms";
+import { RoomError, heartbeat, checkReadLimit, clientIpHash, assertUsernameHeader } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -15,7 +15,7 @@ export async function POST(
       return apiError("X-Uplink-Username header is required", 400);
     }
     assertUsernameHeader(usernameHeader);
-    await checkReadLimit(scopedBudgetKey(req, usernameHeader)); // high-frequency reads get a generous budget
+    await checkReadLimit(clientIpHash(req), usernameHeader); // high-frequency reads get a generous budget
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

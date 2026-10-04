@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, ackBoxes, checkReadLimit, scopedBudgetKey, assertUsernameHeader } from "@/lib/rooms";
+import { RoomError, ackBoxes, checkReadLimit, clientIpHash, assertUsernameHeader } from "@/lib/rooms";
 
 // Explicit acknowledgement: deletes exactly the listed boxes. A message is
 // forgotten by the server only after the recipient confirms receipt.
@@ -15,7 +15,7 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
-    await checkReadLimit(scopedBudgetKey(req, username)); // high-frequency acks share the read budget
+    await checkReadLimit(clientIpHash(req), username); // high-frequency acks share the read budget
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

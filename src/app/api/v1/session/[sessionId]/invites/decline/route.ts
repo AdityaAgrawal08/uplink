@@ -5,7 +5,7 @@ import {
   RoomError,
   declineInvite,
   checkSendLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertRoomCode,
   assertUsernameHeader,
 } from "@/lib/rooms";
@@ -36,7 +36,7 @@ export async function POST(
     assertRoomCode(code);
     if (code !== sessionId) return apiError("Session code mismatch", 400);
 
-    await checkSendLimit("invites", scopedBudgetKey(req, username));
+    await checkSendLimit("invites", clientIpHash(req), username);
     await declineInvite(sessionId, username);
     return NextResponse.json({ ok: true });
   } catch (error) {
