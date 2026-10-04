@@ -1,19 +1,20 @@
 package main
 
-// chat_mention.go — @mentions in the general room.
+// chat_mention.go — @mentions in chat.
 //
 // Mentions ride as PLAINTEXT inside ordinary E2E messages: nothing here
 // mutates message text, adds frame types, or touches the server. Three
 // client-side layers:
 //
 //  1. Composer dropdown — typing "@" opens a member-suggestion drawer above
-//     the input (the "/" palette's mirror); Tab/Enter completes "@name ".
-//  2. Receipt parsing — inbound general messages are scanned for "@name"
-//     tokens so a mention of the local user can ping the desktop.
-//  3. Highlight — "@<own-username>" paints as a distinct chip inside
-//     bubbles.
-//
-// DMs are excluded everywhere: there "@" is plain text.
+//     the input (the "/" palette's mirror); Tab/Enter completes "@name "
+//     with the cursor past the trailing space.
+//  2. Receipt parsing — inbound general-room messages are scanned for
+//     "@name" tokens so a mention of the local user can ping the desktop.
+//     DMs never ping: there "@" is plain text as far as receipts go.
+//  3. Highlight — every valid "@name" token paints as a distinct blue chip
+//     inside bubbles, in the room, own messages, and DMs alike
+//     (display-only in DMs: the receipt gate above still excludes them).
 
 import (
 	"fmt"
@@ -78,46 +79,36 @@ func mentionedIn(text, me string) bool {
 	return false
 }
 
-// mentionExcerptMax caps an @mention notification body so a desktop ping
-// stays one tidy line.
-const mentionExcerptMax = 80
-
-// mentionExcerpt slims a message for the notification body: whitespace runs
-// (newlines included) collapse to single spaces, then the excerpt truncates.
-func mentionExcerpt(text string) string {
-	one := strings.Join(strings.Fields(text), " ")
-	if r := []rune(one); len(r) > mentionExcerptMax {
-		one = string(r[:mentionExcerptMax])
-	}
-	return one
-}
-
 // ---- highlight ---------------------------------------------------------------
 
-// tuiMentionStyle paints an own-username mention inside a bubble: bold in
-// the theme family's blue (colAccent — the same adaptive pair as the
-// sidebar/topbar/link blue, #0b62c9 on light terminals and #4cc9f0 on dark,
-// so the chip stays readable on both). No background fill: the blue
-// foreground against the bubble fills (colOtherBg/colOwnBg) is the
-// distinction, and no padding change keeps every width calculation exact
-// (the token charset is single-width).
+// tuiMentionStyle paints a mention token inside a bubble: bold in the theme
+// family's blue (colAccent — the same adaptive pair as the sidebar/topbar/
+// link blue, #0b62c9 on light terminals and #4cc9f0 on dark, so the chip
+// stays readable on both). No background fill: the blue foreground against
+// the bubble fills (colOtherBg/colOwnBg) is the distinction, and no padding
+// change keeps every width calculation exact (the token charset is
+// single-width).
 var tuiMentionStyle = lipgloss.NewStyle().
 	Bold(true).
 	Foreground(colAccent)
 
-// mentionStyler is the chip style for own-username mentions (production:
+// mentionStyler is the chip style for mention tokens (production:
 // tuiMentionStyle). The indirection mirrors mentionNotifier: color styles
 // paint as plain text under an Ascii color profile (headless tests), so
 // tests swap in a padding style that visibly marks replacements.
 var mentionStyler = tuiMentionStyle
 
-// mentionHighlighted wraps every exact "@me" token of a rendered string in
-// mentionStyler. The scan is ANSI-aware: escape sequences pass through
+// mentionHighlighted wraps every valid "@token" of a rendered string in
+// mentionStyler — the same token rules as the receipt parser (the "@" plus
+// the username charset, terminated by anything outside it), so any @name in
+// a chat message reads as a mention chip: inbound general-room messages,
+// own sends, and DM threads (display-only there — receipts stay
+// general-room-only). The scan is ANSI-aware: escape sequences pass through
 // untouched and only plain-text runs are matched, so the pass composes with
 // markdown and bubble styling already painted into the string. A mention is
-// the whole token — "@me" inside "@me2" stays plain.
-func mentionHighlighted(s, me string) string {
-	if me == "" || !strings.Contains(s, "@"+me) {
+// the whole token — "@me2" chips in full, not just its "@me" prefix.
+func mentionHighlighted(s string) string {
+	if !strings.Contains(s, "@") {
 		return s
 	}
 	var b strings.Builder
@@ -125,10 +116,10 @@ func mentionHighlighted(s, me string) string {
 	for rest != "" {
 		i := strings.Index(rest, "\x1b[")
 		if i < 0 {
-			b.WriteString(mentionStylePlain(rest, me))
+			b.WriteString(mentionStylePlain(rest))
 			break
 		}
-		b.WriteString(mentionStylePlain(rest[:i], me))
+		b.WriteString(mentionStylePlain(rest[:i]))
 		j := strings.IndexByte(rest[i:], 'm')
 		if j < 0 {
 			b.WriteString(rest[i:]) // malformed sequence: pass through
@@ -140,34 +131,19 @@ func mentionHighlighted(s, me string) string {
 	return b.String()
 }
 
-// mentionStylePlain styles "@me" occurrences inside one ANSI-free run.
-func mentionStylePlain(s, me string) string {
-	needle := "@" + me
+// mentionStylePlain styles every "@token" occurrence inside one ANSI-free
+// run. Built on the same regex as the receipt parser, so token boundaries
+// (charset, terminators, end-of-message) can never drift from parseMentions.
+func mentionStylePlain(s string) string {
 	var b strings.Builder
-	rest := s
-	for {
-		i := strings.Index(rest, needle)
-		if i < 0 {
-			b.WriteString(rest)
-			break
-		}
-		j := i + len(needle)
-		if j < len(rest) && isMentionRunChar(rest[j]) {
-			// A charset char follows the match: this "@me" is only the
-			// prefix of a longer identifier ("@me2") — copy the whole
-			// token through unstyled.
-			k := j
-			for k < len(rest) && isMentionRunChar(rest[k]) {
-				k++
-			}
-			b.WriteString(rest[:k])
-			rest = rest[k:]
-			continue
-		}
-		b.WriteString(rest[:i])
-		b.WriteString(mentionStyler.Render(needle))
-		rest = rest[j:]
+	last := 0
+	for _, m := range mentionTokenRe.FindAllStringSubmatchIndex(s, -1) {
+		start, end := m[0], m[1]
+		b.WriteString(s[last:start])
+		b.WriteString(mentionStyler.Render(s[start:end]))
+		last = end
 	}
+	b.WriteString(s[last:])
 	return b.String()
 }
 
@@ -334,12 +310,15 @@ func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action fun
 }
 
 // completeMention replaces the live "@fragment" with "@name " — the
-// trailing space terminates the token, matching the receipt parser — and
-// closes the dropdown.
+// trailing space terminates the token, matching the receipt parser — parks
+// the cursor AFTER that space (ready to type the message), and closes the
+// dropdown.
 func (c *chatScreen) completeMention(name string) {
 	value := c.input.Value()
 	if at := strings.LastIndex(value, "@"); at >= 0 {
-		c.input.SetValue(value[:at] + "@" + name + " ")
+		completed := value[:at] + "@" + name + " "
+		c.input.SetValue(completed)
+		c.input.SetCursor(len(completed))
 	}
 	c.mention.close()
 }

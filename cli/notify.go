@@ -38,13 +38,13 @@ func notifyTransferFailed(filename string, err error) {
 }
 
 // notifyMentioned is the desktop ping for an inbound @mention (general room
-// only): title + body carry the "mentioned in the chat" message with the
-// sender and a message excerpt for context. The ping is ALWAYS attempted —
+// only): title + body carry exactly "<sender> mentioned you in the chat."
+// — one tidy line, no message excerpt. The ping is ALWAYS attempted —
 // focused room or not; own sends never ping and DMs are excluded upstream
 // (handleNewMessage gates) — and the bell/stderr fallback above keeps a dead
 // desktop path visible instead of a silent miss.
-func notifyMentioned(sender, excerpt string) {
-	notify("Uplink-Delta", fmt.Sprintf("%s mentioned you in the chat: %s", sender, excerpt))
+func notifyMentioned(sender string) {
+	notify("Uplink-Delta", fmt.Sprintf("%s mentioned you in the chat.", sender))
 }
 
 // mentionNotifier is the mention-ping sink. The indirection keeps the chat

@@ -1,7 +1,8 @@
 package main
 
 // chat_mention_test.go — @mention receipt parsing, the composer dropdown,
-// the desktop ping, and the in-bubble highlight (all general-room only).
+// the desktop ping, and the in-bubble highlight (receipts: general-room
+// only; highlight: every bubble, DMs included).
 
 import (
 	"fmt"
@@ -70,20 +71,6 @@ func TestMentionedInCaseSensitiveExact(t *testing.T) {
 	}
 	if mentionedIn("@alice", "") {
 		t.Error("empty local username must never match")
-	}
-}
-
-func TestMentionExcerptCollapsesAndCaps(t *testing.T) {
-	if got := mentionExcerpt("line one\n\nline two"); got != "line one line two" {
-		t.Fatalf("excerpt must collapse whitespace runs: %q", got)
-	}
-	long := "x @alice " + strings.Repeat("y", 200)
-	got := mentionExcerpt(long)
-	if r := []rune(got); len(r) > mentionExcerptMax {
-		t.Fatalf("excerpt exceeds %d runes: %d", mentionExcerptMax, len(r))
-	}
-	if strings.ContainsAny(got, "\n\t") {
-		t.Fatalf("excerpt must be one tidy line: %q", got)
 	}
 }
 
@@ -192,12 +179,16 @@ func TestMentionDropdownKeyboard(t *testing.T) {
 		t.Fatalf("up moved selection to %d; want 0", c.mention.sel)
 	}
 
-	// Tab completes "@name " into the input and closes.
+	// Tab completes "@name " into the input and closes, with the cursor
+	// parked AFTER the trailing space (ready to type the message).
 	if handled, _ := c.handleMentionKeys(tea.KeyMsg{Type: tea.KeyTab}); !handled {
 		t.Fatal("tab must be consumed by the open dropdown")
 	}
 	if got := c.input.Value(); got != "@alice " {
 		t.Fatalf("tab completion gave %q; want \"@alice \"", got)
+	}
+	if pos := c.input.Position(); pos != len("@alice ") {
+		t.Fatalf("cursor after tab completion = %d; want %d (after the trailing space)", pos, len("@alice "))
 	}
 	if c.mention.visible() {
 		t.Fatal("tab completion must close the dropdown")
@@ -209,6 +200,9 @@ func TestMentionDropdownKeyboard(t *testing.T) {
 	c2, cmd := step(c, tea.KeyMsg{Type: tea.KeyEnter})
 	if got := c2.input.Value(); got != "say @carol " {
 		t.Fatalf("enter completion gave %q; want \"say @carol \"", got)
+	}
+	if pos := c2.input.Position(); pos != len("say @carol ") {
+		t.Fatalf("cursor after enter completion = %d; want %d (after the trailing space)", pos, len("say @carol "))
 	}
 	if c2.mention.visible() {
 		t.Fatal("enter completion must close the dropdown")
@@ -224,6 +218,9 @@ func TestMentionDropdownKeyboard(t *testing.T) {
 	c3, _ = step(c3, tea.KeyMsg{Type: tea.KeyTab})
 	if got := c3.input.Value(); got != "please tell @alice " {
 		t.Fatalf("mid-sentence completion gave %q; want \"please tell @alice \"", got)
+	}
+	if pos := c3.input.Position(); pos != len("please tell @alice ") {
+		t.Fatalf("cursor after mid-sentence completion = %d; want %d", pos, len("please tell @alice "))
 	}
 }
 
@@ -372,7 +369,7 @@ func TestMentionDropdownClosesOnModeSwitches(t *testing.T) {
 func TestMentionNotifyTriggers(t *testing.T) {
 	var pings []string
 	orig := mentionNotifier
-	mentionNotifier = func(sender, excerpt string) { pings = append(pings, sender+"|"+excerpt) }
+	mentionNotifier = func(sender string) { pings = append(pings, sender) }
 	defer func() { mentionNotifier = orig }()
 
 	c := newFilterScreen("alice", "")
@@ -383,8 +380,8 @@ func TestMentionNotifyTriggers(t *testing.T) {
 	if len(pings) != 1 {
 		t.Fatalf("mention must ping exactly once, got %v", pings)
 	}
-	if pings[0] != "bob|hey @alice check this" {
-		t.Fatalf("ping payload %q; want sender+excerpt context", pings[0])
+	if pings[0] != "bob" {
+		t.Fatalf("ping sender %q; want bob", pings[0])
 	}
 
 	// A second message mentioning us pings again.
@@ -409,7 +406,7 @@ func TestMentionNotifyTriggers(t *testing.T) {
 func TestMentionNotifyNeverPings(t *testing.T) {
 	var pings []string
 	orig := mentionNotifier
-	mentionNotifier = func(sender, excerpt string) { pings = append(pings, sender) }
+	mentionNotifier = func(sender string) { pings = append(pings, sender) }
 	defer func() { mentionNotifier = orig }()
 
 	c := newFilterScreen("alice", "")
@@ -463,11 +460,13 @@ func TestMentionNotifyNeverPings(t *testing.T) {
 // end: a decrypted room broadcast (netChatMsg, as the engine delivers it)
 // enters the bubbletea Update loop and must ping the notifier. This pins the
 // whole chain — netChatMsg handler -> convFor(ConvID) -> handleNewMessage
-// gates -> mentionNotifier — not just the sink in isolation.
+// gates -> mentionNotifier — not just the sink in isolation. The ping
+// payload is the sender only; the desktop body is exactly
+// "<sender> mentioned you in the chat." (no message excerpt).
 func TestMentionNotifyRealInboundPath(t *testing.T) {
 	var pings []string
 	orig := mentionNotifier
-	mentionNotifier = func(sender, excerpt string) { pings = append(pings, sender+"|"+excerpt) }
+	mentionNotifier = func(sender string) { pings = append(pings, sender) }
 	defer func() { mentionNotifier = orig }()
 
 	c := newFilterScreen("alice", "")
@@ -478,14 +477,31 @@ func TestMentionNotifyRealInboundPath(t *testing.T) {
 	if len(pings) != 1 {
 		t.Fatalf("mention over the real inbound path must ping exactly once, got %v", pings)
 	}
-	if pings[0] != "bob|hey @alice check this" {
-		t.Fatalf("ping payload %q; want sender+excerpt context", pings[0])
+	if pings[0] != "bob" {
+		t.Fatalf("ping sender %q; want bob", pings[0])
 	}
 
 	// A DM naming us over the wire never pings (@ is plain text there).
 	_, _ = c.Update(netChatMsg{chat: engineChat{MsgId: "m2", From: "carol", To: "alice", Text: "psst @alice"}})
 	if len(pings) != 1 {
 		t.Fatalf("DM mention must not ping, got %v", pings)
+	}
+
+	// The production sink formats the exact body: sender + period, nothing
+	// else — no excerpt, no colon.
+	var gotTitle, gotBody string
+	origDesktop := notifyDesktop
+	notifyDesktop = func(title, body string, icon any) error {
+		gotTitle, gotBody = title, body
+		return nil
+	}
+	defer func() { notifyDesktop = origDesktop }()
+	notifyMentioned("bob")
+	if gotBody != "bob mentioned you in the chat." {
+		t.Fatalf("notification body %q; want exactly \"bob mentioned you in the chat.\"", gotBody)
+	}
+	if gotTitle != "Uplink-Delta" {
+		t.Fatalf("notification title %q; want Uplink-Delta", gotTitle)
 	}
 }
 
@@ -525,7 +541,9 @@ func TestNotifyFallsBackWhenDesktopUnavailable(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Highlight: @<own-username> paints as a chip (general only)
+// Highlight: every valid @username token paints as a chip — own messages,
+// inbound general-room messages, and DM threads alike (display-only in DMs;
+// receipts stay general-room-only). Non-tokens stay plain.
 // ---------------------------------------------------------------------------
 
 // swapMentionStyler installs a test styler that visibly marks replacements
@@ -542,7 +560,8 @@ func TestMentionHighlight(t *testing.T) {
 	swapMentionStyler(t)
 	c := *newFilterScreen("alice", "")
 
-	// Inbound general message naming us: the token is replaced by the chip.
+	// Inbound general message: ANY valid @token is replaced by the chip —
+	// our own name and every other member's alike.
 	body := c.renderedBody(chatMessage{
 		Seq: 1, MsgId: "m1", Username: "bob", Kind: "chat",
 		Text: "hi @alice!", ConvID: generalConv, CreatedAt: "2026-10-04T10:00:00Z",
@@ -551,34 +570,32 @@ func TestMentionHighlight(t *testing.T) {
 		t.Fatalf("own mention must paint the mention chip:\n%s", body)
 	}
 
-	// Other users' mentions render plain.
-	plain := c.renderedBody(chatMessage{
+	// Other users' mentions chip too — the blue is for every @username.
+	peer := c.renderedBody(chatMessage{
 		Seq: 2, MsgId: "m2", Username: "bob", Kind: "chat",
 		Text: "hi @carol and @dave", ConvID: generalConv, CreatedAt: "2026-10-04T10:01:00Z",
 	})
-	if strings.Contains(plain, "  @carol") || strings.Contains(plain, "  @dave") {
-		t.Fatalf("others' mentions must render plain:\n%s", plain)
+	if !strings.Contains(peer, "  @carol") || !strings.Contains(peer, "  @dave") {
+		t.Fatalf("every member mention must paint the chip:\n%s", peer)
 	}
 
-	// Own message in the room still chips our own name (mention of self).
+	// Own message in the room chips every token too, self included.
 	own := c.renderedBody(chatMessage{
 		Seq: 3, MsgId: "m3", Username: "alice", Kind: "chat",
 		Text: "@alice @bob", ConvID: generalConv, CreatedAt: "2026-10-04T10:02:00Z",
 	})
-	if !strings.Contains(own, "  @alice") {
-		t.Fatal("own message mentioning our name must still chip it")
-	}
-	if strings.Contains(own, "  @bob") {
-		t.Fatal("another member's name must stay plain in the same message")
+	if !strings.Contains(own, "  @alice") || !strings.Contains(own, "  @bob") {
+		t.Fatalf("own message tokens must all chip:\n%s", own)
 	}
 
-	// Longer identifiers sharing our prefix stay plain.
+	// Longer identifiers are whole tokens under the parser's rules: they
+	// chip in FULL ("@alice2" is a valid token, not "@alice" + "2").
 	longer := c.renderedBody(chatMessage{
 		Seq: 4, MsgId: "m4", Username: "bob", Kind: "chat",
 		Text: "@alice2 and @alice_extra", ConvID: generalConv, CreatedAt: "2026-10-04T10:03:00Z",
 	})
-	if strings.Contains(longer, "  @alice2") || strings.Contains(longer, "  @alice_extra") {
-		t.Fatalf("longer identifiers must stay plain:\n%s", longer)
+	if !strings.Contains(longer, "  @alice2") || !strings.Contains(longer, "  @alice_extra") {
+		t.Fatalf("longer identifiers must chip as whole tokens:\n%s", longer)
 	}
 
 	// Markdown interplay: the mention inside bold still chips.
@@ -589,22 +606,45 @@ func TestMentionHighlight(t *testing.T) {
 	if !strings.Contains(bold, "  @alice") {
 		t.Fatal("mention inside bold must still chip")
 	}
+
+	// Non-tokens stay plain: a bare "@" (no charset char after it) and a
+	// username without the "@" render unstyled; a token still ends at the
+	// first non-charset byte ("@al" chips in full, "-ice" stays plain).
+	plain := c.renderedBody(chatMessage{
+		Seq: 6, MsgId: "m6", Username: "bob", Kind: "chat",
+		Text: "just @ now, mail @al-ice, hi alice", ConvID: generalConv,
+		CreatedAt: "2026-10-04T10:05:00Z",
+	})
+	if strings.Contains(plain, "  @ ") {
+		t.Fatalf("a bare @ (nothing after it) must stay plain:\n%s", plain)
+	}
+	if !strings.Contains(plain, "  @al") {
+		t.Fatalf("the char-set prefix of a broken token must still chip:\n%s", plain)
+	}
+	if strings.Contains(plain, "  -ice") {
+		t.Fatalf("the non-charset continuation must stay plain:\n%s", plain)
+	}
+	if strings.Contains(plain, "  alice") {
+		t.Fatalf("a username without @ must stay plain:\n%s", plain)
+	}
 }
 
-func TestMentionHighlightDMsStayPlain(t *testing.T) {
+func TestMentionHighlightDMsChipToo(t *testing.T) {
 	swapMentionStyler(t)
 
+	// DMs highlight every token for display (no receipts there — that gate
+	// lives in handleNewMessage); the text still passes through otherwise.
 	dm := newFilterScreen("alice", "bob")
 	body := dm.renderedBody(chatMessage{
 		Seq: 1, MsgId: "m1", Username: "bob", Kind: "chat",
-		Text: "psst @alice", ConvID: conversationKey("alice", "bob"),
+		Text: "psst @alice watch @carol", ConvID: conversationKey("alice", "bob"),
 		CreatedAt: "2026-10-04T10:00:00Z",
 	})
-	if strings.Contains(body, "  @alice") {
-		t.Fatalf("@ must stay plain text inside a DM thread:\n%s", body)
+	if !strings.Contains(body, "  @alice") || !strings.Contains(body, "  @carol") {
+		t.Fatalf("DM tokens must chip like every other bubble:\n%s", body)
 	}
-	if !strings.Contains(body, "@alice") {
-		t.Fatalf("DM text must pass through untouched: %q", body)
+	if !strings.Contains(body, "psst") {
+		t.Fatalf("DM text must pass through otherwise untouched: %q", body)
 	}
 }
 
@@ -613,18 +653,23 @@ func TestMentionHighlightAnsiAware(t *testing.T) {
 
 	// Hand-crafted SGR input: escape sequences pass through untouched while
 	// plain runs are scanned, so the pass composes with markdown styling.
-	got := mentionHighlighted("\x1b[1m@alice\x1b[0m and @bob", "alice")
+	// Every valid token chips — @alice and @bob alike.
+	got := mentionHighlighted("\x1b[1m@alice\x1b[0m and @bob")
 	if !strings.Contains(got, "\x1b[1m  @alice\x1b[0m") {
 		t.Fatalf("sequence must survive while the mention chips:\n%q", got)
 	}
-	if strings.Contains(got, "  @bob") {
-		t.Fatalf("non-self mention must stay plain:\n%q", got)
+	if !strings.Contains(got, "  @bob") {
+		t.Fatalf("peer mention must chip too:\n%q", got)
+	}
+	if !strings.Contains(got, "\x1b[1m") {
+		t.Fatalf("escape sequence must survive the highlight pass:\n%q", got)
 	}
 
-	// Escape sequences nested around a non-matching identifier survive too.
-	got = mentionHighlighted("\x1b[1m@alice2\x1b[0m", "alice")
-	if got != "\x1b[1m@alice2\x1b[0m" {
-		t.Fatalf("longer identifier inside styling must pass through: %q", got)
+	// Escape sequences nested around a longer identifier survive; the
+	// whole token still chips inside the styling.
+	got = mentionHighlighted("\x1b[1m@alice2\x1b[0m")
+	if got != "\x1b[1m  @alice2\x1b[0m" {
+		t.Fatalf("longer identifier inside styling must chip whole: %q", got)
 	}
 }
 

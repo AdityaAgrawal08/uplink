@@ -919,12 +919,13 @@ func (c *chatScreen) renderSender(m chatMessage) string {
 // chatBubble renders one chat message block: a tinted bubble that hugs its
 // text, right-aligned when it is ours so the two sides of the conversation
 // read as two sides. dim marks a send still waiting for its delivery ack,
-// so "sent" is never confused with "received". me is the local username:
-// when non-empty, "@<me>" tokens in the bubble paint as the mention chip
-// (callers pass "" in DMs, where "@" stays plain text).
-func chatBubble(text string, isOwn, dim bool, availWidth int, me string) string {
+// so "sent" is never confused with "received". Every valid "@username"
+// token in the text paints as the mention chip — own messages, inbound
+// general-room messages, and DM threads alike (DMs highlight for display
+// only; receipts stay general-room-only, gated upstream).
+func chatBubble(text string, isOwn, dim bool, availWidth int) string {
 	textRendered := renderMarkdown(text)
-	textRendered = mentionHighlighted(textRendered, me)
+	textRendered = mentionHighlighted(textRendered)
 	// Fluid bubbles: near-full-width on narrow transcripts, tighter
 	// columns when space abounds. Pure function of width, so the width
 	// cache key stays sufficient.
@@ -973,13 +974,10 @@ func (c *chatScreen) renderBody(m chatMessage) string {
 	if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
 		dim = true
 	}
-	// @mentions are a general-room feature: pass the local username only
-	// for room messages, so DMs render "@" as plain text.
-	me := ""
-	if isGeneralConv(m.ConvID) {
-		me = c.me
-	}
-	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth, me)
+	// Every valid @username token chips — in the room, in own messages, and
+	// in DMs alike (mentionHighlighted runs inside chatBubble; receipts are
+	// gated general-room-only upstream, so DM highlighting is display-only).
+	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth)
 	if badge := c.reactionBadge(m); badge != "" {
 		body += "\n" + badge
 	}
@@ -2463,11 +2461,11 @@ func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
 	// @mention receipts (general room only): a desktop ping whenever an
 	// inbound message names us — ALWAYS, even while the room is focused.
-	// Own sends never ping and DMs are excluded entirely; the excerpt
-	// carries the sender + message context.
+	// Own sends never ping and DMs are excluded entirely; the body carries
+	// exactly "<sender> mentioned you in the chat.", no message excerpt.
 	if c.me != "" && m.Username != c.me && isGeneralConv(m.ConvID) &&
 		mentionedIn(m.Text, c.me) {
-		mentionNotifier(m.Username, mentionExcerpt(m.Text))
+		mentionNotifier(m.Username)
 	}
 }
 
@@ -2644,11 +2642,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	}
 	// Optimistic echo: the same block a confirmed message will paint, held
 	// faint until the delivery ack lands (netDeliveredMsg).
-	me := ""
-	if conv == generalConv {
-		me = c.me // mention chips are a general-room feature
-	}
-	echo := chatBubble(text, true, true, c.transcriptW(), me)
+	echo := chatBubble(text, true, true, c.transcriptW())
 	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
