@@ -103,8 +103,13 @@ func (c *chatScreen) startNextUpload() tea.Cmd {
 	c.uploadQ.gen++        // invalidates any late completion from before
 	gen := c.uploadQ.gen   // captured now: the async run must not re-read
 	// job.To is a raw recipient username ("" = room broadcast); the card
-	// paints into the matching conversation bucket.
+	// paints into the matching conversation bucket. A broadcast send while
+	// a group view is open belongs to that group's bucket (uploads ride
+	// the active session's engine).
 	conv := convFor(c.me, job.To)
+	if c.activeGroup != "" && job.To == "" {
+		conv = groupConv(c.activeGroup)
+	}
 	c.uploadQ.conv = conv
 	c.paintUploadLine(tuiUploadRunStyle.Render(
 		progressBar("Uploading…", 0, 0)), conv)

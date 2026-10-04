@@ -15,6 +15,7 @@ package main
 import (
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 	"time"
 
@@ -254,15 +255,17 @@ func roomAvatarCell() string {
 
 // ---- chat list model ---------------------------------------------------------
 
-// chatItem is one sidebar row set: the General room or a DM thread.
+// chatItem is one sidebar row set: the General room, a DM thread, or a
+// joined group conversation.
 type chatItem struct {
-	peer    string // "" = General room, else the peer username
+	peer    string // "" = General room, "group:<code>" = a group, else the peer username
 	name    string
 	preview string
 	timeStr string
 	unread  int
 	active  bool
 	isRoom  bool
+	isGroup bool
 	live    bool // peer online (room always true)
 	inCall  bool // live voice on this conversation
 }
@@ -319,6 +322,38 @@ func (c *chatScreen) chatItems() []chatItem {
 			unread: c.unread[u], active: c.targetUser == u,
 			isRoom: false, live: live[u], inCall: peerCall,
 		})
+	}
+	// Joined groups follow the member list, newest activity first (same
+	// recency contract as DMs), then name order for ties. Groups run the
+	// full chat engine in their own session; the sidebar row sports the
+	// group name with a DM-style unread badge.
+	if len(c.groups) > 0 {
+		codes := make([]string, 0, len(c.groups))
+		for code := range c.groups {
+			codes = append(codes, code)
+		}
+		sort.SliceStable(codes, func(i, j int) bool {
+			ai, bi := c.lastGroupAt[codes[i]], c.lastGroupAt[codes[j]]
+			if !ai.IsZero() || !bi.IsZero() {
+				if !ai.Equal(bi) {
+					return ai.After(bi)
+				}
+			}
+			return c.groups[codes[i]].name < c.groups[codes[j]].name
+		})
+		for _, code := range codes {
+			g := c.groups[code]
+			if g == nil || g.name == "" {
+				continue
+			}
+			pv, tm := c.convPreview(groupConv(code))
+			items = append(items, chatItem{
+				peer: groupConv(code), name: g.name,
+				preview: pv, timeStr: tm,
+				unread: g.unread, active: c.activeGroup == code,
+				isRoom: false, isGroup: true, live: true,
+			})
+		}
 	}
 	// Inline filter: every list consumer (paint, hit-test, keyboard cursor,
 	// scroll clamp) goes through chatItems, so a filtered list can never
@@ -452,7 +487,22 @@ func topBarView(w int) string {
 // is the main column width so the heading aligns with everything below it.
 func (c *chatScreen) roomHeaderView(outerW int) string {
 	var av, name, sub string
-	if c.targetUser == "" {
+	switch {
+	case c.activeGroup != "":
+		g := c.groups[c.activeGroup]
+		av = roomAvatarCell()
+		name = "General"
+		if g != nil && g.name != "" {
+			name = g.name
+		}
+		sub = "Group"
+		if c.key != "" {
+			sub += "  ·  key " + c.key
+		}
+		if n := c.onlineCount(); n > 0 {
+			sub += fmt.Sprintf("  ·  %d online", n)
+		}
+	case c.targetUser == "":
 		av = roomAvatarCell()
 		name = "General"
 		sub = "Public Room"
@@ -462,7 +512,7 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 		if n := c.onlineCount(); n > 0 {
 			sub += fmt.Sprintf("  ·  %d online", n)
 		}
-	} else {
+	default:
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
 		sub = fmt.Sprintf("Private with %s  ·  ESC = general", c.targetUser)
@@ -482,7 +532,22 @@ func (c *chatScreen) roomHeaderView(outerW int) string {
 // terminals: avatar + name + context on a single line.
 func (c *chatScreen) roomHeaderCompact(outerW int) string {
 	var av, name, sub string
-	if c.targetUser == "" {
+	switch {
+	case c.activeGroup != "":
+		g := c.groups[c.activeGroup]
+		av = roomAvatarCell()
+		name = "General"
+		if g != nil && g.name != "" {
+			name = g.name
+		}
+		sub = "Group"
+		if c.key != "" {
+			sub += " · " + c.key
+		}
+		if n := c.onlineCount(); n > 0 {
+			sub += fmt.Sprintf(" · %d online", n)
+		}
+	case c.targetUser == "":
 		av = roomAvatarCell()
 		name = "General"
 		sub = "Public"
@@ -492,7 +557,7 @@ func (c *chatScreen) roomHeaderCompact(outerW int) string {
 		if n := c.onlineCount(); n > 0 {
 			sub += fmt.Sprintf(" · %d online", n)
 		}
-	} else {
+	default:
 		av = avatarCell(c.targetUser)
 		name = c.targetUser
 		sub = "Private · ESC"

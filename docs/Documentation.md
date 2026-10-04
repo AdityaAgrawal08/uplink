@@ -104,12 +104,12 @@ clear, `↑↓` scroll, mouse supported. There is no right video panel and no
 pinned call card (both removed); liveness shows in the sidebar (`Live now`,
 `Voice call • MM:SS`) and header mic chips.
 
-Slash commands: `/help`, `/reply`, `/upload`, `/download`, `/audio`,
-`/kick`, `/admin`, `/unadmin` (last three role-gated: creator/admin only;
-`/admin` creator-only). Notices (command results, moderation outcomes,
-engine/media events, server-down alert) surface on the **status line**,
-never as transcript rows — only peer messages, own echoes, and file cards
-paint the transcript.
+Slash commands: `/help`, `/reply`, `/settings`, `/new-group`, `/upload`,
+`/download`, `/audio`, `/kick`, `/admin`, `/unadmin` (moderation
+role-gated: creator/admin only; `/admin` creator-only). Notices (command
+results, moderation outcomes, engine/media events, server-down alert)
+surface on the **status line**, never as transcript rows — only peer
+messages, own echoes, and file cards paint the transcript.
 
 ### Reply / quote (WhatsApp-style)
 
@@ -161,6 +161,63 @@ asked afterwards, in a modal overlay, only when the server reports the
 session is password-protected (401 "password required"); Esc dismisses the
 modal back to the form, and an incorrect password can be retried in place.
 CREATE keeps its optional password field for new sessions.
+
+### Groups and Settings
+
+**Groups** are named sessions created inside the current room: the creator
+is crowned automatically by the server, gets a fresh 6-digit code, and can
+invite any member of the room they created the group from. Invitees see a
+desktop ping (`X invited you to group Y`, fallback `a group` for unnamed
+groups) plus a settings badge ⚙ in the sidebar header — the badge shows the
+server's live pending-invite count and doubles as the click target for
+`/settings`.
+
+- **`/settings`** opens a full-screen settings window (landing-style
+  centered card): a **Notifications** section lists every pending invite
+  as `X invited you to group Y` with **X** (decline) and **✓** (accept)
+  actions, keyboard (`↑↓` select, `Enter` accept, `Backspace`/`Delete`
+  decline) and mouse (click the ✕ / ✓ cells) both work, and an **Account**
+  section shows the identity + server. Accepting a protected group runs
+  the same two-step join as the landing: the first accept answers 401
+  "password required" and opens a password modal; a wrong password retries
+  in place (`incorrect password`), and Esc backs out with the invite row
+  intact. A full group answers the exact 403 `Maximum allowance is
+  reached` — the invite is consumed server-side and terminal (the row
+  vanishes; a re-accept 404s, never retries). Success joins the session
+  and opens the group conversation.
+- **`/new-group`** opens the creation window in two stages: a member
+  multi-select (every room user; typing filters, `Space` toggles, `Enter`
+  proceeds — the palette's ranking contract), then the form: **Name**
+  (required, 1–64 chars), **Description** (optional, ≤256), **Max-People**
+  (default `Any`/unlimited, or a whole number ≥ 2; anything else fails
+  inline before any request). Creating POSTs `/session/create` with
+  `parentCode` = the current session code, then invites every pick —
+  `409 User is already in this session` becomes an inline note and the
+  rest continue — and finally opens the new group.
+- **Sidebar**: joined groups list by name under the members (newest
+  activity first, then name), with DM-style unread badges and previews.
+  Opening one runs the **full chat engine** in the group's own session:
+  messages, reactions (+ per-reactor dropdown), @mention highlighting,
+  quote-replies, quote-jump, files and `/upload` all work; `/admin`,
+  `/unadmin` and `/kick` keep their server role checks unchanged. Esc
+  closes the group view (still a member); **Ctrl+C in a group LEAVES it**
+  (standard leave POST, crown transfer is server-side) and returns to the
+  common room — the app keeps running, and only Ctrl+C in the home room
+  quits. Group engines stay alive in the background, so messages arriving
+  while another conversation is open badge the row and land in the group
+  transcript for when you open it.
+- **Invite polling** piggybacks the existing 2s roster/inbox tick
+  (`GET /invites/mine`): new codes ring the desk-based ping once (never on
+  re-polls) and move the badge; declines/accepts shrink it on the next
+  poll. One surface at a time: `/settings` and `/new-group` are full-screen
+  windows over the chat (composer drawers close on entry; Esc/Ctrl+C close
+  the window back to the chat, whose own Ctrl+C remains the single app
+  exit).
+
+Known limitation: joined groups are session-scoped — the sidebar does not
+re-attach groups across app restarts (the server has no "my memberships"
+endpoint), and group passwords are only remembered in memory for the
+engine's self-rejoin.
 
 ### Environment variables (CLI)
 

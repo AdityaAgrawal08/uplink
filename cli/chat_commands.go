@@ -29,6 +29,8 @@ type slashCommand struct {
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
 	{Name: "/reply", Desc: "reply to a message"},
+	{Name: "/settings", Desc: "invites & notifications"},
+	{Name: "/new-group", Desc: "create a group with room members"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
@@ -925,6 +927,16 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 			return nil
 		}
 		return c.openReplyPick(id)
+	case "/settings":
+		// The full-screen settings window (invites inbox) opens over the
+		// chat; the root model hosts it. Drawers close first — one modal
+		// surface at a time.
+		c.closeTransientsForWindow()
+		return func() tea.Msg { return openSettingsMsg{} }
+	case "/new-group":
+		// Member pick + creation window; see groups_ui.go.
+		c.closeTransientsForWindow()
+		return func() tea.Msg { return openNewGroupMsg{} }
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":
@@ -978,6 +990,21 @@ func modTarget(arg string) (string, bool) {
 		return "", false
 	}
 	return t, true
+}
+
+// closeTransientsForWindow dismisses every composer-adjacent transient
+// before a full-screen window (/settings, /new-group) opens: the "/" and
+// "@" drawers, the anchored reaction rows, the reply menu/pick and the
+// pinned quote card. One surface at a time.
+func (c *chatScreen) closeTransientsForWindow() {
+	c.palette.close()
+	c.mention.close()
+	c.closeReactionAux()
+	c.closeReplyMenu()
+	c.closeReplyPick()
+	c.composerQuote = nil
+	c.sideFilter = ""
+	c.input.SetValue("")
 }
 
 // ---- helpers -----------------------------------------------------------------

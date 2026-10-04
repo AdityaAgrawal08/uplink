@@ -9,11 +9,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeSignalServer is a minimal in-memory implementation of the signaling
-// plane contract (create/join/leave/heartbeat/signal/inbox/ack). It mirrors
-// the Next.js semantics closely enough to prove the CLI client against.
+// plane contract (create/join/leave/heartbeat/signal/inbox/ack) plus the
+// groups plane (named group creation, invites, invites/mine, accept with
+// password-first semantics and max-allowance consumption, decline). It
+// mirrors the Next.js semantics closely enough to prove the CLI client
+// against.
 type fakeSignalServer struct {
 	mu        sync.Mutex
 	members   map[string]map[string]rosterMember // code -> username -> member
@@ -21,6 +25,21 @@ type fakeSignalServer struct {
 	boxes     map[string]map[string]inboxBox     // code/username -> msgId -> box
 	epochs    map[string]int64                   // code -> roster generation (join/leave bumps)
 	reactions map[string]map[string]string       // code -> "msgId|emoji|user" -> "1"
+	// Groups plane: named sessions with a cap + optional password, and the
+	// per-user pending invite lists (newest first).
+	groupMeta map[string]fakeGroupMeta // code -> name/desc/max/password
+	invites   map[string][]groupInvite // username -> pending invites
+	groupSeq  int                      // distinct 6-digit codes for groups
+	// inviteConflict force-409s invites for a user, simulating the real
+	// race where the target joins the group by code between the creator's
+	// create and invite calls (test-only hook).
+	inviteConflict map[string]bool
+}
+
+// fakeGroupMeta is the fake's group metadata (max < 0 = unlimited).
+type fakeGroupMeta struct {
+	name, desc, pass string
+	max              int
 }
 
 func newFakeSignalServer() *fakeSignalServer {
@@ -30,7 +49,42 @@ func newFakeSignalServer() *fakeSignalServer {
 		boxes:     map[string]map[string]inboxBox{},
 		epochs:    map[string]int64{},
 		reactions: map[string]map[string]string{},
+		groupMeta: map[string]fakeGroupMeta{},
+		invites:   map[string][]groupInvite{},
+		inviteConflict: map[string]bool{},
 	}
+}
+
+// fakeInviteCount reports pending invites for a user (test accessor).
+func (f *fakeSignalServer) fakeInviteCount(user string) int {
+	return len(f.invites[user])
+}
+
+// fakeHasInvite reports whether user holds a pending invite for code.
+func (f *fakeSignalServer) fakeHasInvite(user, code string) bool {
+	for _, inv := range f.invites[user] {
+		if inv.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+// removeInvite drops one pending invite (accept/decline/consumption).
+func (f *fakeSignalServer) removeInvite(user, code string) {
+	kept := f.invites[user][:0]
+	for _, inv := range f.invites[user] {
+		if inv.Code != code {
+			kept = append(kept, inv)
+		}
+	}
+	f.invites[user] = kept
+}
+
+// fakeGroup returns a group's meta (test accessor).
+func (f *fakeSignalServer) fakeGroup(code string) (fakeGroupMeta, bool) {
+	m, ok := f.groupMeta[code]
+	return m, ok
 }
 
 func (f *fakeSignalServer) me(r *http.Request) string {
@@ -48,14 +102,60 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 	p := r.URL.Path
 
+	// User-scoped invite inbox (outside the /session/ tree).
+	if p == "/api/v1/invites/mine" && r.Method == "GET" {
+		me := f.me(r)
+		out := f.invites[me]
+		if out == nil {
+			out = []groupInvite{}
+		}
+		f.write(w, 200, map[string]any{"invites": out})
+		return
+	}
+
 	if p == "/api/v1/session/create" && r.Method == "POST" {
 		var body struct {
-			Username string `json:"username"`
-			Pubkey   string `json:"pubkey"`
+			Username   string `json:"username"`
+			Pubkey     string `json:"pubkey"`
+			Password   string `json:"password,omitempty"`
+			GroupName  string `json:"groupName"`
+			GroupDesc  string `json:"groupDesc"`
+			MaxMembers *int   `json:"maxMembers"`
+			ParentCode string `json:"parentCode"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		if len(body.Username) < 1 || body.Pubkey == "" {
 			f.write(w, 400, map[string]string{"error": "bad input"})
+			return
+		}
+		if body.GroupName != "" || body.ParentCode != "" {
+			// Group creation: validate per the server contract, then mint
+			// a fresh distinct code (the shared home room stays 123456).
+			if n := len([]rune(body.GroupName)); n < 1 || n > 64 {
+				f.write(w, 400, map[string]string{"error": "groupName must be a string of 1-64 characters"})
+				return
+			}
+			if len([]rune(body.GroupDesc)) > 256 {
+				f.write(w, 400, map[string]string{"error": "groupDesc must be a string of at most 256 characters"})
+				return
+			}
+			if body.MaxMembers != nil && (*body.MaxMembers < 2 || *body.MaxMembers > 1000000) {
+				f.write(w, 400, map[string]string{"error": "maxMembers must be an integer of at least 2, or null for unlimited"})
+				return
+			}
+			f.groupSeq++
+			code := fmt.Sprintf("%06d", 700000+f.groupSeq)
+			if f.members[code] == nil {
+				f.members[code] = map[string]rosterMember{}
+			}
+			max := -1
+			if body.MaxMembers != nil {
+				max = *body.MaxMembers
+			}
+			f.groupMeta[code] = fakeGroupMeta{name: body.GroupName, desc: body.GroupDesc, pass: body.Password, max: max}
+			// The creator is crowned automatically (server role).
+			f.members[code][body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true, Role: "creator"}
+			f.write(w, 201, map[string]string{"sessionId": code})
 			return
 		}
 		code := "123456"
@@ -110,9 +210,107 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.write(w, 409, map[string]string{"error": "Username already taken"})
 			return
 		}
-		members[body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true, Role: "member"}
+		// Plain /join enforces the group cap with the exact server message.
+		if meta, ok := f.groupMeta[code]; ok && meta.max >= 0 && len(members) >= meta.max {
+			f.write(w, 403, map[string]string{"error": "Maximum allowance is reached"})
+			return
+		}
+		role := "member"
+		if gm, ok := f.groupMeta[code]; ok && len(members) == 0 {
+			_ = gm
+			role = "creator"
+		}
+		members[body.Username] = rosterMember{Username: body.Username, Pubkey: body.Pubkey, Online: true, Role: role}
 		f.epochs[code]++
 		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{body.Username}, "roster": roster(), "epoch": f.epochs[code]})
+	case "invites|POST":
+		me := f.me(r)
+		if _, ok := members[me]; !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		var body struct {
+			Username string `json:"username"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if body.Username == me {
+			f.write(w, 400, map[string]string{"error": "You cannot invite yourself"})
+			return
+		}
+		if f.inviteConflict[body.Username] {
+			f.write(w, 409, map[string]string{"error": "User is already in this session"})
+			return
+		}
+		if _, ok := members[body.Username]; ok {
+			f.write(w, 409, map[string]string{"error": "User is already in this session"})
+			return
+		}
+		meta := f.groupMeta[code]
+		inv := groupInvite{Code: code, GroupName: meta.name, GroupDesc: meta.desc, By: me, At: time.Now().Format(time.RFC3339)}
+		// Replace a stale invite for the same code (re-invite refreshes).
+		kept := f.invites[body.Username][:0]
+		for _, old := range f.invites[body.Username] {
+			if old.Code != code {
+				kept = append(kept, old)
+			}
+		}
+		f.invites[body.Username] = append([]groupInvite{inv}, kept...)
+		f.write(w, 201, map[string]bool{"ok": true})
+	case "invites/accept|POST":
+		me := f.me(r)
+		var body struct {
+			Code     string `json:"code"`
+			Pubkey   string `json:"pubkey"`
+			Password string `json:"password,omitempty"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		// Password FIRST: required/incorrect answer 401 before anything
+		// else (the contract's ordering, so the modal opens correctly).
+		if meta, ok := f.groupMeta[code]; ok && meta.pass != "" && body.Password != meta.pass {
+			if body.Password == "" {
+				f.write(w, 401, map[string]string{"error": "Password is required for this session"})
+				return
+			}
+			f.write(w, 401, map[string]string{"error": "Incorrect session password"})
+			return
+		}
+		if !f.fakeHasInvite(me, code) {
+			f.write(w, 404, map[string]string{"error": "Invite not found"})
+			return
+		}
+		sess, exists := f.members[code]
+		if !exists {
+			f.removeInvite(me, code)
+			f.write(w, 404, map[string]string{"error": "Invite not found"})
+			return
+		}
+		// Full: the 403 is TERMINAL — the invite is consumed, re-accept 404s.
+		if meta, ok := f.groupMeta[code]; ok && meta.max >= 0 && len(sess) >= meta.max {
+			f.removeInvite(me, code)
+			f.write(w, 403, map[string]string{"error": "Maximum allowance is reached"})
+			return
+		}
+		if _, ok := sess[me]; ok {
+			f.removeInvite(me, code)
+			f.write(w, 409, map[string]string{"error": "User is already in this session"})
+			return
+		}
+		sess[me] = rosterMember{Username: me, Pubkey: body.Pubkey, Online: true, Role: "member"}
+		f.epochs[code]++
+		f.removeInvite(me, code)
+		f.write(w, 200, map[string]any{"sessionId": code, "participants": []string{me}, "roster": roster(), "epoch": f.epochs[code]})
+	case "invites/decline|POST":
+		me := f.me(r)
+		var body struct {
+			Code string `json:"code"`
+		}
+		json.NewDecoder(r.Body).Decode(&body)
+		if !f.fakeHasInvite(me, body.Code) {
+			f.write(w, 404, map[string]string{"error": "Invite not found"})
+			return
+		}
+		f.removeInvite(me, body.Code)
+		f.write(w, 200, map[string]bool{"ok": true})
 	case "leave|POST":
 		me := f.me(r)
 		if _, ok := members[me]; ok {
