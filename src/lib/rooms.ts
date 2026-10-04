@@ -135,6 +135,11 @@ const inboxKey = (code: string, username: string) => `room:${code}:inbox:${usern
 const reactionsKey = (code: string) => `room:${code}:reactions`;
 const invitesKey = (code: string) => `room:${code}:invites`;
 const userInvitesKey = (username: string) => `user:${username}:invites`;
+// Seat counter for maxMembers enforcement (finding 8): a plain int kept in
+// lockstep with the members hash, claimed via atomic INCR so concurrent
+// joiners can never oversubscribe a capped room. Released on leave/kick/
+// sweep-prune and dropped with the room (see below).
+const seatsKey = (code: string) => `room:${code}:seats`;
 
 // bumpEpoch advances the roster generation after any membership change
 // (join, leave, stale-prune). Polling clients compare it against their last
@@ -270,6 +275,7 @@ async function touchRoom(code: string): Promise<void> {
     { cmd: "expire", key: bannedKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: reactionsKey(code), args: [ROOM_TTL_SEC] },
     { cmd: "expire", key: invitesKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: seatsKey(code), args: [ROOM_TTL_SEC] },
   ]);
 }
 
@@ -487,6 +493,13 @@ export async function createRoom(
       ]);
       continue;
     }
+    // Finding 8: capped rooms start with the creator's seat claimed (the
+    // creator is member #1) — the seats counter is minted here so the first
+    // joiner's claim lands at 2, never 1, and maxMembers stays exact.
+    if (claimed === 1 && opts.maxMembers !== undefined && opts.maxMembers !== null) {
+      await redis.set(seatsKey(code), 1);
+      await redis.expire(seatsKey(code), ROOM_TTL_SEC);
+    }
     await indexRoom(code);
     return { sessionId: code };
   }
@@ -501,9 +514,11 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   assertUsername(username);
   assertPubkey(pubkey);
 
-  // Room meta + ban state + member count in one round trip: the count feeds
-  // the maxMembers gate below and the meta doubles as the existence proof
-  // (no separate roomExists round trip).
+  // Room meta + ban state + member count in one round trip: the meta doubles
+  // as the existence proof (no separate roomExists round trip). The member
+  // count only seeds the maxMembers seat counter for legacy rooms that
+  // predate it (finding 8) — the counter itself is authoritative for the
+  // gate.
   const [metaRaw, banned, memberCount] = (await redis.pipeline([
     { cmd: "hgetall", key: roomKey(code), args: [] },
     { cmd: "hget", key: bannedKey(code), args: [username] },
@@ -516,21 +531,35 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
   if (banned) {
     throw new RoomError(403, "You were kicked from this session");
   }
-  // Max-capacity gate: count BEFORE insert, so the room never exceeds
-  // maxMembers via this path (null = unlimited). ATOMICITY LIMITATION —
-  // this is check-then-add: the hlen above and the hsetnx below are
-  // separate round trips, so concurrent joiners can both pass the gate and
-  // oversubscribe by a few seats (classic TOCTOU; MockRedis pipelines run
-  // sequentially in-process, so tests see an atomicity the real backend
-  // does not guarantee). Making the claim itself conditional needs a Lua
-  // script or WATCH/MULTI, which neither MockRedis nor the Upstash REST
-  // pipeline supports here; clients poll the roster within 2s and
-  // self-correct, so a rare overshoot by N simultaneous joiners is
-  // acceptable — and the accept-invite path consumes the invite on this
-  // exact 403, so a full room never strands a pending invite.
   const meta = parseRoomMeta(metaRaw);
-  if (meta?.maxMembers != null && memberCount >= meta.maxMembers) {
-    throw new RoomError(403, "Maximum allowance is reached");
+  // Max-capacity gate (finding 8): the seat is claimed with an atomic Redis
+  // INCR so concurrent joiners can never both pass the gate — the old
+  // hlen-then-hsetnx was a check-then-add TOCTOU that oversubscribed capped
+  // rooms on real Redis (MockRedis pipelines run sequentially in-process, so
+  // tests saw an atomicity the real backend does not guarantee). Over the
+  // cap → refund the claim and reject with the exact 403 message. Seats are
+  // released on every departure path (leaveRoom/kickMember/sweepRooms) and
+  // dropped with the room; a claim whose join crashes mid-flight self-heals
+  // via sweep (the member never heartbeats, gets pruned, seat released).
+  if (meta?.maxMembers != null) {
+    const seats = await redis.incr(seatsKey(code));
+    let total = seats;
+    if (seats === 1) {
+      // Fresh counter: fold in members who joined before the seats counter
+      // existed (legacy rooms — their seats were never counted) and arm the
+      // sliding TTL backstop.
+      if (memberCount > 0) {
+        await redis.incrBy(seatsKey(code), memberCount);
+        total = 1 + memberCount;
+      }
+      await redis.expire(seatsKey(code), ROOM_TTL_SEC);
+    }
+    if (total > meta.maxMembers) {
+      // Refund the claim — and only the claim. The legacy seed (if any)
+      // represents REAL pre-existing members and stays on the counter.
+      await redis.decr(seatsKey(code));
+      throw new RoomError(403, "Maximum allowance is reached");
+    }
   }
   const now = Date.now();
   // Claim + TTLs + fresh roster in one round trip. Joiners start as
@@ -543,6 +572,10 @@ export async function joinRoom(code: string, username: string, pubkey: string): 
     { cmd: "hgetall", key: membersKey(code), args: [] },
   ])) as [number, unknown, unknown, Record<string, string> | null];
   if (claimed === 0) {
+    // This username is already present: the seat claim above must be
+    // refunded (the members hash did not grow). Both sub-paths keep the
+    // roster size — and therefore the seat count — unchanged.
+    if (meta?.maxMembers != null) await redis.decr(seatsKey(code));
     const existing = await redis.hget(membersKey(code), username);
     if (existing && !parseMember(username, existing)) {
       await redis.hset(membersKey(code), username, JSON.stringify({ pubkey, beat: now, role: "member", joinedAt: now }));
@@ -661,6 +694,9 @@ export async function leaveRoom(code: string, username: string): Promise<{ remai
     await unindexRoom(code);
     ended = true;
   } else {
+    // Finding 8: release the departed member's seat (the room survives; a
+    // destroyed room drops the whole counter in destroyRoom).
+    await redis.decr(seatsKey(code)).catch(() => 0);
     // The creator leaving transfers the crown (best-effort: a failed
     // transfer degrades to "no creator" — moderation gated off — and must
     // never block the leave itself).
@@ -785,6 +821,8 @@ export async function kickMember(
     await unindexRoom(code);
     return { roster: [], epoch: 0, remaining: 0 };
   }
+  // Finding 8: release the kicked member's seat (the room survives).
+  await redis.decr(seatsKey(code)).catch(() => 0);
   await touchRoom(code);
   const epoch = await bumpEpochBestEffort(code);
   return { roster: rosterFrom(await hgetall(membersKey(code))), epoch, remaining };
@@ -840,6 +878,7 @@ export async function destroyRoom(code: string): Promise<void> {
     { cmd: "del", key: bannedKey(code), args: [] },
     { cmd: "del", key: reactionsKey(code), args: [] },
     { cmd: "del", key: invitesKey(code), args: [] },
+    { cmd: "del", key: seatsKey(code), args: [] }, // finding 8: seats die with the room
   ];
   for (const username of Object.keys(members)) {
     ops.push(
@@ -1455,6 +1494,9 @@ export async function sweepRooms(): Promise<{ processed: number; prunedMembers: 
           { cmd: "del", key: sigKey(code, username), args: [] },
           { cmd: "del", key: inboxKey(code, username), args: [] },
         ]).catch(() => [] as unknown[]);
+        // Finding 8: a pruned member frees their maxMembers seat (this also
+        // self-heals seats claimed by joins that crashed mid-flight).
+        await redis.decr(seatsKey(code)).catch(() => 0);
         prunedMembers++;
       }
       if (stale.length > 0) await bumpEpochBestEffort(code); // one bump per swept room

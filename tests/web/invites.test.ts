@@ -89,6 +89,60 @@ describe("group rooms: meta, capacity, crown", () => {
     expect((await getRoster(open.sessionId)).length).toBe(6); // creator + 5
   });
 
+  it("maxMembers seat counter: concurrent joiners never exceed the cap (finding 8)", async () => {
+    const { sessionId } = await makeRoom({ maxMembers: 3 });
+    const joins = await Promise.allSettled(
+      Array.from({ length: 8 }, (_, i) => joinRoom(sessionId, rand(`c${i}`), PUBKEY))
+    );
+    const ok = joins.filter((j) => j.status === "fulfilled");
+    const refused = joins.filter((j) => j.status === "rejected");
+    expect(ok).toHaveLength(2); // creator + 2 concurrent joiners fill the room
+    expect(refused).toHaveLength(6);
+    for (const r of refused) {
+      const e = (r as PromiseRejectedResult).reason;
+      expect(e).toMatchObject({ status: 403, message: "Maximum allowance is reached" });
+    }
+    expect((await getRoster(sessionId)).length).toBe(3); // never exceeds cap
+  });
+
+  it("leaving/kicking/sweeping frees seats for new joiners (finding 8)", async () => {
+    const { sessionId, username: creator } = await makeRoom({ maxMembers: 2 });
+    const a = rand("a");
+    const b = rand("b");
+    const c = rand("c");
+    await joinRoom(sessionId, a, PUBKEY); // full (creator + a)
+    await leaveRoom(sessionId, a); // frees a seat
+    await joinRoom(sessionId, b, PUBKEY); // full again
+    await kickMember(sessionId, creator, b); // frees a seat
+    await joinRoom(sessionId, c, PUBKEY); // joins on the freed seat
+    expect((await getRoster(sessionId)).length).toBe(2);
+
+    // The seat counter mirrors the roster at every step.
+    const seats = Number(await redis.get(`room:${sessionId}:seats`));
+    expect(seats).toBe(2);
+    expect(await redis.get(`room:${sessionId}:seats`)).toBe("2");
+
+    // Destroying the room drops the counter entirely.
+    await leaveRoom(sessionId, creator);
+    await leaveRoom(sessionId, c);
+    expect(await redis.get(`room:${sessionId}:seats`)).toBeNull();
+  });
+
+  it("legacy rooms (members before the seats counter existed) are seeded on first join (finding 8)", async () => {
+    const { sessionId } = await makeRoom({ maxMembers: 3 });
+    // Simulate pre-counter members: two raw roster entries, no seats key.
+    const legacyA = rand("l");
+    const legacyB = rand("l2");
+    await redis.hset(`room:${sessionId}:members`, legacyA, JSON.stringify({ pubkey: PUBKEY, beat: Date.now(), role: "member", joinedAt: Date.now() }));
+    await redis.hset(`room:${sessionId}:members`, legacyB, JSON.stringify({ pubkey: PUBKEY, beat: Date.now(), role: "member", joinedAt: Date.now() }));
+    await redis.del(`room:${sessionId}:seats`);
+
+    // First join mints + seeds the counter (creator 1 + 2 legacy = 3 = full).
+    const err = await joinRoom(sessionId, rand("x"), PUBKEY).catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 403, message: "Maximum allowance is reached" });
+    expect(Number(await redis.get(`room:${sessionId}:seats`))).toBe(3);
+  });
+
   it("crown transfer: creator leave promotes oldest admin, then oldest member", async () => {
     const { sessionId, username: creator } = await makeRoom();
     const admin1 = rand("a");
