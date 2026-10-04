@@ -542,6 +542,7 @@ type chatScreen struct {
 	drag         barDrag // scrollbar drag state (any of the three panes)
 	input        textinput.Model
 	palette      paletteState    // "/" command drawer above the composer
+	mention      paletteState    // "@" member dropdown (general room only; the palette's mirror)
 	picker       pickerState     // file-browser mode of that drawer (/upload)
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
@@ -918,9 +919,12 @@ func (c *chatScreen) renderSender(m chatMessage) string {
 // chatBubble renders one chat message block: a tinted bubble that hugs its
 // text, right-aligned when it is ours so the two sides of the conversation
 // read as two sides. dim marks a send still waiting for its delivery ack,
-// so "sent" is never confused with "received".
-func chatBubble(text string, isOwn, dim bool, availWidth int) string {
+// so "sent" is never confused with "received". me is the local username:
+// when non-empty, "@<me>" tokens in the bubble paint as the mention chip
+// (callers pass "" in DMs, where "@" stays plain text).
+func chatBubble(text string, isOwn, dim bool, availWidth int, me string) string {
 	textRendered := renderMarkdown(text)
+	textRendered = mentionHighlighted(textRendered, me)
 	// Fluid bubbles: near-full-width on narrow transcripts, tighter
 	// columns when space abounds. Pure function of width, so the width
 	// cache key stays sufficient.
@@ -969,7 +973,13 @@ func (c *chatScreen) renderBody(m chatMessage) string {
 	if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
 		dim = true
 	}
-	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth)
+	// @mentions are a general-room feature: pass the local username only
+	// for room messages, so DMs render "@" as plain text.
+	me := ""
+	if isGeneralConv(m.ConvID) {
+		me = c.me
+	}
+	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth, me)
 	if badge := c.reactionBadge(m); badge != "" {
 		body += "\n" + badge
 	}
@@ -2451,6 +2461,14 @@ func (c *chatScreen) markSeen(msgId string) bool {
 
 func (c *chatScreen) handleNewMessage(m chatMessage) {
 	c.addMessage(m)
+	// @mention receipts (general room only): a desktop ping whenever an
+	// inbound message names us — ALWAYS, even while the room is focused.
+	// Own sends never ping and DMs are excluded entirely; the excerpt
+	// carries the sender + message context.
+	if c.me != "" && m.Username != c.me && isGeneralConv(m.ConvID) &&
+		mentionedIn(m.Text, c.me) {
+		mentionNotifier(m.Username, mentionExcerpt(m.Text))
+	}
 }
 
 // ---- media publishing (/audio voice calls) ------------------------------------
@@ -2548,6 +2566,7 @@ func (c *chatScreen) peerInCall(peer string) bool {
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	c.targetUser = user
 	c.palette.close() // stale "/" query must not survive a mode switch
+	c.mention.close() // the "@" dropdown is general-room only
 	// The anchored aux rows do not belong to the new thread.
 	c.pendingReactionMsgId = ""
 	c.detailMsgId, c.detailEmoji = "", ""
@@ -2563,6 +2582,7 @@ func (c *chatScreen) exitPrivate() {
 	}
 	c.targetUser = ""
 	c.palette.close()
+	c.mention.close() // the "@" dropdown stays with the general room
 	c.pendingReactionMsgId = ""
 	c.detailMsgId, c.detailEmoji = "", ""
 	c.roomUnread = 0 // back in the room: everything is visible again
@@ -2624,7 +2644,11 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	}
 	// Optimistic echo: the same block a confirmed message will paint, held
 	// faint until the delivery ack lands (netDeliveredMsg).
-	echo := chatBubble(text, true, true, c.transcriptW())
+	me := ""
+	if conv == generalConv {
+		me = c.me // mention chips are a general-room feature
+	}
+	echo := chatBubble(text, true, true, c.transcriptW(), me)
 	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
@@ -3049,6 +3073,14 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return c, tea.Batch(cmds...)
 		}
+		// "@" member dropdown eats navigation + selection keys while open,
+		// exactly like the "/" drawer above it (general room only).
+		if handled, action := c.handleMentionKeys(msg); handled {
+			if action != nil {
+				cmds = append(cmds, action())
+			}
+			return c, tea.Batch(cmds...)
+		}
 		// Ctrl+K focuses the "/" command drawer (same as typing "/").
 		// Intercepted before the input so the binding works everywhere;
 		// this shadows the input's emacs kill-line, which the footer
@@ -3056,6 +3088,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlK {
 			c.input.SetValue("/")
 			c.palette.sync("/")
+			c.mention.close() // the "/" drawer owns the slot
 			c.input.Focus()
 			c.focus = focusComposer // the drawer rides on the composer
 			c.closeReactionAux()    // one drawer slot: commands replace the aux rows
@@ -3065,6 +3098,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlL {
 			c.input.SetValue("")
 			c.palette.sync("")
+			c.mention.close()
 			return c, tea.ClearScreen
 		}
 		if msg.Type == tea.KeyEsc {
@@ -3166,6 +3200,7 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.focus = focusComposer
 		}
 		if msg.Type == tea.KeyEnter {
+			c.mention.close() // a real send always dismisses the "@" dropdown
 			text := strings.TrimSpace(c.input.Value())
 			c.input.SetValue("")
 			if text == "" {
@@ -3400,11 +3435,12 @@ func (c *chatScreen) scrollRosterToCursor() {
 // grow the sidebar's key state without limit).
 const maxSideFilter = 40
 
-// drawerOpen reports whether the "/" drawer or the file browser owns the
-// slot above the composer — and with it the focused-surface indicator, so
-// nothing else may claim to be focused at the same time.
+// drawerOpen reports whether the "/" drawer, the "@" member dropdown, or
+// the file browser owns the slot above the composer — and with it the
+// focused-surface indicator, so nothing else may claim to be focused at the
+// same time.
 func (c chatScreen) drawerOpen() bool {
-	return c.picker.isActive() || c.palette.visible()
+	return c.picker.isActive() || c.palette.visible() || c.mention.visible()
 }
 
 // textEditKey reports whether a key is text input: printable characters and
