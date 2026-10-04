@@ -37,6 +37,18 @@ func notifyTransferFailed(filename string, err error) {
 	notify("Uplink-Delta", fmt.Sprintf("Transfer failed: %s - %v", filename, err))
 }
 
+// beeepNotify is the desktop-notification entry point for the reply ping,
+// swappable so tests can capture the exact body without popping real
+// toasts; production always routes through beeep.Notify.
+var beeepNotify = beeep.Notify
+
+// notifyReplyTo pings the quoted author of an inbound reply. Body is
+// EXACTLY "<from> replied to you" — the same beeep path (with the fallback
+// surface) mentions use elsewhere.
+func notifyReplyTo(from string) {
+	_ = beeepNotify("Uplink-Delta", fmt.Sprintf("%s replied to you", from), "")
+}
+
 // notifyMentioned is the desktop ping for an inbound @mention (general room
 // only): title + body carry exactly "<sender> mentioned you in the chat."
 // — one tidy line, no message excerpt. The ping is ALWAYS attempted —

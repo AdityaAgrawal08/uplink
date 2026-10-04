@@ -106,6 +106,9 @@ var (
 	colOtherBg = lipgloss.AdaptiveColor{Light: "#eef2f9", Dark: "#111a2b"}
 	colOwnBg   = lipgloss.AdaptiveColor{Light: "#dcebff", Dark: "#122444"}
 
+	// quote-jump highlight: the whole quoted row goes blue for 3s
+	colJumpBg = lipgloss.AdaptiveColor{Light: "#c3d9ff", Dark: "#1d3a6b"}
+
 	// markdown
 	colCodeFg = lipgloss.AdaptiveColor{Light: "#9a3412", Dark: "#f0abfc"}
 	colCodeBg = lipgloss.AdaptiveColor{Light: "#e8ecf4", Dark: "#161d2e"}
@@ -189,6 +192,12 @@ var (
 	thFileNameStyle = lipgloss.NewStyle().Bold(true).Foreground(colText)
 	thFileMetaStyle = lipgloss.NewStyle().Foreground(colDim)
 	thFileDlStyle   = lipgloss.NewStyle().Foreground(colAccent)
+
+	// pinned reply citation above the composer (WhatsApp-style quote card)
+	thQuoteCardStyle = lipgloss.NewStyle().
+				Background(colPanel2).
+				Foreground(colText)
+	thQuoteXStyle = lipgloss.NewStyle().Foreground(colFaint)
 )
 
 // avatarPalettes assign each user a stable, distinct identity hue: the
@@ -574,6 +583,9 @@ func composerTopRows(l layout) int {
 	}
 	if l.paletteRows > 0 {
 		top += l.paletteRows // drawer panel + its spacer row
+	}
+	if l.quoteRows > 0 {
+		top += l.quoteRows // pinned reply citation above the composer
 	}
 	if l.frameOn {
 		top++ // frame top edge

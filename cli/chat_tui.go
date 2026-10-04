@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // ---- styling ---------------------------------------------------------------
@@ -113,6 +114,7 @@ type layout struct {
 	hintRows     int  // composer key-hints row under the composer (0 when collapsed)
 	statusRows   int  // extra rows consumed by the status line (0 or 1)
 	paletteRows  int  // rows reserved for the "/" drawer incl. its spacer (0 = closed)
+	quoteRows    int  // rows the pinned reply citation consumes above the composer (0/1)
 	showHeader   bool // staged degradation: hide banner on tiny heights
 	sidebarWidth int  // density-scaled conversation column
 	composerRows int  // writable rows inside the composer box (1/0)
@@ -121,7 +123,7 @@ type layout struct {
 
 // totalRows reports the exact number of terminal rows a frame will occupy.
 func (l layout) totalRows() int {
-	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.hintRows
+	h := l.vpHeight + l.statusRows + l.paletteRows + l.headRows + l.hintRows + l.quoteRows
 	if l.composerRows > 0 {
 		h += l.composerRows + 2 // composer border
 	} else {
@@ -155,12 +157,12 @@ func computeLayout(termW, termH int, showStatus bool) layout {
 //
 // Pure function => trivially unit-testable.
 func computeLayoutWithPalette(termW, termH int, showStatus bool, paletteRows int) layout {
-	return computeLayoutMedia(termW, termH, showStatus, paletteRows)
+	return computeLayoutMedia(termW, termH, showStatus, paletteRows, 0)
 }
 
 // computeLayoutMedia is THE pure geometry pass: terminal size + status +
-// drawer budget in, every pane's rectangle out.
-func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int) layout {
+// drawer budget + pinned-quote budget in, every pane's rectangle out.
+func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows, quoteRows int) layout {
 	var l layout
 	if termW <= 0 || termH <= 0 {
 		return l
@@ -170,6 +172,7 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int) layo
 		l.statusRows = 1
 	}
 	l.paletteRows = paletteRows
+	l.quoteRows = quoteRows
 	l.showHeader = true
 	// The chat shell is EDGE-TO-EDGE: no outer frame, no margin — every row
 	// and column belongs to content. frameOn/frameChrome stay in the layout
@@ -211,6 +214,8 @@ func computeLayoutMedia(termW, termH int, showStatus bool, paletteRows int) layo
 			l.composerRows = 0 // bare prompt
 		case l.paletteRows > 0:
 			l.paletteRows = 0 // absurdly tiny terminal: dissolve the drawer
+		case l.quoteRows > 0:
+			l.quoteRows = 0 // the pinned quote card goes before the banner
 		default:
 			l.showHeader = false
 		}
@@ -312,6 +317,84 @@ type rosterTickMsg struct{}
 // netRosterMsg arrives when the engine's beat learns membership moved
 // (join/leave): refresh the sidebar now instead of waiting for the tick.
 type netRosterMsg struct{}
+
+// ─── quote-reply state ─────────────────────────────────────────────────────
+//
+// Three cooperating surfaces: the /reply selection pointer (keyboard), the
+// floating right-click menu (mouse + keyboard), and the pinned composer
+// quote card (the one that travels on the wire). All are transient UI
+// state; only the chat frame's optional JSON fields are protocol.
+
+// replyPickState is the /reply selection mode. target is the pointed
+// message; anim is the painted pointer frame (pulse/slide-in reveal mirror
+// of the reaction dropdown); gen fences ticks from a superseded session;
+// row is the pointer's first viewport content row (refreshViewport).
+type replyPickState struct {
+	target string
+	anim   int
+	gen    int
+	row    int
+}
+
+// replyPickAnimFrames is the number of painted stages in the pointer's
+// slide-in reveal: 0 is the "still arriving" state, the last frame is the
+// settled "<" beside the message. replyPickAnimStep spaces the tea.Tick
+// frames ~50ms apart, mirroring the reaction dropdown's reveal.
+const (
+	replyPickAnimFrames = 4
+	replyPickAnimStep   = 50 * time.Millisecond
+)
+
+// replyPickAnimMsg advances the pointer to painted stage frame. gen fences
+// out ticks from a superseded open (dismiss, reopen, a second target).
+type replyPickAnimMsg struct{ gen, frame int }
+
+// scheduleReplyPickAnim arms the next pointer reveal stage for generation gen.
+func scheduleReplyPickAnim(gen, frame int) tea.Cmd {
+	return tea.Tick(replyPickAnimStep, func(time.Time) tea.Msg {
+		return replyPickAnimMsg{gen: gen, frame: frame}
+	})
+}
+
+// replyMenuState is the floating right-click menu. items is the scoped
+// item list ("Reply" always; "Reply-Privately" on others' messages), sel
+// the highlighted row, x/y the overlay origin in terminal coordinates and
+// w/h its size. Both geometry and items are fixed at open time so paint,
+// keyboard selection and click hit-testing can never drift.
+type replyMenuState struct {
+	msgId string
+	items []string
+	sel   int
+	x, y  int
+	w, h  int
+}
+
+// quoteJumpState is an in-flight quote-jump highlight: the quoted message's
+// whole row paints blue until left ticks expire. gen fences stale expiry
+// ticks so a superseded jump can never shorten a newer one.
+type quoteJumpState struct {
+	msgId string
+	gen   int
+	left  int
+}
+
+// quoteJumpTicks is the highlight lifetime in seconds; quoteJumpStep spaces
+// the expiry ticks.
+const (
+	quoteJumpTicks = 3
+	quoteJumpStep  = time.Second
+)
+
+// quoteJumpTickMsg expires one highlight second (or clears the highlight on
+// the final tick).
+type quoteJumpTickMsg struct{ gen int }
+
+// scheduleQuoteJumpTick arms the next highlight expiry second for generation gen.
+func scheduleQuoteJumpTick(gen int) tea.Cmd {
+	return tea.Tick(quoteJumpStep, func(time.Time) tea.Msg {
+		return quoteJumpTickMsg{gen: gen}
+	})
+}
 
 // kickDoneMsg arrives when a /kick request completes.
 type kickDoneMsg struct {
@@ -433,6 +516,7 @@ type sendDoneMsg struct {
 	msgId string // E2E message identity (ACKs/dedup)
 	code  int
 	err   error
+	quote chatQuote // citation this send carried (all-empty = plain)
 }
 type leaveDoneMsg struct{}
 
@@ -527,12 +611,48 @@ type chatScreen struct {
 	// rowMsg (viewport content row -> MsgId) so a click maps to a message.
 	lineMsg []string
 	rowMsg  []string
+	// lineCard is parallel to lines: the row offset INSIDE the entry where
+	// its quote-reply citation card starts (-1 = no card). The card is the
+	// line right after the group header when one paints, else the entry's
+	// first line. refreshViewport expands it into rowCard (content row ->
+	// card row), so a click on the card jumps to the quoted message instead
+	// of opening the reaction picker.
+	lineCard []int
+	rowCard  []bool
 	// roomUnread counts room broadcasts that arrived while a DM thread is
 	// in view (broadcasts otherwise paint nowhere and badge nothing — a
 	// message can sit in history looking "missing"). Cleared on return to
 	// the room. DM unreads keep using the per-peer map.
 	roomUnread int
 	users      []string
+	// composerQuote is the pinned WhatsApp-style reply citation above the
+	// composer (nil = none). The X at the card's right edge clears it; the
+	// next send attaches it to the chat frame. Reply-Privately carries it
+	// into the DM composer untouched.
+	composerQuote *chatQuote
+	// replyPick is the /reply selection mode: an animated "<" pointer
+	// beside the targeted message (nil = closed). Enter on a message opens
+	// the floating reply menu; Esc/typing/sends/mode switches exit.
+	// replyPick.anim is the painted pointer frame (see replyPickAnimFrames);
+	// replyPick.gen fences ticks from a superseded session. replyPick.row
+	// is the pointer's first viewport content row (refreshViewport).
+	replyPick *replyPickState
+	// replyPickLineIdx is the pointer's entry in lines (rebuildView), -1
+	// when no pointer paints.
+	replyPickLineIdx int
+	// replyMenu is the floating right-click menu (nil = closed): a small
+	// boxed panel near the click offering Reply / Reply-Privately. Esc,
+	// click-elsewhere, and typing dismiss it.
+	replyMenu *replyMenuState
+	// quoteJump is an in-flight quote-jump highlight: the quoted message's
+	// ENTIRE row paints blue until quoteJumpTicks ticks expire (nil =
+	// nothing highlighted). gen fences stale expiry ticks.
+	quoteJump *quoteJumpState
+	// replyPickCounter / quoteJumpCounter are monotonic generation
+	// counters: they make tick fencing survive state teardown and reopen
+	// (a fresh session can never collide with a stale timer's gen).
+	replyPickCounter int
+	quoteJumpCounter int
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
 	call         *mediaManager
 	callLevel    float64        // mic loudness for the status meter
@@ -890,6 +1010,12 @@ func (c *chatScreen) transcriptW() int {
 // put the time first and right-align the whole line so the two sides of the
 // conversation read as two sides.
 func (c *chatScreen) senderLabel(name, tsPlain string, isOwn bool) string {
+	return c.senderLabelStyled(name, tsPlain, isOwn, nil)
+}
+
+// senderLabelStyled is senderLabel with an optional full-row background
+// (the quote-jump highlight tints the whole row blue).
+func (c *chatScreen) senderLabelStyled(name, tsPlain string, isOwn bool, bg lipgloss.TerminalColor) string {
 	w := c.transcriptW()
 	display := name
 	var nameStyle lipgloss.Style
@@ -899,6 +1025,9 @@ func (c *chatScreen) senderLabel(name, tsPlain string, isOwn bool) string {
 	} else {
 		nameStyle = lipgloss.NewStyle().Bold(true).Foreground(avatarColorFor(name))
 	}
+	if bg != nil {
+		nameStyle = nameStyle.Background(bg)
+	}
 	var line string
 	if isOwn {
 		line = thMsgTimeStyle.Render(tsPlain) + "  " + nameStyle.Render(display)
@@ -906,7 +1035,14 @@ func (c *chatScreen) senderLabel(name, tsPlain string, isOwn bool) string {
 		line = nameStyle.Render(display) + "  " + thMsgTimeStyle.Render(tsPlain)
 	}
 	if isOwn {
-		return lipgloss.NewStyle().Width(w).Align(lipgloss.Right).Render(line)
+		st := lipgloss.NewStyle().Width(w).Align(lipgloss.Right)
+		if bg != nil {
+			st = st.Background(bg)
+		}
+		return st.Render(line)
+	}
+	if bg != nil {
+		return lipgloss.NewStyle().Background(bg).Width(w).Render(truncateByWidth(line, w))
 	}
 	return truncateByWidth(line, w)
 }
@@ -924,6 +1060,12 @@ func (c *chatScreen) renderSender(m chatMessage) string {
 // general-room messages, and DM threads alike (DMs highlight for display
 // only; receipts stay general-room-only, gated upstream).
 func chatBubble(text string, isOwn, dim bool, availWidth int) string {
+	return chatBubbleStyled(text, isOwn, dim, availWidth, nil)
+}
+
+// chatBubbleStyled is chatBubble with an optional bubble background
+// override (the quote-jump highlight tints the whole bubble blue).
+func chatBubbleStyled(text string, isOwn, dim bool, availWidth int, bg lipgloss.TerminalColor) string {
 	textRendered := renderMarkdown(text)
 	textRendered = mentionHighlighted(textRendered)
 	// Fluid bubbles: near-full-width on narrow transcripts, tighter
@@ -950,6 +1092,9 @@ func chatBubble(text string, isOwn, dim bool, availWidth int) string {
 		if dim {
 			style = style.Faint(true)
 		}
+	}
+	if bg != nil {
+		style = style.Background(bg)
 	}
 	// Re-assert the bubble's colours after every reset the markdown emits,
 	// then let the bubble itself do the wrapping.
@@ -978,10 +1123,87 @@ func (c *chatScreen) renderBody(m chatMessage) string {
 	// in DMs alike (mentionHighlighted runs inside chatBubble; receipts are
 	// gated general-room-only upstream, so DM highlighting is display-only).
 	body := chatBubble(m.Text, m.Username == c.me, dim, availWidth)
+	if card := c.quoteCardBlock(m.quote(), m.Username == c.me, availWidth); card != "" {
+		body = alignBlock(card, m.Username == c.me, availWidth) + "\n" + body
+	}
 	if badge := c.reactionBadge(m); badge != "" {
 		body += "\n" + badge
 	}
 	return body
+}
+
+// alignBlock pins a transcript block to the bubble's side of the column —
+// right for own messages, flush left for peers — clipped to the transcript
+// width so it can never wrap into a second row.
+func alignBlock(block string, isOwn bool, availWidth int) string {
+	if isOwn {
+		return lipgloss.NewStyle().Width(availWidth).Align(lipgloss.Right).Render(block)
+	}
+	return truncateByWidth(block, availWidth)
+}
+
+// quoteCardBlock renders the WhatsApp-style citation card that tops a
+// message carrying a quote: an accent bar, the quoted author, and the
+// excerpt, painted on the bubble's own background so it reads as part of
+// the bubble. One row, always (the excerpt is capped and clipped). Empty
+// when there is no citation.
+func (c *chatScreen) quoteCardBlock(q chatQuote, isOwn bool, availWidth int) string {
+	if q.ReplyTo == "" || q.ReplyAuthor == "" {
+		return ""
+	}
+	bg := colOtherBg
+	if isOwn {
+		bg = colOwnBg
+	}
+	bar := lipgloss.NewStyle().Foreground(colAccent).Render("▎")
+	name := lipgloss.NewStyle().Bold(true).Foreground(avatarColorFor(q.ReplyAuthor)).Render(q.ReplyAuthor)
+	excerpt := lipgloss.NewStyle().Foreground(colDim).Render(sanitizeDisplay(q.ReplyExcerpt))
+	inner := truncateByWidth(bar+" "+name+": "+excerpt, maxInt(availWidth-2, 1))
+	return lipgloss.NewStyle().Background(bg).Foreground(colText).Padding(0, 1).Render(inner)
+}
+
+// jumpBg is the background every row of a quote-jumped message paints with
+// for the 3s highlight.
+func jumpBg() lipgloss.TerminalColor { return colJumpBg }
+
+// renderSenderJump paints the group header of a quote-jumped message with
+// the full-row blue highlight.
+func (c *chatScreen) renderSenderJump(m chatMessage) string {
+	return c.senderLabelStyled(m.Username, chatTimeLabel(m.CreatedAt), m.Username == c.me, jumpBg())
+}
+
+// renderBodyJump paints a quote-jumped message's body with the full-row
+// blue highlight: bubble and citation card both tint blue. System rows are
+// never jump targets and keep their quiet look.
+func (c *chatScreen) renderBodyJump(m chatMessage) string {
+	availWidth := c.transcriptW()
+	if m.Kind == "system" {
+		return c.renderBody(m)
+	}
+	dim := false
+	if _, ok := c.unackedUI[m.MsgId]; ok && m.MsgId != "" {
+		dim = true
+	}
+	body := chatBubbleStyled(m.Text, m.Username == c.me, dim, availWidth, jumpBg())
+	if card := c.quoteCardBlockJump(m.quote(), m.Username == c.me, availWidth); card != "" {
+		body = alignBlock(card, m.Username == c.me, availWidth) + "\n" + body
+	}
+	if badge := c.reactionBadge(m); badge != "" {
+		body += "\n" + badge
+	}
+	return body
+}
+
+// quoteCardBlockJump is quoteCardBlock on the blue highlight background.
+func (c *chatScreen) quoteCardBlockJump(q chatQuote, isOwn bool, availWidth int) string {
+	if q.ReplyTo == "" || q.ReplyAuthor == "" {
+		return ""
+	}
+	bar := lipgloss.NewStyle().Foreground(colAccent).Render("▎")
+	name := lipgloss.NewStyle().Bold(true).Foreground(avatarColorFor(q.ReplyAuthor)).Render(q.ReplyAuthor)
+	excerpt := lipgloss.NewStyle().Foreground(colDim).Render(sanitizeDisplay(q.ReplyExcerpt))
+	inner := truncateByWidth(bar+" "+name+": "+excerpt, maxInt(availWidth-2, 1))
+	return lipgloss.NewStyle().Background(jumpBg()).Foreground(colText).Padding(0, 1).Render(inner)
 }
 
 // reactionChip renders one reaction pill through the shared chip geometry:
@@ -1106,6 +1328,19 @@ func (c *chatScreen) renderEntry(m chatMessage, withHeader bool) string {
 		return body
 	}
 	return c.renderedSender(m) + "\n" + body
+}
+
+// renderEntryJump composes a quote-jumped message's entry with the whole
+// row painted blue (header, bubble, citation card).
+func (c *chatScreen) renderEntryJump(m chatMessage, withHeader bool) string {
+	body := c.renderBodyJump(m)
+	if body == "" {
+		return ""
+	}
+	if !withHeader || m.Kind == "system" {
+		return body
+	}
+	return c.renderSenderJump(m) + "\n" + body
 }
 
 // renderLine renders a message as a complete standalone entry (header +
@@ -1665,9 +1900,11 @@ func (c *chatScreen) messageTime(m chatMessage) time.Time {
 func (c *chatScreen) rebuildView() {
 	c.lines = c.lines[:0]
 	c.lineMsg = c.lineMsg[:0]
+	c.lineCard = c.lineCard[:0]
 	c.reactionLineIdx = -1 // no anchored picker until one is seen below
 	c.detailLineIdx = -1   // no reactor detail bar until one is seen below
 	c.detailN = 0
+	c.replyPickLineIdx = -1 // no reply pointer until one is seen below
 	c.cacheForWidth(c.vp.Width)
 
 	// Partition local lines: file cards (to interleave) vs transient lines (pinned at bottom).
@@ -1733,12 +1970,13 @@ func (c *chatScreen) rebuildView() {
 		}
 		return newRun
 	}
-	push := func(entry, msgId string) {
+	push := func(entry, msgId string, cardOff int) {
 		if entry == "" {
 			return // suppressed (own presence line): leave no blank row
 		}
 		c.lines = append(c.lines, entry)
 		c.lineMsg = append(c.lineMsg, msgId)
+		c.lineCard = append(c.lineCard, cardOff)
 	}
 
 	hi, ci := 0, 0
@@ -1765,12 +2003,25 @@ func (c *chatScreen) rebuildView() {
 			if fd.username == c.me {
 				card = lipgloss.NewStyle().Width(maxInt(c.transcriptW(), 1)).Align(lipgloss.Right).Render(card)
 			}
-			push(header+card, "")
+			push(header+card, "", -1)
 			ci++
 		} else if hasHist {
 			m := visibleHistory[hi]
 			withHeader := startGroup(m.Username, m.Kind, c.messageTime(m))
 			entry := c.renderedEntry(m, withHeader)
+			// A quote-jumped message's WHOLE row paints blue: re-render the
+			// entry with the highlight backgrounds instead of the cached art.
+			if entry != "" && c.quoteJump != nil && m.MsgId == c.quoteJump.msgId {
+				entry = c.renderEntryJump(m, withHeader)
+			}
+			// The /reply pointer is an extra transcript row directly ABOVE
+			// its target message (same anchored pattern as the reaction
+			// picker): it scrolls with the message. refreshViewport turns
+			// replyPickLineIdx into the viewport-relative replyPick.row.
+			if entry != "" && c.replyPick != nil && m.MsgId == c.replyPick.target {
+				c.replyPickLineIdx = len(c.lines)
+				push(c.replyPointerPaint(m), "", -1)
+			}
 			// The reaction picker is an extra transcript row directly ABOVE
 			// its message's entry (WhatsApp-style anchor), never a drawer row:
 			// it scrolls with the message it targets. refreshViewport turns
@@ -1778,9 +2029,16 @@ func (c *chatScreen) rebuildView() {
 			// hit-test reads.
 			if entry != "" && m.MsgId != "" && m.MsgId == c.pendingReactionMsgId {
 				c.reactionLineIdx = len(c.lines)
-				push(c.reactionPickerView(m), "")
+				push(c.reactionPickerView(m), "", -1)
 			}
-			push(entry, reactableMsgId(m))
+			cardOff := -1
+			if entry != "" && m.repliedTo() {
+				cardOff = 0
+				if withHeader && m.Kind != "system" {
+					cardOff = 1 // the card sits right under the group header
+				}
+			}
+			push(entry, reactableMsgId(m), cardOff)
 			// The reactor dropdown hangs directly BELOW its message: a
 			// rounded card (header + divider + reactor rows) whose reveal
 			// frame is c.detailAnim, painted as control lines that never
@@ -1788,7 +2046,7 @@ func (c *chatScreen) rebuildView() {
 			if entry != "" && m.MsgId != "" && m.MsgId == c.detailMsgId && c.detailEmoji != "" {
 				c.detailLineIdx = len(c.lines)
 				for _, row := range c.reactionDetailPaint(m, c.detailEmoji, c.detailAnim) {
-					push(row, "")
+					push(row, "", -1)
 				}
 				c.detailN = len(c.lines) - c.detailLineIdx
 			}
@@ -1799,7 +2057,7 @@ func (c *chatScreen) rebuildView() {
 	}
 	// Append transient pinned lines (pending echo, progress bars, errors) at bottom.
 	for _, ll := range pinned {
-		push(ll.text, "")
+		push(ll.text, "", -1)
 	}
 	c.syncRosterVp() // users list content lives with the screen, not the copy
 	if c.pending != nil && c.pending.conv == c.activeConv() && len(c.lines) > 0 {
@@ -1827,9 +2085,13 @@ func (c *chatScreen) refreshViewport() {
 		// painted straight into the viewport (never into c.lines) so the
 		// transcript's row model stays message-for-message.
 		c.rowMsg = c.rowMsg[:0]
+		c.rowCard = c.rowCard[:0]
 		c.reactionRow = -1
 		c.detailRow = -1
 		c.detailRowH = 0
+		if c.replyPick != nil {
+			c.replyPick.row = -1
+		}
 		c.vp.SetContent(c.emptyStateView(w))
 		if atBottom {
 			c.vp.GotoBottom()
@@ -1861,9 +2123,13 @@ func (c *chatScreen) refreshViewport() {
 	// picker line is indexed in the same pass: reactionRow is the content row
 	// its single line paints on, so the hit-test follows any scroll.
 	c.rowMsg = c.rowMsg[:0]
+	c.rowCard = c.rowCard[:0]
 	c.reactionRow = -1
 	c.detailRow = -1
 	c.detailRowH = 0
+	if c.replyPick != nil {
+		c.replyPick.row = -1
+	}
 	row := 0
 	for i, wl := range wrapped {
 		if i == c.reactionLineIdx {
@@ -1872,9 +2138,16 @@ func (c *chatScreen) refreshViewport() {
 		if i == c.detailLineIdx {
 			c.detailRow = row
 		}
+		if i == c.replyPickLineIdx && c.replyPick != nil {
+			c.replyPick.row = row
+		}
 		id := ""
 		if i < len(c.lineMsg) {
 			id = c.lineMsg[i]
+		}
+		cardOff := -1
+		if i < len(c.lineCard) {
+			cardOff = c.lineCard[i]
 		}
 		n := strings.Count(wl, "\n") + 1
 		if c.detailLineIdx >= 0 && i >= c.detailLineIdx && i < c.detailLineIdx+c.detailN {
@@ -1882,6 +2155,7 @@ func (c *chatScreen) refreshViewport() {
 		}
 		for j := 0; j < n; j++ {
 			c.rowMsg = append(c.rowMsg, id)
+			c.rowCard = append(c.rowCard, cardOff == j)
 		}
 		row += n
 	}
@@ -2395,13 +2669,13 @@ func (c chatScreen) drainNetCmd() tea.Cmd {
 	}
 }
 
-func (c chatScreen) doSend(text, to string, seq int) tea.Cmd {
+func (c chatScreen) doSend(text, to string, seq int, q chatQuote) tea.Cmd {
 	return func() tea.Msg {
-		// engine.sendChat is synchronous: P2P encrypt+send, or inbox seal+
-		// deposit. Map failures onto the legacy settle codes.
-		msgId, err := c.eng.sendChat(to, text)
+		// engine.sendChatQuoted is synchronous: P2P encrypt+send, or inbox
+		// seal+deposit. Map failures onto the legacy settle codes.
+		msgId, err := c.eng.sendChatQuoted(to, text, q)
 		if err == nil {
-			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201}
+			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201, quote: q}
 		}
 		msg := err.Error()
 		switch code := apiStatusCode(err); {
@@ -2568,6 +2842,8 @@ func (c *chatScreen) enterPrivate(user string) tea.Cmd {
 	// The anchored aux rows do not belong to the new thread.
 	c.pendingReactionMsgId = ""
 	c.detailMsgId, c.detailEmoji = "", ""
+	c.closeReplyMenu()
+	c.closeReplyPick()
 	delete(c.unread, user) // opening the thread clears its badge
 	c.rebuildView()
 	return nil
@@ -2584,7 +2860,304 @@ func (c *chatScreen) exitPrivate() {
 	c.pendingReactionMsgId = ""
 	c.detailMsgId, c.detailEmoji = "", ""
 	c.roomUnread = 0 // back in the room: everything is visible again
+	c.closeReplyMenu()
+	c.closeReplyPick()
 	c.rebuildView()
+}
+
+// ─── floating reply menu ────────────────────────────────────────────────────
+
+// openReplyMenu pops the floating Reply / Reply-Privately menu near a
+// transcript click (right mouse button or a committed /reply pick). Own
+// messages offer Reply only. The menu is a small boxed panel right-aligned
+// to the request point, clamped inside the main column; geometry and items
+// are fixed here so paint, keyboard and click hit-testing stay in sync.
+func (c *chatScreen) openReplyMenu(m chatMessage, x, y int) {
+	items := []string{"Reply"}
+	if m.Username != c.me {
+		items = append(items, "Reply-Privately")
+	}
+	inner := 0
+	for _, it := range items {
+		if w := lipgloss.Width(it); w > inner {
+			inner = w
+		}
+	}
+	inner += 4 // breathing room inside the panel
+	l := c.layoutFor()
+	if maxInner := maxInt(l.vpWidth-4, 6); inner > maxInner {
+		inner = maxInner
+	}
+	w := inner + 2 // borders
+	h := len(items) + 2
+	x0 := transcriptX0(l) + 1
+	menuX := x - w + 1 // right edge at the click
+	if menuX < x0 {
+		menuX = x + 1 // no room: hang off the click's left instead
+	}
+	if menuX < x0 {
+		menuX = x0
+	}
+	if menuX+w > c.width {
+		menuX = c.width - w
+	}
+	if menuX < x0 {
+		menuX = x0
+	}
+	menuY := y
+	if menuY+h > c.height {
+		menuY = c.height - h
+	}
+	if menuY < 0 {
+		menuY = 0
+	}
+	c.closeReactionAux()
+	c.closeReplyPick()
+	c.replyMenu = &replyMenuState{msgId: m.MsgId, items: items, sel: 0, x: menuX, y: menuY, w: w, h: h}
+}
+
+// closeReplyMenu dismisses the floating menu. Stale activations are
+// impossible: every entry path re-reads c.replyMenu under Update's single
+// goroutine.
+func (c *chatScreen) closeReplyMenu() {
+	c.replyMenu = nil
+}
+
+// replyMenuMove steps the menu highlight with wrap-around.
+func (c *chatScreen) replyMenuMove(step int) {
+	if c.replyMenu == nil {
+		return
+	}
+	n := len(c.replyMenu.items)
+	if n <= 0 {
+		return
+	}
+	c.replyMenu.sel = ((c.replyMenu.sel+step)%n + n) % n
+}
+
+// replyMenuItemAt maps a click onto a menu item row: (index, true) inside
+// an item, (-1, false) on the border or off the panel.
+func (c *chatScreen) replyMenuItemAt(x, y int) (int, bool) {
+	m := c.replyMenu
+	if m == nil || y < m.y || y >= m.y+m.h || x < m.x || x >= m.x+m.w {
+		return -1, false
+	}
+	row := y - m.y
+	if row == 0 || row == m.h-1 {
+		return -1, false // border rows are not items
+	}
+	return row - 1, true
+}
+
+// replyMenuActivate runs the highlighted menu item: Reply pins the quote
+// card above the composer; Reply-Privately pins it and opens the DM with
+// the target's owner, carrying the card into that composer.
+func (c *chatScreen) replyMenuActivate() tea.Cmd {
+	m := c.replyMenu
+	if m == nil {
+		return nil
+	}
+	target, ok := c.msgById(m.msgId)
+	if !ok || m.sel < 0 || m.sel >= len(m.items) {
+		c.closeReplyMenu()
+		return nil
+	}
+	switch m.items[m.sel] {
+	case "Reply":
+		c.pinComposerQuote(target)
+		c.closeReplyMenu()
+		c.focus = focusComposer
+		return nil
+	case "Reply-Privately":
+		peer := target.Username
+		if target.ConvID != "" && target.ConvID != generalConv {
+			if p := peerOf(c.me, target.ConvID); p != "" && p != c.me {
+				peer = p // reply targets the thread's other participant
+			}
+		}
+		if peer == "" || peer == c.me {
+			c.closeReplyMenu()
+			return nil
+		}
+		c.pinComposerQuote(target)
+		c.closeReplyMenu()
+		return c.enterPrivate(peer)
+	}
+	return nil
+}
+
+// replyMenuBlock paints the menu panel: one row per item inside the shared
+// palette box, the selected row wearing the palette's accent chip.
+func (c *chatScreen) replyMenuBlock() []string {
+	m := c.replyMenu
+	inner := m.w - 2
+	rows := make([]string, 0, len(m.items))
+	for i, item := range m.items {
+		line := padVisible(item, inner)
+		if i == m.sel {
+			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
+		}
+		rows = append(rows, line)
+	}
+	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
+	return strings.Split(panel, "\n")
+}
+
+// overlayReplyMenu splices the floating menu into a painted terminal frame
+// near its anchor: the panel replaces the cells it covers, the rest of each
+// row keeps its own paint. The menu is transient — any repaint that
+// dismisses it restores the untouched rows.
+func (c *chatScreen) overlayReplyMenu(out []string, l layout) {
+	if c.replyMenu == nil || len(out) == 0 {
+		return
+	}
+	m := c.replyMenu
+	for i, r := range c.replyMenuBlock() {
+		y := m.y + i
+		if y < 0 || y >= len(out) {
+			continue
+		}
+		row := out[y]
+		head := truncateByWidth(row, m.x)
+		if lipgloss.Width(head) < m.x {
+			head += strings.Repeat(" ", m.x-lipgloss.Width(head))
+		}
+		merged := head + r
+		if w := lipgloss.Width(row); m.x+m.w < w {
+			merged += ansi.Cut(row, m.x+m.w, w)
+		} else if lipgloss.Width(merged) < c.width {
+			merged += strings.Repeat(" ", c.width-lipgloss.Width(merged))
+		}
+		out[y] = merged
+	}
+}
+
+// ─── pinned composer quote card ─────────────────────────────────────────────
+
+// pinComposerQuote pins the WhatsApp-style citation card above the
+// composer: an accent bar, the quoted author and a capped excerpt, with an
+// X at the right edge. The next send attaches it to the chat frame.
+func (c *chatScreen) pinComposerQuote(m chatMessage) {
+	if m.MsgId == "" {
+		return
+	}
+	c.composerQuote = &chatQuote{
+		ReplyTo:      m.MsgId,
+		ReplyAuthor:  m.Username,
+		ReplyExcerpt: replyExcerptOf(m.Text),
+	}
+	c.closeReactionAux()
+	c.closeReplyMenu()
+	c.closeReplyPick()
+	c.rebuildView()
+}
+
+// clearComposerQuote dismisses the pinned citation (the X click).
+func (c *chatScreen) clearComposerQuote() {
+	if c.composerQuote == nil {
+		return
+	}
+	c.composerQuote = nil
+	c.rebuildView()
+}
+
+// quoteComposerRow paints the single-row pinned citation card above the
+// composer, full column width on the panel tint, X at the right edge.
+func (c *chatScreen) quoteComposerRow(colW int) string {
+	q := c.composerQuote
+	if q == nil {
+		return ""
+	}
+	bar := lipgloss.NewStyle().Foreground(colAccent).Render("▎")
+	name := lipgloss.NewStyle().Bold(true).Foreground(avatarColorFor(q.ReplyAuthor)).Render(q.ReplyAuthor)
+	excerpt := lipgloss.NewStyle().Foreground(colText).Render(sanitizeDisplay(q.ReplyExcerpt))
+	body := bar + "  Reply to " + name + ": " + excerpt
+	x := thQuoteXStyle.Render("  ✕")
+	inner := maxInt(colW-3, 1) // keep the X visible at the right edge
+	if lipgloss.Width(body) > inner {
+		body = truncateByWidth(body, inner)
+	}
+	row := body + strings.Repeat(" ", inner-lipgloss.Width(body)) + x
+	return tintFit(thQuoteCardStyle, row, colW)
+}
+
+// ─── quote-click jump ───────────────────────────────────────────────────────
+
+// notifyReplyHandler is the desktop-ping entry point for inbound replies
+// to my messages; tests swap it to capture the exact body.
+var notifyReplyHandler = notifyReplyTo
+
+// notifyIfRepliedToMe pings the quoted author — me — when an inbound
+// message carries a citation of one of mine: EXACT body "<from> replied to
+// you". Self-replies (sender quoting their own message) never notify.
+func (c *chatScreen) notifyIfRepliedToMe(m chatMessage) {
+	if m.ReplyTo == "" || m.ReplyAuthor != c.me {
+		return
+	}
+	if m.Username == "" || m.Username == m.ReplyAuthor {
+		return // self-reply: quoting your own message must stay silent
+	}
+	if notifyReplyHandler != nil {
+		notifyReplyHandler(m.Username)
+	}
+}
+
+// jumpToQuoted resolves a quote card click: switch to the conversation
+// that owns the quoted message, scroll it to the top of the viewport, and
+// paint its ENTIRE row blue for quoteJumpTicks seconds. When the original
+// was trimmed from history, an inline note says so instead. Returns the
+// expiry-tick command (nil when there is nothing to highlight).
+func (c *chatScreen) jumpToQuoted(m chatMessage) tea.Cmd {
+	target := -1
+	for i := range c.history {
+		if c.history[i].MsgId == m.ReplyTo {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		c.appendLocal(c.activeConv(), tuiSystemStyle.Render("original message no longer in view"))
+		return nil
+	}
+	t := c.history[target]
+	// Mode switch to the quoted message's conversation ("jumps to general
+	// chat" when the original lives in the room and a DM was in view).
+	if t.ConvID != c.activeConv() {
+		switch {
+		case t.ConvID == "" || t.ConvID == generalConv:
+			c.exitPrivate()
+		default:
+			if peer := peerOf(c.me, t.ConvID); peer != "" && peer != c.me {
+				c.enterPrivate(peer)
+			}
+		}
+	}
+	if c.quoteJump == nil {
+		c.quoteJump = &quoteJumpState{}
+	}
+	c.quoteJumpCounter++
+	c.quoteJump.gen = c.quoteJumpCounter // supersede every expiry tick still in flight
+	c.quoteJump.msgId = t.MsgId
+	c.quoteJump.left = quoteJumpTicks
+	c.closeReplyMenu()
+	c.closeReplyPick()
+	c.rebuildView()
+	if row := c.firstRowOfMsg(t.MsgId); row >= 0 {
+		c.vp.SetYOffset(row) // quoted message lands at the viewport top
+	}
+	return scheduleQuoteJumpTick(c.quoteJump.gen)
+}
+
+// quoteJumpRowAt reports whether a transcript click row is the citation
+// card row of a quoted message (a click there jumps instead of opening the
+// reaction picker).
+func (c *chatScreen) quoteJumpRowAt(y int, l layout) bool {
+	top := transcriptTopRow(l)
+	if l.vpHeight <= 0 || y < top || y >= top+l.vpHeight {
+		return false
+	}
+	row := y - top + c.vp.YOffset
+	return row >= 0 && row < len(c.rowCard) && c.rowCard[row]
 }
 
 // submitLine handles one committed input line. It returns the tea.Cmd that
@@ -2640,9 +3213,19 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 			}
 		}
 	}
+	// The pinned citation rides on this send: capture it (and clear the
+	// card) BEFORE the optimistic echo paints, so a queued second send
+	// cannot inherit a quote it never asked for.
+	q := chatQuote{}
+	if c.composerQuote != nil {
+		q = *c.composerQuote
+	}
 	// Optimistic echo: the same block a confirmed message will paint, held
 	// faint until the delivery ack lands (netDeliveredMsg).
 	echo := chatBubble(text, true, true, c.transcriptW())
+	if q.ReplyTo != "" {
+		echo = alignBlock(c.quoteCardBlock(q, true, c.transcriptW()), true, c.transcriptW()) + "\n" + echo
+	}
 	c.pushLocalLine(localLine{conv: conv, text: echo})
 	c.pending = &pendingSend{text: text, conv: conv, to: peer, localIdx: len(c.localLines) - 1}
 	target := peer
@@ -2650,8 +3233,9 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 		target = ""
 	}
 	seq := c.allocSeq()
+	c.composerQuote = nil // WhatsApp-style: one send consumes the citation
 	c.rebuildView()
-	return c.doSend(text, target, seq)
+	return c.doSend(text, target, seq, q)
 }
 
 // syncViewport re-derives viewport/composer geometry from the live layout.
@@ -2835,7 +3419,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Text: m.Text, To: m.To,
 			ConvID:    convFor(m.From, m.To),
 			CreatedAt: time.Now().Format(time.RFC3339),
+			ReplyTo:   m.ReplyTo, ReplyAuthor: m.ReplyAuthor, ReplyExcerpt: m.ReplyExcerpt,
 		}
+		c.notifyIfRepliedToMe(cm)
 		c.handleNewMessage(cm)
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -2962,6 +3548,36 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case replyPickAnimMsg:
+		// One pointer reveal tick: advance the /reply selection pointer a
+		// frame and re-arm. Ticks from a superseded session (dismissed,
+		// reopened, retargeted) are fenced by the generation counter.
+		if c.replyPick == nil || msg.gen != c.replyPick.gen {
+			break
+		}
+		if next := min(msg.frame, replyPickAnimFrames-1); next > c.replyPick.anim {
+			c.replyPick.anim = next
+			c.rebuildView()
+			if c.replyPick.anim < replyPickAnimFrames-1 {
+				cmds = append(cmds, scheduleReplyPickAnim(msg.gen, c.replyPick.anim+1))
+			}
+		}
+
+	case quoteJumpTickMsg:
+		// One highlight second elapsed: expire the quote-jump blue tint.
+		// Ticks from a superseded jump are fenced by the generation counter.
+		if c.quoteJump == nil || msg.gen != c.quoteJump.gen {
+			break
+		}
+		c.quoteJump.left--
+		if c.quoteJump.left <= 0 {
+			c.quoteJump = nil
+		}
+		c.rebuildView()
+		if c.quoteJump != nil {
+			cmds = append(cmds, scheduleQuoteJumpTick(msg.gen))
+		}
+
 	case mediaInfoMsg:
 		// Media chatter never reaches the transcript: the latest event
 		// parks on the status line, conversation stays clean.
@@ -3067,6 +3683,53 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return c, tea.Batch(cmds...)
 		}
+		// The floating reply menu owns navigation + selection keys while it
+		// is open: Up/Down move the highlight, Enter runs, Esc dismisses.
+		// Any typing dismisses it and falls through to the composer.
+		if c.replyMenu != nil {
+			switch msg.Type {
+			case tea.KeyUp:
+				c.replyMenuMove(-1)
+				return c, tea.Batch(cmds...)
+			case tea.KeyDown:
+				c.replyMenuMove(1)
+				return c, tea.Batch(cmds...)
+			case tea.KeyEnter:
+				if cmd := c.replyMenuActivate(); cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+				return c, tea.Batch(cmds...)
+			case tea.KeyEsc:
+				c.closeReplyMenu()
+				return c, tea.Batch(cmds...)
+			}
+			if textEditKey(msg) {
+				c.closeReplyMenu()
+			}
+		}
+		// /reply selection mode: Up/Down move the "<" pointer across
+		// messages, Enter opens the same menu on the pointed message, Esc
+		// exits. Any send is impossible here (Enter is owned); typing and
+		// mode switches exit too.
+		if c.replyPick != nil {
+			switch msg.Type {
+			case tea.KeyUp:
+				c.replyPickMove(-1)
+				return c, tea.Batch(cmds...)
+			case tea.KeyDown:
+				c.replyPickMove(1)
+				return c, tea.Batch(cmds...)
+			case tea.KeyEnter:
+				c.replyPickConfirm()
+				return c, tea.Batch(cmds...)
+			case tea.KeyEsc:
+				c.closeReplyPick()
+				return c, tea.Batch(cmds...)
+			}
+			if textEditKey(msg) {
+				c.closeReplyPick()
+			}
+		}
 		// "@" member dropdown eats navigation + selection keys while open,
 		// exactly like the "/" drawer above it (general room only).
 		if handled, action := c.handleMentionKeys(msg); handled {
@@ -3086,6 +3749,8 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.Focus()
 			c.focus = focusComposer // the drawer rides on the composer
 			c.closeReactionAux()    // one drawer slot: commands replace the aux rows
+			c.closeReplyMenu()
+			c.closeReplyPick()
 			break
 		}
 		// Ctrl+L clears the composer line and repaints the screen.
@@ -3307,6 +3972,8 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			Seq: msg.seq, MsgId: msg.msgId, Username: c.me, Kind: "chat",
 			Text: msg.text, To: to, ConvID: conv,
 			CreatedAt: time.Now().Format(time.RFC3339),
+			ReplyTo:   msg.quote.ReplyTo, ReplyAuthor: msg.quote.ReplyAuthor,
+			ReplyExcerpt: msg.quote.ReplyExcerpt,
 		}
 		// Defensive: seqs come from one allocator now, but never drop a
 		// confirmed own message over a counter surprise.
@@ -3631,6 +4298,167 @@ func (c chatScreen) reactionTarget() (chatMessage, bool) {
 	return c.msgById(c.pendingReactionMsgId)
 }
 
+// ─── /reply pointer ─────────────────────────────────────────────────────────
+
+// replyPointerPaint paints the selection pointer for a /reply target at its
+// animation frame: a "<" that slides in from the right over
+// replyPickAnimFrames (frame 0 = "still arriving", last frame = settled
+// beside the message) and pulses via the accent colour. Plain runs paint
+// the settled frame instantly. One row, clipped to the transcript width.
+func (c *chatScreen) replyPointerPaint(m chatMessage) string {
+	f := c.replyPick.anim
+	if f > replyPickAnimFrames-1 {
+		f = replyPickAnimFrames - 1
+	}
+	indent := (replyPickAnimFrames - 1 - f) * 2
+	sym := "<"
+	st := lipgloss.NewStyle().Bold(true).Foreground(colAccent)
+	if f < replyPickAnimFrames-1 {
+		sym = "‹"
+		st = lipgloss.NewStyle().Foreground(colDim)
+	}
+	line := strings.Repeat(" ", indent) + st.Render(sym) + " reply…"
+	return truncateByWidth(line, maxInt(c.transcriptW(), 1))
+}
+
+// replyPickRowY maps the reply pointer onto the terminal: the pointer is a
+// transcript row, so its screen row is the transcript top plus its content
+// row minus the scroll offset. Returns -1 when picking is closed, the
+// pointer is not painted, or it is scrolled out of view.
+func (c *chatScreen) replyPickRowY(l layout) int {
+	if c.replyPick == nil || c.replyPick.row < 0 || l.vpHeight <= 0 {
+		return -1
+	}
+	top := transcriptTopRow(l)
+	y := top + c.replyPick.row - c.vp.YOffset
+	if y < top || y >= top+l.vpHeight {
+		return -1
+	}
+	return y
+}
+
+// firstRowOfMsg is the first viewport content row painted for msgId
+// (-1 when the message is not in the paint buffer).
+func (c *chatScreen) firstRowOfMsg(msgId string) int {
+	if msgId == "" {
+		return -1
+	}
+	for i, id := range c.rowMsg {
+		if id == msgId {
+			return i
+		}
+	}
+	return -1
+}
+
+// ensureMsgVisible scrolls the transcript just enough that the message's
+// first row is on screen (a no-op when it already is). Called after the
+// paint buffer is fresh, so rowMsg reflects the target.
+func (c *chatScreen) ensureMsgVisible(msgId string) {
+	row := c.firstRowOfMsg(msgId)
+	if row < 0 {
+		return
+	}
+	if row < c.vp.YOffset || row >= c.vp.YOffset+maxInt(c.vp.Height, 1) {
+		c.vp.SetYOffset(row)
+	}
+}
+
+// openReplyPick enters /reply selection mode pointed at msgId, arming the
+// pointer's slide-in reveal (nil in plain runs: the settled frame paints
+// immediately, no timers). Opening it dismisses every other transient.
+func (c *chatScreen) openReplyPick(msgId string) tea.Cmd {
+	if msgId == "" {
+		return nil
+	}
+	if c.replyPick == nil {
+		c.replyPick = &replyPickState{target: msgId, anim: 0, row: -1}
+	} else {
+		c.replyPick.target = msgId
+		c.replyPick.anim = 0
+	}
+	c.replyPickCounter++
+	c.replyPick.gen = c.replyPickCounter // supersede every reveal still in flight
+	c.replyPickLineIdx = -1
+	c.closeReactionAux() // one aux row at a time
+	c.closeReplyMenu()
+	if !c.animations {
+		c.replyPick.anim = replyPickAnimFrames - 1 // plain run: no timers, final paint
+		c.rebuildView()
+		c.ensureMsgVisible(msgId)
+		return nil
+	}
+	c.rebuildView()
+	c.ensureMsgVisible(msgId)
+	return scheduleReplyPickAnim(c.replyPick.gen, 1)
+}
+
+// closeReplyPick exits /reply selection mode; the pointer row vanishes with
+// the next repaint. Stale reveal ticks are fenced by the generation counter.
+func (c *chatScreen) closeReplyPick() {
+	if c.replyPick == nil {
+		return
+	}
+	c.replyPick = nil
+	c.replyPickLineIdx = -1
+	c.rebuildView()
+}
+
+// replyPickMove steps the pointer across the active conversation's messages
+// (wrapping at both ends); the target scrolls into view when it moves.
+func (c *chatScreen) replyPickMove(step int) {
+	if c.replyPick == nil {
+		return
+	}
+	var ids []string
+	for _, m := range c.history {
+		if reactableMsgId(m) != "" && c.shouldRender(m) {
+			ids = append(ids, m.MsgId)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	cur := -1
+	for i, id := range ids {
+		if id == c.replyPick.target {
+			cur = i
+			break
+		}
+	}
+	if cur < 0 {
+		cur = len(ids) - 1
+	}
+	nxt := (cur + step) % len(ids)
+	if nxt < 0 {
+		nxt += len(ids)
+	}
+	c.replyPick.target = ids[nxt]
+	c.rebuildView()
+	c.ensureMsgVisible(ids[nxt])
+}
+
+// replyPickConfirm commits the pointed message: the floating Reply /
+// Reply-Privately menu opens anchored at the pointer's row (own messages
+// offer Reply only). Nothing to commit closes the mode.
+func (c *chatScreen) replyPickConfirm() {
+	if c.replyPick == nil {
+		return
+	}
+	m, ok := c.msgById(c.replyPick.target)
+	if !ok || reactableMsgId(m) == "" {
+		c.closeReplyPick()
+		return
+	}
+	l := c.layoutFor()
+	x := transcriptX0(l) + 2
+	y := c.replyPickRowY(l)
+	if y < 0 {
+		y = transcriptTopRow(l) // pointer scrolled out: anchor at transcript top
+	}
+	c.openReplyMenu(m, x, y) // openReplyMenu closes the pick itself
+}
+
 // reactionDetailY maps the open detail bar's first row onto the terminal:
 // anchored directly below its message, so it follows the viewport like the
 // picker. Returns -1 when closed, not painted, or scrolled out of view.
@@ -3809,8 +4637,57 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 
 	switch action {
 	case tea.MouseActionPress:
-		if msg.Button != tea.MouseButtonLeft || c.width == 0 || c.height == 0 {
+		if c.width == 0 || c.height == 0 {
 			break
+		}
+		// Right button: the WhatsApp-style context menu on a transcript
+		// message (Reply / Reply-Privately). Any open menu closes first;
+		// a right-click off any message just dismisses.
+		if msg.Button == tea.MouseButtonRight {
+			c.closeReplyMenu()
+			if !c.drawerOpen() {
+				if id := c.msgAtY(msg.Y, l); id != "" {
+					if m, ok := c.msgById(id); ok && reactableMsgId(m) != "" {
+						c.openReplyMenu(m, msg.X, msg.Y)
+						return nil
+					}
+				}
+				c.closeReplyPick() // right-click elsewhere also cancels picking
+			}
+			break
+		}
+		if msg.Button != tea.MouseButtonLeft {
+			break
+		}
+		// The floating reply menu owns clicks over its own cells: a pick
+		// activates the item, anything else on the panel is a miss. A
+		// click ANYWHERE else dismisses the menu and is consumed (the
+		// underlying row does not react to the same click).
+		if c.replyMenu != nil {
+			if idx, hit := c.replyMenuItemAt(msg.X, msg.Y); hit {
+				c.replyMenu.sel = idx
+				if cmd := c.replyMenuActivate(); cmd != nil {
+					return cmd
+				}
+				return nil
+			}
+			c.closeReplyMenu()
+			return nil
+		}
+		// Pinned quote card above the composer: the X at its right edge
+		// clears the citation; the rest of the row just focuses the box.
+		if c.composerQuote != nil && l.quoteRows > 0 {
+			top := composerTopRows(l)
+			cardY := top - l.quoteRows
+			if msg.Y == cardY {
+				x0 := transcriptX0(l)
+				if msg.X >= x0+l.vpWidth+transcriptBorder-2 { // the "  ✕" tail
+					c.clearComposerQuote()
+				} else {
+					c.focus = focusComposer
+				}
+				return nil
+			}
 		}
 		// Clip glyph: open the upload browser (same as /upload). Painted
 		// whenever the box fits it — clickable with or without the sidebar.
@@ -3906,6 +4783,18 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		}
 		if id := c.msgAtY(msg.Y, l); id != "" && !c.drawerOpen() {
 			c.focus = focusTranscript
+			// Quote-card click: jump to the quoted message instead of
+			// opening the reaction picker.
+			if c.quoteJumpRowAt(msg.Y, l) {
+				if m, ok := c.msgById(id); ok && m.repliedTo() {
+					c.pendingReactionMsgId = ""
+					c.detailMsgId, c.detailEmoji = "", ""
+					if cmd := c.jumpToQuoted(m); cmd != nil {
+						return cmd
+					}
+					return nil
+				}
+			}
 			if emoji, ok := c.reactionBadgeEmojiAt(id, msg.X, msg.Y, l); ok {
 				return c.toggleReactionDetail(id, emoji)
 			}
@@ -4085,6 +4974,12 @@ func (c chatScreen) View() string {
 		appendRows(pal, lipgloss.Height(pal))
 	}
 
+	// 3.5 pinned reply citation — one tinted row directly above the
+	// composer, X at the right edge (WhatsApp-style quote card).
+	if l.quoteRows > 0 {
+		appendRows(c.quoteComposerRow(colW), l.quoteRows)
+	}
+
 	// 4. composer — the one persistently bordered surface.
 	composerRows := 1
 	if l.composerRows > 0 {
@@ -4122,6 +5017,11 @@ func (c chatScreen) View() string {
 	// painted frame can never exceed the window.
 	for i := range out {
 		out[i] = fitRow(out[i], c.width)
+	}
+	// The floating reply menu overlays the frame near its anchor; any
+	// repaint after it dismisses repaints the pristine rows underneath.
+	if c.replyMenu != nil {
+		c.overlayReplyMenu(out, l)
 	}
 	result := strings.Join(out, "\n")
 	if l.frameOn {

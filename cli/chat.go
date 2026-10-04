@@ -23,6 +23,47 @@ type chatMessage struct {
 	To        string `json:"to,omitempty"` // recipient of a 1:1 message
 	ConvID    string `json:"convId"`       // "general" or canonical "a|b"
 	CreatedAt string `json:"createdAt"`
+	// Quote-reply citation (all empty = plain message). Rides the chat
+	// frame's optional JSON fields; an old peer's quote-less frames decode
+	// to empty, so rendering falls back to a plain bubble.
+	ReplyTo      string `json:"replyTo,omitempty"`
+	ReplyAuthor  string `json:"replyAuthor,omitempty"`
+	ReplyExcerpt string `json:"replyExcerpt,omitempty"`
+}
+
+// chatQuote is the optional quoted-message citation attached to a reply
+// (WhatsApp-style quote-reply). All fields empty = plain message.
+type chatQuote struct {
+	ReplyTo      string
+	ReplyAuthor  string
+	ReplyExcerpt string
+}
+
+// quote returns the message's citation as a chatQuote (all-empty = none).
+func (m chatMessage) quote() chatQuote {
+	return chatQuote{ReplyTo: m.ReplyTo, ReplyAuthor: m.ReplyAuthor, ReplyExcerpt: m.ReplyExcerpt}
+}
+
+// repliedTo reports whether the message carries a quote citation.
+func (m chatMessage) repliedTo() bool { return m.ReplyTo != "" }
+
+// replyExcerptMax caps the quoted excerpt sent over the wire (and painted
+// on the receiving side's quote card): enough context to identify the
+// message, never a full dump.
+const replyExcerptMax = 120
+
+// replyExcerptOf builds the quoted excerpt from a message body: the first
+// line, de-escaped, whitespace-folded, capped at replyExcerptMax runes.
+func replyExcerptOf(text string) string {
+	if i := strings.Index(text, "\n"); i >= 0 {
+		text = text[:i]
+	}
+	text = sanitizeDisplay(text)
+	text = strings.Join(strings.Fields(text), " ")
+	if r := []rune(text); len(r) > replyExcerptMax {
+		text = string(r[:replyExcerptMax]) + "…"
+	}
+	return text
 }
 
 // conversationKey builds the canonical bucket id for a 1:1 thread.

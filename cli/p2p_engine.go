@@ -47,6 +47,10 @@ const (
 
 type engineChat struct {
 	MsgId, From, To, Text string
+	// Optional quote-reply citation (all empty = plain message). Decoded
+	// from the frame's optional JSON fields; empty when the sender is an
+	// old client that never emitted them.
+	ReplyTo, ReplyAuthor, ReplyExcerpt string
 }
 
 type engineFile struct {
@@ -950,7 +954,8 @@ func (e *engine) dispatch(f frame) {
 	switch f.Type {
 	case frameChat:
 		if e.cb.onChat != nil {
-			e.cb.onChat(engineChat{MsgId: f.MsgId, From: f.From, To: f.To, Text: f.Data})
+			e.cb.onChat(engineChat{MsgId: f.MsgId, From: f.From, To: f.To, Text: f.Data,
+				ReplyTo: f.ReplyTo, ReplyAuthor: f.ReplyAuthor, ReplyExcerpt: f.ReplyExcerpt})
 		}
 	case frameAck:
 		// The ack names the ORIGINAL message in Data (MsgId is the ack's
@@ -1237,6 +1242,13 @@ func (e *engine) retryOnce() {
 }
 
 func (e *engine) sendChat(to, text string) (string, error) {
+	return e.sendChatQuoted(to, text, chatQuote{})
+}
+
+// sendChatQuoted sends a chat message with an optional quote-reply
+// citation (WhatsApp-style). An all-empty quote is a plain message; the
+// frame fields are omitempty so old peers decode them as absent.
+func (e *engine) sendChatQuoted(to, text string, q chatQuote) (string, error) {
 	if text == "" {
 		return "", fmt.Errorf("empty message")
 	}
@@ -1247,6 +1259,7 @@ func (e *engine) sendChat(to, text string) (string, error) {
 	e.ensureFreshRoster()
 	f := newFrame(frameChat, id, e.me, to)
 	f.Data = text
+	f.ReplyTo, f.ReplyAuthor, f.ReplyExcerpt = q.ReplyTo, q.ReplyAuthor, q.ReplyExcerpt
 	if err := e.sendFrame(to, f); err != nil {
 		return "", err
 	}

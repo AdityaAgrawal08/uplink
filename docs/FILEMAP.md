@@ -27,8 +27,8 @@ docs/                Documentatio.md (this project manual) + FILEMAP.md (this fi
 
 ## 1. CLI root — chat TUI (`cli/chat_*.go`)
 
-- `cli/chat.go` | 139 | Routes chat between fullscreen TUI and plain mode. | `chatMessage, conversationKey, generalConv, runChat, runChatPlain`
-- `cli/chat_commands.go` | 985 | Slash-command registry (7 commands), palette, member picker, @member dropdown, settled layout. | `slashCommands, rankSlashCommands, paletteState, paletteView, handlePaletteKeys, runCommand, modTarget, layoutFor, drawerView, drawerRowsBudget`
+- `cli/chat.go` | 187 | Routes chat between fullscreen TUI and plain mode. | `chatMessage, chatQuote, replyExcerptOf, conversationKey, generalConv, runChat, runChatPlain`
+- `cli/chat_commands.go` | 1006 | Slash-command registry (8 commands), palette, member picker, @member dropdown, settled layout, /reply pointer animation. | `slashCommands, rankSlashCommands, paletteState, paletteView, handlePaletteKeys, runCommand, modTarget, layoutFor, drawerView, drawerRowsBudget, paletteRows, quoteRows, ensurePaletteOpen, replyPickAnimFrames, scheduleReplyPickAnim`
 - `cli/chat_conv_test.go` | 211 | DM isolation from general view and navigation. | `TestDMNeverPaintsInGeneralView, TestThreadViewIsolatedFromRoom, TestMultipleIndependentThreads, TestPendingEchoLivesInItsConversation, TestEnterPrivateSwitchesInstantly`
 - `cli/chat_download.go` | 43 | Downloads dir resolution + unique file paths. | `downloadsDir, uniquePath`
 - `cli/chat_filecard.go` | 247 | File attachment cards, icons, rune-safe truncation. | `fileIcon, fileExtLabel, truncateFilename, fileAttachmentCard, fileKindLabel`
@@ -41,10 +41,11 @@ docs/                Documentatio.md (this project manual) + FILEMAP.md (this fi
 - `cli/chat_picker_test.go` | 564 | Picker browsing, buffering, upload pipeline, drawer. | `TestListDirDirsFirstWithDotfiles, TestParentDirAndBreadcrumb, TestPickerRangeMath, TestPickerBrowseBufferAndQuickUpload`
 - `cli/chat_privacy_test.go` | 186 | Private-view filtering, echoes, targeting. | `TestPrivateViewRetroFiltersHistory, TestPendingEchoSurvivesModeSwitch, TestSendTargetsCurrentPeer, TestCommonRoomSendsBroadcast`
 - `cli/chat_repro_test.go` | 77 | DM routing over the wire through real Update pipeline. | `TestReproDMRoutingOverWire`
+- `cli/chat_reply_test.go` | 750 | Quote-reply: right-click menu scope, /reply pointer nav/animation, quote frame round-trip + old-client compat, exact notify + self-silence, jump scroll-top + 3s expiry + trimmed fallback, card render. | `TestReplyMenuScopeOwnVsOthers, TestReplyPickOpensOnNewestAndNavigates, TestReplyQuoteFrameRoundTripAndOldCompat, TestReplyNotifyExactBodyAndSelfSilence, TestReplyQuoteJumpScrollsAndExpires, TestReplyQuoteJumpTrimmedFallback`
 - `cli/chat_sanitize_test.go` | 44 | Escape stripping, markdown attack neutralization. | `TestSanitizeDisplayStripsEscapes, TestRenderMarkdownNeutralizesTerminalAttacks`
-- `cli/chat_theme.go` | 583 | Pure presentation theme: sidebar, header, bubbles, composer, system card. No video/tabs/panel/Send/call-card code remains. | `bubbleRatioFor, avatarColorFor, avatarCell, chatItem, chatItems, topBarView, roomHeaderView, roomHeaderCompact, keyHintsView, renderSystemCard, convPreview`
+- `cli/chat_theme.go` | 670 | Pure presentation theme: sidebar, header, bubbles, composer, system card, quote-jump highlight, composer quote card. No video/tabs/panel/Send/call-card code remains. | `bubbleRatioFor, avatarColorFor, avatarCell, chatItem, chatItems, topBarView, roomHeaderView, roomHeaderCompact, keyHintsView, renderSystemCard, convPreview, colJumpBg, thQuoteCardStyle`
 - `cli/chat_theme_test.go` | 453 | Density, headers, clean-UI and no-surface contracts. | `TestAudioStateSurvivesLayout, TestNoVideoSurfaces, TestNoCallCard, TestSidebarPreviewSanitized, TestTopBarCollapsesByWidth, TestComposerFullWidthNoSend, TestRoomTabsRemoved, TestSystemCardGreenBar, TestResizeSweepExactFrame`
-- `cli/chat_tui.go` | 4226 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave. | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, orderedUsers, Update, View, runChatTUI, currentScope, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox`
+- `cli/chat_tui.go` | 5120 | Full-screen chat model: Update/View, mouse, viewports, outbox/settle, audio toggles, leave, @mentions, quote-reply (menu/pick/jump/notify). | `chatScreen, layout, computeLayout, layoutFor, newChatScreen, orderedUsers, Update, View, runChatTUI, currentScope, toggleAudio, callParties, settleSend, tryEnqueue, maxOutbox, openReplyMenu, openReplyPick, jumpToQuoted, quoteCardBlock, notifyIfRepliedToMe, quoteComposerRow`
 - `cli/chat_tui_test.go` | 1052 | Layout, viewport, sending, outbox, alerts, wire integration. | `newFilterScreen, wireTestEngine, TestComputeLayout, TestFrameNeverExceedsTerminal, TestTryEnqueue, TestSettle410DrainsOutbox, TestOutboxCap, TestLeaveGuardResets, TestRosterTickBareScreen, TestSearchHeightAgreement, TestNotesParkOnStatusLine, TestServerDownAlertAcrossActions, TestMediaInfoStaysOutOfTranscript`
 - `cli/chat_ui_test.go` | 146 | Sidebar density, composer sizing, fullscreen frame. | `TestSidebarWidthDensity, TestComposerRowsDensity, TestFullScreenFrame, TestSidebarSectionsAndNavigation, TestComposerGrowsAndShrinks`
 - `cli/chat_unread_test.go` | 221 | Recency ordering, unread badges, roster pruning. | `TestOrderedUsersRecency, TestUnreadLifecycle, TestSidebarRendersAndClearsBadge, TestBeatPrunesDepartedPeers, TestMouseFollowsRecencyOrder`
@@ -72,13 +73,13 @@ Video calling is fully removed on this branch. Audio-only.
 
 - `cli/p2p_box.go` | 99 | Async E2E pairwise boxes (static ECDH → AES-GCM) for inbox fallback. | `deriveBoxKey, sealBox, openBox`
 - `cli/p2p_box_test.go` | 87 | Box round-trip, tamper, wrong-peer, nonce, inputs. | `TestBoxRoundTrip, TestBoxTamperRejected, TestBoxWrongPeerFails, TestBoxNonceRandomness`
-- `cli/p2p_engine.go` | 1560 | Mesh+Noise orchestration, heartbeats, inbox, files, roster, beat-error record. | `engineChat, engineFile, engineCallbacks, engine, newEngine, sendChat, sendFile, beatErr, saveVerifiedFile, safeDestName, maxFileAssemblies, fileAssembly, PublishTo`
+- `cli/p2p_engine.go` | 1708 | Mesh+Noise orchestration, heartbeats, inbox, files, roster, beat-error record. | `engineChat, engineFile, engineCallbacks, engine, newEngine, sendChat, sendChatQuoted, sendFile, beatErr, saveVerifiedFile, safeDestName, maxFileAssemblies, fileAssembly, PublishTo`
 - `cli/p2p_engine_test.go` | 460 | Engine e2e, assembly bounds, size checks, beat failures. | `TestEngineEndToEnd, TestAssemblyBounds, TestSaveVerifiedSizeMismatch, TestSafeDestName, TestBeatRecordsAndClearsFailures`
 - `cli/p2p_mesh.go` | 552 | WebRTC mesh transport, deterministic offer roles, STUN. | `meshLabel, resolveStunURLs, meshCallbacks, meshPeer, mesh, newMesh, ensurePeer`
 - `cli/p2p_mesh_test.go` | 186 | Mesh loopback messaging and tie-break roles. | `TestMeshLoopback, TestMeshTieBreak`
 - `cli/p2p_noise.go` | 211 | Noise_XX E2E sessions per peer pair. | `identityKey, generateIdentity, peerSession, beginNoise, stepNoise`
 - `cli/p2p_noise_test.go` | 150 | Handshake round-trip, tamper, guards, safety codes. | `TestNoiseHandshakeRoundTrip, TestNoiseTamperRejected, TestSafetyCodeAgainstHandshake`
-- `cli/p2p_proto.go` | 160 | JSON frame protocol, chunking, safety codes, seen-sets. | `frameChat, frameAck, frameChunkSize, frame, newFrame, encodeFrame, decodeFrame, newMsgId`
+- `cli/p2p_proto.go` | 189 | JSON frame protocol, chunking, safety codes, seen-sets, quote-reply citation fields. | `frameChat, frameAck, frameChunkSize, frame, newFrame, encodeFrame, decodeFrame, newMsgId`
 - `cli/p2p_proto_test.go` | 141 | Frame encoding, IDs, dedup, chunking, codes. | `TestFrameRoundTrip, TestDecodeFrameRejects, TestNewMsgIdUnique, TestSeenSetDedupAndEvict, TestSplitChunks`
 - `cli/p2p_signal.go` | 356 | Thin HTTP signaling client + server-down classifier. | `rosterMember, signalNote, inboxBox, signalClient, createRoom, joinRoom, signalSend, isServerDown, serverDownMsg, apiStatusCode`
 - `cli/p2p_signal_test.go` | 453 | Fake signaling server + full client flow + classifier. | `fakeSignalServer, TestSignalFullFlow, TestIsServerDown, TestIsServerDownExcludesMesh`
@@ -100,7 +101,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `cli/encrypt.go` | 160 | Streaming AES-GCM file encrypt/decrypt in chunks. | `EncryptFileStream, DecryptFileStream`
 - `cli/qr.go` | 55 | Terminal QR rendering (capability-gated). | `ShouldShowQR, PrintQRCode`
 - `cli/clipboard.go` | 11 | Silent system-clipboard copy. | `copyToClipboard`
-- `cli/notify.go` | 29 | Desktop notifications: transfer outcomes + @mention pings. | `notifyTransferComplete, notifyTransferFailed, notifyMentioned, mentionNotifier`
+- `cli/notify.go` | 65 | Desktop notifications: transfer outcomes, @mention pings, quote-reply pings (duel swappable sinks). | `notifyDesktop, notify, notifyTransferComplete, notifyTransferFailed, beeepNotify, notifyReplyTo, notifyMentioned, mentionNotifier`
 - `cli/version.go` | 462 | Version display, update check, checksum-verified install. | `handleVersion, normVersion, handleUpdate, installBinary, verifyReleaseChecksum`
 - `cli/version_update_test.go` | 198 | Release extraction, versions, auth headers, zip-slip. | `TestExtractReleaseAssetTar, TestExtractReleaseAssetZipSlip, TestCmpVersions`
 - `cli/scrollbars_test.go` | 149 | Scrollbar geometry + independent pane scrolling. | `geomScreen, TestScrollbarDragGeometry, TestIndependentScrollPanes, TestRosterScrollKeepsSelection`

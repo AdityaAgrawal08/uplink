@@ -104,12 +104,46 @@ clear, `↑↓` scroll, mouse supported. There is no right video panel and no
 pinned call card (both removed); liveness shows in the sidebar (`Live now`,
 `Voice call • MM:SS`) and header mic chips.
 
-Slash commands: `/help`, `/upload`, `/download`, `/audio`, `/kick`,
-`/admin`, `/unadmin` (last three role-gated: creator/admin only; `/admin`
-creator-only). Notices (command results, moderation outcomes, engine/media
-events, server-down alert) surface on the **status line**, never as
-transcript rows — only peer messages, own echoes, and file cards paint
-the transcript.
+Slash commands: `/help`, `/reply`, `/upload`, `/download`, `/audio`,
+`/kick`, `/admin`, `/unadmin` (last three role-gated: creator/admin only;
+`/admin` creator-only). Notices (command results, moderation outcomes,
+engine/media events, server-down alert) surface on the **status line**,
+never as transcript rows — only peer messages, own echoes, and file cards
+paint the transcript.
+
+### Reply / quote (WhatsApp-style)
+
+Quote-replies have two entry points that share one flow:
+
+- **Right-click** a transcript message (mouse) opens a small context menu
+  near the click: **Reply** pins a quote card — colored bar, quoted
+  sender, excerpt — above the composer; **Reply-Privately** pins the same
+  card and jumps into a DM with that message's author, carrying the card
+  into that composer. Own messages offer Reply only (a self-reply never
+  notifies the author). `Esc`, a click anywhere outside the menu, or
+  typing dismisses it.
+- **`/reply`** is the keyboard entry: an animated `<` pointer slides in
+  beside the newest message (a few `tea.Tick` frames, mirroring the
+  reaction dropdown reveal), `↑/↓` moves it across messages, `Enter` on a
+  message opens the same Reply / Reply-Privately menu, `Esc` exits. Any
+  send or mode switch exits the selection too.
+
+Sending with a pinned card attaches the citation to the outgoing chat
+frame as optional JSON fields — `replyTo` (quoted MsgId), `replyAuthor`,
+`replyExcerpt` (first line, capped at 120 chars). Old clients ignore the
+unknown fields; our decode of older quote-less messages yields an empty
+quote, so nothing breaks either direction. The card's `✕` clears it
+before sending. Recipients render the quoted card (author + excerpt)
+above the bubble in both the general room and DMs, and the **quoted
+author gets a desktop ping** with exactly `X replied to you` when someone
+replies to their message — self-replies stay silent.
+
+Clicking a rendered quote card **jumps** to the quoted message: the view
+switches to its conversation (general chat when it lives in the room),
+scrolls it to the top of the viewport, and highlights the entire row
+(name, time, text) blue for 3 seconds. If the original was trimmed from
+history, an inline note — `original message no longer in view` — says so
+instead.
 
 @mentions (general room only): typing `@` in the composer opens a
 member-suggestion dropdown — Tab/Enter completes `@name `, Esc dismisses;

@@ -28,6 +28,7 @@ type slashCommand struct {
 // declared; execution switches on Name below.
 var slashCommands = []slashCommand{
 	{Name: "/help", Desc: "show available commands"},
+	{Name: "/reply", Desc: "reply to a message"},
 	{Name: "/upload", Desc: "send file(s) into the room"},
 	{Name: "/download", Desc: "fetch shared room files"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room"},
@@ -345,6 +346,15 @@ func drawerRowsBudget(n int) int {
 	return 1 + rows + 1 + 2 // spacer + commands(+overflow) + hints footer + border
 }
 
+// quoteRows is the exact terminal-row budget a pinned reply citation
+// consumes above the composer: one tinted row, or none.
+func (c chatScreen) quoteRows() int {
+	if c.composerQuote != nil && c.composerQuote.ReplyTo != "" {
+		return 1
+	}
+	return 0
+}
+
 // paletteRows is the exact terminal-row budget the drawer slot consumes
 // right now: the file browser (/upload), the "/" command drawer, or the "@"
 // member dropdown — one mode owns the slot at a time. In file-browser mode
@@ -377,7 +387,7 @@ func (c chatScreen) paletteRows() int {
 // layoutFor is THE geometry every paint/hit-test must agree on: it folds the
 // live "/" drawer budget into the pure layout function.
 func (c chatScreen) layoutFor() layout {
-	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows())
+	l := computeLayoutMedia(c.width, c.height, c.status != "", c.paletteRows(), c.quoteRows())
 	// Chat header above the transcript (main column only): full two-row
 	// heading when roomy, compact single row when short or narrow, hidden
 	// when every row counts.
@@ -904,6 +914,17 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 			" · type / for the picker · Ctrl+C leaves the session"
 		c.rebuildView()
 		return nil
+	case "/reply":
+		// Keyboard fallback for the right-click menu: enter selection mode
+		// with the "<" pointer on the newest message; Up/Down move it,
+		// Enter opens Reply / Reply-Privately on the pointed message.
+		id := c.newestReactableMsgId()
+		if id == "" {
+			c.status = "nothing to reply to yet"
+			c.rebuildView()
+			return nil
+		}
+		return c.openReplyPick(id)
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":

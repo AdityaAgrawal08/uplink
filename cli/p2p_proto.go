@@ -77,6 +77,13 @@ type frame struct {
 	Active     bool   `json:"active,omitempty"`     // typing
 	Target     string `json:"target,omitempty"`     // reaction: the reacted msgId
 	Emoji      string `json:"emoji,omitempty"`      // reaction
+	// chat quote-reply citation (frameChat only). All three travel inside
+	// the encrypted frame and are optional: plain messages carry nothing.
+	// Unknown fields are ignored by old clients, and decoding a
+	// quote-less frame yields an all-empty quote.
+	ReplyTo      string `json:"replyTo,omitempty"`      // quoted message's msgId
+	ReplyAuthor  string `json:"replyAuthor,omitempty"`  // quoted message's sender
+	ReplyExcerpt string `json:"replyExcerpt,omitempty"` // quoted excerpt (truncated)
 }
 
 func newFrame(ftype, msgId, from, to string) frame {
