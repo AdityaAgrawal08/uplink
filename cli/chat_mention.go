@@ -94,15 +94,16 @@ func mentionExcerpt(text string) string {
 
 // ---- highlight ---------------------------------------------------------------
 
-// tuiMentionStyle paints an own-username mention inside a bubble: the
-// palette's selected-chip family (bold + accent background — same values as
-// tuiPaletteSelStyle), so a name that pings you reads as a distinct chip.
-// No padding change: the token charset is single-width, so every width
-// calculation stays exact.
+// tuiMentionStyle paints an own-username mention inside a bubble: bold in
+// the theme family's blue (colAccent — the same adaptive pair as the
+// sidebar/topbar/link blue, #0b62c9 on light terminals and #4cc9f0 on dark,
+// so the chip stays readable on both). No background fill: the blue
+// foreground against the bubble fills (colOtherBg/colOwnBg) is the
+// distinction, and no padding change keeps every width calculation exact
+// (the token charset is single-width).
 var tuiMentionStyle = lipgloss.NewStyle().
 	Bold(true).
-	Foreground(lipgloss.AdaptiveColor{Light: "15", Dark: "16"}).
-	Background(colAccent)
+	Foreground(colAccent)
 
 // mentionStyler is the chip style for own-username mentions (production:
 // tuiMentionStyle). The indirection mirrors mentionNotifier: color styles

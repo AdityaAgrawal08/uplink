@@ -4,6 +4,9 @@ package main
 // the desktop ping, and the in-bubble highlight (all general-room only).
 
 import (
+	"fmt"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -456,6 +459,71 @@ func TestMentionNotifyNeverPings(t *testing.T) {
 	}
 }
 
+// TestMentionNotifyRealInboundPath drives the REAL inbound pipeline end to
+// end: a decrypted room broadcast (netChatMsg, as the engine delivers it)
+// enters the bubbletea Update loop and must ping the notifier. This pins the
+// whole chain — netChatMsg handler -> convFor(ConvID) -> handleNewMessage
+// gates -> mentionNotifier — not just the sink in isolation.
+func TestMentionNotifyRealInboundPath(t *testing.T) {
+	var pings []string
+	orig := mentionNotifier
+	mentionNotifier = func(sender, excerpt string) { pings = append(pings, sender+"|"+excerpt) }
+	defer func() { mentionNotifier = orig }()
+
+	c := newFilterScreen("alice", "")
+	_, _ = c.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+
+	// A general-room mention arriving over the wire (To="" = broadcast).
+	_, _ = c.Update(netChatMsg{chat: engineChat{MsgId: "m1", From: "bob", To: "", Text: "hey @alice check this"}})
+	if len(pings) != 1 {
+		t.Fatalf("mention over the real inbound path must ping exactly once, got %v", pings)
+	}
+	if pings[0] != "bob|hey @alice check this" {
+		t.Fatalf("ping payload %q; want sender+excerpt context", pings[0])
+	}
+
+	// A DM naming us over the wire never pings (@ is plain text there).
+	_, _ = c.Update(netChatMsg{chat: engineChat{MsgId: "m2", From: "carol", To: "alice", Text: "psst @alice"}})
+	if len(pings) != 1 {
+		t.Fatalf("DM mention must not ping, got %v", pings)
+	}
+}
+
+// TestNotifyFallsBackWhenDesktopUnavailable pins the fire-and-forget ping
+// contract's visible half: when the desktop notification path errors (no
+// notification daemon / no session bus — the silent-failure mode behind the
+// old "_ = beeep.Notify(...)" discards), the failure must surface on stderr
+// with the underlying reason plus the terminal-bell BEL, never vanish.
+func TestNotifyFallsBackWhenDesktopUnavailable(t *testing.T) {
+	orig := notifyDesktop
+	notifyDesktop = func(title, body string, icon any) error { return fmt.Errorf("no notification daemon") }
+	defer func() { notifyDesktop = orig }()
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	notify("Uplink-Delta", "alice mentioned you in the chat")
+
+	w.Close()
+	out, _ := io.ReadAll(r)
+	r.Close()
+	s := string(out)
+	if !strings.Contains(s, "uplink: desktop notification unavailable") {
+		t.Fatalf("failure must surface on stderr: %q", s)
+	}
+	if !strings.Contains(s, "no notification daemon") {
+		t.Fatalf("stderr must name the underlying reason: %q", s)
+	}
+	if !strings.Contains(s, "\a") {
+		t.Fatalf("terminal bell must ring as the fallback: %q", s)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Highlight: @<own-username> paints as a chip (general only)
 // ---------------------------------------------------------------------------
@@ -579,20 +647,31 @@ func TestMentionHighlightEscapesNeverBreak(t *testing.T) {
 	}
 }
 
-// TestMentionStylerIsPaletteChipFamily pins the production chip identity:
-// bold + accent background, the same family as the palette's selected row.
+// TestMentionStylerIsThemeFamilyBlue pins the production chip identity:
+// bold in the theme family's blue — exactly colAccent, the same adaptive
+// pair as the sidebar/topbar/link blue (#0b62c9 light / #4cc9f0 dark) — with
+// NO background fill, so the chip reads on both dark and light bubbles.
 // Needs a truecolor profile because headless tests paint Ascii (colors are
 // stripped there).
-func TestMentionStylerIsPaletteChipFamily(t *testing.T) {
+func TestMentionStylerIsThemeFamilyBlue(t *testing.T) {
 	prev := lipgloss.ColorProfile()
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	t.Cleanup(func() { lipgloss.SetColorProfile(prev) })
 
 	probe := tuiMentionStyle.Render("x")
 	if !strings.HasPrefix(probe, "\x1b[1;") {
-		t.Fatalf("mention chip must carry the palette family's bold: %q", probe)
+		t.Fatalf("mention chip must carry the theme family's bold: %q", probe)
 	}
-	if !strings.Contains(probe, "48;") { // a background: the accent chip
-		t.Fatalf("mention chip must carry a background: %q", probe)
+	// The foreground must be precisely colAccent — reference-render it and
+	// require the same SGR color sequence inside the chip's sequence.
+	ref := lipgloss.NewStyle().Foreground(colAccent).Render("x")
+	s := strings.Index(ref, "38;")
+	e := strings.Index(ref[s:], "m")
+	refColor := ref[s : s+e]
+	if !strings.Contains(probe, refColor) {
+		t.Fatalf("mention chip must use the theme blue %s: %q", refColor, probe)
+	}
+	if strings.Contains(probe, "48;") {
+		t.Fatalf("mention chip must carry no background fill: %q", probe)
 	}
 }
