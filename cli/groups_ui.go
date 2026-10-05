@@ -52,10 +52,23 @@ type createGroupDoneMsg struct {
 // highlight (same window discipline as the command drawer).
 const maxInviteRows = 8
 
+// Invite-row choice cursor: the focused row carries a choice between its two
+// action targets. ← moves it onto ✕ (decline), → onto ✓ (accept); Enter
+// applies whichever target is highlighted. The cursor defaults to ✓ so the
+// long-standing Enter=accept binding is unchanged.
+const (
+	inviteChoiceDecline = iota
+	inviteChoiceAccept
+)
+
 // settingsModel is the full-screen settings window: an invite inbox listing
-// "X invited you to group Y" rows with X (decline) and ✓ (accept) actions,
-// plus an account section. Accepting a protected group opens the two-step
-// password modal (401-required → modal; wrong → retry in place; Esc back).
+// "X invited you to group Y" rows, each exposing two explicit action targets
+// — ✕ (decline) and ✓ (accept) — plus an account section. The focused row
+// carries a ←/→ choice cursor over those targets; Enter applies the
+// highlighted one. Mouse clicks hit the SAME two glyph cells, resolved per
+// row (any other cell is inert). Accepting a protected group opens the
+// two-step password modal (401-required → modal; wrong → retry in place; Esc
+// back).
 type settingsModel struct {
 	w, h      int
 	me        string
@@ -64,6 +77,7 @@ type settingsModel struct {
 	sig       *signalClient
 	invites   []groupInvite
 	sel       int
+	choice    int // inviteChoiceDecline / inviteChoiceAccept on the focused row
 	off       int // scroll window offset into the invite list
 	notice    string
 	busy      bool
@@ -123,6 +137,7 @@ func newSettingsModel(serverURL, me string, id *identityKey, w, h int) settingsM
 		sig:       &signalClient{serverURL: serverURL, me: me, id: id},
 		w:         w,
 		h:         h,
+		choice:    inviteChoiceAccept,
 		passInput: pi,
 	}
 }
@@ -357,6 +372,18 @@ func (m settingsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
 			return m, func() tea.Msg { return closeOverlayMsg{} }
+		case tea.KeyLeft:
+			// Choice cursor: ← picks the ✕ (decline) target on the focused row.
+			if len(m.invites) > 0 {
+				m.choice = inviteChoiceDecline
+			}
+			return m, nil
+		case tea.KeyRight:
+			// → picks the ✓ (accept) target on the focused row.
+			if len(m.invites) > 0 {
+				m.choice = inviteChoiceAccept
+			}
+			return m, nil
 		case tea.KeyUp:
 			if n := len(m.invites); n > 0 {
 				m.sel = ((m.sel-1)%n + n) % n
@@ -371,6 +398,9 @@ func (m settingsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyEnter:
 			if len(m.invites) > 0 {
+				if m.choice == inviteChoiceDecline {
+					return m, m.declineCurrent()
+				}
 				return m, m.acceptCurrent()
 			}
 			return m, nil
@@ -388,11 +418,18 @@ func (m settingsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 type settingsGeom struct {
 	outerW   int
 	innerW   int
+	rowW     int // painted row width (the card's text area: innerW - padding)
 	top      int
 	left     int
 	invFirst int // first invite row (terminal Y)
 	invN     int // painted invite rows
+	declineX int // terminal X of the ✕ (decline) action glyph
+	acceptX  int // terminal X of the ✓ (accept) action glyph
 }
+
+// settingsTailW is the painted width of an invite row's two action chips:
+// " ✕ " then " ✓ ". Only the glyph cells are live hit targets.
+const settingsTailW = 6
 
 func (m settingsModel) geom() settingsGeom {
 	outerW := m.w - 4
@@ -402,7 +439,11 @@ func (m settingsModel) geom() settingsGeom {
 	if outerW > 78 {
 		outerW = 78
 	}
-	innerW := outerW - 4 // border + padding leave 2 cells per side
+	innerW := outerW - 4 // card style width (padding sits INSIDE it)
+	// lipgloss Width includes the horizontal padding, so the card's text
+	// area — and its word-wrap boundary — is innerW-2 cells. Rows must be
+	// fit to rowW or they wrap a trailing cell onto a second line.
+	rowW := innerW - 2
 	n := len(m.invites)
 	v := m.visibleRows()
 	if n > v {
@@ -419,7 +460,18 @@ func (m settingsModel) geom() settingsGeom {
 	if left < 0 {
 		left = 0
 	}
-	return settingsGeom{outerW: outerW, innerW: innerW, top: top, left: left, invFirst: top + 1 + 2, invN: n}
+	// Terminal-precise text origin: the card block (innerW + 2 border cells)
+	// centers one cell right of `left` (the outerW - innerW + 2 difference),
+	// then the border and padding put the row text at left+3. The two action
+	// chips ride the row's right edge; their glyphs sit at the centre of
+	// their 3-cell chips and are the only live cells.
+	contentX := left + 3
+	tailX := contentX + rowW - settingsTailW
+	return settingsGeom{
+		outerW: outerW, innerW: innerW, rowW: rowW, top: top, left: left,
+		invFirst: top + 1 + 2, invN: n,
+		declineX: tailX + 1, acceptX: tailX + 4,
+	}
 }
 
 func (m settingsModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
@@ -438,19 +490,42 @@ func (m settingsModel) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if idx < 0 || idx >= len(m.invites) {
 		return m, nil
 	}
-	m.sel = idx
-	m.clampSel()
-	// " ✕ ✓" tail at the row's right edge: ✕ at +1, ✓ at +3 of the tail.
-	// Content starts at left + 2 (border + padding).
-	tail := " ✕ ✓"
-	tailX := g.left + 2 + g.innerW - lipgloss.Width(tail)
+	// Each row exposes exactly two live targets: the ✕ and ✓ glyph cells.
+	// Any other cell (the row body, the chip padding, the chrome) is inert —
+	// the click resolves the specific target, not merely the row.
 	switch msg.X {
-	case tailX + 1:
+	case g.declineX:
+		m.sel = idx
+		m.choice = inviteChoiceDecline
+		m.clampSel()
 		return m, m.declineCurrent()
-	case tailX + 3:
+	case g.acceptX:
+		m.sel = idx
+		m.choice = inviteChoiceAccept
+		m.clampSel()
 		return m, m.acceptCurrent()
 	}
 	return m, nil
+}
+
+// inviteTail paints one invite row's two action chips, " ✕ " (decline) then
+// " ✓ " (accept). On the FOCUSED row the active choice wears the shared
+// cursor-bar style (tuiPaletteSelStyle) and the inactive chip rests muted;
+// unfocused rows keep the resting language (✕ dim, ✓ accent). The glyph
+// cells are exactly the mouse hit targets — the surrounding pad is inert.
+func (m settingsModel) inviteTail(focused bool) string {
+	decline := lipgloss.NewStyle().Foreground(colDim)
+	accept := lipgloss.NewStyle().Foreground(colAccent).Bold(true)
+	if focused {
+		if m.choice == inviteChoiceDecline {
+			decline = tuiPaletteSelStyle
+			accept = lipgloss.NewStyle().Foreground(colDim)
+		} else {
+			accept = tuiPaletteSelStyle
+			decline = lipgloss.NewStyle().Foreground(colDim)
+		}
+	}
+	return decline.Render(" ✕ ") + accept.Render(" ✓ ")
 }
 
 func (m settingsModel) View() string {
@@ -459,8 +534,9 @@ func (m settingsModel) View() string {
 	}
 	g := m.geom()
 	inner := g.innerW
+	rowW := g.rowW
 
-	fit := func(s string) string { return fitRow(s, inner) }
+	fit := func(s string) string { return fitRow(s, rowW) }
 	rows := make([]string, 0, 8+g.invN)
 	rows = append(rows, fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ SETTINGS")))
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Bold(true).Render("NOTIFICATIONS")))
@@ -483,16 +559,18 @@ func (m settingsModel) View() string {
 				grp = "a group"
 			}
 			body := fmt.Sprintf("%s invited you to group %s", by, grp)
-			if len([]rune(body)) > inner-8 {
-				body = truncateStringPlain(body, inner-8)
+			if len([]rune(body)) > rowW-8 {
+				body = truncateStringPlain(body, rowW-8)
 			}
-			tail := lipgloss.NewStyle().Foreground(colDim).Render(" ✕ ") +
-				lipgloss.NewStyle().Foreground(colAccent).Bold(true).Render("✓")
-			line := fit(padVisible(body, inner-lipgloss.Width(tail)) + tail)
+			// The focused row carries the cursor marker; its ACTIVE choice
+			// chip wears the shared cursor-bar style. The two glyph cells are
+			// exactly the mouse hit targets (settingsGeom.declineX/acceptX).
+			lead := "  "
 			if idx == m.sel {
-				line = fit(tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle)))
+				lead = lipgloss.NewStyle().Foreground(colAccent).Bold(true).Render("> ")
 			}
-			rows = append(rows, line)
+			tail := m.inviteTail(idx == m.sel)
+			rows = append(rows, fit(padVisible(lead+body, rowW-lipgloss.Width(tail))+tail))
 		}
 		if len(m.invites) > g.invN {
 			rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
@@ -510,7 +588,7 @@ func (m settingsModel) View() string {
 		"  "+sanitizeDisplay(m.me)+"  ·  "+sanitizeDisplay(m.serverURL))))
 	rows = append(rows, " ")
 	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
-		"↑↓ select · enter ✓ accept · backspace ✕ decline · esc close")))
+		"↑↓ select · ←→ choose · enter apply · esc close")))
 
 	card := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).

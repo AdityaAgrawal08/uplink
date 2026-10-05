@@ -9,7 +9,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // ---------------------------------------------------------------------------
@@ -485,12 +484,10 @@ func TestSettingsDecline(t *testing.T) {
 	m = stepSettings(m, invitesFetchedMsg{invites: []groupInvite{
 		{Code: code, GroupName: "Chess", By: "bob", At: time.Now().UnixMilli()},
 	}})
-	// Mouse path: click the ✕ cell of the row (widths must match the
-	// handler's lipgloss.Width math — ✕/✓ are multi-byte UTF-8).
+	// Mouse path: click the ✕ action glyph of the row (the shared
+	// settingsGeom hit-test cell — paint and click walk the same geometry).
 	g := m.geom()
-	tail := " ✕ ✓"
-	tailX := g.left + 2 + g.innerW - lipgloss.Width(tail)
-	m, cmd := stepSettingsC(m, tea.MouseMsg{Type: tea.MouseLeft, Action: tea.MouseActionPress, X: tailX + 1, Y: g.invFirst})
+	m, cmd := stepSettingsC(m, tea.MouseMsg{Type: tea.MouseLeft, Action: tea.MouseActionPress, X: g.declineX, Y: g.invFirst})
 	next := runCmdStep(t, m, cmd)
 	m = next.(settingsModel)
 	if len(m.invites) != 0 {
