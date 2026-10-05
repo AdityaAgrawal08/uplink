@@ -354,7 +354,7 @@ export async function checkCreateLimit(ipHash: string): Promise<void> {
 // share (fairness among members behind one NAT). Usernames are validated
 // upstream (assertUsernameHeader) before they ever key a bucket, and the IP
 // component comes from clientIpHash (TRUST_PROXY-aware — see finding 10).
-export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invites", ipHash: string, username?: string): Promise<void> {
+export async function checkSendLimit(kind: "sig" | "inbox" | "reactions" | "invites" | "meta", ipHash: string, username?: string): Promise<void> {
   if (username) {
     const userKey = `rate:${kind}:user:${ipHash}:${username}`;
     const userHits = await redis.incr(userKey);
@@ -629,7 +629,7 @@ function rosterFrom(all: Record<string, string> | null): MemberInfo[] {
   return out;
 }
 
-async function requireMember(code: string, username: string): Promise<Record<string, string>> {
+export async function requireMember(code: string, username: string): Promise<Record<string, string>> {
   const all = await hgetall(membersKey(code));
   if (!all) throw new RoomError(404, "Session not found");
   if (!all[username]) throw new RoomError(403, "Not in this session");
@@ -925,6 +925,102 @@ export async function setRole(
   await touchRoom(code);
   const epoch = await bumpEpochBestEffort(code);
   return { roster: rosterFrom(await hgetall(membersKey(code))), epoch };
+}
+
+// ─── Group administration (rename / dissolve) ──────────────────────────────
+//
+// A group's display meta (groupName/groupDesc) is editable after create.
+// Renames are creator/admin privileges; dissolving is creator-only. Every
+// identity-bearing route signs with the roster key first (see
+// request-signature.ts), so these helpers trust the roster role, not the
+// caller-supplied header.
+
+// requireCreator resolves the caller's roster entry and enforces the crown.
+// The delete gate is the only caller: admins/members are refused with the
+// exact 403 message, non-members with "Not in this session", vanished rooms
+// with 404. deleteRoom re-runs it so the mutation is self-guarding.
+export async function requireCreator(code: string, username: string): Promise<MemberInfo> {
+  assertRoomCode(code);
+  assertUsername(username);
+  const all = await hgetall(membersKey(code));
+  if (!all) throw new RoomError(404, "Session not found");
+  const raw = all[username];
+  const member = raw ? parseMember(username, raw) : null;
+  if (!member) throw new RoomError(403, "Not in this session");
+  if (member.role !== "creator") {
+    throw new RoomError(403, "Only the group creator can delete this group");
+  }
+  return member;
+}
+
+export interface UpdateRoomMetaPatch {
+  groupName?: unknown;
+  groupDesc?: unknown;
+}
+
+// updateRoomMeta edits groupName/groupDesc for a creator or admin. The
+// stored meta JSON doc is merged in place — passwordHash, creator,
+// createdAt, maxMembers, parentCode (and any unknown field) survive
+// untouched. Length validation reuses createRoom's exact messages so the
+// create and update contracts agree. Returns the resulting display fields,
+// null-normalized like getRoomMeta.
+export async function updateRoomMeta(
+  code: string,
+  actor: string,
+  patch: UpdateRoomMetaPatch = {}
+): Promise<{ groupName: string | null; groupDesc: string | null }> {
+  assertRoomCode(code);
+  assertUsername(actor);
+  const nextName = patch.groupName;
+  const nextDesc = patch.groupDesc;
+  if (nextName !== undefined) {
+    if (typeof nextName !== "string" || nextName.length < 1 || nextName.length > GROUP_NAME_MAX) {
+      throw new RoomError(400, `groupName must be a string of 1-${GROUP_NAME_MAX} characters`);
+    }
+  }
+  if (nextDesc !== undefined) {
+    if (typeof nextDesc !== "string" || nextDesc.length > GROUP_DESC_MAX) {
+      throw new RoomError(400, `groupDesc must be a string of at most ${GROUP_DESC_MAX} characters`);
+    }
+  }
+  // Roster + meta doc in one round trip: membership and the role gate read
+  // the same snapshot the write is based on.
+  const [membersRaw, roomRaw] = (await redis.pipeline([
+    { cmd: "hgetall", key: membersKey(code), args: [] },
+    { cmd: "hgetall", key: roomKey(code), args: [] },
+  ])) as [Record<string, string> | null, Record<string, string> | null];
+  if (isEmptyRecord(membersRaw)) throw new RoomError(404, "Session not found");
+  if (isEmptyRecord(roomRaw)) throw new RoomError(404, "Session not found");
+  const raw = membersRaw[actor];
+  const member = raw ? parseMember(actor, raw) : null;
+  if (!member) throw new RoomError(403, "Not in this session");
+  if (member.role !== "creator" && member.role !== "admin") {
+    throw new RoomError(403, "Only admins can change group details");
+  }
+  const doc = parseStored<Record<string, unknown>>(roomRaw["meta"]);
+  if (!doc) throw new RoomError(404, "Session not found");
+  if (nextName !== undefined) doc.groupName = nextName;
+  if (nextDesc !== undefined) doc.groupDesc = nextDesc;
+  await redis.pipeline([
+    { cmd: "hset", key: roomKey(code), args: ["meta", JSON.stringify(doc)] },
+    { cmd: "expire", key: roomKey(code), args: [ROOM_TTL_SEC] },
+    { cmd: "expire", key: membersKey(code), args: [ROOM_TTL_SEC] },
+  ]);
+  return {
+    groupName: typeof doc.groupName === "string" ? doc.groupName : null,
+    groupDesc: typeof doc.groupDesc === "string" ? doc.groupDesc : null,
+  };
+}
+
+// deleteRoom dissolves a group for everyone — creator only. destroyRoom
+// already purges the meta doc, roster, seats, bans, reactions, invites and
+// per-member queues (reaping the code from each invitee's per-user index);
+// unindexRoom then drops the code from the sweep index so the deletion is
+// final on every path. Survivors see the room vanish on their next beat.
+export async function deleteRoom(code: string, actor: string): Promise<void> {
+  await requireCreator(code, actor);
+  await destroyRoom(code);
+  await unindexRoom(code);
 }
 
 export async function destroyRoom(code: string): Promise<void> {
