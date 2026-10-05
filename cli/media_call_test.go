@@ -202,7 +202,7 @@ func TestAudioBothTalkersDecoded(t *testing.T) {
 }
 
 func TestSlashRegistryExact(t *testing.T) {
-	want := []string{"/help", "/reply", "/settings", "/new-group", "/invite", "/upload", "/download", "/audio", "/kick", "/admin", "/unadmin"}
+	want := []string{"/help", "/reply", "/settings", "/new-group", "/invite", "/group-edit", "/group-members", "/group-leave", "/upload", "/download", "/audio", "/kick", "/admin", "/unadmin"}
 	got := make([]string, 0, len(slashCommands))
 	for _, cmd := range slashCommands {
 		got = append(got, cmd.Name)

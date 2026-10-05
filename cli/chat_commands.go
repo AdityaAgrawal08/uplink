@@ -36,6 +36,9 @@ var slashCommands = []slashCommand{
 	{Name: "/settings", Desc: "invites & notifications", Group: "Settings"},
 	{Name: "/new-group", Desc: "create a group (add members with /invite)", Group: "Groups"},
 	{Name: "/invite", Desc: "invite room users to this group", Group: "Groups"},
+	{Name: "/group-edit", Desc: "rename, transfer admin, or delete this group", Group: "Groups"},
+	{Name: "/group-members", Desc: "list group members & roles", Group: "Groups"},
+	{Name: "/group-leave", Desc: "leave this group", Group: "Groups"},
 	{Name: "/upload", Desc: "send file(s) into the room", Group: "Files"},
 	{Name: "/download", Desc: "fetch shared room files", Group: "Files"},
 	{Name: "/audio", Desc: "toggle mic to your DM peer / the room", Group: "Voice"},
@@ -1275,6 +1278,35 @@ func (c *chatScreen) runCommand(name, arg string) tea.Cmd {
 		// and let rootModel build the window from the group session.
 		c.closeTransientsForWindow()
 		return func() tea.Msg { return openInviteMsg{} }
+	case "/group-edit":
+		// Administration window (groups only): rename/description, admin
+		// transfer, and creator-only dissolve. Members open the same window
+		// read-only with the reason.
+		if c.activeGroup == "" {
+			c.status = "/group-edit works inside a group — open the group conversation first"
+			c.rebuildView()
+			return nil
+		}
+		c.closeTransientsForWindow()
+		return func() tea.Msg { return openGroupEditMsg{} }
+	case "/group-members":
+		// Member list (groups only) in the shared drawer craft.
+		if c.activeGroup == "" {
+			c.status = "/group-members works inside a group — open the group conversation first"
+			c.rebuildView()
+			return nil
+		}
+		c.closeTransientsForWindow()
+		return func() tea.Msg { return openGroupMembersMsg{} }
+	case "/group-leave":
+		// Leave (groups only), refused for the LAST admin so a group is
+		// never left crownless by accident.
+		if c.activeGroup == "" {
+			c.status = "/group-leave works inside a group — open the group conversation first"
+			c.rebuildView()
+			return nil
+		}
+		return c.leaveGroupCmd(c.activeGroup)
 	case "/upload":
 		return c.openPicker() // morphs the drawer into a file browser
 	case "/download":

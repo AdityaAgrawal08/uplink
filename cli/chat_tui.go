@@ -486,8 +486,16 @@ func (c *chatScreen) syncRosterFromEngine() {
 	if c.activeGroup == "" && c.hoverPeer != "" && groupPeerCode(c.hoverPeer) == "" && !live[c.hoverPeer] {
 		c.hoverPeer = ""
 	}
-	if c.hoverPeer != "" && groupPeerCode(c.hoverPeer) != "" && c.groups[groupPeerCode(c.hoverPeer)] == nil {
-		c.hoverPeer = ""
+	if c.hoverPeer != "" && groupPeerCode(c.hoverPeer) != "" {
+		// A tombstone row is still a real (explainable) row; only a peer
+		// that vanished from both the live set and the tombstones drops
+		// the cursor.
+		code := groupPeerCode(c.hoverPeer)
+		if c.groups[code] == nil {
+			if _, dead := c.tombstones[code]; !dead {
+				c.hoverPeer = ""
+			}
+		}
 	}
 	if changed {
 		c.rebuildView() // repaint the sidebar NOW, not on the next message
@@ -557,6 +565,15 @@ type sendDoneMsg struct {
 }
 type leaveDoneMsg struct{}
 type groupLeftMsg struct{ code string }
+
+// groupRestoreDoneMsg resolves one startup re-join attempt for a group row
+// painted optimistically from the local store. nil error = the session is
+// live again (the engine starts); a terminal failure drops the row and
+// prunes the store.
+type groupRestoreDoneMsg struct {
+	code string
+	err  error
+}
 
 // ---- model -----------------------------------------------------------------
 
@@ -730,7 +747,14 @@ type chatScreen struct {
 	groups         map[string]*groupSession // code -> joined group
 	activeGroup    string                   // open group code ("" = home room)
 	lastGroupAt    map[string]time.Time     // code -> newest inbound message (recency sort)
-	homeKey        string                   // the constructor's session code (the main room)
+	// tombstones are session-only placeholder rows for groups this client is
+	// no longer a member of (left/kicked/dissolved). Never persisted.
+	tombstones map[string]groupTombstone
+	// groupsPath is the local membership store (~/.uplink/groups.json; env
+	// override UPLINK_GROUPS_FILE). Only runChatTUI wires it — bare/test
+	// screens leave it empty so no test ever touches a developer's HOME.
+	groupsPath    string
+	homeKey       string // the constructor's session code (the main room)
 	homeSig        *signalClient            // home session client (survives group switches)
 	homeEng        *engine                  // home session engine (kept running in background)
 	id             *identityKey             // device identity (group engines reuse it)
@@ -2667,6 +2691,10 @@ func chatItemRow(it chatItem, inner int, hover string, h int, focused bool) []st
 	switch {
 	case it.isRoom:
 		presence = thPresenceStyle.Render("●")
+	case it.tombstone:
+		// Dead group: hollow group glyph in the resting tone, never the
+		// live accent.
+		presence = thPresenceOff.Render("▣")
 	case it.isGroup:
 		presence = thPresenceStyle.Render("▣")
 	case it.live:
@@ -2680,7 +2708,7 @@ func chatItemRow(it chatItem, inner int, hover string, h int, focused bool) []st
 	if it.unread > 0 {
 		nameStyle = thChatActive
 	}
-	if !it.live && !it.isRoom {
+	if (!it.live && !it.isRoom) || it.tombstone {
 		nameStyle = tuiDimStyle
 	}
 	nameRendered := nameStyle.Render(name)
@@ -2910,8 +2938,9 @@ func (c chatScreen) doLeave() tea.Cmd {
 
 // doLeaveGroup leaves the ACTIVE group server-side (reusing the standard
 // leave POST), stops its engine and returns to the common room — the group
-// leaves the sidebar (re-entry needs a fresh invite). The creator's crown
-// transfers server-side; rooms vanish when the last member leaves.
+// leaves the sidebar live set and a tombstone row stays for the session
+// (re-entry needs a fresh invite or code). The creator's crown transfers
+// server-side; rooms vanish when the last member leaves.
 func (c *chatScreen) doLeaveGroup(code string) tea.Cmd {
 	g := c.groups[code]
 	return func() tea.Msg {
@@ -2925,11 +2954,52 @@ func (c *chatScreen) doLeaveGroup(code string) tea.Cmd {
 	}
 }
 
-// dropGroup removes a background group from the sidebar (its session ended
-// or was left server-side): stops the engine, forgets ordering state. When
-// the dropped group was the active view, the screen returns to the common
-// room first.
-func (c *chatScreen) dropGroup(code, reason string) {
+// lastAdminLeaveBlock returns the leave-refusal reason when the caller is
+// the group's LAST admin: the crown must never be left ownerless by
+// accident, so the leave is blocked until another admin is promoted. An
+// empty string means the leave is allowed (members always are).
+func (c *chatScreen) lastAdminLeaveBlock(code string) string {
+	g := c.groups[code]
+	if g == nil || g.eng == nil {
+		return ""
+	}
+	admins := 0
+	isAdminMe := false
+	for _, m := range g.eng.peers() {
+		if m.Role == "creator" || m.Role == "admin" {
+			admins++
+		}
+		if m.Username == c.me && (m.Role == "creator" || m.Role == "admin") {
+			isAdminMe = true
+		}
+	}
+	if !isAdminMe || admins > 1 {
+		return ""
+	}
+	return "you are the last admin — promote another admin first (/group-edit → Transfer admin)"
+}
+
+// leaveGroupCmd is the single leave path for the open group (/group-leave
+// and Ctrl+C): it enforces the last-admin guard, then runs the standard
+// leave. A blocked leave parks the reason on the status line and returns no
+// command.
+func (c *chatScreen) leaveGroupCmd(code string) tea.Cmd {
+	if why := c.lastAdminLeaveBlock(code); why != "" {
+		c.status = why
+		c.rebuildView()
+		return nil
+	}
+	return c.doLeaveGroup(code)
+}
+
+// dropGroupAs removes a group from the sidebar live set (its
+// session ended or was left server-side), leaving a TOMBSTONE row that
+// survives until a fresh attach; the local store is pruned in the same step
+// so a restart can never resurrect the dead group. When the dropped group
+// was the active view, the screen returns to the common room first.
+// tombReason selects the tombstone's message ("left", "ended", "kicked",
+// "full"); status, when non-empty, lands on the status line.
+func (c *chatScreen) dropGroupAs(code, status, tombReason string) {
 	g := c.groups[code]
 	if g == nil {
 		return
@@ -2939,42 +3009,72 @@ func (c *chatScreen) dropGroup(code, reason string) {
 	}
 	delete(c.groups, code)
 	delete(c.lastGroupAt, code)
-	g.eng.stop()
-	if reason != "" {
-		c.status = reason
+	if g.eng != nil {
+		g.eng.stop()
+	}
+	c.noteGroupTombstone(code, g.name, tombReason)
+	c.persistGroups() // prune: the row must never come back on restart
+	if status != "" {
+		c.status = status
 	}
 	c.rebuildView()
+}
+
+// noteGroupTombstone records the session-only placeholder row.
+func (c *chatScreen) noteGroupTombstone(code, name, reason string) {
+	if code == "" {
+		return
+	}
+	if c.tombstones == nil {
+		c.tombstones = map[string]groupTombstone{}
+	}
+	if name == "" {
+		name = code
+	}
+	c.tombstones[code] = groupTombstone{code: code, name: name, reason: reason}
 }
 
 // shutdownSessions tears down every session this screen owns (groups +
 // home). Called after the bubbletea Run returns; each engine's stop is
 // idempotent, so a normal Ctrl+C leave that already stopped the home
-// engine costs nothing.
+// engine costs nothing. The local store is deliberately NOT touched here:
+// a normal app exit must keep memberships for the next launch's restore.
 func (c *chatScreen) shutdownSessions() {
 	for code, g := range c.groups {
-		if err := g.sig.leaveRoom(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: group leave may not have registered (%v)\n", err)
+		if g.sig != nil {
+			if err := g.sig.leaveRoom(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: group leave may not have registered (%v)\n", err)
+			}
 		}
-		g.eng.stop()
+		if g.eng != nil {
+			g.eng.stop()
+		}
 		delete(c.groups, code)
 	}
-	c.eng.stop()
+	if c.eng != nil {
+		c.eng.stop()
+	}
 }
 
 // attachGroup registers a joined group session: builds and starts its
 // engine (tagged traffic keeps the sidebar fresh in the background) and
 // remembers display state. The group password ("" for open groups) enables
-// the engine's self-rejoin after a prune.
+// the engine's self-rejoin after a prune and is persisted locally so the
+// row can auto-rejoin on the next launch.
 //
-// DISCOVERY LIMITATION: the server exposes no "groups I belong to" list
+// The call is idempotent per code: an existing group with a running engine
+// is only refreshed (display meta + password), never double-attached; an
+// optimistic restore row (engine still nil) is upgraded in place, keeping
+// its password when the caller has none. attachGroup also clears any
+// tombstone for the code: a fresh accept/join is exactly what re-establishes
+// the live row.
+//
+// DISCOVERY/LIMITATION: the server exposes no "groups I belong to" list
 // (src/ owns the API surface), so the sidebar's group set is derived
-// client-side from creation, invites+accepts, and this local map — the
-// rows appear the moment a group is created or an invite is accepted, and
-// vanish when the engine reports the room destroyed. A client restart
-// starts with an empty group set: memberships are re-established only by
-// accepting a fresh invite or re-joining by code. Group meta (name) also
-// rides the invite/create payloads, so a group loses its label if the
-// client forgets it and never re-attaches.
+// client-side from creation, invites+accepts, and the local store restored
+// at startup. Group meta (name/desc) rides the invite/create payloads and
+// the PATCH response — the server has no meta GET, so members other than
+// the editor see renames only after a rejoin.
 func (c *chatScreen) attachGroup(code, name, desc string, sig *signalClient, password string) {
 	if c.groups == nil {
 		c.groups = map[string]*groupSession{}
@@ -2982,20 +3082,205 @@ func (c *chatScreen) attachGroup(code, name, desc string, sig *signalClient, pas
 	if c.lastGroupAt == nil {
 		c.lastGroupAt = map[string]time.Time{}
 	}
+	delete(c.tombstones, code) // a live attach supersedes the placeholder
+	if existing := c.groups[code]; existing != nil {
+		if name != "" {
+			existing.name = name
+		}
+		existing.desc = desc
+		if password == "" {
+			password = existing.password // keep the saved secret on a meta-only refresh
+		}
+		existing.password = password
+		existing.restoring = false
+		if existing.eng != nil {
+			return // already attached: never a second engine for one group
+		}
+		eng := c.newSessionEngine(sig)
+		eng.joinPassword = password
+		existing.sig = sig
+		existing.eng = eng
+		eng.start()
+		c.persistGroups()
+		return
+	}
 	eng := c.newSessionEngine(sig)
-	eng.joinPassword = password // enables engine self-rejoin after prune
-	c.groups[code] = &groupSession{code: code, name: name, desc: desc, sig: sig, eng: eng}
+	eng.joinPassword = password
+	c.groups[code] = &groupSession{code: code, name: name, desc: desc, sig: sig, eng: eng, password: password}
 	c.lastGroupAt[code] = time.Now()
 	eng.start()
+	c.persistGroups()
+}
+
+// persistGroups snapshots the live group memberships for c.homeKey into the
+// local store. A no-op when the store path is unwired (bare/test screens).
+func (c *chatScreen) persistGroups() {
+	if c.groupsPath == "" || c.homeKey == "" {
+		return
+	}
+	list := make([]storedGroup, 0, len(c.groups))
+	for _, g := range c.groups {
+		if g == nil || g.restoring {
+			continue // an unconfirmed restore row is not a membership yet
+		}
+		list = append(list, storedGroup{Code: g.code, Name: g.name, Desc: g.desc, Password: g.password})
+	}
+	if err := saveGroupsForRoom(c.groupsPath, c.homeKey, list); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: groups store not saved (%v)\n", err)
+	}
+}
+
+// restorePersistedGroups paints this home room's saved memberships into the
+// sidebar OPTIMISTICALLY (engine nil, preview "re-joining…") before any
+// network work happens; restoreGroupsCmd then re-joins each in the
+// background. Codes already present are skipped (no double-attach).
+func (c *chatScreen) restorePersistedGroups() {
+	if c.groupsPath == "" || c.homeKey == "" {
+		return
+	}
+	saved := loadGroupsForRoom(c.groupsPath, c.homeKey)
+	if len(saved) == 0 {
+		return
+	}
+	if c.groups == nil {
+		c.groups = map[string]*groupSession{}
+	}
+	if c.lastGroupAt == nil {
+		c.lastGroupAt = map[string]time.Time{}
+	}
+	now := time.Now()
+	for _, sg := range saved {
+		if sg.Code == "" {
+			continue
+		}
+		if _, ok := c.groups[sg.Code]; ok {
+			continue // already attached (or restoring): avoid double-attach
+		}
+		name := sg.Name
+		if name == "" {
+			name = sg.Code
+		}
+		sig := &signalClient{serverURL: c.sig.serverURL, key: sg.Code, me: c.me, id: c.id}
+		c.groups[sg.Code] = &groupSession{
+			code: sg.Code, name: name, desc: sg.Desc,
+			sig: sig, password: sg.Password, restoring: true,
+		}
+		c.lastGroupAt[sg.Code] = now
+	}
+}
+
+// restoreGroupsCmd arms the background signed re-join for every optimistic
+// row (nil when nothing was restored). Each command resolves to a
+// groupRestoreDoneMsg.
+func (c chatScreen) restoreGroupsCmd() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, g := range c.groups {
+		if g == nil || !g.restoring {
+			continue
+		}
+		g := g
+		cmds = append(cmds, func() tea.Msg {
+			pk := ""
+			if c.id != nil {
+				pk = pubkeyB64(c.id)
+			}
+			_, _, err := g.sig.joinRoom(c.me, pk, g.password)
+			return groupRestoreDoneMsg{code: g.code, err: err}
+		})
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return tea.Batch(cmds...)
+}
+
+// restoreFailure classifies a startup re-join error: terminal failures
+// (room gone, kicked, full, password rejected) drop the row and prune the
+// store; transport/5xx failures keep the optimistic row ("re-joining…") so
+// a server outage at launch never wipes real memberships.
+func restoreFailure(err error) (reason string, terminal bool) {
+	if err == nil {
+		return "", false
+	}
+	if isServerDown(err) {
+		return "", false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case apiStatusCode(err) == 404:
+		return "ended", true
+	case apiStatusCode(err) == 403 && strings.Contains(msg, "kicked"):
+		return "kicked", true
+	case apiStatusCode(err) == 403 && strings.Contains(msg, "maximum allowance"):
+		return "full", true
+	case apiStatusCode(err) == 401 && strings.Contains(msg, "password"):
+		return "password", true
+	default:
+		return "", false
+	}
+}
+
+// groupEndEvent classifies an engine error against a group expected to be
+// dead: "session ended" (room gone), kicked (rejoin banned), full (rejoin
+// 403 max allowance). ok=false keeps the ordinary error path.
+func groupEndEvent(err error) (tombReason string, ok bool) {
+	low := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(low, "session ended"):
+		return "ended", true
+	case strings.Contains(low, "kicked"):
+		return "kicked", true
+	case strings.Contains(low, "maximum allowance"):
+		return "full", true
+	}
+	return "", false
+}
+
+// applyGroupMeta plumbs a successful PATCH /meta response into the local
+// group session and repaints the sidebar immediately (the editor sees the
+// rename at once). REFRESH LIMITATION: the server exposes no GET for group
+// meta, so other members keep the name learned at invite/create until they
+// rejoin — there is nothing for the roster/beat tick to re-read. If a meta
+// fetch ever lands, re-read it there and update the session from here.
+func (c *chatScreen) applyGroupMeta(code, name, desc string) {
+	g := c.groups[code]
+	if g == nil {
+		return
+	}
+	if name != "" {
+		g.name = name
+	}
+	g.desc = desc
+	c.persistGroups()
+	c.rebuildView()
+}
+
+// dissolveGroup applies a creator DELETE locally: the row drops to a
+// tombstone, the store is pruned, and the status line states what happened
+// for everyone.
+func (c *chatScreen) dissolveGroup(code, name string) {
+	if g := c.groups[code]; g != nil && name == "" {
+		name = g.name
+	}
+	if name == "" {
+		name = code
+	}
+	c.dropGroupAs(code, "", "ended")
+	c.status = "group " + name + " dissolved for everyone"
+	c.rebuildView()
 }
 
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
 	// No backlog (the server keeps no transcript), no WS upgrade, no beat
-	// tick (the engine owns heartbeats): just drain engine events and
-	// refresh the sidebar roster on a slow tick.
-	return tea.Batch(c.drainNetCmd(), scheduleRoster())
+	// tick (the engine owns heartbeats): drain engine events, refresh the
+	// sidebar roster on a slow tick, and fire the optimistic group restore
+	// (no-op when no store path is wired or nothing was saved).
+	return tea.Batch(c.drainNetCmd(), scheduleRoster(), c.restoreGroupsCmd())
 }
 
 // markSeen records an inbound msgId, reporting true on repeats (skip
@@ -3748,11 +4033,63 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case groupLeftMsg:
-		g := c.groups[msg.code]
-		if g != nil {
-			c.status = "You left group " + g.name + "."
+		name := msg.code
+		if g := c.groups[msg.code]; g != nil && g.name != "" {
+			name = g.name
 		}
-		c.dropGroup(msg.code, "")
+		// The live row drops and a tombstone stays for the session; the
+		// store is pruned so a restart never ghosts the left group.
+		c.dropGroupAs(msg.code, "", "left")
+		c.status = "You left group " + name + "."
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case groupRestoreDoneMsg:
+		g := c.groups[msg.code]
+		if g == nil || !g.restoring {
+			break // superseded by an accept/attach while the re-join was in flight
+		}
+		if msg.err != nil && apiStatusCode(msg.err) != 409 {
+			// 409 "Username already taken" means the seat SURVIVED the
+			// restart (rooms outlive clients): that is a live membership,
+			// handled by the success path below. Every other error is
+			// classified: terminal failures drop the row + prune the store;
+			// transient ones (server down, 5xx) keep the optimistic row so
+			// an outage at launch never wipes real memberships.
+			reason, terminal := restoreFailure(msg.err)
+			if !terminal {
+				c.status = "could not re-join group " + g.name + " (" + msg.err.Error() + ")"
+				c.rebuildView()
+				break
+			}
+			name := g.name
+			delete(c.groups, msg.code)
+			delete(c.lastGroupAt, msg.code)
+			if g.eng != nil {
+				g.eng.stop()
+			}
+			c.persistGroups() // prune: the dead membership must not come back
+			switch reason {
+			case "kicked":
+				c.status = "you were removed from group " + name
+			case "full":
+				c.status = "could not re-join group " + name + " — it is full"
+			case "password":
+				c.status = "could not re-join group " + name + " — the saved password no longer works"
+			default:
+				c.status = "group " + name + " ended — removed from the sidebar"
+			}
+			c.rebuildView()
+			break
+		}
+		g.restoring = false
+		if g.eng == nil {
+			eng := c.newSessionEngine(g.sig)
+			eng.joinPassword = g.password
+			g.eng = eng
+			eng.start()
+		}
+		c.persistGroups()
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netRosterMsg:
@@ -4034,29 +4371,43 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Engine errors surface on the status line, never as chat rows.
 		// Server outages hold the down alert; everything else parks once.
 		// A background group that died (last member left / 24h TTL /
-		// server sweep) leaves the sidebar instead of retrying into the
-		// void forever — the engine's beat classifies the ghost-room 404
-		// (or a rejoin that finds the room gone) as "session ended".
+		// server sweep / kicked / full) leaves the live sidebar instead of
+		// retrying into the void forever — the engine's beat classifies
+		// the ghost-room 404 (or a rejoin that finds the room gone) as
+		// "session ended", and a kicked/full rejoin is terminal too. Each
+		// drop leaves a tombstone for the session.
 		if msg.key != "" && msg.key != c.key {
-			if g := c.groups[msg.key]; g != nil && strings.Contains(strings.ToLower(msg.err.Error()), "session ended") {
-				reason := ""
-				if g.name != "" {
-					reason = "group " + g.name + " ended — rooms vanish when emptied"
-				} else {
-					reason = "group " + msg.key + " ended — rooms vanish when emptied"
+			if g := c.groups[msg.key]; g != nil {
+				if tombReason, ok := groupEndEvent(msg.err); ok {
+					name := g.name
+					if name == "" {
+						name = msg.key
+					}
+					status := ""
+					switch tombReason {
+					case "kicked":
+						status = "you were removed from group " + name
+					case "full":
+						status = "group " + name + " is full — you were dropped from the sidebar"
+					default:
+						status = "group " + name + " ended — rooms vanish when emptied"
+					}
+					c.dropGroupAs(msg.key, status, tombReason)
 				}
-				c.dropGroup(msg.key, reason)
 			}
 			cmds = append(cmds, c.drainNetCmd())
 			break
 		}
 		if isServerDown(msg.err) {
 			c.status = serverDownMsg
-		} else if msg.key == c.key && c.activeGroup != "" &&
-			strings.Contains(strings.ToLower(msg.err.Error()), "session ended") {
-			// The open group ended (everyone left): leave the view, drop
-			// the dead session.
-			c.dropGroup(msg.key, msg.err.Error())
+		} else if msg.key == c.key && c.activeGroup != "" {
+			if tombReason, ok := groupEndEvent(msg.err); ok {
+				// The open group died (ended/kicked/full): leave the view,
+				// drop the dead session.
+				c.dropGroupAs(msg.key, msg.err.Error(), tombReason)
+			} else {
+				c.status = msg.err.Error()
+			}
 		} else {
 			c.status = msg.err.Error()
 		}
@@ -4109,9 +4460,11 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyCtrlC {
 			// In a group, Ctrl+C LEAVES it (server-side, standard leave
 			// POST) and returns to the common room — the app keeps
-			// running. In the home room it leaves the session and quits.
+			// running. The last admin is refused with a promotion pointer
+			// (a group must never be left crownless). In the home room it
+			// leaves the session and quits.
 			if c.activeGroup != "" {
-				return c, c.doLeaveGroup(c.activeGroup)
+				return c, c.leaveGroupCmd(c.activeGroup)
 			}
 			// Leave first, quit when it completes (leaveDoneMsg→Quit):
 			// quitting alongside would kill the POST mid-flight.
@@ -4328,10 +4681,17 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.input.SetValue("")
 			if text == "" {
 				// Empty Enter on a highlighted roster row OPENS that
-				// entry: a DM thread or a group conversation.
+				// entry: a DM thread or a group conversation. A tombstone
+				// row (left/kicked/dissolved) is not joinable: it explains
+				// how to get back in instead of doing nothing.
 				if c.hoverPeer != "" && c.hoverPeer != c.me && c.hoverPeer != c.targetUser {
 					if code := groupPeerCode(c.hoverPeer); code != "" {
-						c.openGroup(code)
+						if t, dead := c.tombstones[code]; dead {
+							c.status = tombstoneStatus(t)
+							c.rebuildView()
+						} else {
+							c.openGroup(code)
+						}
 					} else {
 						cmd := c.enterPrivate(c.hoverPeer)
 						if cmd != nil {
@@ -5265,6 +5625,12 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				return nil // already chatting privately with them
 			}
 			if code := groupPeerCode(u); code != "" {
+				if t, dead := c.tombstones[code]; dead {
+					// Dead group row: explain, never open (there is no
+					// session behind it).
+					c.status = tombstoneStatus(t)
+					return nil
+				}
 				if c.activeGroup != code {
 					c.openGroup(code)
 				}
@@ -5622,6 +5988,11 @@ func (c chatScreen) composerBox(l layout, colW int, drawerOpen bool) string {
 // windows (/settings, /new-group) hosted on top.
 func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 	scr := newChatScreen(serverURL, key, me, id, password)
+	// Wire the local group-membership store and paint its saved groups
+	// optimistically BEFORE the roster seed: the sidebar shows the known
+	// groups immediately and Init fires the signed background re-joins.
+	scr.groupsPath = groupsStorePath()
+	scr.restorePersistedGroups()
 	// Seed the roster synchronously so the sidebar isn't empty on paint;
 	// the engine beat loop keeps it fresh, rosterTickMsg renders it.
 	if roster, epoch, err := scr.sig.heartbeat("", nil); err == nil {

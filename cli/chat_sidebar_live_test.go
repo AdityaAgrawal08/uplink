@@ -231,20 +231,28 @@ func TestSidebarLiveGroupDissolveDropsRow(t *testing.T) {
 	// exactly like the app's event pump.
 	r.chat.groups[code].eng.beatOnce()
 	r = drainEndEvent(t, r)
-	if inList(sidebarNames(&r.chat), "Design") {
-		t.Fatalf("dissolved group must leave the sidebar: %v", sidebarNames(&r.chat))
+	if _, live := r.chat.groups[code]; live {
+		t.Fatal("dissolved group must leave the live set")
 	}
-	if strings.Contains(r.chat.rosterBody(r.chat.sidebarFill(r.chat.layoutFor())), "Design") {
-		t.Fatal("the PAINTED sidebar still shows the dead group row")
+	// The agreed tombstone contract: the dead group keeps a visible
+	// placeholder row (so the end is acknowledged), never a live group row.
+	found := false
+	for _, it := range r.chat.chatItems() {
+		if it.isGroup && it.tombstone && it.name == "Design" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dissolved group must leave a tombstone row: %v", sidebarNames(&r.chat))
 	}
 	if !strings.Contains(r.chat.status, "Design") || !strings.Contains(r.chat.status, "ended") {
 		t.Fatalf("the drop must name the ended group on the status line: %q", r.chat.status)
 	}
-	// A later tick must not resurrect it either (no dead rows).
+	// A later tick must not resurrect a LIVE row either (no dead sessions).
 	rn, _ = r.Update(rosterTickMsg{})
 	r = rn.(rootModel)
-	if inList(sidebarNames(&r.chat), "Design") {
-		t.Fatalf("a later roster tick must not resurrect the dead row: %v", sidebarNames(&r.chat))
+	if _, live := r.chat.groups[code]; live {
+		t.Fatalf("a later roster tick must not resurrect the dead session: %v", sidebarNames(&r.chat))
 	}
 }
 
@@ -289,8 +297,11 @@ func TestSidebarLiveGroupDissolveActiveView(t *testing.T) {
 	if r.chat.activeGroup != "" {
 		t.Fatalf("the destroyed open group must return to the common room, active=%q", r.chat.activeGroup)
 	}
-	if inList(sidebarNames(&r.chat), "Design") {
-		t.Fatalf("the destroyed group row must be gone: %v", sidebarNames(&r.chat))
+	if _, live := r.chat.groups[code]; live {
+		t.Fatalf("the destroyed group must leave the live set: %v", sidebarNames(&r.chat))
+	}
+	if tmb, ok := r.chat.tombstones[code]; !ok || tmb.name != "Design" {
+		t.Fatalf("the destroyed group must leave a tombstone: %+v", r.chat.tombstones)
 	}
 }
 
@@ -344,22 +355,23 @@ func TestSidebarLiveAcceptAddsRowAndReinviteKeepsDead(t *testing.T) {
 	}
 
 	// ── server forgets the group; the engine's beat classifies it ended
-	// and the row drops (the active-view drop path). ──
+	// and the live row drops to a tombstone (the active-view drop path). ──
 	fake.mu.Lock()
 	delete(fake.members, code)
 	delete(fake.groupMeta, code)
 	fake.mu.Unlock()
 	r.chat.groups[code].eng.beatOnce()
 	r = drainEndEvent(t, r)
-	if inList(sidebarNames(&r.chat), "Design") {
-		t.Fatalf("dead group must leave the sidebar: %v", sidebarNames(&r.chat))
+	if _, live := r.chat.groups[code]; live {
+		t.Fatalf("dead group must leave the live set: %v", sidebarNames(&r.chat))
 	}
-	if strings.Contains(r.chat.rosterBody(r.chat.sidebarFill(r.chat.layoutFor())), "Design") {
-		t.Fatal("the PAINTED sidebar keeps a dead group row")
+	if tmb, ok := r.chat.tombstones[code]; !ok || tmb.name != "Design" {
+		t.Fatalf("dead group must keep a tombstone row: %+v", r.chat.tombstones)
 	}
 
 	// ── a NEW room reuses the code and alice re-invites bob: the 2s tick
-	// must badge the invite but must NOT resurrect the dropped row. ──
+	// must badge the invite but must NOT resurrect a LIVE row; the
+	// tombstone stays until bob accepts. ──
 	fake.mu.Lock()
 	fake.members[code] = map[string]rosterMember{
 		"alice": {Username: "alice", Pubkey: pubkeyB64(aliceID), Online: true, Role: "creator"},
@@ -377,11 +389,11 @@ func TestSidebarLiveAcceptAddsRowAndReinviteKeepsDead(t *testing.T) {
 	}
 	rn, _ = r.Update(polled)
 	r = rn.(rootModel)
-	if inList(sidebarNames(&r.chat), "Design") {
-		t.Fatalf("a re-invite must not resurrect a dropped group row: %v", sidebarNames(&r.chat))
+	if _, live := r.chat.groups[code]; live {
+		t.Fatalf("a re-invite must not resurrect a live group row: %v", sidebarNames(&r.chat))
 	}
-	if strings.Contains(r.chat.rosterBody(r.chat.sidebarFill(r.chat.layoutFor())), "Design") {
-		t.Fatal("the PAINTED sidebar must stay dead until a fresh accept")
+	if _, dead := r.chat.tombstones[code]; !dead {
+		t.Fatal("a pending re-invite must keep the tombstone until a fresh accept")
 	}
 	if r.chat.pendingInvites != 1 {
 		t.Fatalf("the re-invite must still badge: %d", r.chat.pendingInvites)

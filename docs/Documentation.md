@@ -104,12 +104,13 @@ clear, `↑↓` scroll, mouse supported. There is no right video panel and no
 pinned call card (both removed); liveness shows in the sidebar (`Live now`,
 `Voice call • MM:SS`) and header mic chips.
 
-Slash commands: `/help`, `/reply`, `/settings`, `/new-group`, `/upload`,
-`/download`, `/audio`, `/kick`, `/admin`, `/unadmin` (moderation
-role-gated: creator/admin only; `/admin` creator-only). Notices (command
-results, moderation outcomes, engine/media events, server-down alert)
-surface on the **status line**, never as transcript rows — only peer
-messages, own echoes, and file cards paint the transcript.
+Slash commands: `/help`, `/reply`, `/settings`, `/new-group`, `/invite`,
+`/group-edit`, `/group-members`, `/group-leave`, `/upload`, `/download`,
+`/audio`, `/kick`, `/admin`, `/unadmin` (moderation role-gated:
+creator/admin only; `/admin` creator-only). Notices (command results,
+moderation outcomes, engine/media events, server-down alert) surface on the
+**status line**, never as transcript rows — only peer messages, own echoes,
+and file cards paint the transcript.
 
 ### Reply / quote (WhatsApp-style)
 
@@ -203,21 +204,57 @@ server's live pending-invite count and doubles as the click target for
   closes the group view (still a member); **Ctrl+C in a group LEAVES it**
   (standard leave POST, crown transfer is server-side) and returns to the
   common room — the app keeps running, and only Ctrl+C in the home room
-  quits. Group engines stay alive in the background, so messages arriving
+  quits. The last remaining admin is refused (see `/group-leave` below).
+  Group engines stay alive in the background, so messages arriving
   while another conversation is open badge the row and land in the group
   transcript for when you open it.
+- **`/group-members`** opens the member list in the same drawer craft the
+  pickers use: role headers (Admins first), each member with their role tag
+  (`(main admin)` / `(admin)`), footer count. Read-only; Esc closes.
+- **`/group-edit`** is the group administration window (open a group
+  conversation first; elsewhere the command answers inline). An admin (and
+  the creator) gets editable **Name** (1–64) and **Description** (≤256)
+  fields with a SAVE button that PATCHes only the changed fields — the
+  response updates the local name/description and sidebar immediately; an
+  empty/invalid field or a non-admin request fails inline/with the server's
+  exact 403. **Transfer admin** opens the multi-select member picker
+  (`Space`/`Enter` toggles, `Tab` reaches the MAKE ADMINS button); each pick
+  POSTs the same `/admin` client call `/admin` uses, existing admins answer
+  a note instead of a duplicate grant. **Delete group** is creator-only and
+  opens a confirmation that spells out the consequences — *dissolves for
+  everyone; members lose access on their next heartbeat* — then issues the
+  DELETE that purges the room for every member. A non-creator admin sees
+  the blocked reason; plain members see the whole window read-only with
+  "only admins can change group details".
+- **`/group-leave`** (and Ctrl+C inside the group view) leaves the group
+  via the standard leave POST. Members may always leave; an admin may leave
+  while another admin remains, but the **last admin is refused** with
+  `promote another admin first (/group-edit → Transfer admin)` so a group
+  can never be left crownless by accident.
+- **Persistence & restart re-join**: joined groups are saved to
+  `~/.uplink/groups.json` (0600, keyed by home room code; group passwords
+  in plaintext — documented security tradeoff in `cli/groups_store.go`) on
+  create, invite-accept, rename, leave, kick and dissolve. On TUI start
+  every saved group paints optimistically in the sidebar and is re-joined in
+  the background with its saved password: success keeps the row (a seat
+  that survived the restart also counts as live), while 404 / kicked / full /
+  password-rejected failures drop the row AND prune the store (no ghost
+  rows); a server outage at launch keeps the row for the next attempt.
+  Leaving, being kicked, or a dissolve leaves a dimmed **tombstone** row
+  until a fresh invite/join re-establishes the live row; tombstones are
+  never persisted.
 - **Invite polling** piggybacks the existing 2s roster/inbox tick
   (`GET /invites/mine`): new codes ring the desk-based ping once (never on
   re-polls) and move the badge; declines/accepts shrink it on the next
-  poll. One surface at a time: `/settings` and `/new-group` are full-screen
-  windows over the chat (composer drawers close on entry; Esc/Ctrl+C close
-  the window back to the chat, whose own Ctrl+C remains the single app
-  exit).
+  poll. One surface at a time: `/settings`, `/new-group`, `/invite`,
+  `/group-edit` and `/group-members` are full-screen windows over the chat
+  (composer drawers close on entry; Esc/Ctrl+C close the window back to the
+  chat, whose own Ctrl+C remains the single app exit).
 
-Known limitation: joined groups are session-scoped — the sidebar does not
-re-attach groups across app restarts (the server has no "my memberships"
-endpoint), and group passwords are only remembered in memory for the
-engine's self-rejoin.
+Known limitation: the server exposes no group-meta GET, so a rename or
+description change is visible immediately to the editor (local session +
+sidebar) and reaches other members only when they rejoin — the
+invite/create payload is the only other source of group meta.
 
 ### Environment variables (CLI)
 

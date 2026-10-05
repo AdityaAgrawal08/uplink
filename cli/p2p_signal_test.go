@@ -294,11 +294,24 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Username string `json:"username"`
 			Pubkey   string `json:"pubkey"`
+			Password string `json:"password"`
 		}
 		json.NewDecoder(r.Body).Decode(&body)
 		if _, taken := members[body.Username]; taken {
 			f.write(w, 409, map[string]string{"error": "Username already taken"})
 			return
+		}
+		// Password check FIRST, exactly like the real join route (the
+		// restore path must be able to prove a saved password works).
+		if meta, ok := f.groupMeta[code]; ok && meta.pass != "" {
+			if body.Password == "" {
+				f.write(w, 401, map[string]string{"error": "Password is required for this session"})
+				return
+			}
+			if body.Password != meta.pass {
+				f.write(w, 401, map[string]string{"error": "Incorrect session password"})
+				return
+			}
 		}
 		// Plain /join enforces the group cap with the exact server message.
 		if meta, ok := f.groupMeta[code]; ok && meta.max >= 0 && len(members) >= meta.max {
@@ -599,6 +612,73 @@ func (f *fakeSignalServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		members[body.Target] = m
 		f.epochs[code]++
 		f.write(w, 200, map[string]any{"ok": true, "roster": roster(), "epoch": f.epochs[code]})
+	case "meta|PATCH":
+		me := f.me(r)
+		actor, ok := members[me]
+		if !f.requireSig(w, r, actor.Pubkey) {
+			return
+		}
+		if !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		var raw map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			f.write(w, 400, map[string]string{"error": "Request body must be a JSON object"})
+			return
+		}
+		meta := f.groupMeta[code]
+		if v, present := raw["groupName"]; present {
+			var s string
+			if err := json.Unmarshal(v, &s); err != nil || len([]rune(s)) < 1 || len([]rune(s)) > 64 {
+				f.write(w, 400, map[string]string{"error": "groupName must be a string of 1-64 characters"})
+				return
+			}
+			meta.name = s
+		}
+		if v, present := raw["groupDesc"]; present {
+			var s string
+			if err := json.Unmarshal(v, &s); err != nil || len([]rune(s)) > 256 {
+				f.write(w, 400, map[string]string{"error": "groupDesc must be a string of at most 256 characters"})
+				return
+			}
+			meta.desc = s
+		}
+		// Role gate mirrors updateRoomMeta: creator/admin only (validation
+		// above runs first, exactly like the real route).
+		if actor.Role != "creator" && actor.Role != "admin" {
+			f.write(w, 403, map[string]string{"error": "Only admins can change group details"})
+			return
+		}
+		f.groupMeta[code] = meta
+		f.write(w, 200, map[string]any{"groupName": meta.name, "groupDesc": meta.desc})
+	case "|DELETE":
+		me := f.me(r)
+		actor, ok := members[me]
+		if !f.requireSig(w, r, actor.Pubkey) {
+			return
+		}
+		if !ok {
+			f.write(w, 403, map[string]string{"error": "Not in this session"})
+			return
+		}
+		if actor.Role != "creator" {
+			f.write(w, 403, map[string]string{"error": "Only the group creator can delete this group"})
+			return
+		}
+		delete(f.members, code)
+		delete(f.groupMeta, code)
+		delete(f.epochs, code)
+		for user, invs := range f.invites {
+			kept := invs[:0]
+			for _, inv := range invs {
+				if inv.Code != code {
+					kept = append(kept, inv)
+				}
+			}
+			f.invites[user] = kept
+		}
+		f.write(w, 200, map[string]bool{"ok": true})
 	case "inbox/ack|POST":
 		me := f.me(r)
 		if !f.requireSig(w, r, members[me].Pubkey) {

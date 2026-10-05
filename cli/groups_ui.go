@@ -1635,6 +1635,894 @@ func (m inviteModel) inviteItemRowView(item int, hit fuzzyHit, inner int) string
 	return drawerItemRow(r, 26, inner, item == m.sel)
 }
 
+// ─── /group-edit and /group-members windows ──────────────────────────────────
+//
+// Both are hosted by rootModel like /settings and /invite. /group-edit owns
+// the group's administration: rename + description (admin-only PATCH), admin
+// transfer (multi-select member picker -> batch setRole admin calls), and the
+// creator-only DELETE dissolve behind an explicit confirmation. Members open
+// the same window read-only with the reason, never a dead end. /group-members
+// is the read-only roster in the shared drawer craft: role-grouped rows,
+// Admins first.
+
+// openGroupEditMsg / openGroupMembersMsg travel from the /group-edit and
+// /group-members command handlers to rootModel (the commands refuse outside
+// a group view, so these only arrive with a group conversation active).
+type openGroupEditMsg struct{}
+type openGroupMembersMsg struct{}
+
+// groupMetaSavedMsg resolves a PATCH /meta attempt: err nil = the server's
+// resulting display fields; both rootModel (plumb into the session + store)
+// and the window (busy/notice) consume it.
+type groupMetaSavedMsg struct {
+	code, name, desc string
+	err              error
+}
+
+// groupAdminsAppliedMsg resolves one batch of setRole(admin=true) calls:
+// notes carries per-user outcomes (successes and refusals), promoted the
+// users the server actually promoted, roster/epoch the last fresh roster for
+// an immediate sidebar refresh.
+type groupAdminsAppliedMsg struct {
+	code     string
+	notes    []string
+	promoted []string
+	roster   []rosterMember
+	epoch    int64
+	err      error
+}
+
+// groupDeletedMsg resolves the creator DELETE dissolve.
+type groupDeletedMsg struct {
+	code, name string
+	err        error
+}
+
+// Window modes for groupEditModel.
+const (
+	geModeForm = iota
+	geModeAdmins
+	geModeDelete
+)
+
+// Form focus rows for groupEditModel.
+const (
+	geFocusName = iota
+	geFocusDesc
+	geFocusTransfer
+	geFocusDelete
+	geFocusSave
+	geFocusCount
+)
+
+// groupEditModel is the /group-edit window. Admin view: editable Name /
+// Description with a SAVE button, a Transfer-admin action that opens the
+// multi-select member picker, and a Delete-group action (creator only) with
+// a confirmation spelling out the dissolve. Member view: the same card
+// read-only, with the reason ("only admins can change group details") —
+// never a screen that silently refuses keys.
+type groupEditModel struct {
+	w, h      int
+	me        string
+	code      string
+	name      string // server-known name (updated from the PATCH response)
+	desc      string
+	sig       *signalClient // group session client
+	role      string        // creator | admin | member
+	members   []rosterMember
+	mode      int
+	focus     int
+	nameInput textinput.Model
+	descInput textinput.Model
+	picked    map[string]bool
+	pickSel   int
+	pickOff   int
+	pickApply bool
+	busy      bool
+	notice    string
+	errMsg    string
+}
+
+func (m groupEditModel) isAdmin() bool   { return m.role == "creator" || m.role == "admin" }
+func (m groupEditModel) isCreator() bool { return m.role == "creator" }
+
+// groupRoleLabel names my role in the window's context line.
+func groupRoleLabel(role string) string {
+	switch role {
+	case "creator":
+		return "creator (main admin)"
+	case "admin":
+		return "admin"
+	default:
+		return "member"
+	}
+}
+
+// groupRoleRank orders members for display: creator, admins, members.
+func groupRoleRank(role string) int {
+	switch role {
+	case "creator":
+		return 0
+	case "admin":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// sortGroupMembers returns the roster in the display order every group
+// surface uses: creator first, then admins, then members, alpha within each
+// class (case-insensitive).
+func sortGroupMembers(ms []rosterMember) []rosterMember {
+	out := append([]rosterMember(nil), ms...)
+	sort.SliceStable(out, func(i, j int) bool {
+		ri, rj := groupRoleRank(out[i].Role), groupRoleRank(out[j].Role)
+		if ri != rj {
+			return ri < rj
+		}
+		return strings.ToLower(out[i].Username) < strings.ToLower(out[j].Username)
+	})
+	return out
+}
+
+// groupMembersOf snapshots a group session's live roster (sorted). Bare
+// sessions without an engine report nothing.
+func groupMembersOf(g *groupSession) []rosterMember {
+	if g == nil || g.eng == nil {
+		return nil
+	}
+	return sortGroupMembers(g.eng.peers())
+}
+
+func newGroupEditModel(serverURL, me string, id *identityKey, code, name, desc, role string, members []rosterMember, w, h int) groupEditModel {
+	ni := textinput.New()
+	ni.Placeholder = "Design Team"
+	ni.CharLimit = 64
+	ni.Prompt = "> "
+	ni.Width = 40
+	ni.TextStyle = lipgloss.NewStyle().Foreground(colText)
+	ni.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
+	ni.SetValue(name)
+
+	di := textinput.New()
+	di.Placeholder = "what is this group about?"
+	di.CharLimit = 256
+	di.Prompt = "> "
+	di.Width = 40
+	di.TextStyle = lipgloss.NewStyle().Foreground(colText)
+	di.PlaceholderStyle = lipgloss.NewStyle().Foreground(colFaint)
+	di.SetValue(desc)
+
+	// The picker works on OTHER members only (self needs no promotion).
+	others := make([]rosterMember, 0, len(members))
+	for _, m := range sortGroupMembers(members) {
+		if m.Username == "" || m.Username == me {
+			continue
+		}
+		others = append(others, m)
+	}
+	m := groupEditModel{
+		me:        me,
+		code:      code,
+		name:      name,
+		desc:      desc,
+		sig:       &signalClient{serverURL: serverURL, key: code, me: me, id: id},
+		role:      role,
+		members:   others,
+		picked:    map[string]bool{},
+		nameInput: ni,
+		descInput: di,
+		w:         w,
+		h:         h,
+	}
+	if m.isAdmin() {
+		m.nameInput.Focus()
+	}
+	return m
+}
+
+func (m groupEditModel) Init() tea.Cmd { return textinput.Blink }
+
+func (m groupEditModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+		return m, nil
+
+	case groupMetaSavedMsg:
+		m.busy = false
+		m.mode = geModeForm
+		if msg.err != nil {
+			if isServerDown(msg.err) {
+				m.errMsg = serverDownMsg
+			} else {
+				m.errMsg = msg.err.Error()
+			}
+			return m, nil
+		}
+		m.name, m.desc = msg.name, msg.desc
+		m.nameInput.SetValue(msg.name)
+		m.descInput.SetValue(msg.desc)
+		m.focus = geFocusSave
+		m.syncFocus()
+		m.notice = "group details saved"
+		m.errMsg = ""
+		return m, nil
+
+	case groupAdminsAppliedMsg:
+		m.busy = false
+		m.mode = geModeForm
+		m.focus = geFocusTransfer
+		m.picked = map[string]bool{}
+		m.pickApply = false
+		m.notice = ""
+		m.errMsg = ""
+		// Reflect the promotions locally so the picker never offers an
+		// already-promoted member twice.
+		promoted := map[string]bool{}
+		for _, u := range msg.promoted {
+			promoted[u] = true
+		}
+		for i := range m.members {
+			if promoted[m.members[i].Username] {
+				m.members[i].Role = "admin"
+			}
+		}
+		if len(msg.notes) > 0 {
+			m.notice = strings.Join(msg.notes, " · ")
+		}
+		if msg.err != nil && len(msg.notes) == 0 {
+			m.errMsg = msg.err.Error()
+		}
+		return m, nil
+
+	case groupDeletedMsg:
+		m.busy = false
+		if msg.err != nil {
+			if isServerDown(msg.err) {
+				m.errMsg = serverDownMsg
+			} else {
+				m.errMsg = "delete failed: " + msg.err.Error()
+			}
+			m.mode = geModeForm
+			return m, nil
+		}
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+
+	case tea.KeyMsg:
+		if m.busy {
+			return m, nil // one request at a time; the window settles on its own
+		}
+		switch m.mode {
+		case geModeAdmins:
+			return m.handleAdminKeys(msg)
+		case geModeDelete:
+			return m.handleDeleteKeys(msg)
+		default:
+			return m.handleFormKeys(msg)
+		}
+	}
+	return m, nil
+}
+
+// handleFormKeys: Tab walks the focus rows, Enter advances/open/submits
+// depending on the row, Esc closes. Text edits ride the focused input only
+// for admins (the member view accepts nothing).
+func (m groupEditModel) handleFormKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	case tea.KeyEsc:
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	case tea.KeyTab, tea.KeyShiftTab:
+		step := 1
+		if msg.Type == tea.KeyShiftTab || msg.String() == "shift+tab" {
+			step = geFocusCount - 1
+		}
+		m.focus = (m.focus + step) % geFocusCount
+		m.syncFocus()
+		return m, nil
+	case tea.KeyEnter:
+		switch m.focus {
+		case geFocusName, geFocusDesc:
+			if !m.isAdmin() {
+				m.errMsg = "only admins can change group details"
+				return m, nil
+			}
+			m.focus = (m.focus + 1) % geFocusCount
+			m.syncFocus()
+			return m, nil
+		case geFocusTransfer:
+			if !m.isAdmin() {
+				m.errMsg = "only admins can change group details"
+				return m, nil
+			}
+			m.mode = geModeAdmins
+			m.picked = map[string]bool{}
+			m.pickSel, m.pickOff, m.pickApply = 0, 0, false
+			m.notice, m.errMsg = "", ""
+			return m, nil
+		case geFocusDelete:
+			if !m.isCreator() {
+				if m.isAdmin() {
+					m.errMsg = "Only the group creator can delete this group"
+				} else {
+					m.errMsg = "only admins can change group details"
+				}
+				return m, nil
+			}
+			m.mode = geModeDelete
+			m.notice, m.errMsg = "", ""
+			return m, nil
+		case geFocusSave:
+			if !m.isAdmin() {
+				m.errMsg = "only admins can change group details"
+				return m, nil
+			}
+			return m, m.submitMeta()
+		}
+		return m, nil
+	default:
+		if !m.isAdmin() {
+			return m, nil // read-only: no field ever receives text
+		}
+		switch m.focus {
+		case geFocusName:
+			var cmd tea.Cmd
+			m.nameInput, cmd = m.nameInput.Update(msg)
+			return m, cmd
+		case geFocusDesc:
+			var cmd tea.Cmd
+			m.descInput, cmd = m.descInput.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+	}
+}
+
+// syncFocus keeps exactly one field (or none) focused.
+func (m *groupEditModel) syncFocus() {
+	m.nameInput.Blur()
+	m.descInput.Blur()
+	if !m.isAdmin() {
+		return
+	}
+	switch m.focus {
+	case geFocusName:
+		m.nameInput.Focus()
+	case geFocusDesc:
+		m.descInput.Focus()
+	}
+}
+
+// submitMeta PATCHes only the changed fields, with the same inline
+// validation as /new-group (the server re-validates).
+func (m *groupEditModel) submitMeta() tea.Cmd {
+	m.errMsg = ""
+	name := strings.TrimSpace(m.nameInput.Value())
+	if e := validateGroupName(name); e != "" {
+		m.errMsg = e
+		return nil
+	}
+	desc := strings.TrimSpace(m.descInput.Value())
+	if e := validateGroupDesc(desc); e != "" {
+		m.errMsg = e
+		return nil
+	}
+	var namePtr, descPtr *string
+	if name != m.name {
+		namePtr = &name
+	}
+	if desc != m.desc {
+		descPtr = &desc
+	}
+	if namePtr == nil && descPtr == nil {
+		m.notice = "nothing changed"
+		return nil
+	}
+	m.busy = true
+	m.notice = ""
+	sig := m.sig
+	code := m.code
+	return func() tea.Msg {
+		n, d, err := sig.patchGroupMeta(namePtr, descPtr)
+		return groupMetaSavedMsg{code: code, name: n, desc: d, err: err}
+	}
+}
+
+// handleAdminKeys drives the multi-select member picker: arrows walk the
+// grouped display order, Space/Enter toggles a plain member, Tab moves to
+// the APPLY button, Enter there fires the batch.
+func (m groupEditModel) handleAdminKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	case tea.KeyEsc:
+		m.mode = geModeForm
+		m.focus = geFocusTransfer
+		m.errMsg = ""
+		return m, nil
+	case tea.KeyUp:
+		m.movePick(-1)
+		return m, nil
+	case tea.KeyDown:
+		m.movePick(+1)
+		return m, nil
+	case tea.KeyTab, tea.KeyShiftTab:
+		m.pickApply = !m.pickApply
+		return m, nil
+	case tea.KeySpace:
+		m.togglePick()
+		return m, nil
+	case tea.KeyEnter:
+		if m.pickApply {
+			return m, m.applyPicks()
+		}
+		m.togglePick()
+		return m, nil
+	}
+	return m, nil
+}
+
+// movePick steps the highlight through the PAINTED display order of the
+// grouped plan (role headers shift display rows), exactly like the /invite
+// picker.
+func (m *groupEditModel) movePick(d int) {
+	n := len(m.members)
+	if n == 0 {
+		m.pickSel, m.pickOff = 0, 0
+		return
+	}
+	plan := buildDrawerPlan(n, true, func(i int) string { return userGroupLabel(m.members[i]) }, drawerMaxRows(m.h))
+	disp := plan.displayOrder()
+	cur := 0
+	for i, it := range disp {
+		if it == m.pickSel {
+			cur = i
+			break
+		}
+	}
+	cur = (cur + d + len(disp)) % len(disp)
+	m.pickSel = disp[cur]
+	settleDrawerWindow(&m.pickSel, &m.pickOff, plan)
+}
+
+// togglePick flips the highlighted member's pick state. The creator and
+// existing admins are not promotable (the server refuses creator changes and
+// no-ops admin grants), so they answer with a note instead.
+func (m *groupEditModel) togglePick() {
+	if m.pickSel < 0 || m.pickSel >= len(m.members) {
+		return
+	}
+	u := m.members[m.pickSel]
+	if u.Role == "creator" || u.Role == "admin" {
+		m.notice = u.Username + " is already " + map[bool]string{true: "the main admin", false: "an admin"}[u.Role == "creator"]
+		m.errMsg = ""
+		return
+	}
+	if m.picked[u.Username] {
+		delete(m.picked, u.Username)
+	} else {
+		m.picked[u.Username] = true
+	}
+	m.notice, m.errMsg = "", ""
+}
+
+// applyPicks POSTs /admin for every picked member (the same setRole client
+// path /admin and /unadmin use). Per-user failures become notes; the rest
+// continue.
+func (m *groupEditModel) applyPicks() tea.Cmd {
+	picks := make([]string, 0, len(m.picked))
+	for _, u := range m.members {
+		if m.picked[u.Username] {
+			picks = append(picks, u.Username)
+		}
+	}
+	if len(picks) == 0 {
+		m.notice = "pick at least one member first"
+		return nil
+	}
+	m.busy = true
+	m.notice = ""
+	sig := m.sig
+	code := m.code
+	return func() tea.Msg {
+		var notes, promoted []string
+		var roster []rosterMember
+		var epoch int64
+		var firstErr error
+		for _, u := range picks {
+			r, e, err := sig.setRole(u, true)
+			if err != nil {
+				notes = append(notes, u+": "+err.Error())
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			roster, epoch = r, e
+			promoted = append(promoted, u)
+			notes = append(notes, u+" is now an admin")
+		}
+		return groupAdminsAppliedMsg{code: code, notes: notes, promoted: promoted, roster: roster, epoch: epoch, err: firstErr}
+	}
+}
+
+// handleDeleteKeys: Enter confirms, Esc backs out.
+func (m groupEditModel) handleDeleteKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, func() tea.Msg { return closeOverlayMsg{} }
+	case tea.KeyEsc:
+		m.mode = geModeForm
+		m.focus = geFocusDelete
+		return m, nil
+	case tea.KeyEnter:
+		if !m.isCreator() {
+			m.mode = geModeForm
+			m.errMsg = "Only the group creator can delete this group"
+			return m, nil
+		}
+		m.busy = true
+		sig := m.sig
+		code, name := m.code, m.name
+		return m, func() tea.Msg {
+			return groupDeletedMsg{code: code, name: name, err: sig.deleteGroupRoom()}
+		}
+	}
+	return m, nil
+}
+
+// paintStrip centers a drawer panel (exact row count, inner cells wide) in
+// the full-screen overlay. Shared by the /group-edit picker and the
+// /group-members list.
+func paintStrip(body string, inner, w, h int) string {
+	if body == "" {
+		return strings.Repeat("\n", maxInt(h-1, 0))
+	}
+	lines := strings.Split(body, "\n")
+	top := (h - len(lines)) / 2
+	if top < 0 {
+		top = 0
+	}
+	left := (w - inner) / 2
+	if left < 0 {
+		left = 0
+	}
+	out := make([]string, maxInt(h, 0))
+	for i, ln := range lines {
+		y := top + i
+		if y >= 0 && y < len(out) {
+			out[y] = strings.Repeat(" ", left) + ln
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// adminPanelRows builds the /group-edit transfer picker in the shared drawer
+// craft: role-grouped member rows with pick checks, the APPLY button and the
+// keymap footer.
+func (m groupEditModel) adminPanelRows() []drawerRow {
+	win := drawerMaxRows(m.h)
+	plan := buildDrawerPlan(len(m.members), true, func(i int) string { return userGroupLabel(m.members[i]) }, win)
+	wrows, below, above := windowDrawerPlan(plan, m.pickOff, m.pickSel)
+	panel := make([]drawerRow, 0, 12)
+	panel = append(panel, drawerRow{kind: drBorder},
+		drawerRow{kind: drHeader, text: "Transfer admin — " + sanitizeDisplay(m.name)})
+	if len(m.members) == 0 {
+		panel = append(panel, drawerRow{kind: drEmpty, text: "No other members to promote"})
+	} else {
+		for _, r := range wrows {
+			if r.kind == drItem {
+				cand := m.members[r.item]
+				rr := drawerRow{
+					kind: drItem, item: r.item,
+					text: sanitizeDisplay(cand.Username),
+					desc: roleSuffixTag(cand.Role),
+					hit:  plan.hitOf(r.item),
+					lead: "  ",
+				}
+				rr.picked = m.picked[cand.Username]
+				panel = append(panel, rr)
+			} else {
+				panel = append(panel, r)
+			}
+		}
+		if below > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: below, text: "more"})
+		} else if above > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: above, text: "above"})
+		}
+	}
+	if m.notice != "" {
+		panel = append(panel, drawerRow{kind: drNotice,
+			text: lipgloss.NewStyle().Foreground(colDim).Render(m.notice)})
+	} else if m.errMsg != "" {
+		panel = append(panel, drawerRow{kind: drNotice,
+			text: lipgloss.NewStyle().Foreground(colRed).Render(m.errMsg)})
+	}
+	btnN := 0
+	if m.pickApply {
+		btnN = 1
+	}
+	btn := "MAKE ADMINS"
+	if m.busy {
+		btn = "promoting…"
+	}
+	panel = append(panel, drawerRow{kind: drButton, text: btn, n: btnN})
+	panel = append(panel, drawerRow{kind: drFooter,
+		text: "↑↓ move · space toggle · tab apply · esc back", n: len(m.members)})
+	return panel
+}
+
+func (m groupEditModel) adminView() string {
+	inner := m.w - 2
+	if inner > 80 {
+		inner = 80
+	}
+	if inner < 30 {
+		inner = 30
+	}
+	return paintStrip(drawerPanelView(inner, m.adminPanelRows(), m.pickSel), inner, m.w, m.h)
+}
+
+// deleteConfirmView is the modal over the form: the exact consequences are
+// spelled out, Enter confirms, Esc backs out.
+func (m groupEditModel) deleteConfirmView() string {
+	innerW := m.w - 8
+	if innerW < 24 {
+		innerW = 24
+	}
+	if innerW > 56 {
+		innerW = 56
+	}
+	title := lipgloss.NewStyle().Bold(true).Foreground(colRed).Render("DELETE GROUP?")
+	body := "This dissolves " + sanitizeDisplay(m.name) + " for everyone;"
+	body2 := "members lose access on their next heartbeat."
+	if w := innerW - 2; w > 0 {
+		body = truncateByWidth(body, w)
+		body2 = truncateByWidth(body2, w)
+	}
+	warn := "This cannot be undone."
+	lines := []string{
+		title,
+		landSubtitleStyle.Render(body),
+		landSubtitleStyle.Render(body2),
+		landErrorStyle.Render(warn),
+		"",
+		landHintStyle.Render("ENTER confirm  ·  ESC cancel"),
+	}
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colRed).
+		Background(colPanel).
+		Padding(1, 2).
+		Render(strings.Join(lines, "\n"))
+}
+
+// formView paints the administration card: the context line, the Name and
+// Description sections (editable for admins, static text for members), the
+// Transfer and Delete action rows (disabled with the reason where the role
+// does not allow them), the SAVE button and the notice/error line.
+func (m groupEditModel) formView() string {
+	outerW := m.w - 4
+	if outerW < 60 {
+		outerW = 60
+	}
+	if outerW > 78 {
+		outerW = 78
+	}
+	inner := outerW - 4
+	fit := func(s string) string { return fitRow(s, inner) }
+	labelOf := func(text string, f int) string {
+		st := landLabelStyle
+		if m.focus == f && m.isAdmin() {
+			st = landLabelFocusStyle
+		}
+		return st.Width(14).Render(text)
+	}
+	box := func(ti textinput.Model, f int) string {
+		st := landInputBlurStyle
+		if m.focus == f && m.isAdmin() {
+			st = landInputFocusedStyle
+		}
+		return st.Render(ti.View())
+	}
+	row := func(label, input string) string {
+		return lipgloss.JoinHorizontal(lipgloss.Top, label, " ", input)
+	}
+	actionRow := func(label, note string, f int, enabled bool) string {
+		w := maxInt(inner-2, 1)
+		st := landButtonBlurStyle.Width(w)
+		if m.focus == f && enabled {
+			st = landButtonSelectedStyle.Width(w)
+		}
+		text := "  " + label
+		if note != "" {
+			text += "  ·  " + note
+		}
+		if !enabled {
+			st = lipgloss.NewStyle().Foreground(colFaint)
+		}
+		return fit(st.Render(text))
+	}
+
+	rows := []string{
+		fit(lipgloss.NewStyle().Bold(true).Foreground(colAccent).Render("◆ GROUP EDIT — " + sanitizeDisplay(m.name))),
+		fit(lipgloss.NewStyle().Foreground(colDim).Render(
+			fmt.Sprintf("key %s  ·  you are %s", sanitizeDisplay(m.code), groupRoleLabel(m.role)))),
+	}
+	if !m.isAdmin() {
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colRed).Render(
+			"Read-only — only admins can change group details.")))
+	}
+	rows = append(rows, " ")
+	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Bold(true).Render("NAME")))
+	if m.isAdmin() {
+		rows = append(rows, row(labelOf("Name :", geFocusName), box(m.nameInput, geFocusName)))
+	} else {
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colText).Render("  "+sanitizeDisplay(m.name))))
+	}
+	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Bold(true).Render("DESCRIPTION")))
+	if m.isAdmin() {
+		rows = append(rows, row(labelOf("Description :", geFocusDesc), box(m.descInput, geFocusDesc)))
+	} else {
+		text := sanitizeDisplay(m.desc)
+		if text == "" {
+			text = "(none)"
+		}
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colText).Render("  "+text)))
+	}
+	rows = append(rows, " ")
+	transferNote := "make members admins"
+	if n := len(m.picked); n > 0 {
+		transferNote = fmt.Sprintf("%d selected", n)
+	}
+	if !m.isAdmin() {
+		transferNote = "admins only"
+	}
+	rows = append(rows, actionRow("Transfer admin", transferNote, geFocusTransfer, m.isAdmin()))
+	deleteNote := "creator only — dissolves for everyone"
+	if m.isCreator() {
+		deleteNote = "dissolves for everyone"
+	} else if m.isAdmin() {
+		deleteNote = "creator only"
+	} else {
+		deleteNote = "admins only"
+	}
+	rows = append(rows, actionRow("Delete group", deleteNote, geFocusDelete, m.isCreator()))
+	if m.isAdmin() {
+		btnText := "SAVE"
+		if m.busy {
+			btnText = "saving…"
+		}
+		btnW := lipgloss.Width(btnText) + 4
+		btnStyle := landButtonBlurStyle.Width(btnW).Padding(0, 1)
+		if m.focus == geFocusSave && !m.busy {
+			btnStyle = landButtonSelectedStyle.Width(btnW).Padding(0, 1)
+		}
+		rows = append(rows, lipgloss.NewStyle().Width(inner).Align(lipgloss.Center).Render(btnStyle.Render(btnText)))
+	}
+	if m.errMsg != "" {
+		rows = append(rows, fit(landErrorStyle.Render(m.errMsg)))
+	} else if m.notice != "" {
+		rows = append(rows, fit(lipgloss.NewStyle().Foreground(colDim).Render(m.notice)))
+	}
+	rows = append(rows, fit(lipgloss.NewStyle().Foreground(colFaint).Render(
+		"tab move · enter open/save · esc close")))
+
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colEdge).
+		Background(colPanel).
+		Width(inner).
+		Padding(0, 1).
+		Render(strings.Join(rows, "\n"))
+	centered := lipgloss.NewStyle().Width(m.w).Height(m.h).
+		Align(lipgloss.Center).AlignVertical(lipgloss.Center).Render(card)
+	if m.mode == geModeDelete {
+		return overlayCenter(centered, m.deleteConfirmView(), m.w, m.h)
+	}
+	return centered
+}
+
+func (m groupEditModel) View() string {
+	if m.w == 0 || m.h == 0 {
+		return "loading…"
+	}
+	if m.mode == geModeAdmins {
+		return m.adminView()
+	}
+	return m.formView()
+}
+
+// ─── /group-members window ───────────────────────────────────────────────────
+
+// groupMembersModel is the read-only member list: role-grouped rows in the
+// shared drawer craft, admins first, with the group name in the header. Esc
+// closes.
+type groupMembersModel struct {
+	w, h    int
+	code    string
+	name    string
+	members []rosterMember
+}
+
+func newGroupMembersModel(code, name string, members []rosterMember, w, h int) groupMembersModel {
+	if name == "" {
+		name = code
+	}
+	return groupMembersModel{code: code, name: name, members: sortGroupMembers(members), w: w, h: h}
+}
+
+func (m groupMembersModel) Init() tea.Cmd { return nil }
+
+func (m groupMembersModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.w, m.h = msg.Width, msg.Height
+		return m, nil
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+			return m, func() tea.Msg { return closeOverlayMsg{} }
+		}
+	}
+	return m, nil
+}
+
+// panelRows builds the member list plan: role headers ("Admins" first), one
+// row per member with the role tag, the overflow marker, and the footer
+// count. Read-only: no cursor, no picked state.
+func (m groupMembersModel) panelRows() []drawerRow {
+	win := drawerMaxRows(m.h)
+	plan := buildDrawerPlan(len(m.members), true, func(i int) string { return userGroupLabel(m.members[i]) }, win)
+	rows, below, above := windowDrawerPlan(plan, 0, -1)
+	panel := make([]drawerRow, 0, len(rows)+4)
+	panel = append(panel, drawerRow{kind: drBorder},
+		drawerRow{kind: drHeader, text: "Members — " + sanitizeDisplay(m.name)})
+	if len(m.members) == 0 {
+		panel = append(panel, drawerRow{kind: drEmpty, text: "No members reported yet"})
+	} else {
+		for _, r := range rows {
+			if r.kind == drItem {
+				u := m.members[r.item]
+				panel = append(panel, drawerRow{
+					kind: drItem, item: r.item,
+					text: sanitizeDisplay(u.Username),
+					desc: roleSuffixTag(u.Role),
+				})
+			} else {
+				panel = append(panel, r)
+			}
+		}
+		if below > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: below, text: "more"})
+		} else if above > 0 {
+			panel = append(panel, drawerRow{kind: drOverflow, n: above, text: "above"})
+		}
+	}
+	count := fmt.Sprintf("%d member", len(m.members))
+	if len(m.members) != 1 {
+		count += "s"
+	}
+	panel = append(panel, drawerRow{kind: drFooter, text: "esc close", count: count})
+	return panel
+}
+
+func (m groupMembersModel) View() string {
+	if m.w == 0 || m.h == 0 {
+		return "loading…"
+	}
+	inner := m.w - 2
+	if inner > 80 {
+		inner = 80
+	}
+	if inner < 30 {
+		inner = 30
+	}
+	return paintStrip(drawerPanelView(inner, m.panelRows(), -1), inner, m.w, m.h)
+}
+
 // ─── root model: hosts the chat + full-screen windows ───────────────────────
 
 // rootModel is the program model runChatTUI starts: the chat screen at
@@ -1684,12 +2572,63 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return r, r.overlay.Init()
 		}
 		return r, nil
+	case openGroupEditMsg:
+		if r.overlay == nil {
+			code := r.chat.activeGroup
+			g := r.chat.groups[code]
+			if g == nil || g.sig == nil {
+				return r, nil // a group conversation must be open
+			}
+			r.overlay = newGroupEditModel(r.chat.sig.serverURL, r.chat.me, r.chat.id,
+				code, g.name, g.desc, r.chat.myRole(), groupMembersOf(g),
+				r.chat.width, r.chat.height)
+			return r, r.overlay.Init()
+		}
+		return r, nil
+	case openGroupMembersMsg:
+		if r.overlay == nil {
+			code := r.chat.activeGroup
+			g := r.chat.groups[code]
+			if g == nil {
+				return r, nil // a group conversation must be open
+			}
+			name := g.name
+			if name == "" {
+				name = code
+			}
+			r.overlay = newGroupMembersModel(code, name, groupMembersOf(g), r.chat.width, r.chat.height)
+			return r, r.overlay.Init()
+		}
+		return r, nil
 	case closeOverlayMsg:
 		if r.overlay != nil {
 			r.overlay = nil
 			return r, tea.Batch(r.chat.drainNetCmd(), scheduleRoster())
 		}
 		return r, nil
+	case groupMetaSavedMsg:
+		// Plumb a successful rename/description straight into the local
+		// session + sidebar (the server has no meta GET for others — see
+		// applyGroupMeta), then let the window settle its own state.
+		if m.err == nil {
+			r.chat.applyGroupMeta(m.code, m.name, m.desc)
+		}
+		return r.forwardOverlay(m)
+	case groupAdminsAppliedMsg:
+		if m.roster != nil {
+			if g := r.chat.groups[m.code]; g != nil && g.eng != nil {
+				g.eng.applyPushedRoster(m.roster, m.epoch)
+			}
+			r.chat.syncRosterFromEngine()
+		}
+		return r.forwardOverlay(m)
+	case groupDeletedMsg:
+		if m.err != nil {
+			return r.forwardOverlay(m)
+		}
+		r.overlay = nil
+		r.chat.dissolveGroup(m.code, m.name)
+		return r, tea.Batch(r.chat.drainNetCmd(), scheduleRoster())
 	case acceptGroupDoneMsg:
 		r.overlay = nil
 		sig := &signalClient{serverURL: r.chat.sig.serverURL, key: m.code, me: r.chat.me, id: r.chat.id}
@@ -1721,6 +2660,17 @@ func (r rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return r, cmd
 	}
 	return m, cmd
+}
+
+// forwardOverlay hands a window-scoped result message to the open window
+// (busy/notice settle); nil-safe when the window already closed.
+func (r rootModel) forwardOverlay(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if r.overlay == nil {
+		return r, nil
+	}
+	ov, cmd := r.overlay.Update(msg)
+	r.overlay = ov
+	return r, cmd
 }
 
 func (r rootModel) View() string {

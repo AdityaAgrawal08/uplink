@@ -380,7 +380,7 @@ func TestPalettePanelLayout(t *testing.T) {
 		t.Fatalf("header contract missing (title/esc): %q", panel)
 	}
 	// Footer contract: keymap hints left, count right.
-	if !strings.Contains(panel, "navigate") || !strings.Contains(panel, "1/8") {
+	if !strings.Contains(panel, "navigate") || !strings.Contains(panel, "1/11") {
 		t.Fatalf("footer contract missing (hints/count): %q", panel)
 	}
 
@@ -388,7 +388,7 @@ func TestPalettePanelLayout(t *testing.T) {
 	if !strings.Contains(view, "enter select") {
 		t.Fatal("footer must be visible in the painted frame")
 	}
-	if !strings.Contains(view, "1/8") {
+	if !strings.Contains(view, "1/11") {
 		t.Fatal("footer count must be visible in the painted frame")
 	}
 }
@@ -1018,7 +1018,7 @@ func TestPaletteWindowShortListNeverScrolls(t *testing.T) {
 func TestPaletteHomeEndPageMoves(t *testing.T) {
 	c := newPaletteScreen()
 	c, _ = typeKeys(c, "/")
-	const n = 8 // member-visible commands (11 registered minus 3 moderation)
+	const n = 11 // member-visible commands (14 registered minus 3 moderation)
 	c, _ = step(c, tea.KeyMsg{Type: tea.KeyEnd})
 	if c.palette.sel != n-1 {
 		t.Fatalf("End: sel=%d; want %d", c.palette.sel, n-1)

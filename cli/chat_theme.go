@@ -268,6 +268,11 @@ type chatItem struct {
 	isGroup bool
 	live    bool // peer online (room always true)
 	inCall  bool // live voice on this conversation
+	// tombstone marks a group this client is no longer a member of (left,
+	// kicked, dissolved): the row stays visible for the session so the end is
+	// acknowledged, but it is not a joinable conversation (clicking explains
+	// how to rejoin) and it never survives a restart.
+	tombstone bool
 }
 
 // itemRowsPerChat is the row height of one chat item: the identity line
@@ -347,11 +352,39 @@ func (c *chatScreen) chatItems() []chatItem {
 				continue
 			}
 			pv, tm := c.convPreview(groupConv(code))
+			if g.restoring {
+				pv, tm = "re-joining…", ""
+			}
 			items = append(items, chatItem{
 				peer: groupConv(code), name: g.name,
 				preview: pv, timeStr: tm,
 				unread: g.unread, active: c.activeGroup == code,
 				isRoom: false, isGroup: true, live: true,
+			})
+		}
+	}
+	// Tombstones: groups this client is no longer a member of stay on the
+	// sidebar as dimmed placeholder rows for the REST of this session (a
+	// fresh invite/join clears them). They are never persisted, so a restart
+	// shows no ghosts.
+	if len(c.tombstones) > 0 {
+		codes := make([]string, 0, len(c.tombstones))
+		for code := range c.tombstones {
+			codes = append(codes, code)
+		}
+		sort.SliceStable(codes, func(i, j int) bool {
+			return c.tombstones[codes[i]].name < c.tombstones[codes[j]].name
+		})
+		for _, code := range codes {
+			t := c.tombstones[code]
+			name := t.name
+			if name == "" {
+				name = code
+			}
+			items = append(items, chatItem{
+				peer: groupConv(code), name: name,
+				preview: tombstonePreview(t), timeStr: "",
+				isRoom: false, isGroup: true, tombstone: true,
 			})
 		}
 	}

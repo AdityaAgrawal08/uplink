@@ -10,13 +10,13 @@ import (
 
 // ---------------------------------------------------------------------------
 // Command-panel end-to-end audit (BUG 2 regression suite): the whole panel
-// driving through the REAL Update path — open, list all 11 commands,
+// driving through the REAL Update path — open, list all 14 commands,
 // filter-as-you-type, every navigation key, Enter runs, Esc closes, footer
 // hints, empty state, mouse select, and the budget/paint single-plan
 // contract after every interaction.
 // ---------------------------------------------------------------------------
 
-// auditScreen is a creator-role chat screen (sees all 11 commands) with a
+// auditScreen is a creator-role chat screen (sees all 14 commands) with a
 // real layout, driven through Update like the live app.
 func auditScreen(t *testing.T) chatScreen {
 	t.Helper()
@@ -82,7 +82,7 @@ func lipglossHeight(s string) int {
 func TestPaletteEndToEndCreator(t *testing.T) {
 	c := auditScreen(t)
 
-	// Open with "/": all 11 registered commands listed.
+	// Open with "/": all 14 registered commands listed.
 	c, _ = typeKeys(&c, "/")
 	if !c.palette.visible() {
 		t.Fatal("typing / must open the command panel")
@@ -125,8 +125,8 @@ func TestPaletteEndToEndCreator(t *testing.T) {
 	if !strings.Contains(panel, "navigate") || !strings.Contains(panel, "enter") {
 		t.Fatalf("footer must carry the palette hints: %q", panel)
 	}
-	if !strings.Contains(panel, "1/11") {
-		t.Fatalf("footer must carry the 1/11 count: %q", panel)
+	if !strings.Contains(panel, "1/14") {
+		t.Fatalf("footer must carry the 1/14 count: %q", panel)
 	}
 	// The header contract: Bold title left, muted esc right.
 	if !strings.Contains(panel, "Commands") || !strings.Contains(panel, "esc") {

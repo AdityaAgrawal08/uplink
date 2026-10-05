@@ -67,7 +67,59 @@ type groupSession struct {
 	sig    *signalClient
 	eng    *engine
 	unread int
+	// password is the group's join password ("" = open), remembered so a
+	// protected group can auto-rejoin on restart and after an engine prune.
+	// It lives wherever this struct lives — the local store persists it in
+	// plaintext deliberately (see groups_store.go's security note).
+	password string
+	// restoring marks an optimistic row painted from the local store at TUI
+	// start: the row shows in the sidebar before the background signed
+	// re-join lands; eng is nil until it does. A failed re-join drops the
+	// row (and prunes the store) — a restoring row must never survive as a
+	// ghost.
+	restoring bool
 }
+
+// groupTombstone is the visible placeholder row for a group this client is
+// no longer a member of (left, kicked, dissolved, full). It is session-only
+// display state — NEVER persisted: the row acknowledges the end honestly on
+// the sidebar until a fresh invite/join re-establishes the live row, and a
+// restart never resurrects it as a ghost.
+type groupTombstone struct {
+	code   string
+	name   string
+	reason string // "left" | "ended" | "kicked" | "full"
+}
+
+// tombstonePreview is the sidebar sub-line for a tombstone row.
+func tombstonePreview(t groupTombstone) string {
+	switch t.reason {
+	case "left":
+		return "you left · invite or code to rejoin"
+	case "kicked":
+		return "removed by an admin · fresh invite required"
+	case "full":
+		return "group full · rejoin when a seat frees"
+	default:
+		return "group ended · invite or code to rejoin"
+	}
+}
+
+// tombstoneStatus explains a tombstone row on the status line (clicking or
+// Enter on a dead group row lands here instead of silently doing nothing).
+func tombstoneStatus(t groupTombstone) string {
+	switch t.reason {
+	case "left":
+		return "you left " + t.name + " — rejoin needs a fresh invite or code"
+	case "kicked":
+		return "you were removed from " + t.name + " — a fresh invite is required"
+	case "full":
+		return t.name + " is full — you can rejoin when a seat frees up"
+	default:
+		return t.name + " ended — rejoin needs a fresh invite or code"
+	}
+}
+
 
 // ─── validation (mirrors the server contract, pre-flight only) ──────────────
 
@@ -237,6 +289,65 @@ func (c *signalClient) declineInvite(code string) error {
 	}
 	return nil
 }
+
+// patchGroupMeta renames a group / edits its description (creator or admin
+// only; members get 403 "Only admins can change group details"). Both fields
+// are optional — a nil pointer leaves that field untouched. Returns the
+// server's resulting display fields (null-normalized to "").
+//
+// REFRESH LIMITATION: the server exposes no GET for group meta, so this
+// response is the ONLY way a rename becomes locally visible. The caller
+// plumbs it into the local group session immediately; other members keep the
+// name learned at invite/create time until they re-invite/rejoin. If a meta
+// fetch endpoint ever lands, re-read it on the roster/beat tick from here.
+func (c *signalClient) patchGroupMeta(groupName, groupDesc *string) (string, string, error) {
+	payload := map[string]any{}
+	if groupName != nil {
+		payload["groupName"] = *groupName
+	}
+	if groupDesc != nil {
+		payload["groupDesc"] = *groupDesc
+	}
+	endpoint := c.endpoint("/meta")
+	code, body, err := patchJSON(endpoint, payload, c.sigHeaders("PATCH", endpoint))
+	if err != nil {
+		return "", "", err
+	}
+	if code != 200 {
+		return "", "", apiErr(code, body)
+	}
+	var r struct {
+		GroupName *string `json:"groupName"`
+		GroupDesc *string `json:"groupDesc"`
+	}
+	if err := jsonDecode(body, &r); err != nil {
+		return "", "", err
+	}
+	name, desc := "", ""
+	if r.GroupName != nil {
+		name = *r.GroupName
+	}
+	if r.GroupDesc != nil {
+		desc = *r.GroupDesc
+	}
+	return name, desc, nil
+}
+
+// deleteGroupRoom dissolves the group for everyone (creator only). The
+// server purges the room fully: survivors see it gone on their next
+// heartbeat (404 "Session not found") and drop it from their sidebar.
+func (c *signalClient) deleteGroupRoom() error {
+	endpoint := c.endpoint("")
+	code, body, err := deleteJSON(endpoint, c.sigHeaders("DELETE", endpoint))
+	if err != nil {
+		return err
+	}
+	if code != 200 {
+		return apiErr(code, body)
+	}
+	return nil
+}
+
 
 // ─── desktop ping ────────────────────────────────────────────────────────────
 
