@@ -247,6 +247,111 @@ func TestMentionDropdownEscDismisses(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Composer dropdown: fuzzy rank, Home/End/page moves, mouse parity
+// ---------------------------------------------------------------------------
+
+func TestMentionFuzzyRankHomeEndPage(t *testing.T) {
+	all := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		all = append(all, fmt.Sprintf("user%02d", i))
+	}
+	c := *newFilterScreen("peer", "", all...)
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	c = m.(chatScreen)
+	c, _ = typeKeys(c, "@")
+	_, cands, _ := c.mentionCandidates()
+	n := len(cands) // 20 (self "peer" is not among them)
+
+	// End jumps to the last member; the window centres on it (the last row
+	// is visible, the first is scrolled out of the 6-row window).
+	if handled, _ := c.handleMentionKeys(tea.KeyMsg{Type: tea.KeyEnd}); !handled {
+		t.Fatal("End must be consumed by the dropdown")
+	}
+	if c.mention.sel != n-1 {
+		t.Fatalf("End: sel=%d; want %d", c.mention.sel, n-1)
+	}
+	panel := c.mentionView(c.layoutFor().vpWidth + 2)
+	if !strings.Contains(panel, "user19") {
+		t.Fatalf("End must centre the window on the last member: %q", panel)
+	}
+	if strings.Contains(panel, "user00") {
+		t.Fatalf("End must scroll the first member out: %q", panel)
+	}
+
+	// PgUp/PgDn step by ±10 and clamp at the ends.
+	if handled, _ := c.handleMentionKeys(tea.KeyMsg{Type: tea.KeyPgUp}); !handled {
+		t.Fatal("PgUp must be consumed")
+	}
+	if c.mention.sel != n-1-10 {
+		t.Fatalf("PgUp: sel=%d; want %d", c.mention.sel, n-1-10)
+	}
+	c.mention.sel = 1
+	if handled, _ := c.handleMentionKeys(tea.KeyMsg{Type: tea.KeyPgUp}); !handled {
+		t.Fatal("PgUp must clamp")
+	}
+	if c.mention.sel != 0 {
+		t.Fatalf("PgUp clamp: sel=%d; want 0", c.mention.sel)
+	}
+
+	// Fuzzy rank: "@ca" keeps only carol (everything else vanishes).
+	c2 := *newFilterScreen("bob", "", "alice", "carol", "dave")
+	c2, _ = typeKeys(c2, "@ca")
+	_, users2, ok := c2.mentionCandidates()
+	if !ok || len(users2) != 1 || users2[0].Username != "carol" {
+		t.Fatalf("fragment @ca must rank carol only, got %+v ok=%v", users2, ok)
+	}
+	// The dropdown paints the muted empty state for "@zzz" — Esc dismisses.
+	c3 := *newFilterScreen("bob", "", "alice")
+	c3.vp = *viewportPtr(40, 10)
+	m3, _ := c3.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	c3 = m3.(chatScreen)
+	c3, _ = typeKeys(c3, "@zzz")
+	if !strings.Contains(c3.mentionView(c3.layoutFor().vpWidth+2), "No results found") {
+		t.Fatal("unmatched fragment must paint the muted no-results row")
+	}
+	if handled, _ := c3.handleMentionKeys(tea.KeyMsg{Type: tea.KeyCtrlC}); !handled || c3.mention.visible() {
+		t.Fatal("Ctrl+C must dismiss the dropdown (never quits)")
+	}
+}
+
+// Mouse parity on the "@" dropdown: clicking a row selects it.
+func TestMentionMouseClickSelects(t *testing.T) {
+	c := *newFilterScreen("bob", "", "alice", "carol", "dave")
+	c.vp = *viewportPtr(40, 10)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	c = m.(chatScreen)
+	c, _ = typeKeys(c, "@")
+	l := c.layoutFor()
+	y0, _ := c.drawerYRange(l)
+	x := transcriptX0(l) + 2
+	var itemYs []int
+	for i, r := range c.mentionPanelRows() {
+		if r.kind == drItem {
+			itemYs = append(itemYs, y0+i)
+		}
+	}
+	if len(itemYs) < 2 {
+		t.Fatalf("expected item rows, got %v", itemYs)
+	}
+	c.handleMouse(mouseAt(x, itemYs[1]))
+	if got, want := c.mention.sel, itemAtNext(&c, itemYs[1], y0); got != want {
+		t.Fatalf("click must select the hovered member: sel=%d; want %d", got, want)
+	}
+}
+
+// itemAtNext resolves the ranked index painted at a drawer terminal row
+// (mirrors drawerSelAt's plan walk).
+func itemAtNext(c *chatScreen, row, y0 int) int {
+	for i, r := range c.mentionPanelRows() {
+		if y0+i == row && r.kind == drItem {
+			return r.item
+		}
+	}
+	return -1
+}
+
 func TestMentionDropdownEmptyCandidatesPassKeysThrough(t *testing.T) {
 	c := *newFilterScreen("bob", "", "alice")
 	c, _ = typeKeys(c, "@zzz")
@@ -310,13 +415,16 @@ func TestMentionDropdownPaintAndBudget(t *testing.T) {
 		t.Fatalf("dropdown must emerge ABOVE the composer: dropdown@%d composer@%d", palIdx, composerIdx)
 	}
 
-	// Budget dissolves with the dropdown: no candidates, no rows.
+	// Budget stays EXACT with the empty state: an unmatched fragment keeps
+	// the drawer visible with its muted "No results found" row — the
+	// dropdown never flashes empty.
 	c, _ = typeKeys(c, "zzz") // "@zzz"
-	if c.paletteRows() != 0 {
-		t.Fatalf("empty-candidate dropdown must reserve no rows, got %d", c.paletteRows())
+	if c.paletteRows() != 5 {
+		t.Fatalf("empty-candidate dropdown must reserve the empty-state panel (5 rows), got %d", c.paletteRows())
 	}
-	if got := c.mentionView(l.vpWidth + 2); got != "" {
-		t.Fatal("empty-candidate dropdown must paint nothing")
+	empty := c.mentionView(l.vpWidth + 2)
+	if empty == "" || !strings.Contains(empty, "No results found") {
+		t.Fatalf("empty-candidate dropdown must paint the muted no-results row: %q", empty)
 	}
 
 	// DM threads: no dropdown rows either.

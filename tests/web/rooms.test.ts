@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { NextRequest } from "next/server";
 import { redis } from "../../src/lib/redis";
 import {
   RoomError,
@@ -18,6 +19,7 @@ import {
   roomExists,
   toggleReaction,
   fetchReactions,
+  MAX_INBOX,
 } from "../../src/lib/rooms";
 
 const PUBKEY = Buffer.alloc(32, 7).toString("base64");
@@ -196,6 +198,122 @@ describe("rooms signaling plane", () => {
     await expect(checkSendLimit("sig", ip3)).rejects.toMatchObject({ status: 429 });
   });
 
+  it("rotatable budgets: fresh-username rotation from one IP still throttles (finding 6)", async () => {
+    const { checkSendLimit, checkReadLimit, SEND_USER_SHARE_PER_WINDOW, READ_USER_SHARE_PER_WINDOW } = await import("../../src/lib/rooms");
+    const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
+
+    // Per-username fairness share: a single user trips at 60 sends, far below
+    // the 120 IP total.
+    for (let i = 0; i < SEND_USER_SHARE_PER_WINDOW; i++) await checkSendLimit("sig", ip, "alice");
+    await expect(checkSendLimit("sig", ip, "alice")).rejects.toMatchObject({ status: 429 });
+
+    // Per-IP anti-Sybil total: rotating to FRESH usernames mints new user
+    // buckets but the IP total is shared — the 121st send from this IP is
+    // refused no matter which fresh name it rides.
+    const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 120; i++) {
+      await checkSendLimit("sig", ip2, `rotating_user_${i}`);
+    }
+    await expect(checkSendLimit("sig", ip2, "brand_new_user")).rejects.toMatchObject({ status: 429 });
+
+    // Reads: same two-bucket structure.
+    const ip3 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < READ_USER_SHARE_PER_WINDOW; i++) await checkReadLimit(ip3, "bob");
+    await expect(checkReadLimit(ip3, "bob")).rejects.toMatchObject({ status: 429 });
+    const ip4 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    for (let i = 0; i < 1200; i++) await checkReadLimit(ip4, `reader_${i}`);
+    await expect(checkReadLimit(ip4, "fresh_reader")).rejects.toMatchObject({ status: 429 });
+
+    // A different IP is unaffected.
+    const ip5 = `test-ip-${Math.random().toString(36).slice(2)}`;
+    await expect(checkSendLimit("sig", ip5, "alice")).resolves.toBeUndefined();
+  });
+
+  it("per-room join throttle: shotgun on one room 429s while other rooms are unaffected (finding 14)", async () => {
+    const { checkRoomJoinLimit, checkJoinLimit, JOIN_LIMIT_PER_ROOM_PER_WINDOW } = await import("../../src/lib/rooms");
+    const codeA = "111111";
+    const codeB = "222222";
+    for (let i = 0; i < JOIN_LIMIT_PER_ROOM_PER_WINDOW; i++) await checkRoomJoinLimit(codeA);
+    await expect(checkRoomJoinLimit(codeA)).rejects.toMatchObject({ status: 429 });
+    // Other rooms and the per-IP budget are untouched by room A's shotgun.
+    await expect(checkRoomJoinLimit(codeB)).resolves.toBeUndefined();
+    await expect(checkRoomJoinLimit("333333")).resolves.toBeUndefined();
+    await expect(checkJoinLimit(`ip-${Math.random().toString(36).slice(2)}`)).resolves.toBeUndefined();
+  });
+
+  it("route-level: rotating-IP join probes against one room hit the per-room budget (finding 14)", async () => {
+    const { POST: joinPOST } = await import("../../src/app/api/v1/session/[sessionId]/join/route");
+    const { createRoom } = await import("../../src/lib/rooms");
+    const sessionId = (await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, "fake-hash-for-401s")).sessionId;
+    const other = (await createRoom(`u_${Math.random().toString(36).slice(2, 10)}`, PUBKEY, "fake-hash-for-401s")).sessionId;
+
+    process.env.TRUST_PROXY = "true"; // XFF is the per-IP budget key here
+    try {
+      // Pre-warm the ROOM budget exactly to the cap (this simulates 120
+      // shotgun probes from rotating IPs: per-IP budgets can't trip because
+      // every probe has a fresh IP — only the per-room budget can).
+      for (let i = 0; i < 120; i++) await redis.incr(`rate:joinroom:${sessionId}`);
+      // The 121st well-formed attempt is refused by the per-room budget
+      // BEFORE the password gate (message is distinct from the per-IP 429).
+      const probe = (code: string, ip: string) =>
+        joinPOST(
+          new NextRequest(`http://localhost/api/v1/session/${code}/join`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-forwarded-for": ip },
+            body: JSON.stringify({ username: "probe_user", pubkey: PUBKEY, password: "wrong" }),
+          }),
+          { params: Promise.resolve({ sessionId: code }) }
+        );
+      const throttled = await probe(sessionId, "198.51.100.1");
+      expect(throttled.status).toBe(429);
+      expect(((await throttled.json()) as { error: string }).error).toMatch(/join attempts/i);
+      // A different room still answers normally (per-room isolation).
+      const otherRes = await probe(other, "198.51.100.2");
+      expect(otherRes.status).toBe(401); // wrong password — not throttled
+    } finally {
+      delete process.env.TRUST_PROXY;
+    }
+  });
+
+  it("XFF trust: TRUST_PROXY=true keys budgets per IP, unset/false shares one bucket (finding 10)", async () => {
+    const { clientIpHash, trustProxyHeader, checkSendLimit, SEND_LIMIT_PER_WINDOW } = await import("../../src/lib/rooms");
+    const mkReq = (xff: string) => new Request("http://localhost/x", { headers: { "x-forwarded-for": xff } });
+
+    // Default (TRUST_PROXY unset, no VERCEL): XFF is untrusted.
+    delete process.env.TRUST_PROXY;
+    delete process.env.VERCEL;
+    expect(trustProxyHeader()).toBe(false);
+    expect(clientIpHash(mkReq("1.2.3.4"))).toBe(clientIpHash(mkReq("9.9.9.9"))); // one shared bucket
+
+    // Platform mode: VERCEL=1 trusts the platform's XFF even with the env unset.
+    process.env.VERCEL = "1";
+    expect(trustProxyHeader()).toBe(true);
+    expect(clientIpHash(mkReq("1.2.3.4"))).not.toBe(clientIpHash(mkReq("9.9.9.9")));
+    delete process.env.VERCEL;
+
+    // Explicit "true": trusted — distinct XFF values get distinct buckets and
+    // independent budgets.
+    process.env.TRUST_PROXY = "true";
+    expect(trustProxyHeader()).toBe(true);
+    const ipA = clientIpHash(mkReq("1.2.3.4"));
+    const ipB = clientIpHash(mkReq("9.9.9.9"));
+    expect(ipA).not.toBe(ipB);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("sig", ipA);
+    await expect(checkSendLimit("sig", ipA)).rejects.toMatchObject({ status: 429 });
+    await expect(checkSendLimit("sig", ipB)).resolves.toBeUndefined();
+    delete process.env.TRUST_PROXY;
+
+    // Explicit "false" (and any other non-true value): XFF ignored — both
+    // "IPs" land in the same bucket and share the budget.
+    process.env.TRUST_PROXY = "false";
+    expect(trustProxyHeader()).toBe(false);
+    const shared = clientIpHash(mkReq("1.2.3.4"));
+    expect(clientIpHash(mkReq("9.9.9.9"))).toBe(shared);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("sig", shared);
+    await expect(checkSendLimit("sig", shared)).rejects.toMatchObject({ status: 429 });
+    delete process.env.TRUST_PROXY;
+  });
+
   it("password hash survives the meta roundtrip (room passwords stay enforced)", async () => {
     const username = `u_${Math.random().toString(36).slice(2, 10)}`;
     const { sessionId } = await createRoom(username, PUBKEY, "argon2id-fake-hash");
@@ -225,7 +343,7 @@ describe("delivery hardening", () => {
     const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
     await joinRoom(sessionId, peer, PUBKEY);
     const big = "x".repeat(1024);
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < MAX_INBOX; i++) {
       await depositBox(sessionId, username, peer, `m-${i}`, "p2p", big);
     }
     await expect(depositBox(sessionId, username, peer, "m-new", "p2p", big)).rejects.toMatchObject({ status: 429 });
@@ -235,12 +353,40 @@ describe("delivery hardening", () => {
     await expect(depositBox(sessionId, other, peer, "m-0", "p2p", big)).rejects.toMatchObject({ status: 409 });
   });
 
+  it("inbox is byte-budgeted: MAX_INBOX × MAX_BOX_PAYLOAD ≈ 6.4MB worst case (finding 5)", async () => {
+    const { MAX_BOX_PAYLOAD } = await import("../../src/lib/rooms");
+    const { sessionId, username } = await makeRoom();
+    const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
+    await joinRoom(sessionId, peer, PUBKEY);
+    // Worst case per recipient is count-cap × payload-cap.
+    expect(MAX_INBOX * MAX_BOX_PAYLOAD).toBeLessThanOrEqual(10 * 1024 * 1024);
+    // Oversized single box: refused outright.
+    await expect(depositBox(sessionId, username, peer, "huge", "p2p", "y".repeat(MAX_BOX_PAYLOAD + 1))).rejects.toMatchObject({ status: 400 });
+    // Flood with max-size boxes fills the inbox…
+    for (let i = 0; i < MAX_INBOX; i++) {
+      await depositBox(sessionId, username, peer, `f-${i}`, "p2p", "y".repeat(MAX_BOX_PAYLOAD));
+    }
+    await expect(depositBox(sessionId, username, peer, "f-over", "p2p", "y".repeat(MAX_BOX_PAYLOAD))).rejects.toMatchObject({ status: 429 });
+    // …but the victim can always ACK (the ACK path is never throttled) and
+    // a legit small message still lands afterwards.
+    await ackBoxes(sessionId, peer, ["f-0", "f-1"]);
+    await depositBox(sessionId, username, peer, "legit-small", "p2p", "hello");
+    const { boxes } = await fetchBoxes(sessionId, peer);
+    expect(boxes.map((b) => b.msgId)).toContain("legit-small");
+  });
+
   it("fetch caps at 50 and reaps corrupt fields", async () => {
     const { sessionId, username } = await makeRoom();
     const peer = `p_${Math.random().toString(36).slice(2, 10)}`;
     await joinRoom(sessionId, peer, PUBKEY);
-    for (let i = 0; i < 60; i++) {
+    // Fill the inbox to its (byte-budgeted) cap of 50 via the API…
+    for (let i = 0; i < MAX_INBOX; i++) {
       await depositBox(sessionId, username, peer, `c-${i}`, "p2p", "e30=");
+    }
+    // …then stuff it past the cap directly (bypassing depositBox, which
+    // refuses): fetch must still return at most 50 boxes.
+    for (let i = MAX_INBOX; i < MAX_INBOX + 10; i++) {
+      await redis.hset(`room:${sessionId}:inbox:${peer}`, `c-${i}`, JSON.stringify({ msgId: `c-${i}`, from: username, kind: "p2p", payload: "e30=", ts: Date.now() }));
     }
     const { boxes } = await fetchBoxes(sessionId, peer);
     expect(boxes.length).toBe(50);

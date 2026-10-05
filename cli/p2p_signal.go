@@ -44,6 +44,7 @@ type signalClient struct {
 	serverURL string
 	key       string // session code; empty until create/join returns it
 	me        string
+	id        *identityKey // device identity; signs every identity-bearing call
 }
 
 func (c *signalClient) endpoint(path string) string {
@@ -55,10 +56,6 @@ func (c *signalClient) endpoint(path string) string {
 		return base + "/api/v1/session" + path
 	}
 	return base + "/api/v1/session/" + url.PathEscape(c.key) + path
-}
-
-func (c *signalClient) headers() map[string]string {
-	return map[string]string{"X-Uplink-Username": c.me}
 }
 
 // apiError extracts a server error message or falls back to status text.
@@ -212,7 +209,7 @@ func (c *signalClient) joinRoom(username, pubkey, password string) ([]rosterMemb
 // enforced). Returns the fresh roster + epoch so the caller refreshes
 // without waiting for the next beat.
 func (c *signalClient) kickUser(target string) ([]rosterMember, int64, error) {
-	code, body, err := postJSON(c.endpoint("/kick"), map[string]any{"target": target}, c.headers())
+	code, body, err := postJSON(c.endpoint("/kick"), map[string]any{"target": target}, c.sigHeaders("POST", c.endpoint("/kick")))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -232,7 +229,7 @@ func (c *signalClient) kickUser(target string) ([]rosterMember, int64, error) {
 // setRole grants (admin=true) or revokes (admin=false) the admin role
 // (room creator only, server enforced). Returns the fresh roster + epoch.
 func (c *signalClient) setRole(target string, admin bool) ([]rosterMember, int64, error) {
-	code, body, err := postJSON(c.endpoint("/admin"), map[string]any{"target": target, "admin": admin}, c.headers())
+	code, body, err := postJSON(c.endpoint("/admin"), map[string]any{"target": target, "admin": admin}, c.sigHeaders("POST", c.endpoint("/admin")))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -250,7 +247,7 @@ func (c *signalClient) setRole(target string, admin bool) ([]rosterMember, int64
 }
 
 func (c *signalClient) leaveRoom() error {
-	code, body, err := postJSON(c.endpoint("/leave"), map[string]any{}, c.headers())
+	code, body, err := postJSON(c.endpoint("/leave"), map[string]any{}, c.sigHeaders("POST", c.endpoint("/leave")))
 	if err != nil {
 		return err
 	}
@@ -271,7 +268,7 @@ func (c *signalClient) heartbeat(peerId string, addrs []string) ([]rosterMember,
 	if addrs != nil {
 		payload["addrs"] = addrs
 	}
-	code, body, err := postJSON(c.endpoint("/heartbeat"), payload, c.headers())
+	code, body, err := postJSON(c.endpoint("/heartbeat"), payload, c.sigHeaders("POST", c.endpoint("/heartbeat")))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -291,7 +288,7 @@ func (c *signalClient) heartbeat(peerId string, addrs []string) ([]rosterMember,
 // signalSend deposits one rendezvous note (SDP offer/answer, ICE).
 func (c *signalClient) signalSend(to, sigType, payload string) error {
 	code, body, err := postJSON(c.endpoint("/signal"),
-		map[string]any{"to": to, "type": sigType, "payload": payload}, c.headers())
+		map[string]any{"to": to, "type": sigType, "payload": payload}, c.sigHeaders("POST", c.endpoint("/signal")))
 	if err != nil {
 		return err
 	}
@@ -303,7 +300,7 @@ func (c *signalClient) signalSend(to, sigType, payload string) error {
 
 // signalPoll drains my rendezvous queue.
 func (c *signalClient) signalPoll() ([]signalNote, error) {
-	code, body, err := getJSON(c.endpoint("/signal"), c.headers())
+	code, body, err := getJSON(c.endpoint("/signal"), c.sigHeaders("GET", c.endpoint("/signal")))
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +323,7 @@ func (c *signalClient) signalPoll() ([]signalNote, error) {
 // P2P-fallback relay). Idempotent on msgId — safe to retry.
 func (c *signalClient) inboxSend(to, msgId, kind, payload string) error {
 	code, body, err := postJSON(c.endpoint("/inbox"),
-		map[string]any{"to": to, "msgId": msgId, "kind": kind, "payload": payload}, c.headers())
+		map[string]any{"to": to, "msgId": msgId, "kind": kind, "payload": payload}, c.sigHeaders("POST", c.endpoint("/inbox")))
 	if err != nil {
 		return err
 	}
@@ -339,7 +336,7 @@ func (c *signalClient) inboxSend(to, msgId, kind, payload string) error {
 // inboxFetch returns my boxes WITHOUT deleting (deletion is explicit ACK),
 // plus the roster epoch piggybacked on the response.
 func (c *signalClient) inboxFetch() ([]inboxBox, int64, error) {
-	code, body, err := getJSON(c.endpoint("/inbox"), c.headers())
+	code, body, err := getJSON(c.endpoint("/inbox"), c.sigHeaders("GET", c.endpoint("/inbox")))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -362,7 +359,7 @@ func (c *signalClient) inboxFetch() ([]inboxBox, int64, error) {
 // inboxAck deletes exactly the acknowledged boxes.
 func (c *signalClient) inboxAck(ids []string) (int, error) {
 	code, body, err := postJSON(c.endpoint("/inbox/ack"),
-		map[string]any{"ids": ids}, c.headers())
+		map[string]any{"ids": ids}, c.sigHeaders("POST", c.endpoint("/inbox/ack")))
 	if err != nil {
 		return 0, err
 	}
@@ -468,7 +465,7 @@ func parseReactionDetails(blob json.RawMessage) []reactionDetail {
 // returns the resulting state; callers rely on the next poll for truth.
 func (c *signalClient) react(msgId, emoji string) error {
 	code, body, err := postJSON(c.endpoint("/reactions"),
-		map[string]any{"msgId": msgId, "emoji": emoji}, c.headers())
+		map[string]any{"msgId": msgId, "emoji": emoji}, c.sigHeaders("POST", c.endpoint("/reactions")))
 	if err != nil {
 		return err
 	}
@@ -486,7 +483,7 @@ func (c *signalClient) reactions(msgIds []string) ([]reactionSummary, error) {
 	if len(msgIds) > 0 {
 		path += "?msgIds=" + url.QueryEscape(strings.Join(msgIds, ","))
 	}
-	code, body, err := getJSON(c.endpoint(path), c.headers())
+	code, body, err := getJSON(c.endpoint(path), c.sigHeaders("GET", c.endpoint(path)))
 	if err != nil {
 		return nil, err
 	}

@@ -17,10 +17,9 @@ package main
 //     (display-only in DMs: the receipt gate above still excludes them).
 
 import (
-	"fmt"
 	"regexp"
-	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -149,8 +148,9 @@ func mentionStylePlain(s string) string {
 
 // ---- composer dropdown -------------------------------------------------------
 
-// mentionFooterHints is the dim keymap legend under the "@" member list.
-const mentionFooterHints = "↑↓ select · tab/enter complete · esc dismiss"
+// mentionFooterHints is the dim keymap legend under the "@" member list,
+// derived from the keys handleMentionKeys actually binds.
+const mentionFooterHints = "↑↓ navigate · tab/enter complete · esc dismiss"
 
 // mentionQuery extracts the live "@"-fragment from composer text (everything
 // after the LAST "@") and reports whether a mention is being typed right
@@ -176,114 +176,86 @@ func mentionQuery(text string) (frag string, ok bool) {
 // syncMention derives mention-dropdown visibility from the live composer
 // text: open only in the general room, only when the input is not a "/"
 // command shape (the command palette owns that), and only while a mention
-// fragment is being typed.
+// fragment is being typed. A fragment change resets the selection to the
+// top (the live synchronous filter contract).
 func (m *paletteState) syncMention(text string, inGeneral bool) {
 	_, live := mentionQuery(text)
 	m.open = inGeneral && text != "" && !strings.HasPrefix(text, "/") && live
+	frag := ""
+	if f, ok := mentionQuery(text); ok {
+		frag = f
+	}
+	if frag != m.query {
+		m.query = frag
+		m.sel, m.off = 0, 0
+	}
 }
 
 // mentionCandidates resolves the dropdown state from the live composer:
-// the fragment being completed plus the room members whose name matches it
-// (case-insensitive prefix of the typed fragment, alphabetical; an empty
-// fragment lists everyone) — self excluded. Source is userCandidates:
-// eng.peers() live (refreshed by netRosterMsg), or the sidebar snapshot on
-// bare screens. ok=false when no mention fragment is live.
+// the fragment being completed plus the room members matching it — an empty
+// fragment lists everyone (alphabetical; the view groups under role
+// headers), a non-empty fragment runs the weighted fuzzy rank (members that
+// do not contain the full fragment vanish) — self excluded. Source is
+// userCandidates: eng.peers() live (refreshed by netRosterMsg), or the
+// sidebar snapshot on bare screens. ok=false when no mention fragment is
+// live.
 func (c *chatScreen) mentionCandidates() (frag string, users []rosterMember, ok bool) {
 	frag, ok = mentionQuery(c.input.Value())
 	if !ok {
 		return "", nil, false
 	}
-	q := strings.ToLower(frag)
-	matched := make([]rosterMember, 0, len(c.users)+1)
-	for _, u := range c.userCandidates() {
-		if q == "" || strings.HasPrefix(strings.ToLower(u.Username), q) {
-			matched = append(matched, u)
-		}
-	}
-	sort.SliceStable(matched, func(i, j int) bool {
-		return matched[i].Username < matched[j].Username
-	})
-	return frag, matched, true
+	users = rankUsersF(c.userCandidates(), frag, c.frec, time.Now())
+	return frag, users, true
 }
 
-// mentionView renders the "@" member dropdown — the palette mirror: the
-// same box/chip/scroll-window geometry as the "/" drawer, one row per
-// candidate with its role tag, the typed fragment highlighted. Returns ""
-// when the dropdown is closed or nothing matches.
-func (c chatScreen) mentionView(maxW int) string {
+// mentionPanelRows builds the "@" dropdown's painted rows — the palette
+// mirror: the same border/header/window/footer contract, one row per
+// candidate with its role tag, grouped under role headers while the
+// fragment is empty, flattened (and fuzzy-ranked, non-matches gone) while
+// filtering. The muted "No results found" state paints when nothing matches,
+// so the dropdown never flashes empty.
+func (c chatScreen) mentionPanelRows() []drawerRow {
 	frag, users, ok := c.mentionCandidates()
-	if !ok || len(users) == 0 {
+	if !ok {
+		return nil
+	}
+	win := drawerMaxRows(c.height)
+	plan := usersPlan(users, win, frag == "")
+	plan.hits = c.userHits(users, frag)
+	return c.listPanelRows(&c.mention, len(users), plan, paletteTitleUsers, mentionFooterHints,
+		func(i int) string { return users[i].Username }, func(i int) string { return userRoleTag(users[i].Role) })
+}
+
+// mentionView renders the "@" member dropdown — the palette mirror: the same
+// border/header/window/footer contract as the "/" drawer. Returns "" when
+// the dropdown is closed (an unmatched fragment still paints its muted
+// "No results found" row).
+func (c chatScreen) mentionView(maxW int) string {
+	if !c.mention.visible() || maxW < 6 {
 		return ""
 	}
-	c.mention.clampSel(len(users))
-	off := c.mention.off
-	end := min(off+paletteMaxVisible, len(users))
-
-	inner := maxW - 2 // room for the box border
-	query := strings.ToLower(frag)
-
-	fit := func(s string) string {
-		if lipgloss.Width(s) > inner {
-			return lipgloss.NewStyle().MaxWidth(inner).Render(s)
-		}
-		return s
+	if _, _, ok := c.mentionCandidates(); !ok {
+		return ""
 	}
-
-	nameCol := 0 // dynamic name column: longest visible name + gap
-	for _, u := range users[off:end] {
-		if w := lipgloss.Width(u.Username); w > nameCol {
-			nameCol = w
-		}
-	}
-	nameCol += 2
-
-	rows := make([]string, 0, paletteMaxVisible+2)
-	for idx := off; idx < end; idx++ {
-		u := users[idx]
-		name := u.Username
-		// Highlight the typed fragment inside the member name.
-		if len(name) >= len(query) && len(query) > 0 &&
-			strings.EqualFold(name[:len(query)], query) {
-			name = tuiPaletteMatchStyle.Render(name[:len(query)]) + name[len(query):]
-		}
-		line := fit(padVisible(name, nameCol) + tuiPaletteDescStyle.Render(userRoleTag(u.Role)))
-		line = padVisible(line, inner) // full-width rows: chip reaches both edges
-		if idx == c.mention.sel {
-			line = tuiPaletteSelStyle.Render(retint(line, tuiPaletteSelStyle))
-		}
-		rows = append(rows, line)
-	}
-	// Overflow indicator, same wording as the "/" drawer: the painted
-	// height always matches the paletteRows() budget.
-	if below := len(users) - end; below > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d more", below)), inner)))
-	} else if above := off; above > 0 {
-		rows = append(rows, fit(padVisible(
-			tuiPaletteHintStyle.Render(fmt.Sprintf("… +%d above", above)), inner)))
-	}
-	rows = append(rows, fit(tuiPaletteHintStyle.Render(padVisible(mentionFooterHints, inner))))
-
-	panel := tuiPaletteBoxStyle.Width(inner).Render(strings.Join(rows, "\n"))
-	if lipgloss.Width(panel) > maxW {
-		panel = lipgloss.NewStyle().MaxWidth(maxW).Render(panel)
-	}
-	return panel
+	return c.renderPanel(drawerMaxW(c.width, maxW), c.mentionPanelRows(), c.mention.sel)
 }
 
 // handleMentionKeys intercepts keys while the "@" member dropdown is open
 // (mirrors handlePaletteKeys): Up/Down move the highlight, Tab/Enter
-// complete "@name " into the composer, Esc dismisses. handled=true means the
-// caller must skip normal editing. With no matching candidates the dropdown
-// paints nothing and only Esc stays meaningful — every other key keeps
-// normal editing, so Enter still sends and Tab still cycles focus.
+// complete "@name " into the composer, Home/End/PgUp/PgDn jump, Esc or
+// Ctrl+C dismiss. handled=true means the caller must skip normal editing.
+// With no matching candidates the dropdown paints its muted empty state and
+// only Esc/Ctrl+C stay meaningful — every other key keeps normal editing,
+// so Enter still sends and Tab still cycles focus.
 func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action func() tea.Cmd) {
 	if !c.mention.visible() {
 		return false, nil
 	}
+	c.mention.win = drawerMaxRows(c.height)
+	defer c.settleActiveDrawer()
 	_, users, ok := c.mentionCandidates()
 	if !ok || len(users) == 0 {
-		if msg.Type == tea.KeyEsc {
+		if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
 			c.mention.close()
 			return true, nil
 		}
@@ -291,10 +263,26 @@ func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action fun
 	}
 	switch msg.Type {
 	case tea.KeyUp:
-		c.mention.moveUp(len(users))
+		c.mention.moveUpOrdered(c.drawerItemSeq())
 		return true, nil
 	case tea.KeyDown:
-		c.mention.moveDown(len(users))
+		c.mention.moveDownOrdered(c.drawerItemSeq())
+		return true, nil
+	case tea.KeyHome:
+		c.mention.moveHome(len(users))
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyEnd:
+		c.mention.moveEnd(len(users))
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyPgUp:
+		c.mention.movePage(len(users), -10)
+		c.centerActiveDrawer()
+		return true, nil
+	case tea.KeyPgDown:
+		c.mention.movePage(len(users), 10)
+		c.centerActiveDrawer()
 		return true, nil
 	case tea.KeyTab, tea.KeyEnter:
 		c.mention.clampSel(len(users))
@@ -302,7 +290,7 @@ func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action fun
 			c.completeMention(users[c.mention.sel].Username)
 		}
 		return true, nil
-	case tea.KeyEsc:
+	case tea.KeyEsc, tea.KeyCtrlC:
 		c.mention.close()
 		return true, nil
 	}
@@ -312,7 +300,7 @@ func (c *chatScreen) handleMentionKeys(msg tea.KeyMsg) (handled bool, action fun
 // completeMention replaces the live "@fragment" with "@name " — the
 // trailing space terminates the token, matching the receipt parser — parks
 // the cursor AFTER that space (ready to type the message), and closes the
-// dropdown.
+// dropdown. The completed name feeds the frecency tiebreak.
 func (c *chatScreen) completeMention(name string) {
 	value := c.input.Value()
 	if at := strings.LastIndex(value, "@"); at >= 0 {
@@ -320,5 +308,6 @@ func (c *chatScreen) completeMention(name string) {
 		c.input.SetValue(completed)
 		c.input.SetCursor(len(completed))
 	}
+	c.bumpFrec(name)
 	c.mention.close()
 }

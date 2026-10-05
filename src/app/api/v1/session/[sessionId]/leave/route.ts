@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { apiError } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, leaveRoom, checkJoinLimit, clientIpHash } from "@/lib/rooms";
+import { RoomError, leaveRoom, checkJoinLimit, clientIpHash, assertUsernameHeader, getMemberPubkey } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 export async function POST(
   req: NextRequest,
@@ -13,6 +14,13 @@ export async function POST(
     const { sessionId } = await props.params;
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
+    assertUsernameHeader(username);
+    // Signature gate: a leave is a membership mutation AND, for a creator,
+    // the crown-change authorization (transferCreator runs because this
+    // signed request proved the leaver holds the rostered key).
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
 
     // Idempotent: leaving twice reports the true count; the last member out
     // destroys the room instantly (rooms live till empty).

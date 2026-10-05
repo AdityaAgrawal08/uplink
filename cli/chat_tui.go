@@ -302,16 +302,28 @@ func truncateStringPlain(s string, n int) string {
 // main loop. Buffer is generous; a dropped paint is only a missed row when
 // the sender still retries — so chat acks ride on successful enqueue (see
 // onChat), never before it. P2P is otherwise reliably delivered.
-type netChatMsg struct{ chat engineChat }
-type netFileMsg struct{ file engineFile }
+type netChatMsg struct {
+	key  string // session code that produced this event ("" = pre-groups/legacy: treat as active)
+	chat engineChat
+}
+type netFileMsg struct {
+	key  string
+	file engineFile
+}
 type netFileErrMsg struct {
+	key                 string
 	msgId, from, reason string
 }
 type netReadyMsg struct {
-	user, code string
+	key, user, code string
 }
-type netLostMsg struct{ user string }
-type netErrMsg struct{ err error }
+type netLostMsg struct {
+	key, user string
+}
+type netErrMsg struct {
+	key string
+	err error
+}
 type rosterTickMsg struct{}
 
 // netRosterMsg arrives when the engine's beat learns membership moved
@@ -417,11 +429,22 @@ type roleDoneMsg struct {
 // roster: membership, call publish scope, unread/hover pruning, and an
 // immediate repaint on ANY change. Shared by the 2s render tick and the
 // engine's roster-changed push.
+//
+// The sidebar ALWAYS renders the HOME session's membership — General,
+// every main-room user, then every joined group — in every conversation
+// view. While a group view is open c.eng is the GROUP's engine, whose peer
+// set is a different room's membership: feeding it to the sidebar would
+// hide main-room users (and prune their unread/recency) behind the group
+// view, so the roster derives from c.homeEng whenever one exists.
 func (c *chatScreen) syncRosterFromEngine() {
 	if c.eng == nil {
 		return // bare/test screens carry no engine
 	}
-	roster := c.eng.peers()
+	eng := c.eng
+	if c.homeEng != nil {
+		eng = c.homeEng
+	}
+	roster := eng.peers()
 	users := onlineNames(roster, c.me)
 	changed := len(users) != len(c.users)
 	if !changed {
@@ -456,8 +479,23 @@ func (c *chatScreen) syncRosterFromEngine() {
 			delete(c.lastDMAt, peer)
 		}
 	}
-	if c.hoverPeer != "" && !live[c.hoverPeer] {
+	// Group hover targets survive roster syncs (groups are not in the
+	// member roster). The live roster above is always the HOME room's
+	// membership, so main-room hover pruning stays correct in every view;
+	// a group view only skips it because group rows are not home members.
+	if c.activeGroup == "" && c.hoverPeer != "" && groupPeerCode(c.hoverPeer) == "" && !live[c.hoverPeer] {
 		c.hoverPeer = ""
+	}
+	if c.hoverPeer != "" && groupPeerCode(c.hoverPeer) != "" {
+		// A tombstone row is still a real (explainable) row; only a peer
+		// that vanished from both the live set and the tombstones drops
+		// the cursor.
+		code := groupPeerCode(c.hoverPeer)
+		if c.groups[code] == nil {
+			if _, dead := c.tombstones[code]; !dead {
+				c.hoverPeer = ""
+			}
+		}
 	}
 	if changed {
 		c.rebuildView() // repaint the sidebar NOW, not on the next message
@@ -476,13 +514,19 @@ const unconfirmedAfter = 30 * time.Second
 const receiptExpiry = 5 * time.Minute
 
 // netDeliveredMsg arrives when the peer acked one of our messages.
-type netDeliveredMsg struct{ msgId string }
+type netDeliveredMsg struct {
+	key   string
+	msgId string
+}
 
 // netReactionMsg carries one inbound reaction nudge. It never mutates local
 // counts directly: the nudge schedules an immediate GET /reactions, keeping
 // the server the single source of truth (and correctly handling replace and
 // remove, which a delta-only frame cannot express without per-sender state).
-type netReactionMsg struct{ reaction engineReaction }
+type netReactionMsg struct {
+	key      string
+	reaction engineReaction
+}
 
 // reactionsFetchedMsg carries one GET /reactions result: the ids that were
 // asked for plus the server's summaries. The requested scope is replaced
@@ -517,8 +561,19 @@ type sendDoneMsg struct {
 	code  int
 	err   error
 	quote chatQuote // citation this send carried (all-empty = plain)
+	conv  string    // conversation bucket the send was dispatched into
 }
 type leaveDoneMsg struct{}
+type groupLeftMsg struct{ code string }
+
+// groupRestoreDoneMsg resolves one startup re-join attempt for a group row
+// painted optimistically from the local store. nil error = the session is
+// live again (the engine starts); a terminal failure drops the row and
+// prunes the store.
+type groupRestoreDoneMsg struct {
+	code string
+	err  error
+}
 
 // ---- model -----------------------------------------------------------------
 
@@ -654,24 +709,59 @@ type chatScreen struct {
 	replyPickCounter int
 	quoteJumpCounter int
 	// call owns the media lifecycle (publish/subscribe; nil-safe).
-	call         *mediaManager
-	callLevel    float64        // mic loudness for the status meter
-	callStart    time.Time      // latched while a call is live (timer source)
-	rosterVp     viewport.Model // scrollable users list (wheel + scrollbar)
-	vp           viewport.Model
-	drag         barDrag // scrollbar drag state (any of the three panes)
-	input        textinput.Model
-	palette      paletteState    // "/" command drawer above the composer
-	mention      paletteState    // "@" member dropdown (general room only; the palette's mirror)
-	picker       pickerState     // file-browser mode of that drawer (/upload)
+	call      *mediaManager
+	callLevel float64        // mic loudness for the status meter
+	callStart time.Time      // latched while a call is live (timer source)
+	rosterVp  viewport.Model // scrollable users list (wheel + scrollbar)
+	vp        viewport.Model
+	drag      barDrag // scrollbar drag state (any of the three panes)
+	input     textinput.Model
+	palette   paletteState // "/" command drawer above the composer
+	mention   paletteState // "@" member dropdown (general room only; the palette's mirror)
+	picker    pickerState  // file-browser mode of that drawer (/upload)
+	// frec is the picker/palette usage history behind the ranking's
+	// frecency tiebreak (name-keyed; nil = no history yet).
+	frec map[string]frecEntry
+	// drawerHoverLock is the mouse-parity hold after a filter change: the
+	// next motion event is ignored so a stale hover cannot fight the fresh
+	// ranking (inputMode tracking lives in mouseActive).
+	drawerHoverLock int
+	// mouseActive tracks the last input class (true = mouse): hover
+	// follows rows only while the mouse is actually in play.
+	mouseActive  bool
 	uploadBuf    []string        // persistent upload buffer (survives picker close)
 	uploadBufSet map[string]bool // set view of uploadBuf for O(1) lookups
 	uploadQ      uploadState     // sequential session-file transfer queue
 	received     []receivedFile  // files arrived this session (for /download)
 	status       string
-	targetUser   string       // private-chat peer; "" = general room
-	leftSent     *atomic.Bool // per-screen leave guard (pointer: screen is copied by value)
-	drainTimer   *time.Timer  // reused pump timer (no time.After alloc per cycle)
+	targetUser   string // private-chat peer; "" = general room
+	// ── groups ────────────────────────────────────────────────────────────
+	// A group is a named session (code) joined via invite or created with
+	// /new-group. Every joined group keeps its own signal client + engine
+	// running in the background so sidebar unread/previews stay fresh; the
+	// ACTIVE session's client/engine live in sig/eng (the constructor's are
+	// the home room, preserved in homeSig/homeEng so switching back is a
+	// pointer swap). Group messages travel with key = group code and land
+	// in history under the "group:<code>" conversation bucket, so the whole
+	// transcript/reaction/reply pipeline works unchanged.
+	groups         map[string]*groupSession // code -> joined group
+	activeGroup    string                   // open group code ("" = home room)
+	lastGroupAt    map[string]time.Time     // code -> newest inbound message (recency sort)
+	// tombstones are session-only placeholder rows for groups this client is
+	// no longer a member of (left/kicked/dissolved). Never persisted.
+	tombstones map[string]groupTombstone
+	// groupsPath is the local membership store (~/.uplink/groups.json; env
+	// override UPLINK_GROUPS_FILE). Only runChatTUI wires it — bare/test
+	// screens leave it empty so no test ever touches a developer's HOME.
+	groupsPath    string
+	homeKey       string // the constructor's session code (the main room)
+	homeSig        *signalClient            // home session client (survives group switches)
+	homeEng        *engine                  // home session engine (kept running in background)
+	id             *identityKey             // device identity (group engines reuse it)
+	pendingInvites int                      // badge: invite rows the server currently holds
+	seenInvites    map[string]bool          // invite codes already beeep'd (one ping per invite)
+	leftSent       *atomic.Bool             // per-screen leave guard (pointer: screen is copied by value)
+	drainTimer     *time.Timer              // reused pump timer (no time.After alloc per cycle)
 }
 
 // focusPane names the one component that owns keyboard focus. Exactly one
@@ -784,8 +874,12 @@ type queuedLine struct {
 }
 
 // activeConv is the conversation bucket currently painted on screen:
-// "general" in the common room, the canonical pair key inside a thread.
+// the open group's bucket, "general" in the common room, the canonical
+// pair key inside a thread.
 func (c *chatScreen) activeConv() string {
+	if c.activeGroup != "" {
+		return groupConv(c.activeGroup)
+	}
 	if c.targetUser == "" {
 		return generalConv
 	}
@@ -841,10 +935,11 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		PageDown: bkeys.NewBinding(bkeys.WithKeys("pgdown")),
 	}
 	netCh := make(chan tea.Msg, 256)
-	sig := &signalClient{serverURL: serverURL, key: key, me: me}
+	sig := &signalClient{serverURL: serverURL, key: key, me: me, id: id}
 	// Engine callbacks only ever push into netCh (never touch the screen:
 	// they run on network goroutines). The drain command below feeds them
-	// into Update on the main loop.
+	// into Update on the main loop. Every event is tagged with the session
+	// code that produced it so Update can route background groups.
 	push := func(m tea.Msg) {
 		// Control/notice messages (ready/lost/error/file) must not be
 		// silently dropped under burst while chat backpressures: retry
@@ -875,18 +970,20 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 			// Ack only what the queue accepted: a dropped slot stays
 			// unacked so the sender's retry redelivers it (paint dedups
 			// via seenMsg — at-least-once in, exactly-once shown).
-			if tryEnqueue(netCh, netChatMsg{chat: c}) {
+			if tryEnqueue(netCh, netChatMsg{key: key, chat: c}) {
 				_ = eng.sendAck(c.From, c.MsgId)
 			}
 		},
-		onFile:       func(f engineFile) { push(netFileMsg{file: f}) },
-		onFileErr:    func(msgId, from, reason string) { push(netFileErrMsg{msgId: msgId, from: from, reason: reason}) },
-		onPeerReady:  func(user, code string) { push(netReadyMsg{user: user, code: code}) },
-		onPeerLost:   func(user string) { push(netLostMsg{user: user}) },
+		onFile: func(f engineFile) { push(netFileMsg{key: key, file: f}) },
+		onFileErr: func(msgId, from, reason string) {
+			push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason})
+		},
+		onPeerReady:  func(user, code string) { push(netReadyMsg{key: key, user: user, code: code}) },
+		onPeerLost:   func(user string) { push(netLostMsg{key: key, user: user}) },
 		onRoster:     func() { push(netRosterMsg{}) },
-		onDelivered:  func(msgId string) { push(netDeliveredMsg{msgId: msgId}) },
-		onReaction:   func(r engineReaction) { push(netReactionMsg{reaction: r}) },
-		onError:      func(err error) { push(netErrMsg{err: err}) },
+		onDelivered:  func(msgId string) { push(netDeliveredMsg{key: key, msgId: msgId}) },
+		onReaction:   func(r engineReaction) { push(netReactionMsg{key: key, reaction: r}) },
+		onError:      func(err error) { push(netErrMsg{key: key, err: err}) },
 		onSignalNote: func(n signalNote) { callMgr.onSignalNote(n) },
 	})
 	eng.joinPassword = password // enables engine self-rejoin after prune
@@ -912,12 +1009,58 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 		myReactions:     map[string]string{},
 		reactionDetails: map[string][]reactionDetail{},
 		animations:      chatAnimationsEnabled(),
+		// Group state: the constructor's session IS the home room.
+		homeKey: key,
+		homeSig: sig,
+		homeEng: eng,
+		id:      id,
+		groups:  map[string]*groupSession{},
 		// No aux row painted yet; -1 keeps stale indexes from ever matching.
 		reactionLineIdx: -1,
 		reactionRow:     -1,
 		detailLineIdx:   -1,
 		detailRow:       -1,
 	}
+}
+
+// newSessionEngine builds an engine for an extra session (a joined group):
+// same shared UI queue, every event tagged with the session code so Update
+// routes background traffic. No media: calls are home-session-only.
+func (c *chatScreen) newSessionEngine(sig *signalClient) *engine {
+	key := sig.key
+	push := func(m tea.Msg) {
+		if _, ok := m.(netChatMsg); !ok {
+			if tryEnqueue(c.netCh, m) {
+				return
+			}
+			select {
+			case c.netCh <- m:
+			default:
+			}
+			return
+		}
+		tryEnqueue(c.netCh, m)
+	}
+	var eng *engine
+	eng = newEngine(c.me, c.id, sig, engineCallbacks{
+		onChat: func(ch engineChat) {
+			if tryEnqueue(c.netCh, netChatMsg{key: key, chat: ch}) {
+				_ = eng.sendAck(ch.From, ch.MsgId)
+			}
+		},
+		onFile: func(f engineFile) { push(netFileMsg{key: key, file: f}) },
+		onFileErr: func(msgId, from, reason string) {
+			push(netFileErrMsg{key: key, msgId: msgId, from: from, reason: reason})
+		},
+		onPeerReady:  func(user, code string) { push(netReadyMsg{key: key, user: user, code: code}) },
+		onPeerLost:   func(user string) { push(netLostMsg{key: key, user: user}) },
+		onRoster:     func() { push(netRosterMsg{}) },
+		onDelivered:  func(msgId string) { push(netDeliveredMsg{key: key, msgId: msgId}) },
+		onReaction:   func(r engineReaction) { push(netReactionMsg{key: key, reaction: r}) },
+		onError:      func(err error) { push(netErrMsg{key: key, err: err}) },
+		onSignalNote: nil, // groups have no media surface
+	})
+	return eng
 }
 
 // orderedUsers produces the sidebar display order:
@@ -1356,7 +1499,21 @@ func (c *chatScreen) addMessage(m chatMessage) {
 		return
 	}
 	c.rendered[m.Seq] = true
-	if m.ConvID != "" && m.ConvID != generalConv && m.Username != c.me {
+	// Group buckets: unread lives on the group session (badged on its
+	// sidebar row), recency drives the groups' display order. Background
+	// group traffic (engine running while another conversation is active)
+	// lands here too — the transcript filters it out until the group opens.
+	if gc := groupCodeOf(m.ConvID); gc != "" {
+		if g := c.groups[gc]; g != nil {
+			if c.activeGroup != gc {
+				g.unread++
+			}
+			if c.lastGroupAt == nil {
+				c.lastGroupAt = map[string]time.Time{}
+			}
+			c.lastGroupAt[gc] = time.Now() // recency bump on EVERY arrival
+		}
+	} else if m.ConvID != "" && m.ConvID != generalConv && m.Username != c.me {
 		if c.unread == nil {
 			c.unread = map[string]int{}
 		}
@@ -1817,6 +1974,11 @@ func (c chatScreen) toForMsgId(msgId string) string {
 			continue
 		}
 		if m.ConvID == "" || m.ConvID == generalConv {
+			return ""
+		}
+		// Groups broadcast inside their own session: no per-peer nudge
+		// target, exactly like the common room.
+		if groupCodeOf(m.ConvID) != "" {
 			return ""
 		}
 		return peerOf(c.me, m.ConvID)
@@ -2368,13 +2530,18 @@ func (c chatScreen) sidebarFill(l layout) int {
 }
 
 // sidebarHeader paints the rail's one-row inline filter: the live query (or
-// a faint placeholder) with the "/" affordance right-aligned. It sits on a
-// stronger tint so it reads as a header without spending a row on a rule.
+// a faint placeholder) with the right-edge affordance. The affordance is
+// the "/" drawer opener normally; with pending invites it becomes the
+// settings ⚙ badge (clicking it opens /settings). It sits on a stronger
+// tint so it reads as a header without spending a row on a rule.
 func (c chatScreen) sidebarHeader(inner int) string {
 	glyph := "⌕ "
 	affordance := " "
 	textBudget := inner - lipgloss.Width(glyph) - 2
-	if textBudget >= 1 {
+	if c.pendingInvites > 0 {
+		affordance = "⚙" + tuiUnreadStyle.Render(circledNum(c.pendingInvites))
+		textBudget = inner - lipgloss.Width(glyph) - lipgloss.Width(affordance)
+	} else if textBudget >= 1 {
 		affordance = "/"
 	}
 	var body string
@@ -2518,11 +2685,18 @@ func chatItemRow(it chatItem, inner int, hover string, h int, focused bool) []st
 	if inner < 8 {
 		inner = 8
 	}
-	// Presence: the room is always live, peers show online/offline.
+	// Presence: the room is always live, peers show online/offline, groups
+	// wear the group glyph.
 	presence := thPresenceStyle.Render("●")
 	switch {
 	case it.isRoom:
 		presence = thPresenceStyle.Render("●")
+	case it.tombstone:
+		// Dead group: hollow group glyph in the resting tone, never the
+		// live accent.
+		presence = thPresenceOff.Render("▣")
+	case it.isGroup:
+		presence = thPresenceStyle.Render("▣")
 	case it.live:
 		presence = thPresenceStyle.Render("●")
 	default:
@@ -2534,7 +2708,7 @@ func chatItemRow(it chatItem, inner int, hover string, h int, focused bool) []st
 	if it.unread > 0 {
 		nameStyle = thChatActive
 	}
-	if !it.live && !it.isRoom {
+	if (!it.live && !it.isRoom) || it.tombstone {
 		nameStyle = tuiDimStyle
 	}
 	nameRendered := nameStyle.Render(name)
@@ -2631,6 +2805,58 @@ func (c chatScreen) sidebarInnerWidth() int {
 
 // ---- async commands --------------------------------------------------------
 
+// invitesPolledMsg resolves one GET /invites/mine poll (piggybacked on the
+// 2s roster tick). Only NEW invite codes ring + badge.
+type invitesPolledMsg struct {
+	invites []groupInvite
+	err     error
+}
+
+// pollInvitesCmd builds the invites poll for the roster tick cadence (nil
+// on unwired screens). The settings window polls for itself while open.
+func (c *chatScreen) pollInvitesCmd() tea.Cmd {
+	if c.sig == nil {
+		return nil
+	}
+	sig := &signalClient{serverURL: c.sig.serverURL, me: c.me, id: c.id}
+	return func() tea.Msg {
+		invites, err := sig.myInvites()
+		return invitesPolledMsg{invites: invites, err: err}
+	}
+}
+
+// applyInvites reconciles the pending-invite badge with server truth and
+// rings the desk-based ping ONCE per invite code. The badge shows the live
+// list length (declines/accepts shrink it on the next poll); the seen set
+// gates the beeep, so re-polls never re-ring.
+func (c *chatScreen) applyInvites(invites []groupInvite) {
+	if c.seenInvites == nil {
+		c.seenInvites = map[string]bool{}
+	}
+	n := 0
+	for _, inv := range invites {
+		if inv.Code == "" {
+			continue
+		}
+		n++
+		if !c.seenInvites[inv.Code] {
+			c.seenInvites[inv.Code] = true
+			grp := inv.GroupName
+			if grp == "" {
+				grp = "a group" // unnamed groups read naturally in the ping
+			}
+			if inviteNotifier != nil {
+				inviteNotifier(inv.By, grp)
+			}
+		}
+	}
+	if n != c.pendingInvites {
+		c.pendingInvites = n
+		c.rebuildView()
+	}
+}
+
+// scheduleRoster arms the 2s sidebar/invites/reactions tick.
 func scheduleRoster() tea.Cmd {
 	return tea.Tick(2*time.Second, func(time.Time) tea.Msg { return rosterTickMsg{} })
 }
@@ -2669,30 +2895,31 @@ func (c chatScreen) drainNetCmd() tea.Cmd {
 	}
 }
 
-func (c chatScreen) doSend(text, to string, seq int, q chatQuote) tea.Cmd {
+func (c chatScreen) doSend(text, to string, seq int, q chatQuote, conv string) tea.Cmd {
 	return func() tea.Msg {
 		// engine.sendChatQuoted is synchronous: P2P encrypt+send, or inbox
 		// seal+deposit. Map failures onto the legacy settle codes.
 		msgId, err := c.eng.sendChatQuoted(to, text, q)
 		if err == nil {
-			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201, quote: q}
+			return sendDoneMsg{text: text, to: to, seq: seq, msgId: msgId, code: 201, quote: q, conv: conv}
 		}
 		msg := err.Error()
 		switch code := apiStatusCode(err); {
 		case code == 429 || (code == 0 && strings.Contains(msg, "429")):
-			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err}
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 429, err: err, conv: conv}
 		case code == 404 || code == 410 || strings.Contains(msg, "gone") ||
 			strings.Contains(msg, "not in session") ||
 			strings.Contains(msg, "Session not found"):
-			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err}
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 410, err: err, conv: conv}
 		default:
-			return sendDoneMsg{text: text, to: to, seq: seq, code: 500, err: err}
+			return sendDoneMsg{text: text, to: to, seq: seq, code: 500, err: err, conv: conv}
 		}
 	}
 }
 
 // doLeave guards the leave POST exactly-once per screen across the
-// in-loop leave, repeat Ctrl+C presses, and the post-Run backup.
+// in-loop leave, repeat Ctrl+C presses, and the post-Run backup. The HOME
+// session always leaves (groups have their own leave path).
 func (c chatScreen) doLeave() tea.Cmd {
 	return func() tea.Msg {
 		if c.leftSent.Swap(true) {
@@ -2709,13 +2936,351 @@ func (c chatScreen) doLeave() tea.Cmd {
 	}
 }
 
+// doLeaveGroup leaves the ACTIVE group server-side (reusing the standard
+// leave POST), stops its engine and returns to the common room — the group
+// leaves the sidebar live set and a tombstone row stays for the session
+// (re-entry needs a fresh invite or code). The creator's crown transfers
+// server-side; rooms vanish when the last member leaves.
+func (c *chatScreen) doLeaveGroup(code string) tea.Cmd {
+	g := c.groups[code]
+	return func() tea.Msg {
+		if g != nil {
+			if err := g.sig.leaveRoom(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: group leave may not have registered (%v)\n", err)
+			}
+			g.eng.stop()
+		}
+		return groupLeftMsg{code: code}
+	}
+}
+
+// lastAdminLeaveBlock returns the leave-refusal reason when the caller is
+// the group's LAST admin: the crown must never be left ownerless by
+// accident, so the leave is blocked until another admin is promoted. An
+// empty string means the leave is allowed (members always are).
+func (c *chatScreen) lastAdminLeaveBlock(code string) string {
+	g := c.groups[code]
+	if g == nil || g.eng == nil {
+		return ""
+	}
+	admins := 0
+	isAdminMe := false
+	for _, m := range g.eng.peers() {
+		if m.Role == "creator" || m.Role == "admin" {
+			admins++
+		}
+		if m.Username == c.me && (m.Role == "creator" || m.Role == "admin") {
+			isAdminMe = true
+		}
+	}
+	if !isAdminMe || admins > 1 {
+		return ""
+	}
+	return "you are the last admin — promote another admin first (/group-edit → Transfer admin)"
+}
+
+// leaveGroupCmd is the single leave path for the open group (/group-leave
+// and Ctrl+C): it enforces the last-admin guard, then runs the standard
+// leave. A blocked leave parks the reason on the status line and returns no
+// command.
+func (c *chatScreen) leaveGroupCmd(code string) tea.Cmd {
+	if why := c.lastAdminLeaveBlock(code); why != "" {
+		c.status = why
+		c.rebuildView()
+		return nil
+	}
+	return c.doLeaveGroup(code)
+}
+
+// dropGroupAs removes a group from the sidebar live set (its
+// session ended or was left server-side), leaving a TOMBSTONE row that
+// survives until a fresh attach; the local store is pruned in the same step
+// so a restart can never resurrect the dead group. When the dropped group
+// was the active view, the screen returns to the common room first.
+// tombReason selects the tombstone's message ("left", "ended", "kicked",
+// "full"); status, when non-empty, lands on the status line.
+func (c *chatScreen) dropGroupAs(code, status, tombReason string) {
+	g := c.groups[code]
+	if g == nil {
+		return
+	}
+	if c.activeGroup == code {
+		c.exitGroup()
+	}
+	delete(c.groups, code)
+	delete(c.lastGroupAt, code)
+	if g.eng != nil {
+		g.eng.stop()
+	}
+	c.noteGroupTombstone(code, g.name, tombReason)
+	c.persistGroups() // prune: the row must never come back on restart
+	if status != "" {
+		c.status = status
+	}
+	c.rebuildView()
+}
+
+// noteGroupTombstone records the session-only placeholder row.
+func (c *chatScreen) noteGroupTombstone(code, name, reason string) {
+	if code == "" {
+		return
+	}
+	if c.tombstones == nil {
+		c.tombstones = map[string]groupTombstone{}
+	}
+	if name == "" {
+		name = code
+	}
+	c.tombstones[code] = groupTombstone{code: code, name: name, reason: reason}
+}
+
+// shutdownSessions tears down every session this screen owns (groups +
+// home). Called after the bubbletea Run returns; each engine's stop is
+// idempotent, so a normal Ctrl+C leave that already stopped the home
+// engine costs nothing. The local store is deliberately NOT touched here:
+// a normal app exit must keep memberships for the next launch's restore.
+func (c *chatScreen) shutdownSessions() {
+	for code, g := range c.groups {
+		if g.sig != nil {
+			if err := g.sig.leaveRoom(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: group leave may not have registered (%v)\n", err)
+			}
+		}
+		if g.eng != nil {
+			g.eng.stop()
+		}
+		delete(c.groups, code)
+	}
+	if c.eng != nil {
+		c.eng.stop()
+	}
+}
+
+// attachGroup registers a joined group session: builds and starts its
+// engine (tagged traffic keeps the sidebar fresh in the background) and
+// remembers display state. The group password ("" for open groups) enables
+// the engine's self-rejoin after a prune and is persisted locally so the
+// row can auto-rejoin on the next launch.
+//
+// The call is idempotent per code: an existing group with a running engine
+// is only refreshed (display meta + password), never double-attached; an
+// optimistic restore row (engine still nil) is upgraded in place, keeping
+// its password when the caller has none. attachGroup also clears any
+// tombstone for the code: a fresh accept/join is exactly what re-establishes
+// the live row.
+//
+// DISCOVERY/LIMITATION: the server exposes no "groups I belong to" list
+// (src/ owns the API surface), so the sidebar's group set is derived
+// client-side from creation, invites+accepts, and the local store restored
+// at startup. Group meta (name/desc) rides the invite/create payloads and
+// the PATCH response — the server has no meta GET, so members other than
+// the editor see renames only after a rejoin.
+func (c *chatScreen) attachGroup(code, name, desc string, sig *signalClient, password string) {
+	if c.groups == nil {
+		c.groups = map[string]*groupSession{}
+	}
+	if c.lastGroupAt == nil {
+		c.lastGroupAt = map[string]time.Time{}
+	}
+	delete(c.tombstones, code) // a live attach supersedes the placeholder
+	if existing := c.groups[code]; existing != nil {
+		if name != "" {
+			existing.name = name
+		}
+		existing.desc = desc
+		if password == "" {
+			password = existing.password // keep the saved secret on a meta-only refresh
+		}
+		existing.password = password
+		existing.restoring = false
+		if existing.eng != nil {
+			return // already attached: never a second engine for one group
+		}
+		eng := c.newSessionEngine(sig)
+		eng.joinPassword = password
+		existing.sig = sig
+		existing.eng = eng
+		eng.start()
+		c.persistGroups()
+		return
+	}
+	eng := c.newSessionEngine(sig)
+	eng.joinPassword = password
+	c.groups[code] = &groupSession{code: code, name: name, desc: desc, sig: sig, eng: eng, password: password}
+	c.lastGroupAt[code] = time.Now()
+	eng.start()
+	c.persistGroups()
+}
+
+// persistGroups snapshots the live group memberships for c.homeKey into the
+// local store. A no-op when the store path is unwired (bare/test screens).
+func (c *chatScreen) persistGroups() {
+	if c.groupsPath == "" || c.homeKey == "" {
+		return
+	}
+	list := make([]storedGroup, 0, len(c.groups))
+	for _, g := range c.groups {
+		if g == nil || g.restoring {
+			continue // an unconfirmed restore row is not a membership yet
+		}
+		list = append(list, storedGroup{Code: g.code, Name: g.name, Desc: g.desc, Password: g.password})
+	}
+	if err := saveGroupsForRoom(c.groupsPath, c.homeKey, list); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: groups store not saved (%v)\n", err)
+	}
+}
+
+// restorePersistedGroups paints this home room's saved memberships into the
+// sidebar OPTIMISTICALLY (engine nil, preview "re-joining…") before any
+// network work happens; restoreGroupsCmd then re-joins each in the
+// background. Codes already present are skipped (no double-attach).
+func (c *chatScreen) restorePersistedGroups() {
+	if c.groupsPath == "" || c.homeKey == "" {
+		return
+	}
+	saved := loadGroupsForRoom(c.groupsPath, c.homeKey)
+	if len(saved) == 0 {
+		return
+	}
+	if c.groups == nil {
+		c.groups = map[string]*groupSession{}
+	}
+	if c.lastGroupAt == nil {
+		c.lastGroupAt = map[string]time.Time{}
+	}
+	now := time.Now()
+	for _, sg := range saved {
+		if sg.Code == "" {
+			continue
+		}
+		if _, ok := c.groups[sg.Code]; ok {
+			continue // already attached (or restoring): avoid double-attach
+		}
+		name := sg.Name
+		if name == "" {
+			name = sg.Code
+		}
+		sig := &signalClient{serverURL: c.sig.serverURL, key: sg.Code, me: c.me, id: c.id}
+		c.groups[sg.Code] = &groupSession{
+			code: sg.Code, name: name, desc: sg.Desc,
+			sig: sig, password: sg.Password, restoring: true,
+		}
+		c.lastGroupAt[sg.Code] = now
+	}
+}
+
+// restoreGroupsCmd arms the background signed re-join for every optimistic
+// row (nil when nothing was restored). Each command resolves to a
+// groupRestoreDoneMsg.
+func (c chatScreen) restoreGroupsCmd() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, g := range c.groups {
+		if g == nil || !g.restoring {
+			continue
+		}
+		g := g
+		cmds = append(cmds, func() tea.Msg {
+			pk := ""
+			if c.id != nil {
+				pk = pubkeyB64(c.id)
+			}
+			_, _, err := g.sig.joinRoom(c.me, pk, g.password)
+			return groupRestoreDoneMsg{code: g.code, err: err}
+		})
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	if len(cmds) == 1 {
+		return cmds[0]
+	}
+	return tea.Batch(cmds...)
+}
+
+// restoreFailure classifies a startup re-join error: terminal failures
+// (room gone, kicked, full, password rejected) drop the row and prune the
+// store; transport/5xx failures keep the optimistic row ("re-joining…") so
+// a server outage at launch never wipes real memberships.
+func restoreFailure(err error) (reason string, terminal bool) {
+	if err == nil {
+		return "", false
+	}
+	if isServerDown(err) {
+		return "", false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case apiStatusCode(err) == 404:
+		return "ended", true
+	case apiStatusCode(err) == 403 && strings.Contains(msg, "kicked"):
+		return "kicked", true
+	case apiStatusCode(err) == 403 && strings.Contains(msg, "maximum allowance"):
+		return "full", true
+	case apiStatusCode(err) == 401 && strings.Contains(msg, "password"):
+		return "password", true
+	default:
+		return "", false
+	}
+}
+
+// groupEndEvent classifies an engine error against a group expected to be
+// dead: "session ended" (room gone), kicked (rejoin banned), full (rejoin
+// 403 max allowance). ok=false keeps the ordinary error path.
+func groupEndEvent(err error) (tombReason string, ok bool) {
+	low := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(low, "session ended"):
+		return "ended", true
+	case strings.Contains(low, "kicked"):
+		return "kicked", true
+	case strings.Contains(low, "maximum allowance"):
+		return "full", true
+	}
+	return "", false
+}
+
+// applyGroupMeta plumbs a successful PATCH /meta response into the local
+// group session and repaints the sidebar immediately (the editor sees the
+// rename at once). REFRESH LIMITATION: the server exposes no GET for group
+// meta, so other members keep the name learned at invite/create until they
+// rejoin — there is nothing for the roster/beat tick to re-read. If a meta
+// fetch ever lands, re-read it there and update the session from here.
+func (c *chatScreen) applyGroupMeta(code, name, desc string) {
+	g := c.groups[code]
+	if g == nil {
+		return
+	}
+	if name != "" {
+		g.name = name
+	}
+	g.desc = desc
+	c.persistGroups()
+	c.rebuildView()
+}
+
+// dissolveGroup applies a creator DELETE locally: the row drops to a
+// tombstone, the store is pruned, and the status line states what happened
+// for everyone.
+func (c *chatScreen) dissolveGroup(code, name string) {
+	if g := c.groups[code]; g != nil && name == "" {
+		name = g.name
+	}
+	if name == "" {
+		name = code
+	}
+	c.dropGroupAs(code, "", "ended")
+	c.status = "group " + name + " dissolved for everyone"
+	c.rebuildView()
+}
+
 // ---- tea.Model -------------------------------------------------------------
 
 func (c chatScreen) Init() tea.Cmd {
 	// No backlog (the server keeps no transcript), no WS upgrade, no beat
-	// tick (the engine owns heartbeats): just drain engine events and
-	// refresh the sidebar roster on a slow tick.
-	return tea.Batch(c.drainNetCmd(), scheduleRoster())
+	// tick (the engine owns heartbeats): drain engine events, refresh the
+	// sidebar roster on a slow tick, and fire the optimistic group restore
+	// (no-op when no store path is wired or nothing was saved).
+	return tea.Batch(c.drainNetCmd(), scheduleRoster(), c.restoreGroupsCmd())
 }
 
 // markSeen records an inbound msgId, reporting true on repeats (skip
@@ -2834,8 +3399,12 @@ func (c *chatScreen) peerInCall(peer string) bool {
 }
 
 // enterPrivate switches to a 1:1 thread. There is no server history to
-// deep-fetch (live messages only) — switching is instant.
+// deep-fetch (live messages only) — switching is instant. DMs belong to the
+// HOME session: entering one from inside a group first exits the group
+// view (the engines are swapped back), so a DM send can never ride the
+// group mesh into the wrong thread.
 func (c *chatScreen) enterPrivate(user string) tea.Cmd {
+	c.exitGroup() // no-op unless a group view is open
 	c.targetUser = user
 	c.palette.close() // stale "/" query must not survive a mode switch
 	c.mention.close() // the "@" dropdown is general-room only
@@ -2863,6 +3432,66 @@ func (c *chatScreen) exitPrivate() {
 	c.closeReplyMenu()
 	c.closeReplyPick()
 	c.rebuildView()
+}
+
+// exitConv leaves whichever conversation view is open (a DM thread or a
+// group) back to the common room. Each exit is a no-op when inactive, so
+// this is safe to call unconditionally (General-row click, quote-jump).
+func (c *chatScreen) exitConv() {
+	c.exitPrivate()
+	c.exitGroup()
+}
+
+// exitGroup returns from a group conversation to the common room without
+// leaving the group: the session stays joined and its engine keeps running
+// in the background (unread/preview stay fresh). Esc and clicking General
+// use this; Ctrl+C in a group actually LEAVES it (doLeaveGroup).
+func (c *chatScreen) exitGroup() {
+	if c.activeGroup == "" {
+		return
+	}
+	c.activeGroup = ""
+	c.key, c.sig, c.eng = c.homeKey, c.homeSig, c.homeEng
+	c.targetUser = ""
+	c.palette.close()
+	c.mention.close() // the "@" dropdown is home-room only
+	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = "", ""
+	c.roomUnread = 0 // back in the room: everything is visible again
+	c.closeReplyMenu()
+	c.closeReplyPick()
+	c.composerQuote = nil // the pinned citation belonged to the group view
+	c.syncRosterFromEngine()
+	c.rebuildView()
+}
+
+// openGroup switches the active conversation to a joined group session: the
+// group's client/engine become the screen's active ones, the transcript
+// re-filters to the group bucket, and the group's unread clears. Media is
+// home-session-bound, so a live call stops before the switch.
+func (c *chatScreen) openGroup(code string) tea.Cmd {
+	g := c.groups[code]
+	if g == nil {
+		return nil
+	}
+	if c.call != nil {
+		c.call.stopAll()
+	}
+	c.exitPrivate() // any open DM thread closes (no-op in the room)
+	c.activeGroup = code
+	c.key, c.sig, c.eng = code, g.sig, g.eng
+	g.unread = 0 // opening the group clears its badge
+	c.palette.close()
+	c.mention.close()
+	c.pendingReactionMsgId = ""
+	c.detailMsgId, c.detailEmoji = "", ""
+	c.closeReplyMenu()
+	c.closeReplyPick()
+	c.composerQuote = nil // quotes are conversation-scoped
+	delete(c.unread, code)
+	c.syncRosterFromEngine()
+	c.rebuildView()
+	return nil
 }
 
 // ─── floating reply menu ────────────────────────────────────────────────────
@@ -2970,7 +3599,7 @@ func (c *chatScreen) replyMenuActivate() tea.Cmd {
 		return nil
 	case "Reply-Privately":
 		peer := target.Username
-		if target.ConvID != "" && target.ConvID != generalConv {
+		if gc := groupCodeOf(target.ConvID); gc == "" && target.ConvID != "" && target.ConvID != generalConv {
 			if p := peerOf(c.me, target.ConvID); p != "" && p != c.me {
 				peer = p // reply targets the thread's other participant
 			}
@@ -2979,6 +3608,9 @@ func (c *chatScreen) replyMenuActivate() tea.Cmd {
 			c.closeReplyMenu()
 			return nil
 		}
+		// DMs belong to the HOME session: a group view must close first,
+		// or the DM would ride the group engine into the wrong thread.
+		c.exitGroup()
 		c.pinComposerQuote(target)
 		c.closeReplyMenu()
 		return c.enterPrivate(peer)
@@ -3121,13 +3753,16 @@ func (c *chatScreen) jumpToQuoted(m chatMessage) tea.Cmd {
 	}
 	t := c.history[target]
 	// Mode switch to the quoted message's conversation ("jumps to general
-	// chat" when the original lives in the room and a DM was in view).
+	// chat" when the original lives in the room; a quoted group message
+	// opens that group; a quoted DM thread opens the peer).
 	if t.ConvID != c.activeConv() {
 		switch {
 		case t.ConvID == "" || t.ConvID == generalConv:
-			c.exitPrivate()
+			c.exitConv()
 		default:
-			if peer := peerOf(c.me, t.ConvID); peer != "" && peer != c.me {
+			if gc := groupCodeOf(t.ConvID); gc != "" {
+				c.openGroup(gc) // exits whatever view was open
+			} else if peer := peerOf(c.me, t.ConvID); peer != "" && peer != c.me {
 				c.enterPrivate(peer)
 			}
 		}
@@ -3202,10 +3837,11 @@ func (c *chatScreen) dispatchSend(text string) tea.Cmd {
 }
 
 // dispatchInConv paints the echo into a specific conversation bucket and
-// targets the peer that conversation represents (empty conv => broadcast).
+// targets the peer that conversation represents (empty conv => broadcast;
+// group buckets always broadcast inside their own session).
 func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	var peer string
-	if conv != generalConv {
+	if conv != generalConv && groupCodeOf(conv) == "" {
 		parts := strings.Split(conv, "|")
 		for _, u := range parts {
 			if u != c.me {
@@ -3235,7 +3871,7 @@ func (c *chatScreen) dispatchInConv(conv, text string) tea.Cmd {
 	seq := c.allocSeq()
 	c.composerQuote = nil // WhatsApp-style: one send consumes the citation
 	c.rebuildView()
-	return c.doSend(text, target, seq, q)
+	return c.doSend(text, target, seq, q, conv)
 }
 
 // syncViewport re-derives viewport/composer geometry from the live layout.
@@ -3318,6 +3954,25 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, scheduleCallTick())
 		}
 
+	case reloadPickerMsg:
+		// Debounced filesystem re-read: fires ~150ms after the picker's
+		// filter committed. The stale listing painted with the spinner the
+		// whole time — never a flash of empty. A navigation mid-wait bumps
+		// reloadGen, so a stale gen is dropped silently.
+		if c.picker.isActive() && msg.gen == c.picker.reloadGen {
+			c.picker.loading = false
+			c.loadPickerDir()
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
+	case pickerTickMsg:
+		// Spinner frames while a debounced reload is in flight.
+		if c.picker.isActive() && c.picker.loading {
+			c.picker.spin++
+			cmds = append(cmds, tea.Tick(pickerTickStep, func(time.Time) tea.Msg { return pickerTickMsg{} }))
+		}
+		cmds = append(cmds, c.drainNetCmd())
+
 	case rosterTickMsg:
 		// Sidebar freshness from the engine's heartbeat roster (the engine
 		// owns the 5s beat; this only renders, every 2s). Membership lives
@@ -3364,7 +4019,78 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if cmd := c.fetchReactionsCmd(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
+		// Invites ride the same tick: a fresh pending invite rings the
+		// desktop ping once and lights the settings badge. The settings
+		// window polls for itself while open, so this never double-fires.
+		if cmd := c.pollInvitesCmd(); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
 		cmds = append(cmds, scheduleRoster())
+
+	case invitesPolledMsg:
+		if msg.err == nil {
+			c.applyInvites(msg.invites)
+		}
+
+	case groupLeftMsg:
+		name := msg.code
+		if g := c.groups[msg.code]; g != nil && g.name != "" {
+			name = g.name
+		}
+		// The live row drops and a tombstone stays for the session; the
+		// store is pruned so a restart never ghosts the left group.
+		c.dropGroupAs(msg.code, "", "left")
+		c.status = "You left group " + name + "."
+		c.rebuildView()
+		cmds = append(cmds, c.drainNetCmd())
+
+	case groupRestoreDoneMsg:
+		g := c.groups[msg.code]
+		if g == nil || !g.restoring {
+			break // superseded by an accept/attach while the re-join was in flight
+		}
+		if msg.err != nil && apiStatusCode(msg.err) != 409 {
+			// 409 "Username already taken" means the seat SURVIVED the
+			// restart (rooms outlive clients): that is a live membership,
+			// handled by the success path below. Every other error is
+			// classified: terminal failures drop the row + prune the store;
+			// transient ones (server down, 5xx) keep the optimistic row so
+			// an outage at launch never wipes real memberships.
+			reason, terminal := restoreFailure(msg.err)
+			if !terminal {
+				c.status = "could not re-join group " + g.name + " (" + msg.err.Error() + ")"
+				c.rebuildView()
+				break
+			}
+			name := g.name
+			delete(c.groups, msg.code)
+			delete(c.lastGroupAt, msg.code)
+			if g.eng != nil {
+				g.eng.stop()
+			}
+			c.persistGroups() // prune: the dead membership must not come back
+			switch reason {
+			case "kicked":
+				c.status = "you were removed from group " + name
+			case "full":
+				c.status = "could not re-join group " + name + " — it is full"
+			case "password":
+				c.status = "could not re-join group " + name + " — the saved password no longer works"
+			default:
+				c.status = "group " + name + " ended — removed from the sidebar"
+			}
+			c.rebuildView()
+			break
+		}
+		g.restoring = false
+		if g.eng == nil {
+			eng := c.newSessionEngine(g.sig)
+			eng.joinPassword = g.password
+			g.eng = eng
+			eng.start()
+		}
+		c.persistGroups()
+		cmds = append(cmds, c.drainNetCmd())
 
 	case netRosterMsg:
 		// Engine beat learned membership moved (join/leave, possibly via
@@ -3409,15 +4135,23 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case netChatMsg:
 		m := msg.chat
 		// Receipt already acked synchronously at queue time (see onChat):
-		// display dedups here, never re-acks.
+		// display dedups here, never re-acks. Background session traffic
+		// (a joined group while another conversation is active) flows
+		// through the same pipeline: the message lands in its own
+		// conversation bucket, badges the group row, and stays out of the
+		// active transcript until that group opens.
 		if c.markSeen(m.MsgId) {
 			cmds = append(cmds, c.drainNetCmd())
 			break
 		}
+		cid := convFor(m.From, m.To)
+		if msg.key != "" && msg.key != c.homeKey {
+			cid = groupConv(msg.key) // group broadcast still reads To==""
+		}
 		cm := chatMessage{
 			Seq: c.allocSeq(), MsgId: m.MsgId, Username: m.From, Kind: "chat",
 			Text: m.Text, To: m.To,
-			ConvID:    convFor(m.From, m.To),
+			ConvID:    cid,
 			CreatedAt: time.Now().Format(time.RFC3339),
 			ReplyTo:   m.ReplyTo, ReplyAuthor: m.ReplyAuthor, ReplyExcerpt: m.ReplyExcerpt,
 		}
@@ -3455,11 +4189,15 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			c.received = append([]receivedFile(nil), c.received[len(c.received)-maxReceivedFiles:]...)
 		}
 		conv := convFor(f.From, f.To)
+		if msg.key != "" && msg.key != c.homeKey {
+			conv = groupConv(msg.key) // group files are session broadcasts
+		}
 		ts := time.Now()
 		// Mirror the text path: DM arrivals always bump recency; room
 		// files arriving in a thread view count room-unread instead of
-		// vanishing silently.
-		if conv != generalConv {
+		// vanishing silently. Group files skip the DM maps (their unread
+		// lives on the group session, bumped below).
+		if groupCodeOf(conv) == "" && conv != generalConv {
 			if c.lastDMAt == nil {
 				c.lastDMAt = map[string]time.Time{}
 			}
@@ -3480,9 +4218,18 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				createdAt: ts.Format(time.RFC3339),
 			},
 		})
-		// Bump unread if it landed in a background thread.
+		// Bump unread if it landed in a background thread (a group file
+		// badges the group's sidebar row, a DM file its thread).
 		if conv != c.activeConv() && conv != generalConv {
-			if peer := peerOf(c.me, conv); peer != "" {
+			if gc := groupCodeOf(conv); gc != "" {
+				if g := c.groups[gc]; g != nil {
+					g.unread++
+					if c.lastGroupAt == nil {
+						c.lastGroupAt = map[string]time.Time{}
+					}
+					c.lastGroupAt[gc] = ts
+				}
+			} else if peer := peerOf(c.me, conv); peer != "" {
 				c.unread[peer]++
 				c.lastDMAt[peer] = ts
 			}
@@ -3494,7 +4241,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Peer acked one of ours: full confidence, undim the bubble.
 		// (Acks are best-effort frames themselves; a lost ack just leaves
 		// the bubble dimmed until the expiry sweep below.) Evict the
-		// cached bubble or the dimmed paint would stick.
+		// cached bubble or the dimmed paint would stick. Background
+		// sessions never have local unacked sends, so skip them.
+		if msg.key != "" && msg.key != c.key {
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		if c.unackedUI != nil {
 			delete(c.unackedUI, msg.msgId)
 		}
@@ -3506,7 +4258,12 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A live reaction nudge: ask the server now instead of waiting for
 		// the next 2s tick. Counts are never derived from the frame itself
 		// (replace/remove cannot be expressed as a delta without tracking
-		// every sender's prior pick) — the fetch is the truth.
+		// every sender's prior pick) — the fetch is the truth. Background
+		// groups reconcile on their own poll when opened.
+		if msg.key != "" && msg.key != c.key {
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		if msg.reaction.From != c.me {
 			if cmd := c.fetchReactionsCmd(); cmd != nil {
 				cmds = append(cmds, cmd)
@@ -3592,6 +4349,10 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case netFileErrMsg:
+		if msg.key != "" && msg.key != c.key {
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		c.status = fmt.Sprintf("file from %s failed: %s", msg.from, msg.reason)
 		cmds = append(cmds, c.drainNetCmd())
 
@@ -3609,8 +4370,44 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case netErrMsg:
 		// Engine errors surface on the status line, never as chat rows.
 		// Server outages hold the down alert; everything else parks once.
+		// A background group that died (last member left / 24h TTL /
+		// server sweep / kicked / full) leaves the live sidebar instead of
+		// retrying into the void forever — the engine's beat classifies
+		// the ghost-room 404 (or a rejoin that finds the room gone) as
+		// "session ended", and a kicked/full rejoin is terminal too. Each
+		// drop leaves a tombstone for the session.
+		if msg.key != "" && msg.key != c.key {
+			if g := c.groups[msg.key]; g != nil {
+				if tombReason, ok := groupEndEvent(msg.err); ok {
+					name := g.name
+					if name == "" {
+						name = msg.key
+					}
+					status := ""
+					switch tombReason {
+					case "kicked":
+						status = "you were removed from group " + name
+					case "full":
+						status = "group " + name + " is full — you were dropped from the sidebar"
+					default:
+						status = "group " + name + " ended — rooms vanish when emptied"
+					}
+					c.dropGroupAs(msg.key, status, tombReason)
+				}
+			}
+			cmds = append(cmds, c.drainNetCmd())
+			break
+		}
 		if isServerDown(msg.err) {
 			c.status = serverDownMsg
+		} else if msg.key == c.key && c.activeGroup != "" {
+			if tombReason, ok := groupEndEvent(msg.err); ok {
+				// The open group died (ended/kicked/full): leave the view,
+				// drop the dead session.
+				c.dropGroupAs(msg.key, msg.err.Error(), tombReason)
+			} else {
+				c.status = msg.err.Error()
+			}
 		} else {
 			c.status = msg.err.Error()
 		}
@@ -3652,7 +4449,23 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.KeyMsg:
+		// Drawer parity: while a picker owns the drawer slot, Ctrl+C
+		// DISMISSES the drawer (OpenCode behaviour) — the app itself never
+		// quits mid-pick. With no drawer open, Ctrl+C keeps its existing
+		// meaning: leave the open group, or leave the session.
+		if msg.Type == tea.KeyCtrlC && c.drawerOpen() {
+			c.closeDrawers()
+			return c, tea.Batch(cmds...)
+		}
 		if msg.Type == tea.KeyCtrlC {
+			// In a group, Ctrl+C LEAVES it (server-side, standard leave
+			// POST) and returns to the common room — the app keeps
+			// running. The last admin is refused with a promotion pointer
+			// (a group must never be left crownless). In the home room it
+			// leaves the session and quits.
+			if c.activeGroup != "" {
+				return c, c.leaveGroupCmd(c.activeGroup)
+			}
 			// Leave first, quit when it completes (leaveDoneMsg→Quit):
 			// quitting alongside would kill the POST mid-flight.
 			return c, c.doLeave()
@@ -3763,13 +4576,17 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyEsc {
 			// Esc dismisses transient state — the anchored reaction picker
 			// or the reactor detail bar first, then the rail's filter, then
-			// the private view. NEVER quits the app.
+			// the private/group view. NEVER quits the app.
 			if c.pendingReactionMsgId != "" || c.detailMsgId != "" {
 				c.closeReactionAux()
 				break
 			}
 			if c.sideFilter != "" {
 				c.clearSideFilter()
+			}
+			if c.activeGroup != "" {
+				c.exitGroup() // view-only: the group stays joined
+				break
 			}
 			c.exitPrivate()
 			break
@@ -3863,11 +4680,23 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			text := strings.TrimSpace(c.input.Value())
 			c.input.SetValue("")
 			if text == "" {
-				// Empty Enter on a highlighted roster row OPENS that thread.
+				// Empty Enter on a highlighted roster row OPENS that
+				// entry: a DM thread or a group conversation. A tombstone
+				// row (left/kicked/dissolved) is not joinable: it explains
+				// how to get back in instead of doing nothing.
 				if c.hoverPeer != "" && c.hoverPeer != c.me && c.hoverPeer != c.targetUser {
-					cmd := c.enterPrivate(c.hoverPeer)
-					if cmd != nil {
-						cmds = append(cmds, cmd)
+					if code := groupPeerCode(c.hoverPeer); code != "" {
+						if t, dead := c.tombstones[code]; dead {
+							c.status = tombstoneStatus(t)
+							c.rebuildView()
+						} else {
+							c.openGroup(code)
+						}
+					} else {
+						cmd := c.enterPrivate(c.hoverPeer)
+						if cmd != nil {
+							cmds = append(cmds, cmd)
+						}
 					}
 				}
 				break
@@ -3965,7 +4794,9 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 			to = msg.to
 		}
 		conv := generalConv
-		if to != "" {
+		if msg.conv != "" {
+			conv = msg.conv // dispatch-time bucket (group sends are to="")
+		} else if to != "" {
 			conv = conversationKey(c.me, to)
 		}
 		m := chatMessage{
@@ -4102,6 +4933,16 @@ const maxSideFilter = 40
 // same time.
 func (c chatScreen) drawerOpen() bool {
 	return c.picker.isActive() || c.palette.visible() || c.mention.visible()
+}
+
+// closeDrawers dismisses whatever owns the drawer slot (Ctrl+C parity:
+// Esc has its staged per-mode behaviour, Ctrl+C is the hard dismiss).
+func (c *chatScreen) closeDrawers() {
+	if c.picker.isActive() {
+		c.closePicker(composerPlaceholder)
+	}
+	c.palette.close()
+	c.mention.close()
 }
 
 // textEditKey reports whether a key is text input: printable characters and
@@ -4628,6 +5469,7 @@ func thumbGeom(total, visible, offset, h int) (thumbTop, thumbH, trackH int, has
 // handleMouse routes wheel scrolling per pane, scrollbar drags, hover and
 // row selection. Wheel/drag on one section never moves the others.
 func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
+	c.mouseActive = true // inputMode tracking: the mouse is in play now
 	l := c.layoutFor()
 	// Legacy-typed motion messages (tests, X10 paths) carry Action=0.
 	action := msg.Action
@@ -4723,6 +5565,22 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				return nil
 			}
 		}
+		// Mouse+keyboard parity: a click inside the drawer selects the row
+		// under the cursor (Enter/Tab still activate — every action stays
+		// keyboard-reachable). Clicks on the drawer's chrome (border,
+		// header, footer, empty state) are consumed: the panel owns its
+		// rows and nothing beneath may react to the same click.
+		if c.drawerOpen() {
+			y0, y1 := c.drawerYRange(l)
+			x0 := transcriptX0(l)
+			x1 := x0 + drawerMaxW(c.width, l.vpWidth+transcriptBorder)
+			if msg.Y >= y0 && msg.Y < y1 && msg.X >= x0 && msg.X < x1 {
+				if item, ok := c.drawerSelAt(msg.Y, l); ok {
+					c.drawerSelectItem(item, l)
+				}
+				return nil
+			}
+		}
 		sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
 		inColumn := l.sidebarOn && msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
 		if inColumn {
@@ -4733,10 +5591,16 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			if msg.X == l.rosterX+l.sidebarWidth-1 {
 				return nil
 			}
-			// Filter row: the "/" glyph at its right edge opens the command
+			// Filter row: the right-edge affordance opens the settings window when
+			// invites are pending (the ⚙ badge), else the "/" command
 			// drawer; anywhere else focuses the rail so the inline filter
 			// can be typed.
 			if c.atSearchBox(msg.Y, l) {
+				affX := l.rosterX + l.sidebarWidth - 3
+				if c.pendingInvites > 0 && msg.X >= affX && msg.X < l.rosterX+l.sidebarWidth {
+					c.focus = focusComposer
+					return func() tea.Msg { return openSettingsMsg{} }
+				}
 				if msg.X == l.rosterX+l.sidebarWidth-2 {
 					c.input.SetValue("/")
 					c.palette.sync("/")
@@ -4747,19 +5611,30 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 				}
 				return nil
 			}
-			// Chat row selection: General returns to the room, peers open threads.
+			// Chat row selection: General returns to the room, peers open threads,
+			// group rows open their conversation.
 			u, general := c.itemAtY(msg.Y, l)
 			c.focus = focusSidebar
 			switch {
 			case general:
-				if c.targetUser != "" {
-					c.exitPrivate()
-				}
+				c.exitConv()
 				return nil
 			case u == "", u == c.me:
 				return nil // no row / clicking yourself is a no-op
 			case u == c.targetUser:
 				return nil // already chatting privately with them
+			}
+			if code := groupPeerCode(u); code != "" {
+				if t, dead := c.tombstones[code]; dead {
+					// Dead group row: explain, never open (there is no
+					// session behind it).
+					c.status = tombstoneStatus(t)
+					return nil
+				}
+				if c.activeGroup != code {
+					c.openGroup(code)
+				}
+				return nil
 			}
 			c.enterPrivate(u)
 			return nil
@@ -4826,6 +5701,25 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			}
 			return nil
 		}
+		// Drawer hover parity: moving over a row selects it (hover-follow,
+		// fzf-style). One motion event is ignored right after a filter
+		// change (drawerHoverLock) so a stale hover cannot fight the fresh
+		// ranking; hover never fires while the mouse is not the input mode.
+		if c.drawerOpen() {
+			if c.drawerHoverLock > 0 {
+				c.drawerHoverLock--
+			} else {
+				y0, y1 := c.drawerYRange(l)
+				x0 := transcriptX0(l)
+				x1 := x0 + drawerMaxW(c.width, l.vpWidth+transcriptBorder)
+				if msg.Y >= y0 && msg.Y < y1 && msg.X >= x0 && msg.X < x1 {
+					if item, ok := c.drawerSelAt(msg.Y, l); ok {
+						c.drawerSelectItem(item, l)
+						return nil
+					}
+				}
+			}
+		}
 		c.hoverPeer = "" // default: outside every row
 		if msg.X >= 0 && msg.X < c.width && msg.Y >= 0 && msg.Y < c.height {
 			inColumn := msg.X >= l.rosterX && msg.X < l.rosterX+l.sidebarWidth
@@ -4852,6 +5746,20 @@ func (c *chatScreen) handleMouse(msg tea.MouseMsg) tea.Cmd {
 			return nil
 		}
 		up := msg.Type == tea.MouseWheelUp
+		// Drawer wheel parity: over the panel the wheel steps the
+		// selection exactly like the arrow keys (same wrap, same window
+		// settle) — never the transcript underneath.
+		if c.drawerOpen() {
+			y0, y1 := c.drawerYRange(l)
+			if msg.Y >= y0 && msg.Y < y1 {
+				d := 1
+				if up {
+					d = -1
+				}
+				c.drawerStep(d)
+				return nil
+			}
+		}
 		// Route by pane: conversation rail vs transcript — each scrolls only
 		// itself, with steps proportional to its own height.
 		sideTop := l.rosterY0 - searchHeightFor(l.headRows, l.sidebarWidth)
@@ -5076,8 +5984,15 @@ func (c chatScreen) composerBox(l layout, colW int, drawerOpen bool) string {
 }
 
 // runChatTUI is the default interactive experience (alt-screen + mouse).
+// The program model is rootModel: the chat screen at rest, full-screen
+// windows (/settings, /new-group) hosted on top.
 func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 	scr := newChatScreen(serverURL, key, me, id, password)
+	// Wire the local group-membership store and paint its saved groups
+	// optimistically BEFORE the roster seed: the sidebar shows the known
+	// groups immediately and Init fires the signed background re-joins.
+	scr.groupsPath = groupsStorePath()
+	scr.restorePersistedGroups()
 	// Seed the roster synchronously so the sidebar isn't empty on paint;
 	// the engine beat loop keeps it fresh, rosterTickMsg renders it.
 	if roster, epoch, err := scr.sig.heartbeat("", nil); err == nil {
@@ -5085,15 +6000,22 @@ func runChatTUI(serverURL, key, me string, id *identityKey, password string) {
 		scr.users = onlineNames(roster, me)
 	}
 	scr.eng.start()
-	p := tea.NewProgram(scr, tea.WithAltScreen(), tea.WithMouseAllMotion())
-	if _, err := p.Run(); err != nil {
+	p := tea.NewProgram(newRootModel(scr), tea.WithAltScreen(), tea.WithMouseAllMotion())
+	fm, err := p.Run()
+	if err != nil {
 		fmt.Printf("chat UI error: %v\n", err)
 		os.Exit(1)
 	}
-	scr.eng.stop()
-	if !scr.leftSent.Load() {
-		// Backup for abnormal exits where doLeave never ran; normally a no-op.
-		if err := scr.sig.leaveRoom(); err != nil {
+	// Post-Run teardown: stop every session engine and register any leave
+	// that never went through (abnormal exits; normally a no-op thanks to
+	// the in-loop guards).
+	rm, ok := fm.(rootModel)
+	if !ok {
+		rm = newRootModel(scr)
+	}
+	rm.chat.shutdownSessions()
+	if !rm.chat.leftSent.Load() {
+		if err := rm.chat.sig.leaveRoom(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: leave may not have registered (%v)\n", err)
 		}
 	}

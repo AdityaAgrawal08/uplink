@@ -207,13 +207,13 @@ func newFilterScreen(me, target string, users ...string) *chatScreen {
 // fake signaling server) to a bare screen, joins me and every peer, and
 // seeds the engine roster. Returns peer pubkeys keyed by username for
 // assertions that need them.
-func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string, peers ...string) map[string]string {
+func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string, peers ...string) (map[string]string, map[string]*identityKey) {
 	t.Helper()
 	id, err := generateIdentity()
 	if err != nil {
 		t.Fatal(err)
 	}
-	sig := &signalClient{serverURL: srv.URL, me: me}
+	sig := &signalClient{serverURL: srv.URL, me: me, id: id}
 	// First user creates the room; if it already exists (shared server),
 	// fall back to joining it.
 	if sid, err := sig.createRoom(me, base64.StdEncoding.EncodeToString(id.publicKey()), ""); err == nil {
@@ -224,17 +224,19 @@ func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string
 		sig.key = "123456"
 	}
 	pubkeys := map[string]string{}
+	peerIDs := map[string]*identityKey{}
 	for _, p := range peers {
 		pid, err := generateIdentity()
 		if err != nil {
 			t.Fatal(err)
 		}
 		pk := base64.StdEncoding.EncodeToString(pid.publicKey())
-		psig := &signalClient{serverURL: srv.URL, key: "123456", me: p}
+		psig := &signalClient{serverURL: srv.URL, key: "123456", me: p, id: pid}
 		if _, _, err := psig.joinRoom(p, pk, ""); err != nil {
 			t.Fatalf("join %s: %v", p, err)
 		}
 		pubkeys[p] = pk
+		peerIDs[p] = pid
 	}
 	c.sig = sig
 	c.eng = newEngine(me, id, sig, engineCallbacks{})
@@ -244,7 +246,7 @@ func wireTestEngine(t *testing.T, c *chatScreen, srv *httptest.Server, me string
 		roster = append(roster, rosterMember{Username: u, Pubkey: pk, Online: true})
 	}
 	c.eng.setRoster(roster)
-	return pubkeys
+	return pubkeys, peerIDs
 }
 
 // Visibility is now purely conversational; see chat_conv_test.go for the

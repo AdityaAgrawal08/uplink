@@ -104,12 +104,13 @@ clear, `↑↓` scroll, mouse supported. There is no right video panel and no
 pinned call card (both removed); liveness shows in the sidebar (`Live now`,
 `Voice call • MM:SS`) and header mic chips.
 
-Slash commands: `/help`, `/reply`, `/upload`, `/download`, `/audio`,
-`/kick`, `/admin`, `/unadmin` (last three role-gated: creator/admin only;
-`/admin` creator-only). Notices (command results, moderation outcomes,
-engine/media events, server-down alert) surface on the **status line**,
-never as transcript rows — only peer messages, own echoes, and file cards
-paint the transcript.
+Slash commands: `/help`, `/reply`, `/settings`, `/new-group`, `/invite`,
+`/group-edit`, `/group-members`, `/group-leave`, `/upload`, `/download`,
+`/audio`, `/kick`, `/admin`, `/unadmin` (moderation role-gated:
+creator/admin only; `/admin` creator-only). Notices (command results,
+moderation outcomes, engine/media events, server-down alert) surface on the
+**status line**, never as transcript rows — only peer messages, own echoes,
+and file cards paint the transcript.
 
 ### Reply / quote (WhatsApp-style)
 
@@ -161,6 +162,99 @@ asked afterwards, in a modal overlay, only when the server reports the
 session is password-protected (401 "password required"); Esc dismisses the
 modal back to the form, and an incorrect password can be retried in place.
 CREATE keeps its optional password field for new sessions.
+
+### Groups and Settings
+
+**Groups** are named sessions created inside the current room: the creator
+is crowned automatically by the server, gets a fresh 6-digit code, and can
+invite any member of the room they created the group from. Invitees see a
+desktop ping (`X invited you to group Y`, fallback `a group` for unnamed
+groups) plus a settings badge ⚙ in the sidebar header — the badge shows the
+server's live pending-invite count and doubles as the click target for
+`/settings`.
+
+- **`/settings`** opens a full-screen settings window (landing-style
+  centered card): a **Notifications** section lists every pending invite
+  as `X invited you to group Y` with **X** (decline) and **✓** (accept)
+  actions, keyboard (`↑↓` select, `Enter` accept, `Backspace`/`Delete`
+  decline) and mouse (click the ✕ / ✓ cells) both work, and an **Account**
+  section shows the identity + server. Accepting a protected group runs
+  the same two-step join as the landing: the first accept answers 401
+  "password required" and opens a password modal; a wrong password retries
+  in place (`incorrect password`), and Esc backs out with the invite row
+  intact. A full group answers the exact 403 `Maximum allowance is
+  reached` — the invite is consumed server-side and terminal (the row
+  vanishes; a re-accept 404s, never retries). Success joins the session
+  and opens the group conversation.
+- **`/new-group`** opens the creation window in two stages: a member
+  multi-select (every room user; typing filters, `Space` toggles, `Enter`
+  proceeds — the palette's ranking contract), then the form: **Name**
+  (required, 1–64 chars), **Description** (optional, ≤256), **Max-People**
+  (default `Any`/unlimited, or a whole number ≥ 2; anything else fails
+  inline before any request). Creating POSTs `/session/create` with
+  `parentCode` = the current session code, then invites every pick —
+  `409 User is already in this session` becomes an inline note and the
+  rest continue — and finally opens the new group.
+- **Sidebar**: joined groups list by name under the members (newest
+  activity first, then name), with DM-style unread badges and previews.
+  Opening one runs the **full chat engine** in the group's own session:
+  messages, reactions (+ per-reactor dropdown), @mention highlighting,
+  quote-replies, quote-jump, files and `/upload` all work; `/admin`,
+  `/unadmin` and `/kick` keep their server role checks unchanged. Esc
+  closes the group view (still a member); **Ctrl+C in a group LEAVES it**
+  (standard leave POST, crown transfer is server-side) and returns to the
+  common room — the app keeps running, and only Ctrl+C in the home room
+  quits. The last remaining admin is refused (see `/group-leave` below).
+  Group engines stay alive in the background, so messages arriving
+  while another conversation is open badge the row and land in the group
+  transcript for when you open it.
+- **`/group-members`** opens the member list in the same drawer craft the
+  pickers use: role headers (Admins first), each member with their role tag
+  (`(main admin)` / `(admin)`), footer count. Read-only; Esc closes.
+- **`/group-edit`** is the group administration window (open a group
+  conversation first; elsewhere the command answers inline). An admin (and
+  the creator) gets editable **Name** (1–64) and **Description** (≤256)
+  fields with a SAVE button that PATCHes only the changed fields — the
+  response updates the local name/description and sidebar immediately; an
+  empty/invalid field or a non-admin request fails inline/with the server's
+  exact 403. **Transfer admin** opens the multi-select member picker
+  (`Space`/`Enter` toggles, `Tab` reaches the MAKE ADMINS button); each pick
+  POSTs the same `/admin` client call `/admin` uses, existing admins answer
+  a note instead of a duplicate grant. **Delete group** is creator-only and
+  opens a confirmation that spells out the consequences — *dissolves for
+  everyone; members lose access on their next heartbeat* — then issues the
+  DELETE that purges the room for every member. A non-creator admin sees
+  the blocked reason; plain members see the whole window read-only with
+  "only admins can change group details".
+- **`/group-leave`** (and Ctrl+C inside the group view) leaves the group
+  via the standard leave POST. Members may always leave; an admin may leave
+  while another admin remains, but the **last admin is refused** with
+  `promote another admin first (/group-edit → Transfer admin)` so a group
+  can never be left crownless by accident.
+- **Persistence & restart re-join**: joined groups are saved to
+  `~/.uplink/groups.json` (0600, keyed by home room code; group passwords
+  in plaintext — documented security tradeoff in `cli/groups_store.go`) on
+  create, invite-accept, rename, leave, kick and dissolve. On TUI start
+  every saved group paints optimistically in the sidebar and is re-joined in
+  the background with its saved password: success keeps the row (a seat
+  that survived the restart also counts as live), while 404 / kicked / full /
+  password-rejected failures drop the row AND prune the store (no ghost
+  rows); a server outage at launch keeps the row for the next attempt.
+  Leaving, being kicked, or a dissolve leaves a dimmed **tombstone** row
+  until a fresh invite/join re-establishes the live row; tombstones are
+  never persisted.
+- **Invite polling** piggybacks the existing 2s roster/inbox tick
+  (`GET /invites/mine`): new codes ring the desk-based ping once (never on
+  re-polls) and move the badge; declines/accepts shrink it on the next
+  poll. One surface at a time: `/settings`, `/new-group`, `/invite`,
+  `/group-edit` and `/group-members` are full-screen windows over the chat
+  (composer drawers close on entry; Esc/Ctrl+C close the window back to the
+  chat, whose own Ctrl+C remains the single app exit).
+
+Known limitation: the server exposes no group-meta GET, so a rename or
+description change is visible immediately to the editor (local session +
+sidebar) and reaches other members only when they rejoin — the
+invite/create payload is the only other source of group meta.
 
 ### Environment variables (CLI)
 
@@ -221,6 +315,45 @@ versioned tarballs + `checksums.txt`, verified by both installers and
 - Voice: Opus over UDP Noise sessions, jitter buffer, mic-level gate.
 - Share links: `id:KEY` (AES-256 file key, never sent to server in clear).
 
+## 7b. Request signatures (signaling trust plane)
+
+Every identity-bearing signaling call must prove possession of the device
+identity key before the server acts on it. A raw `X-Uplink-Username`
+header alone authorizes nothing.
+
+- **Signed payload:** `METHOD|PATH|TIMESTAMP_MS|NONCE`, signed with the
+  X25519 device identity key (the same keypair whose public half is claimed
+  immutably in the room roster at join — `hsetnx`). Since X25519 cannot
+  sign directly, the CLI signs with the Edwards form of the same private
+  scalar (`a = k mod L`, sign bit forced to 0); the RFC 7748 §4.1
+  birational map (`u = (1+y)/(1−y)`) is a group isomorphism sending the
+  Edwards base point to `u = 9`, so the server derives the verification
+  key from the rostered pubkey alone (`y = (u−1)/(u+1)`, `x` sign bit 0)
+  and runs a stock Ed25519 verify (Node `crypto.verify`, Go
+  `ed25519.Verify`, filippo.io/edwards25519 for the scalar math).
+- **Headers:** `X-Uplink-Timestamp` (unix ms), `X-Uplink-Nonce` (16 random
+  bytes hex), `X-Uplink-Sig` (base64, 64 bytes), `X-Uplink-Username`
+  (unchanged). `X-Uplink-Pubkey` is used ONLY by the invite-scoped calls
+  below on first use.
+- **Replay protection:** timestamp must be within 30s of the server clock;
+  each `(timestamp, nonce)` pair is single-use per username
+  (`SET NX sig:nonce:{user}:{sha256(ts|nonce)} EX 120`).
+- **Failure:** any missing/stale/invalid/replayed signature → `401
+  "Invalid or missing request signature"` (distinct from the 400 for a
+  missing username header). Hard-fail closed; no compat mode.
+- **Anchors per route:** roster pubkey for heartbeat/kick/admin/leave/
+  inbox/ack/signal/reactions/invites-POST; the pubkey **carried in the
+  accept body** for invites/accept (the seat is bound to the key that
+  signed, not just the name); a per-user first-use claim
+  (`SET NX user:{name}:sigkey`) for invites/mine and invites/decline,
+  stamped by accept too.
+- **Crown transfer:** a creator's leave is signature-verified before
+  `transferCreator` runs, so the crown change is authorized by the
+  leaver's own key.
+- **Client:** `signalClient` (cli/p2p_signal.go) signs every call; the
+  engine treats the gate's 401 as "not a member" and rejoins with its
+  identity (the same semantics as the old 403).
+
 ## 8. Implementation conventions (read before changing code)
 
 - **TUI exact-row contract:** every painted frame is exactly `H` rows ×
@@ -242,8 +375,8 @@ versioned tarballs + `checksums.txt`, verified by both installers and
 
 ## 9. Known limitations (audit-backed, not yet fixed)
 
-Member auth is header-only (no join tokens); quota `confirm` trusts
-declared size; LAN discovery is mDNS-trust-on-first-use; WAN receive path
-is non-functional; cloud/LAN/WAN download streams are unbounded; no
-forward secrecy on inbox boxes; no key-continuity store. Fix in priority
-order: signaling auth → quota lifecycle → LAN trust → transfer bounds.
+Quota `confirm` trusts declared size; LAN discovery is
+mDNS-trust-on-first-use; WAN receive path is non-functional; cloud/LAN/WAN
+download streams are unbounded; no forward secrecy on inbox boxes; no
+key-continuity store. Fix in priority order: quota lifecycle → LAN trust →
+transfer bounds.

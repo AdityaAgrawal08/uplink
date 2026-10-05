@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { verifyPassword } from "@/lib/crypto";
+import { verifyPassword, getDummyPasswordHash } from "@/lib/crypto";
 import { apiError, parseJsonBody } from "@/lib/api-utils";
 import { validateSignalingEnv } from "@/lib/env";
-import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, clientIpHash, assertRoomCode } from "@/lib/rooms";
+import { RoomError, joinRoom, getRoomMeta, checkJoinLimit, checkRoomJoinLimit, clientIpHash, assertRoomCode } from "@/lib/rooms";
 
 export async function POST(
   req: NextRequest,
@@ -17,6 +17,11 @@ export async function POST(
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
     const { username, pubkey, password } = parsed.body;
 
+    // Finding 14: per-ROOM join budget (anti-brute-force for 6-digit codes),
+    // counted per well-formed attempt — before the password gate, so failed
+    // guesses (the attacker's probes) burn the room's budget too.
+    await checkRoomJoinLimit(sessionId);
+
     const meta = await getRoomMeta(sessionId);
     if (!meta) {
       return apiError("Session not found", 404);
@@ -29,6 +34,12 @@ export async function POST(
       if (!(await verifyPassword(password, meta.passwordHash))) {
         return apiError("Incorrect session password", 401);
       }
+    } else {
+      // Finding 15 (timing oracle): burn the same argon2 work a protected
+      // room burns per wrong guess — against a dummy hash — so response
+      // timing cannot reveal which rooms are protected. The join still
+      // succeeds; only the side channel is closed.
+      await verifyPassword(typeof password === "string" ? password : "", await getDummyPasswordHash());
     }
 
     const { roster, epoch } = await joinRoom(sessionId, username as string, pubkey as string);

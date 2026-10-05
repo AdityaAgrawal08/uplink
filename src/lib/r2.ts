@@ -326,19 +326,35 @@ export async function completeMultipartUpload(
   }
 }
 
-export async function getObjectText(objectKey: string): Promise<string> {
+export const PREVIEW_TEXT_MAX_BYTES = 100 * 1024; // finding 7: previews read at most 100KB (+1 byte truncation probe)
+
+// getObjectText reads a stored object as text with a hard memory cap: at
+// most maxBytes+1 bytes are ever read from disk or requested from R2 (a
+// Range header bounds the server response), so a 200MB share never gets
+// buffered into memory by a preview request. The +1 byte detects truncation
+// for callers that want to know the object was cut off.
+export async function getObjectText(objectKey: string, maxBytes: number = PREVIEW_TEXT_MAX_BYTES): Promise<string> {
   if (!s3Client || process.env.FORCE_MOCK_STORAGE === "true") {
     const localPath = path.join(process.cwd(), "uploads_dev", objectKey);
-    if (fs.existsSync(localPath)) {
-      return fs.readFileSync(localPath, "utf-8");
+    if (!fs.existsSync(localPath)) return "";
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(localPath, "r");
+      const buf = Buffer.alloc(maxBytes + 1);
+      const bytesRead = fs.readSync(fd, buf, 0, maxBytes + 1, 0);
+      return buf.subarray(0, bytesRead).toString("utf-8");
+    } catch {
+      return "";
+    } finally {
+      if (fd !== null) fs.closeSync(fd);
     }
-    return "";
   }
 
   try {
     const command = new GetObjectCommand({
       Bucket: getBucketName(),
       Key: objectKey,
+      Range: `bytes=0-${maxBytes}`, // server-side truncation: body ≤ maxBytes+1 bytes
     });
     const response = await s3Client.send(command);
     if (response.Body) {

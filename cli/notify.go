@@ -63,3 +63,7 @@ func notifyMentioned(sender string) {
 // loop testable (tests swap it for a recorder); production always routes
 // through notifyMentioned.
 var mentionNotifier = notifyMentioned
+
+// inviteNotifier lives in groups.go (with the invite payload types it
+// renders); it is declared here-adjacent by convention — every desktop ping
+// sink is swappable the same way.

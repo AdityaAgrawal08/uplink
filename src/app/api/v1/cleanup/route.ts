@@ -3,23 +3,53 @@ import crypto from "crypto";
 import { getDb } from "@/lib/mongodb";
 import { deleteObject } from "@/lib/r2";
 import { recordDeleteQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
+import { releaseIpReservation } from "@/lib/reservation";
 import { validateAdminAuth } from "@/lib/auth";
 import { apiError } from "@/lib/api-utils";
 
+// B58 FIX (finding 11): cleanup deletes R2 objects and mutates the quota
+// ledger, but the route was previously admin-gated ONLY (ADMIN_API_KEY).
+// Operators who run cleanup from a Vercel cron (which signs requests with
+// the CRON_SECRET bearer token) had no supported credential and either left
+// the route unauthenticated or deployed with a leaked admin key. Accept
+// either credential:
+//   - Authorization: Bearer <ADMIN_API_KEY> (manual/admin ops)
+//   - Authorization: Bearer <CRON_SECRET>   (Vercel cron style)
+// Both compares are constant-time. performCleanup itself stays the INTERNAL
+// implementation: share-route after() hooks call it directly (server-side
+// background housekeeping that is not reachable through HTTP), which is why
+// the gate lives here and not inside performCleanup.
+export function isCleanupAuthorized(req: NextRequest): boolean {
+  if (validateAdminAuth(req)) return true;
+  const expected = process.env.CRON_SECRET;
+  if (!expected) return false;
+  const authHeader = req.headers.get("authorization") || "";
+  const prefix = "Bearer ";
+  if (!authHeader.startsWith(prefix)) return false;
+  const provided = Buffer.from(authHeader.slice(prefix.length));
+  const expectedBuf = Buffer.from(expected);
+  if (provided.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(provided, expectedBuf);
+}
+
 export async function POST(req: NextRequest) {
-  if (!validateAdminAuth(req)) {
+  if (!isCleanupAuthorized(req)) {
     return apiError("Unauthorized access", 401);
   }
   return performCleanup();
 }
 
 export async function GET(req: NextRequest) {
-  if (!validateAdminAuth(req)) {
+  if (!isCleanupAuthorized(req)) {
     return apiError("Unauthorized access", 401);
   }
   return performCleanup();
 }
 
+// Internal cleanup implementation. NOT an HTTP entry point: POST/GET gate
+// callers behind isCleanupAuthorized; share routes invoke this directly from
+// their after() hooks (background housekeeping on the server, never exposed
+// to clients without the gate).
 export async function performCleanup() {
   try {
     const db = await getDb();
@@ -124,6 +154,11 @@ export async function performCleanup() {
             const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
             const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
             await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+            // Finding 4: refund the initiator's per-IP reservation counter
+            // (initIpHash rides the share doc; no request context here).
+            if (share.initIpHash) {
+              await releaseIpReservation(share.initIpHash, share.size).catch(err => console.error("Failed to release IP reservation in cleanup:", err));
+            }
           } else {
             // If it was committed, decrement active storage bytes and record delete op
             await recordDeleteQuota(share.size);
@@ -154,6 +189,11 @@ export async function performCleanup() {
             const uploadSession = await db.collection("upload_sessions").findOne({ shareId: share.shareId });
             const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
             await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+            // Finding 4: refund the per-IP reservation counter even when the
+            // R2 delete itself failed — the reservation is over either way.
+            if (share.initIpHash) {
+              await releaseIpReservation(share.initIpHash, share.size).catch(err => console.error("Failed to release IP reservation in cleanup (delete failed):", err));
+            }
           }
 
           results.push({ shareId: share.shareId, status: "DELETE_FAILED" });

@@ -8,9 +8,10 @@ import {
   generateShareId,
   sanitizeFilename,
   hashPassword,
-  anonymizeIp,
 } from "@/lib/crypto";
 import { reserveUploadQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
+import { chargeIpReservation, releaseIpReservation } from "@/lib/reservation";
+import { clientIpHash } from "@/lib/rooms";
 import { apiError } from "@/lib/api-utils";
 
 export async function POST(req: NextRequest) {
@@ -20,15 +21,15 @@ export async function POST(req: NextRequest) {
   let quotaReserved = false;
   let success = false;
   let redisIdempotencyKey: string | null = null;
+  let ipHash = "";
 
   try {
     // Rate Limiting check
-    // B8 FIX: Split x-forwarded-for by comma and take the first entry
-    // (client's real IP). The header format is "client, proxy1, proxy2"
-    // and the leftmost is the original client.
-    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
-    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
-    const ipHash = anonymizeIp(clientIp);
+    // B8 FIX: split x-forwarded-for by comma and take the first entry
+    // (client's real IP). clientIpHash additionally honors TRUST_PROXY
+    // (finding 10): when no trusted proxy is in front, XFF is
+    // attacker-controlled and is ignored for budgeting.
+    ipHash = clientIpHash(req);
     const rateLimitKey = `rate:init:${ipHash}`;
     const attempts = await redis.incr(rateLimitKey);
     if (attempts === 1) {
@@ -180,8 +181,31 @@ export async function POST(req: NextRequest) {
       return apiError("Uploads are temporarily unavailable due to system quota validation failure.", 503);
     }
 
-    // 4. Share ID and Key construction
-    const shareId = (typeof body.shareId === "string" && body.shareId) || generateShareId();
+    // 4. Per-IP in-flight reservation budget (finding 4): a single IP cannot
+    // hold more than ~1GB of pending upload reservations at once, so an
+    // attacker cannot carpet-bomb init with large sizes to pin the storage
+    // reservation ledger. Refused → refund the Mongo reservation and answer
+    // 429 before any R2 presigning work.
+    const ipReservationCharged = await chargeIpReservation(ipHash, size);
+    if (!ipReservationCharged) {
+      await releaseUploadQuotaWithRetry(size, estimatedClassAOps).catch(() => {});
+      quotaReserved = false;
+      return apiError("Too many uploads in progress from this IP. Try again later.", 429);
+    }
+
+    // 5. Share ID and Key construction
+    // B59 FIX (finding 12): a client-supplied shareId is honored (the CLI's
+    // resume flow re-sends the previous session's server-generated id), but
+    // it must match the server's own id charset or the request is rejected:
+    // the shareId is embedded in the R2 object key, and an arbitrary value
+    // would smuggle path separators / control characters into object-storage
+    // paths. Server-generated ids (22-char base64url) always match.
+    const SHARE_ID_RE = /^[A-Za-z0-9_-]{10,128}$/;
+    const rawShareId = typeof body.shareId === "string" ? body.shareId : "";
+    if (rawShareId !== "" && !SHARE_ID_RE.test(rawShareId)) {
+      return apiError("shareId must be 10-128 characters of A-Za-z0-9_-", 400);
+    }
+    const shareId = rawShareId || generateShareId();
     const storageFilename = sanitizeFilename(filename);
     const date = new Date();
     const year = date.getUTCFullYear();
@@ -244,6 +268,10 @@ export async function POST(req: NextRequest) {
       downloadsCount: 0,
       firstDownloadedAt: null,
       lastDownloadedAt: null,
+      // Finding 4: the initiator's anonymized IP hash rides the share doc so
+      // confirm/cleanup can refund the per-IP reservation counter without a
+      // request context.
+      initIpHash: ipHash,
       schemaVersion: 1,
       cleanupLockedUntil: null,
       cleanupWorkerId: null,
@@ -324,6 +352,9 @@ export async function POST(req: NextRequest) {
       // B3 FIX: Retry quota release so a transient failure cannot leak quota.
       const estimatedClassAOps = isMultipart ? partsCount + 2 : 1;
       await releaseUploadQuotaWithRetry(size, estimatedClassAOps);
+      // Finding 4: refund the per-IP reservation counter too, or a failed
+      // init would hold the IP's bytes hostage until the 2h TTL.
+      await releaseIpReservation(ipHash, size).catch(err => console.error("Failed to release IP reservation:", err));
     }
     return apiError("Internal server error", 500);
   } finally {

@@ -1,5 +1,12 @@
 name: CI
 
+# SUPPLY-CHAIN NOTE: every `uses:` reference below is pinned to a full
+# commit SHA (with a `# vN` comment naming the tag it corresponds to), so a
+# compromised or retagged action version can never be pulled into CI.
+# Dependabot keeps these SHAs current: it opens a PR bumping the SHA (and
+# the comment) whenever a new action version ships — approve and merge as
+# routine maintenance.
+
 # Validity gate for every push: lint, typecheck, build, unit tests,
 # cross-platform CLI builds, and a full end-to-end integration matrix
 # (real MongoDB service container + mock R2 storage) covering every
@@ -25,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 — SHA-pinned (dependabot updates)
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6 — SHA-pinned (dependabot updates)
         with:
           go-version-file: cli/go.mod
           cache-dependency-path: cli/go.sum
@@ -64,9 +71,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 — SHA-pinned (dependabot updates)
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5 — SHA-pinned (dependabot updates)
         with:
           node-version: 22
           cache: npm
@@ -125,14 +132,14 @@ jobs:
       NEXT_TELEMETRY_DISABLED: 1
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5 — SHA-pinned (dependabot updates)
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6 — SHA-pinned (dependabot updates)
         with:
           go-version-file: cli/go.mod
           cache-dependency-path: cli/go.sum
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5 — SHA-pinned (dependabot updates)
         with:
           node-version: 22
           cache: npm
@@ -190,7 +197,7 @@ jobs:
 
       - name: Upload server logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5 — SHA-pinned (dependabot updates)
         with:
           name: e2e-server-log
           path: server.log

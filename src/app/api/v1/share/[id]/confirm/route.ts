@@ -4,8 +4,9 @@ import fs from "fs";
 import path from "path";
 import { getDb } from "@/lib/mongodb";
 import { checkObjectExists, completeMultipartUpload, s3Client, calculateS3ObjectHash } from "@/lib/r2";
-import { anonymizeIp } from "@/lib/crypto";
 import { commitUploadQuota, releaseUploadQuotaWithRetry } from "@/lib/quota";
+import { releaseIpReservation } from "@/lib/reservation";
+import { clientIpHash } from "@/lib/rooms";
 import { apiError } from "@/lib/api-utils";
 
 interface ShareData {
@@ -17,6 +18,7 @@ interface ShareData {
   hashValue: string;
   checksumCrc64nvme?: string | null;
   downloadCode?: string | null;
+  initIpHash?: string | null; // finding 4: initiator's ipHash for the per-IP reservation refund
 }
 
 interface UploadSessionData {
@@ -40,6 +42,18 @@ export async function POST(
     const { parts } = body;
 
     const db = await getDb();
+
+    // refundReservation releases the Mongo reservation AND the per-IP
+    // reservation counter (finding 4). The IP counter is keyed on the
+    // INITIATOR's ipHash (stored on the share at init) — the caller of
+    // confirm may be a different IP than the uploader (multipart resumers),
+    // and it is the initiator's counter that was charged.
+    const refundReservation = async (sizeBytes: number, ops: number) => {
+      await releaseUploadQuotaWithRetry(sizeBytes, ops);
+      if (share?.initIpHash) {
+        await releaseIpReservation(share.initIpHash, sizeBytes).catch(err => console.error("Failed to release IP reservation on refund:", err));
+      }
+    };
 
     // 1. Fetch Share metadata
     share = (await db.collection("shares").findOne({ $or: [{ shareId: id }, { downloadCode: id }] })) as unknown as ShareData;
@@ -81,7 +95,7 @@ export async function POST(
         .collection("upload_sessions")
         .updateOne({ shareId: share.shareId }, { $set: { status: "EXPIRED" } });
       const estimatedOps = uploadSession.isMultipart ? uploadSession.partsCount + 2 : 1;
-      await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+      await refundReservation(share.size, estimatedOps);
       return apiError("Upload session has expired", 410);
     }
 
@@ -92,7 +106,7 @@ export async function POST(
     if (uploadSession.isMultipart) {
       if (!parts || !Array.isArray(parts)) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        await refundReservation(share.size, estimatedOps);
         return apiError("Parts list is required to complete multipart upload", 400);
       }
 
@@ -108,7 +122,7 @@ export async function POST(
       );
       if (!isValid) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        await refundReservation(share.size, estimatedOps);
         return apiError("Invalid parts list structure. Each part must contain a valid partNumber and etag.", 400);
       }
 
@@ -117,14 +131,14 @@ export async function POST(
       // duplicates would also duplicate bytes in mock-mode assembly.
       if (parts.length === 0 || parts.length > 100) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        await refundReservation(share.size, estimatedOps);
         return apiError("Parts list must contain between 1 and 100 entries", 400);
       }
       const seenParts = new Set<number>();
       for (const p of parts) {
         if (seenParts.has(p.partNumber)) {
           const estimatedOps = uploadSession.partsCount + 2;
-          await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+          await refundReservation(share.size, estimatedOps);
           return apiError(`Duplicate partNumber in parts list: ${p.partNumber}`, 400);
         }
         seenParts.add(p.partNumber);
@@ -139,7 +153,7 @@ export async function POST(
 
       if (completionResult.error) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        await refundReservation(share.size, estimatedOps);
         return apiError(`Failed to complete multipart assembly: ${completionResult.error}`, 400);
       }
 
@@ -149,7 +163,7 @@ export async function POST(
       const objDetails = await checkObjectExists(share.objectKey);
       if (!objDetails.exists) {
         const estimatedOps = uploadSession.partsCount + 2;
-        await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        await refundReservation(share.size, estimatedOps);
         return apiError("Uploaded file was not found in object storage after assembly", 404);
       }
 
@@ -174,12 +188,12 @@ export async function POST(
       // Single-part HEAD check
       const objDetails = await checkObjectExists(share.objectKey);
       if (!objDetails.exists) {
-        await releaseUploadQuotaWithRetry(share.size, 1);
+        await refundReservation(share.size, 1);
         return apiError("Uploaded file was not found in object storage", 404);
       }
 
       if (objDetails.size <= 0) {
-        await releaseUploadQuotaWithRetry(share.size, 1);
+        await refundReservation(share.size, 1);
         return apiError("Uploaded file cannot be empty (0 bytes)", 400);
       }
 
@@ -224,7 +238,7 @@ export async function POST(
         await db
           .collection("upload_sessions")
           .updateOne({ shareId: id }, { $set: { status: "VERIFY_FAILED" } });
-        await releaseUploadQuotaWithRetry(share.size, 1);
+        await refundReservation(share.size, 1);
         return apiError("Integrity check failed: uploaded file SHA-256 does not match client expectation", 412);
       }
     }
@@ -264,7 +278,7 @@ export async function POST(
         });
       }
       const estimatedOps = uploadSession.isMultipart ? uploadSession.partsCount + 2 : 1;
-      await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+      await refundReservation(share.size, estimatedOps);
       return apiError("Conflict updating share status", 409);
     }
 
@@ -275,12 +289,16 @@ export async function POST(
     // Commit the upload quota atomically
     await commitUploadQuota(share.size);
     quotaCommitted = true;
+    // Finding 4: the reservation ended (committed to storage) — refund the
+    // per-IP counter so in-flight bytes account for pending uploads only.
+    if (share.initIpHash) {
+      await releaseIpReservation(share.initIpHash, share.size).catch(err => console.error("Failed to release IP reservation on commit:", err));
+    }
 
     // 5. Structured Diagnostics Logging
-    // B8 FIX: take the leftmost entry of x-forwarded-for (the real client).
-    const rawIp = req.headers.get("x-forwarded-for") || "127.0.0.1";
-    const clientIp = rawIp.split(",")[0].trim() || "127.0.0.1";
-    const ipHash = anonymizeIp(clientIp);
+    // B8 FIX: take the leftmost entry of x-forwarded-for (the real client);
+    // clientIpHash honors TRUST_PROXY (finding 10).
+    const ipHash = clientIpHash(req);
     const userAgent = req.headers.get("user-agent") || "Unknown";
 
     const logEvent = {
@@ -315,6 +333,9 @@ export async function POST(
       try {
         const estimatedOps = uploadSession?.isMultipart ? uploadSession.partsCount + 2 : 1;
         await releaseUploadQuotaWithRetry(share.size, estimatedOps);
+        if (share.initIpHash) {
+          await releaseIpReservation(share.initIpHash, share.size).catch(() => {});
+        }
       } catch (refundErr) {
         console.error("Failed to refund quota on confirm crash:", refundErr);
       }

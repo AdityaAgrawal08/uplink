@@ -5,11 +5,13 @@ import {
   RoomError,
   setRole,
   checkJoinLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertRoomCode,
   assertUsername,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // POST /api/v1/session/{id}/admin — grant/revoke admin (creator only).
 // Body: { target: string, admin: boolean }. Returns the fresh roster +
@@ -25,7 +27,11 @@ export async function POST(
     const actor = req.headers.get("X-Uplink-Username") || "";
     if (!actor) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(actor);
-    await checkJoinLimit(scopedBudgetKey(req, actor)); // membership mutation faucet
+    // Signature gate: only the rostered key of `actor` may wield its role.
+    const anchorPubkey = await getMemberPubkey(sessionId, actor);
+    const sigGate = await requireRequestSignature(req, actor, anchorPubkey);
+    if (sigGate !== true) return sigGate;
+    await checkJoinLimit(clientIpHash(req)); // membership mutation faucet
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);

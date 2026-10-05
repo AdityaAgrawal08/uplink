@@ -113,12 +113,12 @@ func TestEngineEndToEnd(t *testing.T) {
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
 
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	sid, err := sigA.createRoom("alice", pubA, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sid, id: idb}
 	roster, _, err := sigB.joinRoom("bob", pubB, "")
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestEngineBigFileFallbackRefused(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
 
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", base64.StdEncoding.EncodeToString(ida.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
@@ -264,12 +264,12 @@ func TestEngineAutoRejoinAfterPrune(t *testing.T) {
 	idb, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Bob stays behind so the room survives alice's prune.
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +279,7 @@ func TestEngineAutoRejoinAfterPrune(t *testing.T) {
 	ea.setRoster([]rosterMember{{Username: "alice", Pubkey: pubA, Online: true}})
 
 	// Simulate a prune: someone (or the sweeper) drops alice server-side.
-	kicker := &signalClient{serverURL: srv.URL, me: "alice", key: sigA.key}
+	kicker := &signalClient{serverURL: srv.URL, me: "alice", key: sigA.key, id: ida}
 	if err := kicker.leaveRoom(); err != nil {
 		t.Fatal(err)
 	}
@@ -327,11 +327,11 @@ func TestEpochChangeTriggersRosterRefresh(t *testing.T) {
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
 	pubB := base64.StdEncoding.EncodeToString(idb.publicKey())
 	pubC := base64.StdEncoding.EncodeToString(idc.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}
-	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key}
+	sigB := &signalClient{serverURL: srv.URL, me: "bob", key: sigA.key, id: idb}
 	if _, _, err := sigB.joinRoom("bob", pubB, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestEpochChangeTriggersRosterRefresh(t *testing.T) {
 	}
 	// Carol joins elsewhere; alice's next inbox poll (2s cadence) sees the
 	// epoch move and refreshes immediately — no waiting out the 5s beat.
-	sigC := &signalClient{serverURL: srv.URL, me: "carol", key: sigA.key}
+	sigC := &signalClient{serverURL: srv.URL, me: "carol", key: sigA.key, id: idc}
 	if _, _, err := sigC.joinRoom("carol", pubC, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -372,7 +372,7 @@ func TestBeatRecordsAndClearsFailures(t *testing.T) {
 	defer srv.Close()
 	ida, _ := generateIdentity()
 	pubA := base64.StdEncoding.EncodeToString(ida.publicKey())
-	sigA := &signalClient{serverURL: srv.URL, me: "alice"}
+	sigA := &signalClient{serverURL: srv.URL, me: "alice", id: ida}
 	if _, err := sigA.createRoom("alice", pubA, ""); err != nil {
 		t.Fatal(err)
 	}

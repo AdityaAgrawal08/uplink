@@ -133,6 +133,48 @@ func getJSON(url string, headers map[string]string) (int, []byte, error) {
 	return resp.StatusCode, data, err
 }
 
+// patchJSON is postJSON for the PATCH method (group meta updates). Same
+// shared client and keep-alive pooling.
+func patchJSON(url string, payload any, headers map[string]string) (int, []byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, nil, err
+	}
+	req, err := http.NewRequest("PATCH", url, strings.NewReader(string(body)))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
+}
+
+// deleteJSON is a body-less DELETE (group dissolve). Same shared client.
+func deleteJSON(url string, headers map[string]string) (int, []byte, error) {
+	req, err := http.NewRequest("DELETE", url, nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, err
+}
+
 // cmdCreateSession handles: uplink create session
 func cmdCreateSession(args []string, cfg *Config) {
 	fs := flag.NewFlagSet("create session", flag.ExitOnError)

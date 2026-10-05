@@ -4,6 +4,8 @@ export interface IRedisClient {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown, options?: { ex?: number; px?: number; nx?: boolean }): Promise<unknown>;
   incr(key: string): Promise<number>;
+  incrBy(key: string, amount: number): Promise<number>;
+  decr(key: string): Promise<number>;
   expire(key: string, seconds: number): Promise<number>;
   del(key: string): Promise<number>;
   // Hash ops (rooms, members, inboxes). All values are strings.
@@ -104,6 +106,28 @@ export class MockRedis implements IRedisClient {
     val += 1;
     this.store.set(key, { value: String(val), expiry, isObject: false });
     return val;
+  }
+
+  async incrBy(key: string, amount: number): Promise<number> {
+    const item = this.store.get(key);
+    let val = 0;
+    let expiry: number | null = null;
+    if (item) {
+      if (item.expiry && Date.now() > item.expiry) {
+        this.store.delete(key); // window rolled: fresh counter, fresh TTL
+      } else {
+        val = parseInt(item.value as string, 10);
+        if (isNaN(val)) val = 0;
+        expiry = item.expiry;
+      }
+    }
+    val += amount;
+    this.store.set(key, { value: String(val), expiry, isObject: false });
+    return val;
+  }
+
+  async decr(key: string): Promise<number> {
+    return this.incrBy(key, -1);
   }
 
   async expire(key: string, seconds: number): Promise<number> {
@@ -377,6 +401,14 @@ export class LazyRedisClient implements IRedisClient {
 
   async incr(key: string): Promise<number> {
     return this.executeWithFallback(c => c.incr(key));
+  }
+
+  async incrBy(key: string, amount: number): Promise<number> {
+    return this.executeWithFallback(c => c.incrBy(key, amount));
+  }
+
+  async decr(key: string): Promise<number> {
+    return this.executeWithFallback(c => c.decr(key));
   }
 
   async expire(key: string, seconds: number): Promise<number> {

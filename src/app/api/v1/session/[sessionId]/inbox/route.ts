@@ -7,9 +7,11 @@ import {
   fetchBoxes,
   checkSendLimit,
   checkReadLimit,
-  scopedBudgetKey,
+  clientIpHash,
   assertUsernameHeader,
+  getMemberPubkey,
 } from "@/lib/rooms";
+import { requireRequestSignature } from "@/lib/request-signature";
 
 // Unified offline/fallback inbox. Boxes are ciphertext the server cannot
 // read; they live at most 1 hour and die on explicit ACK. Two uses share it:
@@ -31,6 +33,11 @@ export async function POST(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
+    // Signature gate: deposits are identity-bearing (the box is stamped
+    // from); the GET below reads the caller's own queue.
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
 
     const parsed = await parseJsonBody(req);
     if (!parsed.ok) return apiError("Request body must be a JSON object", 400);
@@ -38,7 +45,7 @@ export async function POST(
       to?: unknown; msgId?: unknown; kind?: unknown; payload?: unknown;
     };
 
-    await checkSendLimit("inbox", scopedBudgetKey(req, username));
+    await checkSendLimit("inbox", clientIpHash(req), username);
     await depositBox(sessionId, username, to as string, msgId as string, kind as string, payload as string);
     return NextResponse.json({ ok: true }, { status: 201 });
   } catch (error) {
@@ -58,7 +65,13 @@ export async function GET(
     const username = req.headers.get("X-Uplink-Username") || "";
     if (!username) return apiError("X-Uplink-Username header is required", 400);
     assertUsernameHeader(username);
-    await checkReadLimit(scopedBudgetKey(req, username)); // drains are the hot poll path
+    // Signature gate on the fetch too: draining someone else's queue is a
+    // read of their (ciphertext) fallback traffic — and a presence-visible
+    // sabotage vector (messages disappear without ack).
+    const anchorPubkey = await getMemberPubkey(sessionId, username);
+    const sigGate = await requireRequestSignature(req, username, anchorPubkey);
+    if (sigGate !== true) return sigGate;
+    await checkReadLimit(clientIpHash(req), username); // drains are the hot poll path
 
     const { boxes, epoch } = await fetchBoxes(sessionId, username);
     return NextResponse.json({ boxes, epoch });

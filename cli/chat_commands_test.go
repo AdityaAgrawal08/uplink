@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
 
 // step feeds one msg through Update and hands back the NEW model state —
@@ -45,7 +48,7 @@ func TestRankSlashCommandsPrefixFirst(t *testing.T) {
 	// Synthetic registry exercises the ordering rules that the live one is
 	// too small to show; keeps the contract pinned as commands are added.
 	items := []slashCommand{
-		{Name: "/exit"}, {Name: "/quit"}, {Name: "/help"}, {Name: "/history"},
+		{Name: "/exit"}, {Name: "/quit"}, {Name: "/help", Group: "General"}, {Name: "/history", Group: "General"},
 	}
 	names := func(q string) []string {
 		var out []string
@@ -62,17 +65,116 @@ func TestRankSlashCommandsPrefixFirst(t *testing.T) {
 		}
 	}
 
-	// No query: plain dictionary order over everything.
+	// No query: plain dictionary order over everything (the drawer then
+	// groups the display under its category headers).
 	assertEq(names(""), "/exit", "/help", "/history", "/quit")
 
-	// "/h": all prefix hits first (alphabetical), then the rest in order.
-	assertEq(names("/h"), "/help", "/history", "/exit", "/quit")
-
-	// "/q": single prefix hit floats up, others unchanged.
-	assertEq(names("/q"), "/quit", "/exit", "/help", "/history")
+	// Fuzzy rank: matching commands float to the top (prefix + shortest
+	// title breaking the score ties); non-matching commands VANISH —
+	// fzf semantics, which is what lets the drawer reach its
+	// "No results found" state.
+	assertEq(names("/h"), "/help", "/history")
+	assertEq(names("/q"), "/quit")
+	assertEq(names("/zz")) // nothing matches: empty list
 
 	// Case-insensitive prefix matching.
-	assertEq(names("/H"), "/help", "/history", "/exit", "/quit")
+	assertEq(names("/H"), "/help", "/history")
+}
+
+// The ranking tiebreak chain: score desc, then title-prefix, then shorter
+// title, then frecency, then stable order. Every branch is exercised with
+// synthetic hits so the contract cannot drift when the fuzzy scorer changes.
+func TestLessRankedTiebreaks(t *testing.T) {
+	if !lessRanked(fuzzyHit{q: 5}, fuzzyHit{q: 3}, 0, 0) {
+		t.Fatal("score desc: higher weighted score must win")
+	}
+	if !lessRanked(fuzzyHit{q: 2, prefixTitle: true, titleLen: 3}, fuzzyHit{q: 2, titleLen: 5}, 0, 0) {
+		t.Fatal("prefix tiebreak: a title-prefix match beats a bare match at equal score")
+	}
+	if !lessRanked(fuzzyHit{q: 2, prefixTitle: true, titleLen: 3}, fuzzyHit{q: 2, prefixTitle: true, titleLen: 9}, 0, 0) {
+		t.Fatal("shorter tiebreak: the shorter title wins at equal score+prefix")
+	}
+	if !lessRanked(fuzzyHit{q: 2, titleLen: 4}, fuzzyHit{q: 2, titleLen: 4}, 5, 1) {
+		t.Fatal("frecency tiebreak: the hotter history wins the last tie")
+	}
+	if lessRanked(fuzzyHit{q: 2, titleLen: 4}, fuzzyHit{q: 2, titleLen: 4}, 0, 0) {
+		t.Fatal("stability: equal items must never reorder")
+	}
+	if lessRanked(fuzzyHit{q: 2, titleLen: 4}, fuzzyHit{q: 2, titleLen: 4}, 2, 2) {
+		t.Fatal("stability: equal frecency must never reorder")
+	}
+}
+
+// Title weight (2x) must dominate the group weight (1x): a name match beats
+// a category match of equal fuzzy quality, and the two combine additively.
+func TestRankTitleGroupWeights(t *testing.T) {
+	titleOnly := rankTitleGroup("mod", "mode", "")
+	groupOnly := rankTitleGroup("mod", "", "Moderation")
+	both := rankTitleGroup("mod", "mode", "Moderation")
+	if !titleOnly.matched || !groupOnly.matched || !both.matched {
+		t.Fatalf("all three must match: %+v %+v %+v", titleOnly, groupOnly, both)
+	}
+	if titleOnly.q <= groupOnly.q {
+		t.Fatalf("title 2x must dominate group 1x: title=%d group=%d", titleOnly.q, groupOnly.q)
+	}
+	if both.q <= titleOnly.q {
+		t.Fatalf("title+group must exceed title alone: both=%d title=%d", both.q, titleOnly.q)
+	}
+	if got := rankTitleGroup("zz", "mode", "Moderation"); got.matched {
+		t.Fatal("a query matching neither title nor group must not match")
+	}
+	if got := rankTitleGroup("", "mode", "Moderation"); !got.matched || got.q != 0 {
+		t.Fatal("an empty query matches everything with zero score")
+	}
+}
+
+// Group-only matches still land in the list (fzf matches the whole line),
+// but rank BELOW equal-quality title matches.
+func TestPaletteGroupMatchRanksBelowTitleMatch(t *testing.T) {
+	items := []slashCommand{
+		{Name: "/zzz", Group: "Moderation"},
+		{Name: "/mode", Group: "General"},
+	}
+	names := func(q string) []string {
+		var out []string
+		for _, cmd := range rankSlashCommands(items, q) {
+			out = append(out, cmd.Name)
+		}
+		return out
+	}
+	if got := strings.Join(names("/mo"), ","); got != "/mode,/zzz" {
+		t.Fatalf("title match must outrank group match: %v", got)
+	}
+}
+
+// Frecency is the FINAL tiebreak: identical score/prefix/length pairs sort
+// by pick history, and without history the stable registry order holds.
+func TestRankSlashCommandsFrecencyTiebreak(t *testing.T) {
+	items := []slashCommand{
+		{Name: "/abc"}, {Name: "/abd"},
+	}
+	now := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	names := func(m map[string]frecEntry) string {
+		var out []string
+		for _, cmd := range rankSlashCommandsF(items, "/ab", m, now) {
+			out = append(out, cmd.Name)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := names(nil); got != "/abc,/abd" {
+		t.Fatalf("no history: stable order must hold, got %v", got)
+	}
+	if got := names(map[string]frecEntry{"/abd": {freq: 3, last: now}}); got != "/abd,/abc" {
+		t.Fatalf("frecency must float the hot item first, got %v", got)
+	}
+	// Decay: a fresh single pick outranks a huge but ancient history.
+	ancient := now.Add(-30 * 24 * time.Hour)
+	if got := names(map[string]frecEntry{
+		"/abd": {freq: 10000, last: ancient},
+		"/abc": {freq: 1, last: now},
+	}); got != "/abc,/abd" {
+		t.Fatalf("fresh pick must outrank decayed history, got %v", got)
+	}
 }
 
 // /exit and /quit must be gone from the palette registry — Ctrl+C is the
@@ -255,8 +357,9 @@ func TestPaletteEscClosesDrawerNotPrivateMode(t *testing.T) {
 	}
 }
 
-// UI contract: panel spans the composer's full width, carries the keymap
-// footer, and its border matches the composer accent.
+// UI contract: inline drawer with a single top border line, capped at
+// min(termW-2, 80) — header contract (Bold title left + muted esc right),
+// footer contract (keymap hints left + count right), border always on top.
 func TestPalettePanelLayout(t *testing.T) {
 	c := newPaletteScreen()
 	c, _ = typeKeys(c, "/")
@@ -266,16 +369,27 @@ func TestPalettePanelLayout(t *testing.T) {
 	if panel == "" {
 		t.Fatal("panel must render while query starts with /")
 	}
-	if w := lipgloss.Width(panel); w != l.vpWidth+2 {
-		t.Fatalf("panel width %d; want composer outer width %d", w, l.vpWidth+2)
+	if w := lipgloss.Width(panel); w != drawerMaxW(c.width, l.vpWidth+2) {
+		t.Fatalf("panel width %d; want capped width %d", w, drawerMaxW(c.width, l.vpWidth+2))
 	}
-	if !strings.Contains(panel, paletteFooterHints) {
-		t.Fatalf("keymap footer missing from panel: %q", panel)
+	// Single top border line + header: title left, esc right.
+	if !strings.HasPrefix(panel, "\x1b") && !strings.Contains(panel, "─") {
+		t.Fatal("panel must open with the single top border line")
+	}
+	if !strings.Contains(panel, "Commands") || !strings.Contains(panel, "esc") {
+		t.Fatalf("header contract missing (title/esc): %q", panel)
+	}
+	// Footer contract: keymap hints left, count right.
+	if !strings.Contains(panel, "navigate") || !strings.Contains(panel, "1/11") {
+		t.Fatalf("footer contract missing (hints/count): %q", panel)
 	}
 
 	view := c.View()
-	if !strings.Contains(view, "enter run") {
+	if !strings.Contains(view, "enter select") {
 		t.Fatal("footer must be visible in the painted frame")
+	}
+	if !strings.Contains(view, "1/11") {
+		t.Fatal("footer count must be visible in the painted frame")
 	}
 }
 
@@ -352,16 +466,16 @@ func TestKickMatrixFakeServer(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	defer srv.Close()
 
-	alice := newSignalTestClient(srv, "alice") // room creator = main admin
-	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	alice := newSignalTestClient(t, srv, "alice") // room creator = main admin
+	sid, err := alice.createRoom("alice", pubkeyB64(alice.id), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	alice.key = sid
 	mk := func(u string) *signalClient {
-		c := newSignalTestClient(srv, u)
+		c := newSignalTestClient(t, srv, u)
 		c.key = sid
-		if _, _, err := c.joinRoom(u, "pubkey-"+u, ""); err != nil {
+		if _, _, err := c.joinRoom(u, pubkeyB64(c.id), ""); err != nil {
 			t.Fatal(err)
 		}
 		return c
@@ -466,16 +580,24 @@ func TestRankUsersPrefixFirst(t *testing.T) {
 		}
 		return out
 	}
-	// No query: plain dictionary order (case-insensitive).
+	// No query: plain dictionary order (case-insensitive) — the drawer then
+	// groups the display under role headers.
 	if got := strings.Join(names(""), ","); got != "alice,Bob,carol,zack" {
 		t.Fatalf("ranking = %v", got)
 	}
-	// Prefix hits float first, alphabetical inside each group.
-	if got := strings.Join(names("b"), ","); got != "Bob,alice,carol,zack" {
+	// Fuzzy rank: title matches float to the top; the GROUP label matches
+	// at 1x weight, so "b" (a letter of "Members") keeps the list visible
+	// with the title match on top — the category never vanishes the list.
+	if got := strings.Join(names("b"), ","); got != "Bob,carol,alice,zack" {
 		t.Fatalf("ranking(/b) = %v", got)
 	}
-	if got := strings.Join(names("C"), ","); got != "carol,alice,Bob,zack" {
-		t.Fatalf("ranking(/C) = %v", got)
+	// "ca" hits only carol's title (the other names have no ca run).
+	if got := strings.Join(names("ca"), ","); got != "carol" {
+		t.Fatalf("ranking(/ca) = %v", got)
+	}
+	// "zz" matches neither titles nor group labels: the list vanishes.
+	if got := strings.Join(names("zz"), ","); got != "" {
+		t.Fatalf("ranking(/zz) = %v; want the empty list", got)
 	}
 }
 
@@ -644,17 +766,24 @@ func TestCommandMorphsIntoUserPicker(t *testing.T) {
 		t.Fatalf("tab morphed picker = (%q, %v)", cmd, ok)
 	}
 
-	// Members see no mod commands: "/ki" + Enter runs the top visible
-	// command and closes, never morphs.
+	// Members see no mod commands: "/ki" matches nothing, so Enter stays in
+	// the drawer on its muted "No results found" state — nothing runs,
+	// nothing morphs (fzf semantics: non-matches vanish from the list).
 	mem := newPaletteScreen()
 	mem, _ = typeKeys(mem, "/ki")
 	m3, _ := mem.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	mem = m3.(chatScreen)
-	if mem.palette.visible() {
-		t.Fatal("member enter must close the drawer (command ran)")
+	if !mem.palette.visible() {
+		t.Fatal("enter on an unmatched query must keep the drawer open")
 	}
 	if _, _, ok := mem.paletteUsers(); ok {
 		t.Fatal("member must never enter user mode")
+	}
+	// Esc still dismisses the unmatched drawer.
+	m4, _ := mem.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	mem4 := m4.(chatScreen)
+	if mem4.palette.visible() {
+		t.Fatal("esc must dismiss the unmatched drawer")
 	}
 }
 
@@ -683,15 +812,15 @@ func TestKickAdminDispatchAndClient(t *testing.T) {
 	srv := httptest.NewServer(newFakeSignalServer())
 	defer srv.Close()
 
-	alice := newSignalTestClient(srv, "alice")
-	sid, err := alice.createRoom("alice", "pubkey-alice", "")
+	alice := newSignalTestClient(t, srv, "alice")
+	sid, err := alice.createRoom("alice", pubkeyB64(alice.id), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	alice.key = sid
-	bob := newSignalTestClient(srv, "bob")
+	bob := newSignalTestClient(t, srv, "bob")
 	bob.key = sid
-	if _, _, err := bob.joinRoom("bob", "pubkey-bob", ""); err != nil {
+	if _, _, err := bob.joinRoom("bob", pubkeyB64(bob.id), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -879,4 +1008,476 @@ func TestPaletteWindowShortListNeverScrolls(t *testing.T) {
 	if p.off != 0 || p.sel < 0 || p.sel >= n {
 		t.Fatalf("sel=%d off=%d out of range", p.sel, p.off)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Home / End / page moves: jump (no wrap — only the arrows wrap) and clamp at
+// the ends; the view centres the window on the destination afterwards.
+// ---------------------------------------------------------------------------
+
+func TestPaletteHomeEndPageMoves(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/")
+	const n = 11 // member-visible commands (14 registered minus 3 moderation)
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyEnd})
+	if c.palette.sel != n-1 {
+		t.Fatalf("End: sel=%d; want %d", c.palette.sel, n-1)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyHome})
+	if c.palette.sel != 0 {
+		t.Fatalf("Home: sel=%d; want 0", c.palette.sel)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgDown}) // +10 → clamped at the end
+	if c.palette.sel != n-1 {
+		t.Fatalf("PgDown: sel=%d; want clamped %d", c.palette.sel, n-1)
+	}
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyPgUp}) // −10 → clamped at the top
+	if c.palette.sel != 0 {
+		t.Fatalf("PgUp: sel=%d; want clamped 0", c.palette.sel)
+	}
+	// State-level: the page step is ±10 with clamp, Home/End are exact.
+	var p paletteState
+	p.open = true
+	p.movePage(50, 10)
+	if p.sel != 10 {
+		t.Fatalf("movePage(+10): sel=%d; want 10", p.sel)
+	}
+	p.movePage(50, -100)
+	if p.sel != 0 {
+		t.Fatalf("movePage clamp low: sel=%d; want 0", p.sel)
+	}
+	p.moveEnd(50)
+	if p.sel != 49 {
+		t.Fatalf("moveEnd: sel=%d; want 49", p.sel)
+	}
+	p.moveHome(50)
+	if p.sel != 0 {
+		t.Fatalf("moveHome: sel=%d; want 0", p.sel)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Window settling + centering on grouped plans (headers shift display rows).
+// ---------------------------------------------------------------------------
+
+func TestDrawerWindowSettleAndCenterGrouped(t *testing.T) {
+	// plan rows: H G1(0) i0(1) i1(2) blank(3) H G2(4) i2(5) i3(6)
+	plan := buildDrawerPlan(4, true, func(i int) string {
+		if i < 2 {
+			return "G1"
+		}
+		return "G2"
+	}, 2)
+	if plan.pos[0] != 1 || plan.pos[1] != 2 || plan.pos[2] != 5 || plan.pos[3] != 6 {
+		t.Fatalf("pos = %v; want [1 2 5 6]", plan.pos)
+	}
+	// settle: sel on the last item (row 6), window 2 → first visible item
+	// is the one at row ≥ 6-2+1 = 5 → i2.
+	sel, off := 3, 0
+	settleDrawerWindow(&sel, &off, plan)
+	if off != 2 {
+		t.Fatalf("settle: off=%d; want 2 (i2 at row 5)", off)
+	}
+	if sel != 3 {
+		t.Fatalf("settle must not move sel: %d", sel)
+	}
+	// center: same destination for a 2-row window.
+	sel, off = 3, 0
+	centerDrawerWindow(&sel, &off, plan)
+	if off != 2 {
+		t.Fatalf("center: off=%d; want 2", off)
+	}
+	// The windowed painter keeps the group heading with its first item:
+	// off=1 (i1 at row 2) pulls the window back over the G1 header only
+	// when it is the row directly above; here row 1 is i0, so no pull.
+	rows, below, above := windowDrawerPlan(plan, 1, 1)
+	if len(rows) != 1 || rows[0].kind != drItem || rows[0].item != 1 {
+		t.Fatalf("window(off=1) = %+v; want the single i1 row (blank clipped)", rows)
+	}
+	if below != 4 || above != 2 {
+		t.Fatalf("window(off=1): below=%d above=%d; want 4/2", below, above)
+	}
+	// off on the FIRST item pulls the G1 header into the window.
+	rows, _, _ = windowDrawerPlan(plan, 0, 0)
+	if len(rows) != 2 || rows[0].kind != drHeader || rows[0].text != "G1" || rows[1].item != 0 {
+		t.Fatalf("window(off=0) = %+v; want G1 header + i0", rows)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Grouped headers (Bold accent + blank separators) while the query is empty;
+// flattened to a single ranked list while filtering.
+// ---------------------------------------------------------------------------
+
+func TestPaletteGroupedHeadersFlattenOnFilter(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/") // empty payload: grouped
+	l := c.layoutFor()
+	panel := c.paletteView(l.vpWidth + 2)
+	for _, hdr := range []string{"Voice", "Files"} {
+		if !strings.Contains(panel, hdr) {
+			t.Fatalf("group header %q missing from the empty-query panel: %q", hdr, panel)
+		}
+	}
+	// Blank-line separators BETWEEN groups (never rule lines): at least one
+	// fully-blank painted row.
+	blankRow := false
+	for _, ln := range strings.Split(panel, "\n") {
+		if strings.TrimSpace(stripANSI(ln)) == "" {
+			blankRow = true
+			break
+		}
+	}
+	if !blankRow {
+		t.Fatal("blank-line separators must separate groups (never rule lines)")
+	}
+
+	c2 := newPaletteScreen()
+	c2, _ = typeKeys(c2, "/au") // filtering: flatten
+	p2 := c2.paletteView(c2.layoutFor().vpWidth + 2)
+	for _, gone := range []string{"Voice", "Files", "General", "Settings"} {
+		if strings.Contains(p2, gone) {
+			t.Fatalf("filtering must flatten the groups (header %q still painted): %q", gone, p2)
+		}
+	}
+	if !strings.Contains(p2, "/audio") {
+		t.Fatalf("/au must rank /audio into the flattened list: %q", p2)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Empty state: muted "No results found", budgeted, never flashing.
+// ---------------------------------------------------------------------------
+
+func TestPaletteEmptyStateNoResults(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/zz")
+	if c.paletteRows() == 0 {
+		t.Fatal("the empty state must still reserve drawer rows")
+	}
+	panel := c.paletteView(c.layoutFor().vpWidth + 2)
+	if !strings.Contains(panel, "No results found") {
+		t.Fatalf("empty state row missing: %q", panel)
+	}
+	// Enter swallows (OpenCode: nothing selected, drawer stays open)…
+	got, cmd := step(c, tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || !got.palette.visible() {
+		t.Fatal("enter on an unmatched query must keep the drawer open, no action")
+	}
+	// …Esc dismisses.
+	got2, _ := step(got, tea.KeyMsg{Type: tea.KeyEsc})
+	if got2.palette.visible() {
+		t.Fatal("esc must dismiss the empty drawer")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Selection resets to the top on EVERY filter change (live sync), never on
+// cursor moves.
+// ---------------------------------------------------------------------------
+
+func TestPaletteSelectionResetsOnFilterChange(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/")
+	c, _ = step(c, tea.KeyMsg{Type: tea.KeyDown})
+	if c.palette.sel != 1 {
+		t.Fatalf("precondition: sel=1, got %d", c.palette.sel)
+	}
+	c, _ = typeKeys(c, "h") // filter change
+	if c.palette.sel != 0 {
+		t.Fatal("typing must reset the selection to the top")
+	}
+
+	// Mention mirror: same contract on the "@" dropdown.
+	dm := *newFilterScreen("bob", "", "alice", "carol", "dave")
+	dm, _ = typeKeys(dm, "@")
+	dm, _ = step(dm, tea.KeyMsg{Type: tea.KeyDown})
+	if dm.mention.sel != 1 {
+		t.Fatalf("precondition: mention sel=1, got %d", dm.mention.sel)
+	}
+	dm, _ = typeKeys(dm, "ca")
+	if dm.mention.sel != 0 {
+		t.Fatal("typing a mention fragment must reset the selection to the top")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Matched-char highlight: precomputed byte offsets, merged spans, the
+// accent on unselected rows and the bar's ink on the selected one, skipped
+// below 30 cells of width.
+// ---------------------------------------------------------------------------
+
+func TestPaletteMatchSpansAndHighlight(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256) // SGR sequences needed to assert spans
+	defer lipgloss.SetColorProfile(prev)
+
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/he")
+	ranked := c.rankedCommands("/he")
+	if len(ranked) == 0 || ranked[0].Name != "/help" {
+		t.Fatalf("/he must rank /help first, got %+v", ranked)
+	}
+	hits := c.commandHits(ranked, palettePayload("/he"))
+	if len(hits[0].matches) != 2 || hits[0].matches[0] != 1 || hits[0].matches[1] != 2 {
+		t.Fatalf("match spans = %v; want [1 2] (byte offsets into \"/help\")", hits[0].matches)
+	}
+
+	// Contiguous run: "he" becomes ONE styled span (one accent seq).
+	row := highlightMatches("/help", hits[0].matches, false, 60)
+	seq := styleSeq(tuiPaletteMatchStyle)
+	if seq == "" || strings.Count(row, seq) != 1 {
+		t.Fatalf("contiguous matches must merge into a single span: %q", row)
+	}
+	// Selected rows wear the bar's ink instead of the accent.
+	sel := highlightMatches("/help", hits[0].matches, true, 60)
+	if selSeq := styleSeq(tuiPaletteMatchSelStyle); !strings.Contains(sel, selSeq) {
+		t.Fatalf("selected match must use the bar ink: %q", sel)
+	}
+	// Skipped entirely below 30 cells.
+	if plain := highlightMatches("/help", hits[0].matches, false, 20); plain != "/help" {
+		t.Fatal("highlight must be skipped when the slot is narrower than 30 cells")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Cursor bar: ONE style per state, reused by every picker — the selected
+// row spans edge to edge with the bar style, unselected rows stay plain.
+// ---------------------------------------------------------------------------
+
+func TestPaletteCursorBarStyleIdentity(t *testing.T) {
+	prev := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.ANSI256) // SGR sequences needed to assert the bar
+	defer lipgloss.SetColorProfile(prev)
+
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/")
+	l := c.layoutFor()
+	panel := c.paletteView(l.vpWidth + 2)
+	inner := drawerMaxW(c.width, l.vpWidth+2)
+	bar := styleSeq(tuiPaletteSelStyle)
+	if bar == "" {
+		t.Fatal("cursor-bar style must emit an SGR sequence")
+	}
+	lines := strings.Split(panel, "\n")
+	foundSel, foundPlain := 0, 0
+	for _, ln := range lines {
+		plain := stripANSI(ln)
+		if strings.HasPrefix(plain, "/audio") {
+			if strings.Contains(ln, bar) {
+				foundSel++
+				if w := lipgloss.Width(ln); w != inner {
+					t.Fatalf("the cursor bar must span the full row width: %d != %d", w, inner)
+				}
+			} else {
+				foundPlain++
+			}
+		}
+	}
+	if foundSel != 1 || foundPlain != 0 {
+		t.Fatalf("exactly the selected row must wear the bar (sel=%d): sel=%d plain=%d", c.palette.sel, foundSel, foundPlain)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Geometry caps: min(rows, termH/2-6, 10) rows, min(termW-2, 80) width.
+// ---------------------------------------------------------------------------
+
+func TestDrawerGeometryCaps(t *testing.T) {
+	// Width: composer column, capped at termW-2 and at 80, floored at 6.
+	for _, tc := range []struct{ termW, colW, want int }{
+		{80, 56, 56},
+		{40, 38, 38},
+		{120, 120, 80},
+		{200, 140, 80},
+		{30, 28, 28},
+		{20, 20, 18},
+		{10, 10, 8},
+		{0, 56, 6},
+	} {
+		if got := drawerMaxW(tc.termW, tc.colW); got != tc.want {
+			t.Errorf("drawerMaxW(%d, %d) = %d; want %d", tc.termW, tc.colW, got, tc.want)
+		}
+	}
+	// Height: min(10, termH/2-6), floored at 1.
+	for _, tc := range []struct{ termH, want int }{
+		{24, 6}, {40, 10}, {50, 10}, {10, 1}, {8, 1}, {0, 1},
+	} {
+		if got := drawerMaxRows(tc.termH); got != tc.want {
+			t.Errorf("drawerMaxRows(%d) = %d; want %d", tc.termH, got, tc.want)
+		}
+	}
+
+	// The full frame stays inside an 80x24 terminal with the drawer open.
+	c := newFilterScreen("bob", "", "bob", "alice")
+	c.vp = *viewportPtr(80, 24)
+	m, _ := c.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	sc := m.(chatScreen)
+	sc.input.SetValue("/")
+	ensurePaletteOpen(&sc)
+	view := sc.View()
+	if rows := strings.Count(view, "\n") + 1; rows > 24 {
+		t.Fatalf("80x24: drawer frame painted %d rows", rows)
+	}
+	if mw := maxLineWidth(view); mw > 80 {
+		t.Fatalf("80x24: widest row %d exceeds the terminal", mw)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Mouse + keyboard parity: click selects, hover follows after a one-tick
+// lock post filter-change, wheel steps with wrap, Ctrl+C dismisses, and the
+// input mode is tracked.
+// ---------------------------------------------------------------------------
+
+func TestPaletteMouseParity(t *testing.T) {
+	c := newPaletteScreen()
+	c, _ = typeKeys(c, "/")
+	l := c.layoutFor()
+	x := transcriptX0(l) + 2
+	// Real item rows from the SAME plan the painter and the hit-test use
+	// (the grouped display interleaves headers, so rows are not 2+i).
+	itemRows := func(cc *chatScreen) []int {
+		y0, _ := cc.drawerYRange(l)
+		var ys []int
+		for i, r := range cc.palettePanelRows() {
+			if r.kind == drItem {
+				ys = append(ys, y0+i)
+			}
+		}
+		return ys
+	}
+	ys := itemRows(&c)
+	if len(ys) < 2 {
+		t.Fatalf("expected several item rows, got %v", ys)
+	}
+
+	// Click selects the row (Enter/Tab still activate).
+	c.handleMouse(mouseAt(x, ys[0]))
+	if c.palette.sel != 0 {
+		t.Fatalf("click first item: sel=%d; want 0", c.palette.sel)
+	}
+	c.handleMouse(mouseAt(x, ys[1]))
+	if c.palette.sel != 1 {
+		t.Fatalf("click second item: sel=%d; want 1", c.palette.sel)
+	}
+	// A click on the chrome (header row) is consumed, selection untouched.
+	y0, _ := c.drawerYRange(l)
+	c.handleMouse(mouseAt(x, y0+1))
+	if c.palette.sel != 1 {
+		t.Fatalf("chrome click must not move the selection: sel=%d", c.palette.sel)
+	}
+	if !c.mouseActive {
+		t.Fatal("inputMode tracking: mouse events must mark the mouse as active")
+	}
+
+	// Hover follows — but the FIRST motion after a filter change is ignored.
+	c2 := newPaletteScreen()
+	c2, _ = typeKeys(c2, "/") // filter change → hover lock 1
+	if c2.drawerHoverLock != 1 {
+		t.Fatalf("filter change must arm the one-tick hover lock, got %d", c2.drawerHoverLock)
+	}
+	hover := func(y int) {
+		c2.handleMouse(tea.MouseMsg{Action: tea.MouseActionMotion, Type: tea.MouseMotion, X: x, Y: y})
+	}
+	ys2 := itemRows(&c2)
+	// The display is group-major, so the RANKED index of the hovered row is
+	// not its display position — resolve it from the same panel plan.
+	want := func(cc *chatScreen, row int) int {
+		y0, _ := cc.drawerYRange(l)
+		for i, r := range cc.palettePanelRows() {
+			if y0+i == row && r.kind == drItem {
+				return r.item
+			}
+		}
+		return -1
+	}
+	hover(ys2[2])
+	if c2.palette.sel != 0 {
+		t.Fatal("hover must be ignored 1 tick after a filter change")
+	}
+	if c2.drawerHoverLock != 0 {
+		t.Fatal("the ignored motion must consume the lock")
+	}
+	hover(ys2[2])
+	if c2.palette.sel != want(&c2, ys2[2]) {
+		t.Fatalf("hover after the lock must select the hovered row: sel=%d; want %d", c2.palette.sel, want(&c2, ys2[2]))
+	}
+
+	// Wheel over the drawer steps the selection (arrow parity, wrap).
+	c3 := newPaletteScreen()
+	c3, _ = typeKeys(c3, "/")
+	c3.handleMouse(tea.MouseMsg{Type: tea.MouseWheelDown, X: x, Y: itemRows(&c3)[0]})
+	if c3.palette.sel != 1 {
+		t.Fatalf("wheel down: sel=%d; want 1", c3.palette.sel)
+	}
+
+	// Ctrl+C dismisses the drawer — the app never quits mid-pick.
+	got, cmd := step(c3, tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd != nil {
+		t.Fatal("ctrl+c on an open drawer must not quit the session")
+	}
+	if got.palette.visible() {
+		t.Fatal("ctrl+c must dismiss the drawer")
+	}
+	// Ctrl+C with the file browser open dismisses it too.
+	p := newPaletteScreen()
+	p.openPicker()
+	got2, cmd2 := step(p, tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd2 != nil || got2.picker.isActive() {
+		t.Fatal("ctrl+c must dismiss the file browser, not quit")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzy rank on the member stage + the role-grouped plan.
+// ---------------------------------------------------------------------------
+
+func TestUsersPlanGroupsByRole(t *testing.T) {
+	users := []rosterMember{
+		{Username: "bob", Role: "admin"},
+		{Username: "carol"},
+		{Username: "alice", Role: "creator"},
+	}
+	plan := usersPlan(users, 10, true)
+	var kinds []string
+	var items []int
+	for _, r := range plan.rows {
+		switch r.kind {
+		case drHeader:
+			kinds = append(kinds, "H:"+r.text)
+		case drBlank:
+			kinds = append(kinds, "B")
+		case drItem:
+			kinds = append(kinds, "I")
+			items = append(items, r.item)
+		default:
+			kinds = append(kinds, "?")
+		}
+	}
+	want := []string{"H:Admins", "I", "I", "B", "H:Members", "I"}
+	if strings.Join(kinds, ",") != strings.Join(want, ",") {
+		t.Fatalf("plan = %v; want %v", kinds, want)
+	}
+	if strings.Join(itos(items), ",") != "0,2,1" {
+		t.Fatalf("items = %v; want 0,2,1 (ranked order inside each group)", items)
+	}
+	if plan.pos[0] != 1 || plan.pos[1] != 5 || plan.pos[2] != 2 {
+		t.Fatalf("pos = %v; want [1 5 2]", plan.pos)
+	}
+	// Flattened while filtering: no headers at all.
+	flat := usersPlan(users, 10, false)
+	for _, r := range flat.rows {
+		if r.kind == drHeader || r.kind == drBlank {
+			t.Fatal("filtering must flatten the member list")
+		}
+	}
+}
+
+func itos(in []int) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = fmt.Sprintf("%d", v)
+	}
+	return out
 }

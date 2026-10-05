@@ -159,9 +159,11 @@ func TestPollAdoptsRosterImmediately(t *testing.T) {
 	c.vp = *viewportPtr(40, 10)
 	wireTestEngine(t, c, srv, "bob")
 
-	// A peer joins server-side between beats.
-	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
-	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(make([]byte, 32)), ""); err != nil {
+	// A peer joins server-side between beats (with a REAL device key: the
+	// leave below must verify against the roster-anchored pubkey).
+	aliceID := mustTestIdentity(t)
+	joiner := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: aliceID}
+	if _, _, err := joiner.joinRoom("alice", base64.StdEncoding.EncodeToString(aliceID.publicKey()), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -173,7 +175,7 @@ func TestPollAdoptsRosterImmediately(t *testing.T) {
 	}
 
 	// Everyone else leaves — roster must SHRINK too (no ghost users).
-	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice"}
+	leaver := &signalClient{serverURL: srv.URL, key: "123456", me: "alice", id: aliceID}
 	if err := leaver.leaveRoom(); err != nil {
 		t.Fatal(err)
 	}
