@@ -21,6 +21,9 @@ src/components/      FilePreview, SyntaxHighlighter (React)
 src/lib/             Backend libraries (auth/rooms/redis/r2/crypto/quota/mongo/env/utils/crc64)
 server/              SHELVED Go WebSocket relay (own module) — not deployed
 tests/               Web/E2E test suites + manual probes (see tests/README.md)
+deploy/              EC2 runbook + systemd daily-cleanup timer units
+Dockerfile, docker-compose.yml, Caddyfile, .dockerignore
+                     Root-level EC2 deployment files (image, compose, proxy)
 .github/workflows/  ci.yml, release.yml
 docs/                Documentatio.md (this project manual) + FILEMAP.md (this file)
 ```
@@ -169,7 +172,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `tests/web/redis.test.ts` | 167 | MockRedis semantics + prod gating (vitest). |
 - `tests/web/rooms.test.ts` | 321 | Rooms plane integration (CRUD, heartbeat, signals) (vitest). |
 - `tests/web/run_tests.ts` | 54 | node:test runner for crypto/crc64/redis-mock parity. |
-- Root web config: `package.json` (Next.js app; deps: aws-sdk×2, upstash/redis, hash-wasm, highlight.js, mongodb, next, qrcode, react×2; dev: tailwind, vitest, types, eslint), `tsconfig.json`, `next.config.ts` (security headers/CSP), `postcss.config.mjs`, `vercel.json` (region/timeouts/cleanup cron), `eslint.config.mjs`.
+- Root web config: `package.json` (Next.js app; deps: aws-sdk×2, upstash/redis, hash-wasm, highlight.js, mongodb, next, qrcode, react×2; dev: tailwind, vitest, types, eslint), `tsconfig.json`, `next.config.ts` (security headers/CSP + `output: "standalone"` for the self-hosted image), `postcss.config.mjs`, `vercel.json` (region/timeouts/cleanup cron — retired-fallback config), `eslint.config.mjs`.
 
 ## 8. Shelved server + infra + tooling
 
@@ -188,4 +191,10 @@ Video calling is fully removed on this branch. Audio-only.
 - `tests/e2e/` | `e2e_phase0.sh` (transfer matrix), `session_flow_test.sh` (signaling lifecycle), `chat_two_clients.sh` (two-client chat) — need a live server + built CLI; `make e2e`. |
 - `tests/probes/` | `probe_r2.ts`, `test_quota.ts` — manual debug probes (not run by CI; need `.env`/live server). |
 - `tests/README.md` | Layout, runner mapping, exact commands, why Go tests stay colocated. |
-- `DEPLOY.md`, `.env.example`, `.gitignore` | Deploy guide, env template, ignores (node, `.next`, Go binaries, `.env*`, `uploads_dev`). |
+- `Dockerfile` | Multi-stage `node:20-alpine` build → standalone runtime, non-root user, `HEALTHCHECK` on `/api/v1/speedtest`, honors `PORT`/`HOSTNAME`. |
+- `docker-compose.yml` | `app` (build ., env_file `.env`, `127.0.0.1:3000:3000`) + `caddy` (caddy:2-alpine, :80/:443, Caddyfile + data/config volumes). No Redis container — Upstash stays managed. |
+- `Caddyfile` | `http://` site → `reverse_proxy app:3000` with forged-proof `X-Forwarded-For`/`X-Forwarded-Proto`; commented domain block for later auto-TLS. |
+- `.dockerignore` | Keeps secrets (`/.env*` except `.example`), node_modules/.next/.git, CLI artifacts and dev uploads out of the build context. |
+- `deploy/README.md` | Full EC2 runbook: AL2023 Docker install, env sourcing table, build/up, smoke tests (speedtest, session create/join, share round-trip), cleanup timer install, Atlas/EIP notes, updates, domain cutover, rollback, free-tier costs. |
+- `deploy/uplink-cleanup.service` / `.timer` | systemd oneshot + daily 03:00 UTC timer (Persistent, randomized) hitting `127.0.0.1:3000/api/v1/session/cleanup` with the `CRON_SECRET` bearer — replaces the Vercel cron. |
+- `.env.example`, `.gitignore` | Env template (EC2 vars: `TRUST_PROXY=true`, `HOSTNAME`, `PORT`, `APP_URL`, `CRON_SECRET` note), ignores (node, `.next`, Go binaries, `.env*`, `uploads_dev`). |

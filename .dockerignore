@@ -1,0 +1,36 @@
+# Keep the build context small and secret-free.
+.git
+.github
+node_modules
+.next
+out
+coverage
+uploads_dev
+
+# Environment files — never ship secrets into the image context.
+.env
+.env.*
+!.env.example
+
+# CLI build artifacts (Go binaries are never committed, but be explicit).
+cli/uplink
+cli/cli
+cli/build/
+server/server
+*.test
+*.out
+
+# Docs / tooling not needed by the web build.
+docs
+deploy
+tests
+server
+tsconfig.tsbuildinfo
+Implementation_plan.txt
+Makefile
+install.sh
+install.ps1
+.goreleaser.yaml
+docker-compose.yml
+Caddyfile
+*.md

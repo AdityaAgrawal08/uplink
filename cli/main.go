@@ -195,7 +195,7 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("  receive     Download a file or directory")
 	fmt.Println("              uplink receive 4827165038")
-	fmt.Println("              uplink receive https://uplink-delta-xi.vercel.app/share/...")
+	fmt.Println("              uplink receive http://52.7.217.135:3000/share/...")
 	fmt.Println()
 	fmt.Println("  config           Manage configuration (~/.uplink/config.json)")
 	fmt.Println("                   uplink config ls | get <key> | set <key> <val>")
@@ -303,9 +303,13 @@ func sanitizeServerUrl(serverUrl string) string {
 		}
 		host := parsed.Hostname()
 		ip := net.ParseIP(host)
-		isPrivate := ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast())
+		// Explicit IP literals (e.g. a bare EC2 address before a domain
+		// exists) are honored as plain HTTP: the operator chose the scheme.
+		// Only named hosts are force-upgraded — localhost / private /
+		// link-local IPs and internal domains were already exempt.
+		isIPLiteral := ip != nil
 		isInternalDomain := host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal")
-		if !isPrivate && !isInternalDomain {
+		if !isIPLiteral && !isInternalDomain {
 			fmt.Println("Warning: Upgrading insecure HTTP to HTTPS")
 			serverUrl = "https://" + strings.TrimPrefix(serverUrl, "http://")
 		}
