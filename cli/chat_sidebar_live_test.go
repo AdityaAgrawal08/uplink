@@ -46,19 +46,33 @@ func inList(list []string, s string) bool {
 }
 
 // drainEndEvent pumps the screen's wire channel like drainNetCmd does and
-// feeds every message into Update until the first netErrMsg lands (the
-// earlier seeding beats push netRosterMsg ahead of the end event). Returns
-// the settled rootModel.
+// feeds every message into Update until the group-end event actually
+// LANDS — the netErrMsg the beat's rejoin-classification pushes when a
+// dissolved room answers 404 (emitEndedOnce). The seeding beats push
+// netRosterMsg ahead of it, and a transient channel-open failure can
+// interleave FIRST (a beat that learned a peer before the prune can land
+// its note after it, surfacing a raw 401), so stopping at the first
+// netErrMsg would return before the row dropped. Returns the settled
+// rootModel.
 func drainEndEvent(t *testing.T, r rootModel) rootModel {
 	t.Helper()
-	for {
+	for i := 0; i < 1000; i++ {
 		msg := <-r.chat.netCh
 		rn, _ := r.Update(msg)
 		r = rn.(rootModel)
-		if _, ok := msg.(netErrMsg); ok {
+		em, ok := msg.(netErrMsg)
+		if !ok {
+			continue
+		}
+		if em.key == r.chat.key {
+			continue // home-session errors never end a group
+		}
+		if _, ok := groupEndEvent(em.err); ok {
 			return r
 		}
 	}
+	t.Fatal("drainEndEvent: group-end event never landed")
+	return r
 }
 
 // TestSidebarLiveUserJoinLeave drives the REAL join/leave cadence: a peer
