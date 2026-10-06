@@ -1028,23 +1028,28 @@ func newChatScreen(serverURL, key, me string, id *identityKey, password string) 
 // routes background traffic. No media: calls are home-session-only.
 func (c *chatScreen) newSessionEngine(sig *signalClient) *engine {
 	key := sig.key
+	// Capture the shared queue ONCE: these callbacks outlive the model value
+	// this constructor was called on (the beat loop holds them while Update
+	// reassigns the root model), so reading c.netCh per call would race the
+	// owner. The channel value never changes after construction.
+	netCh := c.netCh
 	push := func(m tea.Msg) {
 		if _, ok := m.(netChatMsg); !ok {
-			if tryEnqueue(c.netCh, m) {
+			if tryEnqueue(netCh, m) {
 				return
 			}
 			select {
-			case c.netCh <- m:
+			case netCh <- m:
 			default:
 			}
 			return
 		}
-		tryEnqueue(c.netCh, m)
+		tryEnqueue(netCh, m)
 	}
 	var eng *engine
 	eng = newEngine(c.me, c.id, sig, engineCallbacks{
 		onChat: func(ch engineChat) {
-			if tryEnqueue(c.netCh, netChatMsg{key: key, chat: ch}) {
+			if tryEnqueue(netCh, netChatMsg{key: key, chat: ch}) {
 				_ = eng.sendAck(ch.From, ch.MsgId)
 			}
 		},
