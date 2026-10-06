@@ -3,6 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
+    "graph:gen": "node scripts/gengraph.mjs",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",

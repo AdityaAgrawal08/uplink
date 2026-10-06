@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 export default function Home() {
   return (
     <div className="container">
@@ -12,6 +14,12 @@ export default function Home() {
       <pre className="code-block">
         uplink send &lt;filepath-or-directory&gt;
       </pre>
+      <h2>Code Graph</h2>
+      <p>
+        <Link className="btn-secondary" href="/graph">
+          Explore the code dependency graph →
+        </Link>
+      </p>
     </div>
   );
 }

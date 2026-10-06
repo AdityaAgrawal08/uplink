@@ -20,6 +20,8 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 # Env validation runs at request time, not build time; no secrets baked in.
+# Generate public/graph.json (served by /graph) before the Next build.
+RUN npm run graph:gen
 RUN npm run build
 
 # ── Stage 3: runner — minimal runtime, non-root ─────────────────────────────
@@ -34,11 +36,12 @@ ENV NODE_ENV=production \
 RUN addgroup --system --gid 1001 nodejs \
     && adduser --system --uid 1001 --ingroup nodejs nextjs
 
-# Standalone bundle ships its own node_modules subset; static assets sit
-# outside it and must be copied alongside. (No public/ dir in this repo —
-# add a COPY line here if one is ever introduced.)
+# Standalone bundle ships its own node_modules subset; static assets and the
+# generated public/ (graph.json for /graph) sit outside it and must be copied
+# alongside.
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
 COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
 
 USER nextjs
 EXPOSE 3000

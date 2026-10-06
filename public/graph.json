@@ -1,0 +1,1128 @@
+{
+  "nodes": [
+    {
+      "id": "cli/chat.go",
+      "label": "chat.go",
+      "group": "cli",
+      "size": 187
+    },
+    {
+      "id": "cli/chat_commands.go",
+      "label": "chat_commands.go",
+      "group": "cli",
+      "size": 1407
+    },
+    {
+      "id": "cli/chat_download.go",
+      "label": "chat_download.go",
+      "group": "cli",
+      "size": 71
+    },
+    {
+      "id": "cli/chat_drawer.go",
+      "label": "chat_drawer.go",
+      "group": "cli",
+      "size": 871
+    },
+    {
+      "id": "cli/chat_filecard.go",
+      "label": "chat_filecard.go",
+      "group": "cli",
+      "size": 207
+    },
+    {
+      "id": "cli/chat_markdown.go",
+      "label": "chat_markdown.go",
+      "group": "cli",
+      "size": 100
+    },
+    {
+      "id": "cli/chat_mention.go",
+      "label": "chat_mention.go",
+      "group": "cli",
+      "size": 313
+    },
+    {
+      "id": "cli/chat_picker.go",
+      "label": "chat_picker.go",
+      "group": "cli",
+      "size": 1255
+    },
+    {
+      "id": "cli/chat_theme.go",
+      "label": "chat_theme.go",
+      "group": "cli",
+      "size": 768
+    },
+    {
+      "id": "cli/chat_tui.go",
+      "label": "chat_tui.go",
+      "group": "cli",
+      "size": 6042
+    },
+    {
+      "id": "cli/chat_upload.go",
+      "label": "chat_upload.go",
+      "group": "cli",
+      "size": 322
+    },
+    {
+      "id": "cli/clipboard.go",
+      "label": "clipboard.go",
+      "group": "cli",
+      "size": 11
+    },
+    {
+      "id": "cli/config.go",
+      "label": "config.go",
+      "group": "cli",
+      "size": 106
+    },
+    {
+      "id": "cli/config_cmd.go",
+      "label": "config_cmd.go",
+      "group": "cli",
+      "size": 175
+    },
+    {
+      "id": "cli/download.go",
+      "label": "download.go",
+      "group": "cli",
+      "size": 210
+    },
+    {
+      "id": "cli/encrypt.go",
+      "label": "encrypt.go",
+      "group": "cli",
+      "size": 224
+    },
+    {
+      "id": "cli/groups.go",
+      "label": "groups.go",
+      "group": "cli",
+      "size": 371
+    },
+    {
+      "id": "cli/groups_store.go",
+      "label": "groups_store.go",
+      "group": "cli",
+      "size": 156
+    },
+    {
+      "id": "cli/groups_ui.go",
+      "label": "groups_ui.go",
+      "group": "cli",
+      "size": 2681
+    },
+    {
+      "id": "cli/lan/discovery.go",
+      "label": "discovery.go",
+      "group": "lan",
+      "size": 119
+    },
+    {
+      "id": "cli/lan/server.go",
+      "label": "server.go",
+      "group": "lan",
+      "size": 191
+    },
+    {
+      "id": "cli/lan/tls.go",
+      "label": "tls.go",
+      "group": "lan",
+      "size": 60
+    },
+    {
+      "id": "cli/lan/transfer.go",
+      "label": "transfer.go",
+      "group": "lan",
+      "size": 171
+    },
+    {
+      "id": "cli/landing.go",
+      "label": "landing.go",
+      "group": "cli",
+      "size": 957
+    },
+    {
+      "id": "cli/main.go",
+      "label": "main.go",
+      "group": "cli",
+      "size": 1708
+    },
+    {
+      "id": "cli/media_audio.go",
+      "label": "media_audio.go",
+      "group": "cli",
+      "size": 635
+    },
+    {
+      "id": "cli/media_audio_alsa.go",
+      "label": "media_audio_alsa.go",
+      "group": "cli",
+      "size": 91
+    },
+    {
+      "id": "cli/media_audio_noalsa.go",
+      "label": "media_audio_noalsa.go",
+      "group": "cli",
+      "size": 11
+    },
+    {
+      "id": "cli/media_call.go",
+      "label": "media_call.go",
+      "group": "cli",
+      "size": 1574
+    },
+    {
+      "id": "cli/media_codec.go",
+      "label": "media_codec.go",
+      "group": "cli",
+      "size": 61
+    },
+    {
+      "id": "cli/media_jitter.go",
+      "label": "media_jitter.go",
+      "group": "cli",
+      "size": 127
+    },
+    {
+      "id": "cli/media_transport.go",
+      "label": "media_transport.go",
+      "group": "cli",
+      "size": 755
+    },
+    {
+      "id": "cli/notify.go",
+      "label": "notify.go",
+      "group": "cli",
+      "size": 69
+    },
+    {
+      "id": "cli/p2p_box.go",
+      "label": "p2p_box.go",
+      "group": "cli",
+      "size": 99
+    },
+    {
+      "id": "cli/p2p_engine.go",
+      "label": "p2p_engine.go",
+      "group": "cli",
+      "size": 1748
+    },
+    {
+      "id": "cli/p2p_mesh.go",
+      "label": "p2p_mesh.go",
+      "group": "cli",
+      "size": 562
+    },
+    {
+      "id": "cli/p2p_noise.go",
+      "label": "p2p_noise.go",
+      "group": "cli",
+      "size": 211
+    },
+    {
+      "id": "cli/p2p_proto.go",
+      "label": "p2p_proto.go",
+      "group": "cli",
+      "size": 189
+    },
+    {
+      "id": "cli/p2p_signal.go",
+      "label": "p2p_signal.go",
+      "group": "cli",
+      "size": 503
+    },
+    {
+      "id": "cli/pkg/crc64/crc64.go",
+      "label": "crc64.go",
+      "group": "pkg",
+      "size": 69
+    },
+    {
+      "id": "cli/pkg/tarball/tarball.go",
+      "label": "tarball.go",
+      "group": "pkg",
+      "size": 240
+    },
+    {
+      "id": "cli/qr.go",
+      "label": "qr.go",
+      "group": "cli",
+      "size": 55
+    },
+    {
+      "id": "cli/reqsig.go",
+      "label": "reqsig.go",
+      "group": "cli",
+      "size": 285
+    },
+    {
+      "id": "cli/resume.go",
+      "label": "resume.go",
+      "group": "cli",
+      "size": 129
+    },
+    {
+      "id": "cli/session.go",
+      "label": "session.go",
+      "group": "cli",
+      "size": 307
+    },
+    {
+      "id": "cli/speed.go",
+      "label": "speed.go",
+      "group": "cli",
+      "size": 72
+    },
+    {
+      "id": "cli/version.go",
+      "label": "version.go",
+      "group": "cli",
+      "size": 483
+    },
+    {
+      "id": "cli/wan/wan.go",
+      "label": "wan.go",
+      "group": "wan",
+      "size": 327
+    },
+    {
+      "id": "src/app/api/v1/admin/quota/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 55
+    },
+    {
+      "id": "src/app/api/v1/cleanup/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 227
+    },
+    {
+      "id": "src/app/api/v1/invites/mine/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 49
+    },
+    {
+      "id": "src/app/api/v1/mock-r2-download/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 72
+    },
+    {
+      "id": "src/app/api/v1/mock-r2-upload/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 80
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/admin/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 49
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/heartbeat/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 45
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/inbox/ack/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 36
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/inbox/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 83
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 108
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/invites/decline/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 58
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/invites/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 56
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/join/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 63
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/kick/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 49
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/leave/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 34
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/meta/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 56
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/reactions/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 98
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 51
+    },
+    {
+      "id": "src/app/api/v1/session/[sessionId]/signal/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 76
+    },
+    {
+      "id": "src/app/api/v1/session/cleanup/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 33
+    },
+    {
+      "id": "src/app/api/v1/session/create/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 58
+    },
+    {
+      "id": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 211
+    },
+    {
+      "id": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 345
+    },
+    {
+      "id": "src/app/api/v1/share/[id]/parts/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 100
+    },
+    {
+      "id": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 149
+    },
+    {
+      "id": "src/app/api/v1/share/[id]/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 71
+    },
+    {
+      "id": "src/app/api/v1/share/init/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 365
+    },
+    {
+      "id": "src/app/api/v1/speedtest/route.ts",
+      "label": "route.ts",
+      "group": "app",
+      "size": 36
+    },
+    {
+      "id": "src/app/graph/page.tsx",
+      "label": "page.tsx",
+      "group": "app",
+      "size": 12
+    },
+    {
+      "id": "src/app/layout.tsx",
+      "label": "layout.tsx",
+      "group": "app",
+      "size": 33
+    },
+    {
+      "id": "src/app/page.tsx",
+      "label": "page.tsx",
+      "group": "app",
+      "size": 25
+    },
+    {
+      "id": "src/app/share/[id]/page.tsx",
+      "label": "page.tsx",
+      "group": "app",
+      "size": 60
+    },
+    {
+      "id": "src/components/CodeGraph.tsx",
+      "label": "CodeGraph.tsx",
+      "group": "components",
+      "size": 1148
+    },
+    {
+      "id": "src/components/FilePreview.tsx",
+      "label": "FilePreview.tsx",
+      "group": "components",
+      "size": 391
+    },
+    {
+      "id": "src/components/SyntaxHighlighter.tsx",
+      "label": "SyntaxHighlighter.tsx",
+      "group": "components",
+      "size": 35
+    },
+    {
+      "id": "src/lib/api-utils.ts",
+      "label": "api-utils.ts",
+      "group": "lib",
+      "size": 27
+    },
+    {
+      "id": "src/lib/auth.ts",
+      "label": "auth.ts",
+      "group": "lib",
+      "size": 25
+    },
+    {
+      "id": "src/lib/crc64.ts",
+      "label": "crc64.ts",
+      "group": "lib",
+      "size": 31
+    },
+    {
+      "id": "src/lib/crypto.ts",
+      "label": "crypto.ts",
+      "group": "lib",
+      "size": 89
+    },
+    {
+      "id": "src/lib/env.ts",
+      "label": "env.ts",
+      "group": "lib",
+      "size": 59
+    },
+    {
+      "id": "src/lib/mongodb.ts",
+      "label": "mongodb.ts",
+      "group": "lib",
+      "size": 140
+    },
+    {
+      "id": "src/lib/quota.ts",
+      "label": "quota.ts",
+      "group": "lib",
+      "size": 400
+    },
+    {
+      "id": "src/lib/r2.ts",
+      "label": "r2.ts",
+      "group": "lib",
+      "size": 384
+    },
+    {
+      "id": "src/lib/redis.ts",
+      "label": "redis.ts",
+      "group": "lib",
+      "size": 533
+    },
+    {
+      "id": "src/lib/request-signature.ts",
+      "label": "request-signature.ts",
+      "group": "lib",
+      "size": 192
+    },
+    {
+      "id": "src/lib/reservation.ts",
+      "label": "reservation.ts",
+      "group": "lib",
+      "size": 56
+    },
+    {
+      "id": "src/lib/rooms.ts",
+      "label": "rooms.ts",
+      "group": "lib",
+      "size": 1671
+    }
+  ],
+  "links": [
+    {
+      "source": "cli/chat_upload.go",
+      "target": "cli/pkg/tarball/tarball.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/lan/discovery.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/lan/server.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/lan/tls.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/lan/transfer.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/pkg/crc64/crc64.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/pkg/tarball/tarball.go"
+    },
+    {
+      "source": "cli/main.go",
+      "target": "cli/wan/wan.go"
+    },
+    {
+      "source": "src/app/api/v1/admin/quota/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/admin/quota/route.ts",
+      "target": "src/lib/auth.ts"
+    },
+    {
+      "source": "src/app/api/v1/admin/quota/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/admin/quota/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/auth.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/cleanup/route.ts",
+      "target": "src/lib/reservation.ts"
+    },
+    {
+      "source": "src/app/api/v1/invites/mine/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/invites/mine/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/invites/mine/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/invites/mine/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/mock-r2-download/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/mock-r2-upload/route.ts",
+      "target": "src/lib/crc64.ts"
+    },
+    {
+      "source": "src/app/api/v1/mock-r2-upload/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/admin/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/admin/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/admin/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/admin/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/heartbeat/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/heartbeat/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/heartbeat/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/heartbeat/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/ack/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/ack/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/ack/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/ack/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/inbox/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/accept/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/decline/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/decline/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/decline/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/decline/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/invites/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/join/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/join/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/join/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/join/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/kick/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/kick/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/kick/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/kick/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/leave/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/leave/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/leave/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/leave/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/meta/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/meta/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/meta/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/meta/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/reactions/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/reactions/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/reactions/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/reactions/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/signal/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/signal/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/signal/route.ts",
+      "target": "src/lib/request-signature.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/[sessionId]/signal/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/cleanup/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/cleanup/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/cleanup/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/create/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/create/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/create/route.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/app/api/v1/session/create/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/app/api/v1/cleanup/route.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/authorize-download/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/reservation.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/confirm/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/parts/route.ts",
+      "target": "src/lib/crc64.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/parts/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/parts/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/preview-text/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/[id]/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/app/api/v1/cleanup/route.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/quota.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/r2.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/reservation.ts"
+    },
+    {
+      "source": "src/app/api/v1/share/init/route.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/app/api/v1/speedtest/route.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/app/api/v1/speedtest/route.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/app/graph/page.tsx",
+      "target": "src/components/CodeGraph.tsx"
+    },
+    {
+      "source": "src/app/share/[id]/page.tsx",
+      "target": "src/components/FilePreview.tsx"
+    },
+    {
+      "source": "src/app/share/[id]/page.tsx",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/components/FilePreview.tsx",
+      "target": "src/components/SyntaxHighlighter.tsx"
+    },
+    {
+      "source": "src/lib/env.ts",
+      "target": "src/lib/rooms.ts"
+    },
+    {
+      "source": "src/lib/mongodb.ts",
+      "target": "src/lib/env.ts"
+    },
+    {
+      "source": "src/lib/quota.ts",
+      "target": "src/lib/mongodb.ts"
+    },
+    {
+      "source": "src/lib/r2.ts",
+      "target": "src/lib/crc64.ts"
+    },
+    {
+      "source": "src/lib/request-signature.ts",
+      "target": "src/lib/api-utils.ts"
+    },
+    {
+      "source": "src/lib/request-signature.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/lib/reservation.ts",
+      "target": "src/lib/redis.ts"
+    },
+    {
+      "source": "src/lib/rooms.ts",
+      "target": "src/lib/crypto.ts"
+    },
+    {
+      "source": "src/lib/rooms.ts",
+      "target": "src/lib/redis.ts"
+    }
+  ]
+}

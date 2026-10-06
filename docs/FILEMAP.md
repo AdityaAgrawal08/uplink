@@ -19,6 +19,9 @@ src/app/api/v1/      19 Next.js API routes (admin/cleanup/mock-r2/session/share/
 src/app/share/       Share landing + preview pages
 src/components/      FilePreview, SyntaxHighlighter (React)
 src/lib/             Backend libraries (auth/rooms/redis/r2/crypto/quota/mongo/env/utils/crc64)
+src/app/graph/       /graph — Obsidian-style code dependency graph page
+scripts/             gengraph.mjs — zero-dep graph generator → public/graph.json
+public/              Generated graph.json (npm run graph:gen; copied into the Docker image)
 server/              SHELVED Go WebSocket relay (own module) — not deployed
 tests/               Web/E2E test suites + manual probes (see tests/README.md)
 deploy/              EC2 runbook + systemd daily-cleanup timer units
@@ -154,8 +157,10 @@ Video calling is fully removed on this branch. Audio-only.
 ## 7. Web app + libraries (`src/`)
 
 - `app/layout.tsx` | 33 | Root HTML layout, fonts, metadata. | `RootLayout`
-- `app/page.tsx` | 17 | CLI-only landing + install instructions. | `Home`
+- `app/page.tsx` | 24 | CLI-only landing + install instructions + /graph link. | `Home`
+- `app/graph/page.tsx` | 12 | `/graph` route metadata + graph renderer. | `GraphPage`
 - `app/share/[id]/page.tsx` | 60 | Share metadata loader + preview renderer. | `SharePage`
+- `components/CodeGraph.tsx` | 1150 | Client-only Obsidian-style canvas: hand-rolled Coulomb/spring layout, DPR + ResizeObserver, IntersectionObserver pause, drag/zoom/pan, 1-hop hover highlight, click-to-pin side panel (file/group/LOC/imports/imported-by), search jump, group legend filters, zoom-scaled labels. | `CodeGraph`
 - `components/FilePreview.tsx` | 391 | Preview, password gate, QR code, download flow. | `FilePreview`
 - `components/SyntaxHighlighter.tsx` | 35 | Safe highlight.js code rendering. | `SyntaxHighlighter`
 - `lib/api-utils.ts` | 27 | JSON error + safe body-parse helpers. | `apiError, parseJsonBody`
@@ -172,6 +177,7 @@ Video calling is fully removed on this branch. Audio-only.
 - `tests/web/redis.test.ts` | 167 | MockRedis semantics + prod gating (vitest). |
 - `tests/web/rooms.test.ts` | 321 | Rooms plane integration (CRUD, heartbeat, signals) (vitest). |
 - `tests/web/run_tests.ts` | 54 | node:test runner for crypto/crc64/redis-mock parity. |
+- `tests/web/gengraph.test.ts` | 234 | Vitest: import parsing (Go single/block/aliased/blank/dot, TS relative/@/bare-drop), exclusion rules, grouped LOC sizes, deterministic output for scripts/gengraph.mjs. |
 - Root web config: `package.json` (Next.js app; deps: aws-sdk×2, upstash/redis, hash-wasm, highlight.js, mongodb, next, qrcode, react×2; dev: tailwind, vitest, types, eslint), `tsconfig.json`, `next.config.ts` (security headers/CSP + `output: "standalone"` for the self-hosted image), `postcss.config.mjs`, `vercel.json` (region/timeouts/cleanup cron — retired-fallback config), `eslint.config.mjs`.
 
 ## 8. Shelved server + infra + tooling
@@ -198,3 +204,12 @@ Video calling is fully removed on this branch. Audio-only.
 - `deploy/README.md` | Full EC2 runbook: AL2023 Docker install, env sourcing table, build/up, smoke tests (speedtest, session create/join, share round-trip), cleanup timer install, Atlas/EIP notes, updates, domain cutover, rollback, free-tier costs. |
 - `deploy/uplink-cleanup.service` / `.timer` | systemd oneshot + daily 03:00 UTC timer (Persistent, randomized) hitting `127.0.0.1:3000/api/v1/session/cleanup` with the `CRON_SECRET` bearer — replaces the Vercel cron. |
 - `.env.example`, `.gitignore` | Env template (EC2 vars: `TRUST_PROXY=true`, `HOSTNAME`, `PORT`, `APP_URL`, `CRON_SECRET` note), ignores (node, `.next`, Go binaries, `.env*`, `uploads_dev`). |
+
+## 9. Code dependency graph (`/graph`, branch `feature/code-graph`)
+
+- `scripts/gengraph.mjs` | 404 | Zero-dep repo scanner (`npm run graph:gen`): parses Go imports (`github.com/AdityaAgrawal08/uplink-delta/cli/...`, incl. block/aliased/blank/dot/raw-string forms) and TS/TSX imports (relative + `@/` alias), drops external-library specifiers, and emits deterministic `public/graph.json` — nodes are non-test `.go` under `cli/` plus non-test `.ts/.tsx` under `src/`; links are internal file→file edges. Node fields: `id` (repo-relative path), `label`, `group` (top-level dir), `size` (LOC). |
+- `public/graph.json` | generated | Output of `npm run graph:gen`; committed so local `npm start` serves `/graph`, regenerated inside the Docker build. Not a source of truth — regenerate after moving/adding files. |
+- `src/app/graph/page.tsx` | 12 | `/graph` route: metadata + full-viewport graph renderer. |
+- `src/components/CodeGraph.tsx` | 1150 | Client component: full-viewport dark canvas with hand-rolled force layout (Coulomb repulsion, spring links, center gravity, damping), DPR-aware, ResizeObserver sizing, IntersectionObserver pause; drag nodes, wheel zoom + pan, hover 1-hop highlight/dim, click-to-pin + side panel (path, group, LOC, imports, imported-by), Enter-to-jump search, group legend filters, LOC-scaled radii and zoom-scaled labels. No new npm dependencies. |
+- `tests/web/gengraph.test.ts` | 234 | Vitest suite for the generator: Go single/block/aliased/blank/dot imports, TS relative/`@`/bare-drop, exclusion rules, grouping/LOC, sorted deterministic output. Runs in `make test-web`/CI via the existing vitest glob. |
+
