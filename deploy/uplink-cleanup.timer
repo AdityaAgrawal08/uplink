@@ -1,0 +1,18 @@
+# Uplink-Delta — daily session cleanup timer.
+# Replaces the Vercel cron `0 3 * * *` from vercel.json (which fired in UTC).
+# Install: sudo cp deploy/uplink-cleanup.{service,timer} /etc/systemd/system/
+#          sudo systemctl daemon-reload && sudo systemctl enable --now uplink-cleanup.timer
+
+[Unit]
+Description=Daily Uplink-Delta session cleanup
+
+[Timer]
+# 03:00 UTC daily, matching the retired Vercel cron schedule.
+OnCalendar=*-*-* 03:00:00 UTC
+# Catch up once if the box was off at 03:00.
+Persistent=true
+RandomizedDelaySec=300
+Unit=uplink-cleanup.service
+
+[Install]
+WantedBy=timers.target

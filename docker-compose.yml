@@ -1,0 +1,38 @@
+# Uplink-Delta — single-box EC2 deployment (Amazon Linux 2023 + Docker).
+#
+# Managed services stay as-is: Upstash Redis, MongoDB Atlas, Cloudflare R2.
+# Only the Next.js web/API tier moves onto this box.
+#
+#   app   — Next.js standalone server, published on loopback only.
+#   caddy — reverse proxy on :80 (and :443, reserved for the future domain).
+#
+# Usage:  docker compose up -d --build    (see deploy/README.md)
+
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Not reachable from the internet: Caddy dials app:3000 over the
+    # compose network; the host publish is loopback-only for debugging and
+    # the systemd cleanup timer.
+    ports:
+      - "127.0.0.1:3000:3000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

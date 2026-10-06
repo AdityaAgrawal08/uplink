@@ -19,7 +19,10 @@ type Config struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		Server:         "https://uplink-delta-xi.vercel.app",
+		// Self-hosted EC2 box (HTTP until a domain/TLS exists). The Vercel
+		// deployment stays live as a fallback: `uplink config set server
+		// https://uplink-delta-xi.vercel.app`.
+		Server:         "http://52.7.217.135:3000",
 		Expiry:         "1h",
 		DownloadDir:    "",
 		LanPort:        9090,

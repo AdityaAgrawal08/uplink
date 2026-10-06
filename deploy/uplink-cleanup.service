@@ -1,0 +1,30 @@
+# Uplink-Delta — daily session cleanup (systemd service unit).
+# Install to /etc/systemd/system/ alongside uplink-cleanup.timer:
+#   sudo cp deploy/uplink-cleanup.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now uplink-cleanup.timer
+#
+# Auth semantics (verified against the code, 2026-10):
+#   * /api/v1/session/cleanup (the former Vercel cron target) is NOT
+#     authenticated — Vercel crons send no credentials.
+#   * The bearer header below is sent anyway: it matches the cleanup auth
+#     convention (isCleanupAuthorized / CRON_SECRET) and keeps this unit
+#     working unchanged if the route is ever gated or repointed at
+#     /api/v1/cleanup (which does require CRON_SECRET or ADMIN_API_KEY).
+#   * CRON_SECRET comes from .env via EnvironmentFile; -f fails the unit on
+#     any HTTP error so a broken box shows up in `systemctl --failed`.
+
+[Unit]
+Description=Uplink-Delta session cleanup (GET /api/v1/session/cleanup)
+Documentation=file:///opt/uplink-delta/deploy/README.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/uplink-delta
+# Default then file: EnvironmentFile entries override Environment=, so an
+# unset CRON_SECRET still expands cleanly to an empty bearer.
+Environment=CRON_SECRET=
+EnvironmentFile=/opt/uplink-delta/.env
+ExecStart=/usr/bin/curl -sS -f -H "Authorization: Bearer ${CRON_SECRET}" http://127.0.0.1:3000/api/v1/session/cleanup

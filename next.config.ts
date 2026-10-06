@@ -25,6 +25,9 @@ const csp = [
 ].join("; ");
 
 const nextConfig: NextConfig = {
+  // Self-hosted (EC2/Docker) deployment: emit a minimal server bundle at
+  // .next/standalone that runs with `node server.js` (see Dockerfile).
+  output: "standalone",
   async headers() {
     return [
       {

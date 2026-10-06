@@ -11,7 +11,7 @@ chat system** with three parts:
 | Part | Location | Role |
 |---|---|---|
 | CLI | `cli/` (Go, module `github.com/AdityaAgrawal08/uplink-delta/cli`, go 1.27) | File send/receive (cloud, LAN, WAN, P2P mesh), terminal chat TUI, voice calls, QR, self-update |
-| Web signaling plane | `src/` (Next.js + TypeScript) | Room signaling (rooms, presence, inbox, WebRTC rendezvous), file-share metadata + R2 presigned URLs, quota, share preview pages. Deployed on Vercel serverless |
+| Web signaling plane | `src/` (Next.js + TypeScript) | Room signaling (rooms, presence, inbox, WebRTC rendezvous), file-share metadata + R2 presigned URLs, quota, share preview pages. Self-hosted on a single AWS EC2 box (Docker + Caddy); Vercel remains a retired fallback |
 | Shelved relay | `server/` (Go, separate module, go 1.23) | **SHELVED, not used in production.** Standalone WebSocket relay kept as documented fallback for an always-on host (see `server/README.md`) |
 
 Core promise: **message/file contents are opaque to the server** (E2E via
@@ -67,7 +67,9 @@ tests/          Web/E2E suites + probes (see tests/README.md; `make test`, `make
 .github/workflows  ci.yml, release.yml
 Makefile        build/install/clean/release + test targets (test-go, test-web, test, e2e, test-all)
 install.sh / install.ps1  checksum-verified installers (fail closed)
-DEPLOY.md       Vercel/Redis/R2 setup + verification steps
+Dockerfile / docker-compose.yml / Caddyfile / .dockerignore
+                EC2 deployment: standalone image, app + Caddy, proxy config
+deploy/         EC2 runbook (README.md) + systemd daily-cleanup timer units
 docs/           This documentation + FILEMAP.md
 ```
 
@@ -284,8 +286,14 @@ Video variables are **retired** (video calling removed). Config lives in
 - Identity model: signaling callers present `X-Uplink-Username` (no bearer
   token — known limitation); file shares are bearer
   (`shareId`/`downloadCode`/`uploadId`); admin uses `ADMIN_API_KEY`.
-- Deploy: Vercel (`vercel.json`: region, function timeouts, daily session
-  cleanup cron). See `DEPLOY.md`.
+- Deploy: single AWS EC2 box (`52.7.217.135`) running Docker Compose:
+  `caddy` (:80/:443, domain-ready) → `app` (Next.js standalone,
+  127.0.0.1:3000). Upstash Redis / Mongo Atlas / R2 stay managed and
+  unchanged. The daily session cleanup moves from the Vercel cron to
+  `deploy/uplink-cleanup.{service,timer}` (03:00 UTC). Vercel is a
+  **retired fallback** — `vercel.json` and the deployment stay live until
+  the domain cutover is proven, but they are no longer the target. Full
+  runbook: `deploy/README.md`.
 
 ## 6. Build, test, CI, release
 

@@ -1,0 +1,30 @@
+# Uplink-Delta reverse proxy (EC2, no domain yet).
+#
+# `http://` = plain HTTP on port 80 for any host, so the box is reachable at
+# http://52.7.217.135/ today. TLS is deferred until a domain exists.
+#
+# X-Forwarded-For is SET (not appended) to the direct peer's address:
+# clients cannot inject a spoofed leftmost entry, and the app (which reads
+# the leftmost XFF entry when TRUST_PROXY=true) always sees the real client
+# IP. X-Forwarded-Proto is set explicitly for the same reason.
+http:// {
+	reverse_proxy app:3000 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
+
+# ─── Domain cutover (later) ──────────────────────────────────────────────────
+# Once a DNS A record for your domain points at 52.7.217.135, replace the
+# site block above with:
+#
+#   uplink.example.com {
+#   	reverse_proxy app:3000 {
+#   		header_up X-Forwarded-For {remote_host}
+#   		header_up X-Forwarded-Proto {scheme}
+#   	}
+#   }
+#
+# Caddy then obtains and renews a Let's Encrypt certificate automatically
+# (requires inbound :80 and :443 open in the security group), and redirects
+# HTTP to HTTPS on its own. Nothing else in this file changes.
