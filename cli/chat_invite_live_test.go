@@ -118,8 +118,43 @@ func TestInviteeLiveChainIsComplete(t *testing.T) {
 	if r.chat.pendingInvites != 1 {
 		t.Fatalf("invitee badge = %d; want 1 after the live poll", r.chat.pendingInvites)
 	}
-	if len(pings) != 1 || pings[0] != "alice|Design" {
-		t.Fatalf("beeep = %v; want exactly one alice|Design", pings)
+	// B62: the fixture invite predates the session's first poll, so it is
+	// a BASELINE — it badges silently and must never ring on launch.
+	if len(pings) != 0 {
+		t.Fatalf("baseline poll must not ring, pings = %v", pings)
+	}
+
+	// ── A NEW invite arriving WHILE the session runs rings exactly once.
+	// (Fresh client: createGroupRoom parks its code in c.key, which would
+	// misroute a second create to /session/<code>/create.)
+	inviter2 := &signalClient{serverURL: srv.URL, me: "alice", id: aliceID}
+	code2, err := inviter2.createGroupRoom("alice", pubkeyB64(aliceID), "Chess", "", nil, "123456")
+	if err != nil {
+		t.Fatalf("createGroupRoom (second): %v", err)
+	}
+	if err := inviter2.sendInvite("bob"); err != nil {
+		t.Fatalf("sendInvite (second): %v", err)
+	}
+	if !fake.fakeHasInvite("bob", code2) {
+		t.Fatal("fixture: the per-user index holds no second invite for bob")
+	}
+	rn, cmd = r.Update(rosterTickMsg{})
+	r = rn.(rootModel)
+	msgs = runBatchCmd(t, cmd)
+	polled, ok = findMsg[invitesPolledMsg](msgs)
+	if !ok {
+		t.Fatal("second roster tick must arm the /invites/mine poll")
+	}
+	if polled.err != nil || len(polled.invites) != 2 {
+		t.Fatalf("second poll = %+v err=%v; want both invites", polled.invites, polled.err)
+	}
+	rn, _ = r.Update(polled)
+	r = rn.(rootModel)
+	if r.chat.pendingInvites != 2 {
+		t.Fatalf("invitee badge = %d; want 2", r.chat.pendingInvites)
+	}
+	if len(pings) != 1 || pings[0] != "alice|Chess" {
+		t.Fatalf("pings = %v; want exactly one alice|Chess for the live invite", pings)
 	}
 
 	// ── /settings through rootModel: the window must arm its own fetch
@@ -134,13 +169,15 @@ func TestInviteeLiveChainIsComplete(t *testing.T) {
 	if !ok {
 		t.Fatal("settings Init must fetch GET /invites/mine immediately")
 	}
-	if fetched.err != nil || len(fetched.invites) != 1 || fetched.invites[0].Code != code {
-		t.Fatalf("settings fetch = %+v err=%v; want the pending invite", fetched.invites, fetched.err)
+	// Both pending invites (the baselined Design one and the live Chess
+	// one) are listed; the window paints both rows.
+	if fetched.err != nil || len(fetched.invites) != 2 {
+		t.Fatalf("settings fetch = %+v err=%v; want both pending invites", fetched.invites, fetched.err)
 	}
 	rn, _ = r.Update(fetched)
 	r = rn.(rootModel)
 	view := r.View()
-	for _, want := range []string{"NOTIFICATIONS", "alice invited you to group Design"} {
+	for _, want := range []string{"NOTIFICATIONS", "alice invited you to group Design", "alice invited you to group Chess"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("settings view missing %q", want)
 		}

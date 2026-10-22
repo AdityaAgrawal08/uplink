@@ -56,14 +56,27 @@ export const MAX_SIG_PAYLOAD = 16 * 1024; // SDP/ICE notes are small
 export const MAX_BOX_PAYLOAD = 128 * 1024; // fallback relay: text + small files only
 
 export const CREATE_LIMIT_PER_HOUR = 10; // room creations per IP
-// B55 FIX (finding 6): send/read budgets now enforce BOTH a per-IP total
-// (the anti-Sybil term — rotating usernames cannot mint fresh buckets) AND a
+// B55 FIX (finding 6): send/read budgets enforce BOTH a per-IP total (the
+// anti-Sybil term — rotating usernames cannot mint fresh buckets) AND a
 // per-username share (a fairness sub-bucket so several members behind one
 // NAT don't starve each other). Membership mutations (join/leave/create/
 // kick/grant) stay purely IP-scoped: budgets that gate Sybil-able actions
 // must not be dodgeable by minting names.
-export const SEND_LIMIT_PER_WINDOW = 120; // signal/inbox/reaction/invite sends per IP per 5 min
-export const SEND_USER_SHARE_PER_WINDOW = 60; // per-username share of the send budget (fairness sub-bucket)
+//
+// B61 SIZING — budgets must absorb the client's REAL cadence, not an idealized
+// one. Measured steady state per chat session per 5 min: signal drain 150 +
+// inbox fetch 150 (2s loops) + heartbeat 60 (5s loop) = 360 reads; the TUI
+// adds reactions + invites polls (~300 more), and EVERY joined group runs a
+// full background engine (another 360 each). The old 600/user read share was
+// exhausted by ~90 seconds of normal use once groups entered the picture —
+// the server then 429'd the client's own polls ("invites unavailable — 429").
+// Mesh setup is the send-side equivalent: joining an N-person room fires ~5
+// signal notes per peer (non-trickle offer/answer + 3 Noise messages), so a
+// 10-person room costs ~45 notes in the first minute and the old 60/user
+// share tripped before the user typed a word. New numbers cover ~6 concurrent
+// sessions per user and multi-user NATs with headroom.
+export const SEND_LIMIT_PER_WINDOW = 240; // signal/inbox/reaction/invite sends per IP per 5 min
+export const SEND_USER_SHARE_PER_WINDOW = 120; // per-username share of the send budget (fairness sub-bucket)
 export const SEND_WINDOW_SEC = 5 * 60;
 export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
 // B60 FIX (finding 14): join attempts are ALSO budgeted per ROOM (global, not
@@ -74,8 +87,8 @@ export const JOIN_LIMIT_PER_WINDOW = 120; // joins + leaves per IP per 5 min
 // minutes) stay far under it. The 6-digit UX is untouched — normal joins use
 // a handful of attempts per room per window.
 export const JOIN_LIMIT_PER_ROOM_PER_WINDOW = 120;
-export const READ_LIMIT_PER_WINDOW = 1200; // heartbeats + polls + fetches + acks per IP per 5 min (~2/s sustained; normal use ≈0.3/s)
-export const READ_USER_SHARE_PER_WINDOW = 600; // per-username share of the read budget (~2/s per user: two same-user tabs + ack overhead)
+export const READ_LIMIT_PER_WINDOW = 6000; // heartbeats + polls + fetches + acks per IP per 5 min (~20/s sustained; sized for several users behind one NAT — see B61 sizing note above)
+export const READ_USER_SHARE_PER_WINDOW = 2400; // per-username read share (~8/s per user: home engine 360 + one background engine per joined group at 360 each + TUI polls ~300 + ack/refresh bursts)
 
 // Reactions are cosmetic metadata on ciphertext messages: one hash per room.
 // Field = `${msgId}|${emoji}|${username}`, value "1" (presence is the datum;
@@ -1089,20 +1102,31 @@ export async function depositSignal(
   ]);
 }
 
-// Drain my signaling queue with one atomic pop per note. The old
-// LRANGE+DEL pipeline dropped notes deposited between the read and the
-// clear; pops are atomic, so concurrent deposits stay queued for the next
-// drain instead of vanishing. RPOP yields newest-first: reversed back to
-// send order. Bounded iterations; leftovers wait for the next poll.
+// Drain my signaling queue atomically. Each note is removed by an RPOP the
+// moment it is read, so concurrent deposits stay queued for the next drain
+// instead of vanishing (the older LRANGE+DEL pipeline dropped them). The
+// pops for one drain are pipelined into a single round trip: the previous
+// loop RPOP'd one note per HTTP request — draining a full 150-note queue
+// cost up to 166 sequential round trips (~25s on a 170ms-RTT Upstash link),
+// stalling the poll loop and bursting every budget downstream. B61 FIX.
+// RPOP yields newest-first: reversed back to send order. Notes deposited
+// between the depth read and the pops wait for the next poll; leftovers
+// beyond the depth snapshot self-paginate the same way.
 export async function drainSignals(code: string, username: string): Promise<SignalNote[]> {
   assertRoomCode(code);
   assertUsername(username);
   await requireMember(code, username);
+  const depthRaw = await redis.llen(sigKey(code, username));
+  const depth = Math.min(Number(depthRaw) || 0, MAX_SIG_QUEUE + 16);
+  if (depth <= 0) return [];
+  const ops: PipeOp[] = [];
+  for (let i = 0; i < depth; i++) {
+    ops.push({ cmd: "rpop", key: sigKey(code, username), args: [] });
+  }
+  const popped = await redis.pipeline(ops);
   const raw: string[] = [];
-  for (let i = 0; i < MAX_SIG_QUEUE + 16; i++) {
-    const item = await redis.rpop(sigKey(code, username));
-    if (item == null) break;
-    raw.push(item);
+  for (const item of popped) {
+    if (typeof item === "string") raw.push(item);
   }
   raw.reverse();
   if (raw.length === 0) return [];

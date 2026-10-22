@@ -548,9 +548,11 @@ func TestSettingsRender(t *testing.T) {
 // Chat-side badge + beeep
 // ---------------------------------------------------------------------------
 
-// TestInviteBadgeAndBeeep proves the 2s poll reconcile: one beeep per new
-// invite code (exact body), the badge reflecting the live list length, and
-// the ⚙ chip painting in the sidebar header.
+// TestInviteBadgeAndBeeep proves the 2s poll reconcile: the FIRST poll of a
+// session is a silent baseline (badge paints, no ping — invites pending
+// before launch must not re-ring on every start, B62), and a code that
+// ARRIVES while running rings exactly once (exact body). The badge reflects
+// the live list length, and the ⚙ chip paints in the sidebar header.
 func TestInviteBadgeAndBeeep(t *testing.T) {
 	var pings []string
 	prev := inviteNotifier
@@ -558,35 +560,37 @@ func TestInviteBadgeAndBeeep(t *testing.T) {
 	defer func() { inviteNotifier = prev }()
 
 	c := groupTestScreen("alice")
+	// First poll = baseline: badge paints, NO ping (B62).
 	c.applyInvites([]groupInvite{
 		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
 	if c.pendingInvites != 1 {
 		t.Fatalf("badge = %d; want 1", c.pendingInvites)
 	}
-	if len(pings) != 1 || pings[0] != "bob|Design" {
-		t.Fatalf("pings = %v; want exactly one bob|Design", pings)
+	if len(pings) != 0 {
+		t.Fatalf("pre-launch invites must badge silently, pings = %v", pings)
 	}
-	// Re-poll with the same list: no re-ring, badge unchanged.
+	if !strings.Contains(c.sidebarHeader(30), "⚙") {
+		t.Error("sidebar header must paint the ⚙ badge with invites pending")
+	}
+	// Re-poll with the same list: no ring, badge unchanged.
 	c.applyInvites([]groupInvite{
 		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
-	if len(pings) != 1 {
-		t.Fatalf("re-poll must not re-ring: %v", pings)
+	if len(pings) != 0 {
+		t.Fatalf("re-poll must not ring: %v", pings)
 	}
-	// A second invite rings with the unnamed-group fallback.
+	// A NEW invite after the baseline rings once, with the unnamed-group
+	// fallback.
 	c.applyInvites([]groupInvite{
 		{Code: "700002", GroupName: "", By: "carol", At: 1},
 		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
 	})
-	if len(pings) != 2 || pings[1] != "carol|a group" {
-		t.Fatalf("pings = %v; want carol|a group second", pings)
+	if len(pings) != 1 || pings[0] != "carol|a group" {
+		t.Fatalf("pings = %v; want exactly one carol|a group", pings)
 	}
 	if c.pendingInvites != 2 {
 		t.Fatalf("badge = %d; want 2", c.pendingInvites)
-	}
-	if !strings.Contains(c.sidebarHeader(30), "⚙") {
-		t.Error("sidebar header must paint the ⚙ badge with invites pending")
 	}
 	c.applyInvites(nil)
 	if c.pendingInvites != 0 {
@@ -594,6 +598,15 @@ func TestInviteBadgeAndBeeep(t *testing.T) {
 	}
 	if strings.Contains(c.sidebarHeader(30), "⚙") {
 		t.Error("badge must vanish when no invites are pending")
+	}
+	// The badge clearing does not reset the ring memory: a code that rang
+	// (or was baselined) never rings again in this session, even if the
+	// server re-lists it after a list hiccup.
+	c.applyInvites([]groupInvite{
+		{Code: "700001", GroupName: "Design", By: "bob", At: 1},
+	})
+	if len(pings) != 1 {
+		t.Fatalf("known codes must never re-ring: %v", pings)
 	}
 }
 

@@ -87,6 +87,9 @@ type settingsModel struct {
 	passErr   string
 	passBusy  bool
 	passInput textinput.Model
+	// skip is the tick-skip counter backing the invite poll off after a
+	// 429 read-budget rejection (B61). Owned by the tea Update loop.
+	skip int
 	// completed accept: payload for acceptGroupDoneMsg
 	doneCode     string
 	doneName     string
@@ -261,14 +264,35 @@ func (m settingsModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleMouse(msg)
 
 	case invitePollTickMsg:
+		// B61: while the read budget is rejecting the poll, skip the fetch
+		// and just re-arm the tick.
+		if m.skip > 0 {
+			m.skip--
+			return m, scheduleInvitePoll()
+		}
 		return m, m.fetchInvitesCmd()
 
 	case invitesFetchedMsg:
 		if msg.err != nil {
+			// B61: a 429 is OUR OWN poll budget — not an outage. Say so
+			// calmly, back the poll off, and keep any existing list.
+			if apiStatusCode(msg.err) == 429 {
+				m.skip = nextReadSkip(m.skip)
+				if len(m.invites) == 0 {
+					m.notice = "Rate limited — the invite list will refresh automatically."
+				}
+				return m, scheduleInvitePoll()
+			}
 			if len(m.invites) == 0 {
 				m.notice = "invites unavailable — " + msg.err.Error()
 			}
 			return m, scheduleInvitePoll()
+		}
+		m.skip = 0 // recovered: back to normal cadence
+		// Clear only the stale rate-limit notice; accept/decline error
+		// notices must survive their own 2s poll.
+		if m.notice == "Rate limited — the invite list will refresh automatically." {
+			m.notice = ""
 		}
 		m.invites = msg.invites
 		m.clampSel()

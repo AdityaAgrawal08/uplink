@@ -744,24 +744,35 @@ type chatScreen struct {
 	// pointer swap). Group messages travel with key = group code and land
 	// in history under the "group:<code>" conversation bucket, so the whole
 	// transcript/reaction/reply pipeline works unchanged.
-	groups         map[string]*groupSession // code -> joined group
-	activeGroup    string                   // open group code ("" = home room)
-	lastGroupAt    map[string]time.Time     // code -> newest inbound message (recency sort)
+	groups      map[string]*groupSession // code -> joined group
+	activeGroup string                   // open group code ("" = home room)
+	lastGroupAt map[string]time.Time     // code -> newest inbound message (recency sort)
 	// tombstones are session-only placeholder rows for groups this client is
 	// no longer a member of (left/kicked/dissolved). Never persisted.
 	tombstones map[string]groupTombstone
 	// groupsPath is the local membership store (~/.uplink/groups.json; env
 	// override UPLINK_GROUPS_FILE). Only runChatTUI wires it — bare/test
 	// screens leave it empty so no test ever touches a developer's HOME.
-	groupsPath    string
-	homeKey       string // the constructor's session code (the main room)
-	homeSig        *signalClient            // home session client (survives group switches)
-	homeEng        *engine                  // home session engine (kept running in background)
-	id             *identityKey             // device identity (group engines reuse it)
-	pendingInvites int                      // badge: invite rows the server currently holds
-	seenInvites    map[string]bool          // invite codes already beeep'd (one ping per invite)
-	leftSent       *atomic.Bool             // per-screen leave guard (pointer: screen is copied by value)
-	drainTimer     *time.Timer              // reused pump timer (no time.After alloc per cycle)
+	groupsPath     string
+	homeKey        string          // the constructor's session code (the main room)
+	homeSig        *signalClient   // home session client (survives group switches)
+	homeEng        *engine         // home session engine (kept running in background)
+	id             *identityKey    // device identity (group engines reuse it)
+	pendingInvites int             // badge: invite rows the server currently holds
+	seenInvites    map[string]bool // invite codes already beeep'd (one ping per invite)
+	leftSent       *atomic.Bool    // per-screen leave guard (pointer: screen is copied by value)
+	drainTimer     *time.Timer     // reused pump timer (no time.After alloc per cycle)
+	// reactionsSkip/invitesSkip are tick-skip counters backing off the 2s
+	// polls after a 429 read-budget rejection (B61). Owned by the tea
+	// Update loop (no locking needed); nextReadSkip grows them, every
+	// roster tick decrements.
+	reactionsSkip int
+	invitesSkip   int
+	// invitesBaselined flips after the first SUCCESSFUL invites poll of a
+	// session (B62): invites already pending at launch badge silently —
+	// they may be hours old, sent on another machine — and only codes
+	// that ARRIVE while the app is running ring the desktop ping.
+	invitesBaselined bool
 }
 
 // focusPane names the one component that owns keyboard focus. Exactly one
@@ -2830,10 +2841,13 @@ func (c *chatScreen) pollInvitesCmd() tea.Cmd {
 	}
 }
 
-// applyInvites reconciles the pending-invite badge with server truth and
-// rings the desk-based ping ONCE per invite code. The badge shows the live
-// list length (declines/accepts shrink it on the next poll); the seen set
-// gates the beeep, so re-polls never re-ring.
+// applyInvites reconciles the pending-invite badge with server truth.
+// B62 — ring semantics: the FIRST successful poll of a session is a
+// baseline, not news. Invites that were already pending when the app
+// launched (sent hours ago, possibly on another machine, or by someone who
+// guessed the username on a shared server) must never re-ring on every
+// start — they badge silently, and /settings can decline them. Only codes
+// that ARRIVE after that baseline ring the desktop ping, exactly once.
 func (c *chatScreen) applyInvites(invites []groupInvite) {
 	if c.seenInvites == nil {
 		c.seenInvites = map[string]bool{}
@@ -2844,17 +2858,22 @@ func (c *chatScreen) applyInvites(invites []groupInvite) {
 			continue
 		}
 		n++
-		if !c.seenInvites[inv.Code] {
-			c.seenInvites[inv.Code] = true
-			grp := inv.GroupName
-			if grp == "" {
-				grp = "a group" // unnamed groups read naturally in the ping
-			}
-			if inviteNotifier != nil {
-				inviteNotifier(inv.By, grp)
-			}
+		if c.seenInvites[inv.Code] {
+			continue // re-polls never re-ring
+		}
+		c.seenInvites[inv.Code] = true
+		if !c.invitesBaselined {
+			continue // pre-launch invite: badge only, no ping
+		}
+		grp := inv.GroupName
+		if grp == "" {
+			grp = "a group" // unnamed groups read naturally in the ping
+		}
+		if inviteNotifier != nil {
+			inviteNotifier(inv.By, grp)
 		}
 	}
+	c.invitesBaselined = true // every later poll can ring fresh codes
 	if n != c.pendingInvites {
 		c.pendingInvites = n
 		c.rebuildView()
@@ -4021,13 +4040,20 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Reaction truth rides the same 2s cadence: one narrowed GET for
 		// the active conversation's newest messages. This is what makes
 		// peer reactions (and lost P2P nudges) eventually consistent.
-		if cmd := c.fetchReactionsCmd(); cmd != nil {
+		// B61: while the server's read budget is rejecting this poll (429),
+		// skip ticks instead of hammering the gate.
+		if c.reactionsSkip > 0 {
+			c.reactionsSkip--
+		} else if cmd := c.fetchReactionsCmd(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 		// Invites ride the same tick: a fresh pending invite rings the
 		// desktop ping once and lights the settings badge. The settings
 		// window polls for itself while open, so this never double-fires.
-		if cmd := c.pollInvitesCmd(); cmd != nil {
+		// B61: same 429 backoff as the reactions poll.
+		if c.invitesSkip > 0 {
+			c.invitesSkip--
+		} else if cmd := c.pollInvitesCmd(); cmd != nil {
 			cmds = append(cmds, cmd)
 		}
 		cmds = append(cmds, scheduleRoster())
@@ -4035,6 +4061,9 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case invitesPolledMsg:
 		if msg.err == nil {
 			c.applyInvites(msg.invites)
+			c.invitesSkip = 0 // recovered: back to normal cadence
+		} else if apiStatusCode(msg.err) == 429 {
+			c.invitesSkip = nextReadSkip(c.invitesSkip)
 		}
 
 	case groupLeftMsg:
@@ -4277,7 +4306,16 @@ func (c chatScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, c.drainNetCmd())
 
 	case reactionsFetchedMsg:
-		if msg.err == nil && c.applyFetchedReactions(msg.ids, msg.summaries) {
+		if msg.err != nil {
+			// B61: a 429 is the read budget backing us off — arm the skip
+			// counter and wait out the window; nothing scary to show.
+			if apiStatusCode(msg.err) == 429 {
+				c.reactionsSkip = nextReadSkip(c.reactionsSkip)
+			}
+			break
+		}
+		c.reactionsSkip = 0 // recovered
+		if c.applyFetchedReactions(msg.ids, msg.summaries) {
 			c.rebuildView()
 		}
 
@@ -4775,6 +4813,13 @@ func (c *chatScreen) settleSend(msg sendDoneMsg) tea.Cmd {
 	case msg.code == 429:
 		if echoIdx >= 0 {
 			c.localLines[echoIdx] = localLine{conv: pc, text: tuiErrStyle.Render("✗ slow down — try again")}
+		}
+		// B61: the text was composed and then destroyed — put it back in
+		// the composer so a rate-limit rejection can never eat a message.
+		if msg.text != "" && c.input.Value() == "" {
+			c.input.SetValue(msg.text)
+			c.input.CursorEnd()
+			c.focus = focusComposer
 		}
 	case msg.code == 410:
 		if echoIdx >= 0 {

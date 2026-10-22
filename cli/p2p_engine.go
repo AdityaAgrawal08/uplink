@@ -171,8 +171,16 @@ type engine struct {
 	// lastBeatErr is the latest heartbeat failure (nil after any success).
 	// The TUI polls it on its render tick to hold the server-down alert.
 	lastBeatErr error
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
+	// sigSkip/inboxSkip/beatSkip are tick-skip counters after a 429 budget
+	// rejection (B61): the server said "slow down", so backing off is the
+	// correct response — hammering at full cadence would only deepen the
+	// lockout. Each field is owned by exactly one loop goroutine (no
+	// mutex needed); nextReadSkip grows it exponentially (4 → 30 ticks).
+	sigSkip   int
+	inboxSkip int
+	beatSkip  int
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
 }
 
 // rosterFreshTTL bounds how stale the send path's roster may be. 2s keeps
@@ -325,6 +333,21 @@ func (e *engine) beatErr() error {
 	return e.lastBeatErr
 }
 
+// nextReadSkip grows the tick-skip counter for a 429'd read poll: bounded
+// exponential backoff in ticks (4 → 8 → 16 → 30). At the 2s poll cadence
+// that is 8s of quiet after the first rejection, topping out at 60s — long
+// enough to outwait a 5-minute budget window edge without freezing recovery.
+func nextReadSkip(prev int) int {
+	n := prev * 2
+	if n < 4 {
+		n = 4
+	}
+	if n > 30 {
+		n = 30
+	}
+	return n
+}
+
 // ─── lifecycle ──────────────────────────────────────────────────────────────
 
 func (e *engine) start() {
@@ -458,6 +481,12 @@ func (e *engine) beatLoop() {
 		case <-e.stopCh:
 			return
 		case <-ticker.C:
+			// B61: honor the server's 429 budget rejections — skip this
+			// beat while backing off instead of hammering the gate.
+			if e.beatSkip > 0 {
+				e.beatSkip--
+				continue
+			}
 			e.beatOnce()
 		}
 	}
@@ -466,6 +495,12 @@ func (e *engine) beatLoop() {
 func (e *engine) beatOnce() {
 	roster, epoch, err := e.sig.heartbeat("", nil)
 	if err != nil {
+		// B61: a 429 is the read budget saying "slow down" — arm the
+		// skip counter and never surface it as a scary status line.
+		if apiStatusCode(err) == 429 {
+			e.beatSkip = nextReadSkip(e.beatSkip)
+			return
+		}
 		// Pruned while asleep (missed beats): rejoin with the same identity
 		// instead of rotting at 403 forever. A 409 here means someone took
 		// our name meanwhile — surface it, don't loop.
@@ -521,6 +556,7 @@ func (e *engine) beatOnce() {
 	e.presence = roster
 	e.lastEpoch = epoch
 	e.lastBeatErr = nil
+	e.beatSkip = 0 // budget recovered: resume normal cadence
 	before := make(map[string]bool, len(e.roster))
 	for u := range e.roster {
 		before[u] = true
@@ -648,10 +684,19 @@ func (e *engine) signalLoop() {
 		case <-e.stopCh:
 			return
 		case <-ticker.C:
-			notes, err := e.sig.signalPoll()
-			if err != nil {
+			// B61: back off while the read budget is rejecting us.
+			if e.sigSkip > 0 {
+				e.sigSkip--
 				continue
 			}
+			notes, err := e.sig.signalPoll()
+			if err != nil {
+				if apiStatusCode(err) == 429 {
+					e.sigSkip = nextReadSkip(e.sigSkip)
+				}
+				continue
+			}
+			e.sigSkip = 0
 			for _, n := range notes {
 				e.onNote(n)
 			}
@@ -908,6 +953,11 @@ func (e *engine) inboxLoop() {
 		case <-e.stopCh:
 			return
 		case <-ticker.C:
+			// B61: back off while the read budget is rejecting us.
+			if e.inboxSkip > 0 {
+				e.inboxSkip--
+				continue
+			}
 			e.inboxOnce()
 		}
 	}
@@ -916,8 +966,14 @@ func (e *engine) inboxLoop() {
 func (e *engine) inboxOnce() {
 	boxes, epoch, err := e.sig.inboxFetch()
 	if err != nil {
+		// A 429 arms the skip counter; other failures wait for the next
+		// tick as before.
+		if apiStatusCode(err) == 429 {
+			e.inboxSkip = nextReadSkip(e.inboxSkip)
+		}
 		return
 	}
+	e.inboxSkip = 0
 	// Roster generation moved (join/leave/prune elsewhere): refresh the
 	// roster NOW on the 2s inbox cadence instead of waiting out the 5s
 	// beat. Costs nothing extra — the epoch rides the fetch we already
