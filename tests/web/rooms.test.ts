@@ -183,18 +183,18 @@ describe("rooms signaling plane", () => {
   });
 
   it("rate limiters trip at their budgets with 429", async () => {
-    const { checkJoinLimit, checkReadLimit, checkSendLimit } = await import("../../src/lib/rooms");
+    const { checkJoinLimit, checkReadLimit, checkSendLimit, JOIN_LIMIT_PER_WINDOW, READ_LIMIT_PER_WINDOW, SEND_LIMIT_PER_WINDOW } = await import("../../src/lib/rooms");
     const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
     // join budget: 120 per window
-    for (let i = 0; i < 120; i++) await checkJoinLimit(ip);
+    for (let i = 0; i < JOIN_LIMIT_PER_WINDOW; i++) await checkJoinLimit(ip);
     await expect(checkJoinLimit(ip)).rejects.toMatchObject({ status: 429 });
-    // read budget covers two same-user tabs plus ack overhead
+    // read budget covers several concurrent engines + TUI polls (B61 sizing)
     const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 1200; i++) await checkReadLimit(ip2);
+    for (let i = 0; i < READ_LIMIT_PER_WINDOW; i++) await checkReadLimit(ip2);
     await expect(checkReadLimit(ip2)).rejects.toMatchObject({ status: 429 });
-    // send budget unchanged
+    // send budget covers mesh setup bursts (~5 signal notes per peer joined)
     const ip3 = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 120; i++) await checkSendLimit("sig", ip3);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("sig", ip3);
     await expect(checkSendLimit("sig", ip3)).rejects.toMatchObject({ status: 429 });
   });
 
@@ -208,10 +208,11 @@ describe("rooms signaling plane", () => {
     await expect(checkSendLimit("sig", ip, "alice")).rejects.toMatchObject({ status: 429 });
 
     // Per-IP anti-Sybil total: rotating to FRESH usernames mints new user
-    // buckets but the IP total is shared — the 121st send from this IP is
-    // refused no matter which fresh name it rides.
+    // buckets but the IP total is shared — the send just past the IP cap
+    // from this IP is refused no matter which fresh name it rides.
     const ip2 = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 120; i++) {
+    const { SEND_LIMIT_PER_WINDOW: sendTotal } = await import("../../src/lib/rooms");
+    for (let i = 0; i < sendTotal; i++) {
       await checkSendLimit("sig", ip2, `rotating_user_${i}`);
     }
     await expect(checkSendLimit("sig", ip2, "brand_new_user")).rejects.toMatchObject({ status: 429 });
@@ -221,7 +222,8 @@ describe("rooms signaling plane", () => {
     for (let i = 0; i < READ_USER_SHARE_PER_WINDOW; i++) await checkReadLimit(ip3, "bob");
     await expect(checkReadLimit(ip3, "bob")).rejects.toMatchObject({ status: 429 });
     const ip4 = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 1200; i++) await checkReadLimit(ip4, `reader_${i}`);
+    const { READ_LIMIT_PER_WINDOW: readTotal } = await import("../../src/lib/rooms");
+    for (let i = 0; i < readTotal; i++) await checkReadLimit(ip4, `reader_${i}`);
     await expect(checkReadLimit(ip4, "fresh_reader")).rejects.toMatchObject({ status: 429 });
 
     // A different IP is unaffected.
@@ -661,9 +663,9 @@ describe("message reactions", () => {
   });
 
   it("reaction sends trip the send budget with 429", async () => {
-    const { checkSendLimit } = await import("../../src/lib/rooms");
+    const { checkSendLimit, SEND_LIMIT_PER_WINDOW } = await import("../../src/lib/rooms");
     const ip = `test-ip-${Math.random().toString(36).slice(2)}`;
-    for (let i = 0; i < 120; i++) await checkSendLimit("reactions", ip);
+    for (let i = 0; i < SEND_LIMIT_PER_WINDOW; i++) await checkSendLimit("reactions", ip);
     await expect(checkSendLimit("reactions", ip)).rejects.toMatchObject({ status: 429 });
   });
 });

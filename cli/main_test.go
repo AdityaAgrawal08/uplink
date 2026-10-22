@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -288,5 +290,50 @@ func TestUploadLimitConstants(t *testing.T) {
 	const serverMax = int64(9_400_000_000)
 	if dirLimit > serverMax {
 		t.Errorf("dir limit %d exceeds server storage ceiling %d", dirLimit, serverMax)
+	}
+}
+
+// TestSanitizeServerUrlMangledVercelDomain covers the dash-for-dot typo in
+// Vercel server URLs ("project-vercel.app" instead of "project.vercel.app"),
+// which fails TLS with an opaque x509 error instead of a readable one.
+func TestSanitizeServerUrlMangledVercelDomain(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		// The reported failure: dashes swallow the dot before vercel.app.
+		{"https://uplink-delta-xi-vercel.app", "https://uplink-delta-xi.vercel.app"},
+		{"uplink-delta-xi-vercel.app", "https://uplink-delta-xi.vercel.app"}, // no scheme
+		{"https://uplink-delta-xi-vercel.app/", "https://uplink-delta-xi.vercel.app"},
+		// Legit hosts pass through untouched.
+		{"https://uplink-delta-xi.vercel.app", "https://uplink-delta-xi.vercel.app"},
+		{"https://example.com", "https://example.com"},
+		{"http://52.7.217.135:3000", "http://52.7.217.135:3000"}, // IP literals keep plain HTTP
+		{"http://uplink-delta-xi.vercel.app", "https://uplink-delta-xi.vercel.app"}, // named hosts upgrade
+	}
+	for _, tt := range tests {
+		if got := sanitizeServerUrl(tt.input); got != tt.expected {
+			t.Errorf("sanitizeServerUrl(%q) = %q; want %q", tt.input, got, tt.expected)
+		}
+	}
+}
+
+// TestAnnotateTLSError pins the actionable hint attached to certificate
+// verification failures, and that unrelated errors pass through untouched.
+func TestAnnotateTLSError(t *testing.T) {
+	tlsErr := fmt.Errorf(`Post "https://uplink-delta-xi-vercel.app/api/v1/session/create": tls: failed to verify certificate: x509: certificate signed by unknown authority`)
+	got := annotateTLSError(tlsErr)
+	if !strings.Contains(got.Error(), "TLS certificate verification failed") {
+		t.Errorf("expected hint in %q", got.Error())
+	}
+	if !strings.Contains(got.Error(), "vercel.app") {
+		t.Errorf("expected vercel.app typo hint in %q", got.Error())
+	}
+	other := fmt.Errorf("connection refused")
+	if got := annotateTLSError(other); got != other {
+		t.Errorf("non-TLS errors must pass through unchanged, got %v", got)
+	}
+	if annotateTLSError(nil) != nil {
+		t.Error("nil error must stay nil")
 	}
 }

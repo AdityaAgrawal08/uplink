@@ -58,7 +58,7 @@
       "id": "cli/chat_tui.go",
       "label": "chat_tui.go",
       "group": "cli",
-      "size": 6042
+      "size": 6079
     },
     {
       "id": "cli/chat_upload.go",
@@ -112,7 +112,7 @@
       "id": "cli/groups_ui.go",
       "label": "groups_ui.go",
       "group": "cli",
-      "size": 2681
+      "size": 2705
     },
     {
       "id": "cli/lan/discovery.go",
@@ -148,7 +148,7 @@
       "id": "cli/main.go",
       "label": "main.go",
       "group": "cli",
-      "size": 1708
+      "size": 1732
     },
     {
       "id": "cli/media_audio.go",
@@ -208,7 +208,7 @@
       "id": "cli/p2p_engine.go",
       "label": "p2p_engine.go",
       "group": "cli",
-      "size": 1748
+      "size": 1804
     },
     {
       "id": "cli/p2p_mesh.go",
@@ -268,7 +268,7 @@
       "id": "cli/session.go",
       "label": "session.go",
       "group": "cli",
-      "size": 307
+      "size": 340
     },
     {
       "id": "cli/speed.go",
@@ -412,7 +412,7 @@
       "id": "src/app/api/v1/session/create/route.ts",
       "label": "route.ts",
       "group": "app",
-      "size": 58
+      "size": 57
     },
     {
       "id": "src/app/api/v1/share/[id]/authorize-download/route.ts",
@@ -568,7 +568,7 @@
       "id": "src/lib/rooms.ts",
       "label": "rooms.ts",
       "group": "lib",
-      "size": 1671
+      "size": 1695
     }
   ],
   "links": [

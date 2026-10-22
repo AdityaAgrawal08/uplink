@@ -314,7 +314,31 @@ func sanitizeServerUrl(serverUrl string) string {
 			serverUrl = "https://" + strings.TrimPrefix(serverUrl, "http://")
 		}
 	}
+	// A host ending in "-vercel.app" is never a real Vercel deployment
+	// (those always end in ".vercel.app" — dot, not dash). It is a typo
+	// like "uplink-delta-xi-vercel.app" for "uplink-delta-xi.vercel.app",
+	// which fails TLS with an opaque x509 error. Correct it up front.
+	if fixed, mangled := fixMangledVercelDomain(serverUrl); mangled {
+		fmt.Printf("Warning: %q is not a valid Vercel domain (dash instead of dot before vercel.app); using %q\n", serverUrl, fixed)
+		serverUrl = fixed
+	}
 	return serverUrl
+}
+
+// fixMangledVercelDomain rewrites hosts like "project-vercel.app" to
+// "project.vercel.app" (the dash-before-vercel.app typo). Returns the
+// input unchanged when the host is not a mangled Vercel domain.
+func fixMangledVercelDomain(serverUrl string) (string, bool) {
+	parsed, err := url.Parse(serverUrl)
+	if err != nil || parsed.Hostname() == "" {
+		return serverUrl, false
+	}
+	host := parsed.Hostname()
+	if !strings.HasSuffix(strings.ToLower(host), "-vercel.app") {
+		return serverUrl, false
+	}
+	fixedHost := host[:len(host)-len("-vercel.app")] + ".vercel.app"
+	return strings.Replace(serverUrl, host, fixedHost, 1), true
 }
 
 func parseDurationToSeconds(durationStr string) (int, error) {

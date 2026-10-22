@@ -242,7 +242,7 @@ A consolidated reference of the numbers that shape behavior, all adjustable only
 - Room codes are six digits; usernames are 3–20 characters of letters, digits, and underscores.
 - Room creation: ten per address per hour.
 - Presence: five-second heartbeats; a member is offline after twenty seconds of silence; the room's sliding safety expiry is twenty-four hours.
-- Send budgets: 120 sends per address per five minutes, with a 60-per-five-minute fairness share per username; join and leave: 120 per address per five minutes plus 120 join attempts per room per five minutes against code scanning; reads (heartbeats, polls, fetches, acknowledgments): 1,200 per address per five minutes with a 600 share per username.
+- Send budgets: 240 sends per address per five minutes, with a 120-per-five-minute fairness share per username (sized to absorb mesh-setup bursts — joining an N-person room costs about five signal notes per peer); join and leave: 120 per address per five minutes plus 120 join attempts per room per five minutes against code scanning; reads (heartbeats, polls, fetches, acknowledgments): 6,000 per address per five minutes with a 2,400 share per username (a chat session's steady state is about 360 reads per five minutes, and every joined group runs a full background engine of its own).
 - Signaling queue: 150 notes per user, each up to 16 KB.
 - Inbox: 50 boxes per recipient, each up to 128 KB, one-hour sliding lifetime, fetched and acknowledged on a two-second poll.
 - Message deduplication remembers the 5,000 most recent identifiers; file deduplication 2,000.

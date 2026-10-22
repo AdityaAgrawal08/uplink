@@ -10,7 +10,6 @@ import {
   createRoom,
   checkCreateLimit,
   clientIpHash,
-  assertRoomCode,
 } from "@/lib/rooms";
 
 // Rooms live until the last member leaves — there is no duration/expiry

@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -24,6 +26,26 @@ var usernameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{3,20}$`)
 var sharedHTTPClient = &http.Client{Timeout: 15 * time.Second}
 
 const chatUsernameHint = "3-20 chars, letters/digits/underscore"
+
+// annotateTLSError rewrites bare TLS certificate-verification failures into
+// actionable errors. Go surfaces them as opaque "x509: certificate signed
+// by unknown authority" messages, but the usual causes are a mistyped
+// server URL (e.g. "project-vercel.app" instead of "project.vercel.app" —
+// a parked domain serving an untrusted certificate) or a broken local
+// trust store / TLS-intercepting proxy.
+func annotateTLSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var certErr *tls.CertificateVerificationError
+	isTLSVerify := errors.As(err, &certErr) ||
+		strings.Contains(err.Error(), "failed to verify certificate") ||
+		strings.Contains(err.Error(), "certificate signed by unknown authority")
+	if !isTLSVerify {
+		return err
+	}
+	return fmt.Errorf("%w — TLS certificate verification failed for the server URL: check it for typos (a dash instead of a dot before \"vercel.app\" is a common one) and your system CA certificates / TLS proxy", err)
+}
 
 // promptLine asks until non-empty; trims spaces and surrounding quotes.
 func promptLine(reader *bufio.Reader, label string) string {
@@ -66,7 +88,7 @@ func postJSONCtx(ctx context.Context, url string, payload any, headers map[strin
 	}
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -83,7 +105,7 @@ func getJSONCtx(ctx context.Context, url string, headers map[string]string) (int
 	}
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -108,7 +130,7 @@ func postJSON(url string, payload any, headers map[string]string) (int, []byte, 
 	// dials), defeating HTTP keep-alive on every poll/heartbeat.
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -126,7 +148,7 @@ func getJSON(url string, headers map[string]string) (int, []byte, error) {
 	// B25 FIX: shared client (see postJSON).
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -150,7 +172,7 @@ func patchJSON(url string, payload any, headers map[string]string) (int, []byte,
 	}
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -168,7 +190,7 @@ func deleteJSON(url string, headers map[string]string) (int, []byte, error) {
 	}
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, annotateTLSError(err)
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
@@ -290,6 +312,17 @@ func cmdJoinChat(args []string, cfg *Config) {
 		case code == 404:
 			fmt.Println("✗ Session not found — check the 6-digit code (rooms vanish when emptied).")
 			os.Exit(1)
+		case code == 429:
+			// B61: the room's anti-brute-force budget tripped (failed probes
+			// from anyone burn it). Not fatal for a legit joiner — wait the
+			// window out with backoff instead of exiting to the shell.
+			transientFails++
+			if transientFails > 3 {
+				fmt.Printf("✗ Join failed: %s\n", msg)
+				os.Exit(1)
+			}
+			fmt.Printf("This session is rate-limited right now — retrying in 10s (%d/3)…\n", transientFails)
+			time.Sleep(10 * time.Second)
 		case code >= 500 || code == 0:
 			transientFails++
 			if transientFails > 3 {
